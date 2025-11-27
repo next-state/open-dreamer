@@ -18,7 +18,7 @@ class Modality(IntEnum):
     SPATIAL = 4
     SHORTCUT_SIGNAL = 5
     SHORTCUT_STEP = 6
-    AGENT = 7
+    AGENT = 100
     # add more as needed
 
 @flax.struct.dataclass  # immutable, PyTree-friendly
@@ -196,72 +196,26 @@ class SpaceSelfAttentionModality(nn.Module):
         q_idx = jnp.arange(S)[:, None]       # (S,1)
         k_idx = jnp.arange(S)[None, :]       # (1,S)
 
-        is_q_lat = q_idx < self.n_latents     # (S,1) bool
-        is_k_lat = k_idx < self.n_latents     # (1,S) bool
-
         q_mod = self.modality_ids[q_idx]      # (S,1)
         k_mod = self.modality_ids[k_idx]      # (1,S)
-        same_mod = (q_mod == k_mod)           # (S,S)
 
         if self.mode == "encoder":
-            # latents -> all; non-latents -> same modality only (no access to latents unless same modality==latent, which they aren't)
-            allow_lat_q = jnp.ones((S, S), dtype=bool)             # lat q attends to everything
-            allow_nonlat_q = same_mod                              # non-lat q attends within itself only
-            mask = jnp.where(is_q_lat, allow_lat_q, allow_nonlat_q)
+            # latents -> all; non-latents -> same modality only
+            mask = (q_mod == k_mod) | (q_mod == Modality.LATENT)
         elif self.mode == "decoder":
-            # latents -> latents only; non-latents -> same modality OR latents
-            allow_lat_q = is_k_lat                                  # lat q -> lat k only
-            allow_nonlat_q = jnp.logical_or(same_mod, is_k_lat)     # non-lat q -> same mod + latents
-            mask = jnp.where(is_q_lat, allow_lat_q, allow_nonlat_q)
+            # latents -> latents only; non-latents -> same modality + latents
+            mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
         elif self.mode in ["wm_agent", "wm_agent_isolated"]:
-            S = int(self.modality_ids.shape[0])
-            q_idx = jnp.arange(S)[:, None]   # (S,1)
-            k_idx = jnp.arange(S)[None, :]   # (1,S)
-            q_mod = self.modality_ids[q_idx] # (S,1)
-            k_mod = self.modality_ids[k_idx] # (1,S)
-
+            # wm_agent: agent reads all; all non-agent tokens read all *except* agent.
+            # wm_agent_isolated: agent reads nobody; all non-agent tokens read all *except* agent.
             is_agent_q = (q_mod == Modality.AGENT)
             is_agent_k = (k_mod == Modality.AGENT)
-            is_action_q = (q_mod == Modality.ACTION)
-            is_action_k = (k_mod == Modality.ACTION)
-
-            # Observation bucket = spatial ∪ register ∪ shortcut tokens
-            is_obs_k = (
-                (k_mod == Modality.SPATIAL) |
-                (k_mod == Modality.REGISTER) |
-                (k_mod == Modality.SHORTCUT_SIGNAL) |
-                (k_mod == Modality.SHORTCUT_STEP)
-            )
-            is_obs_q = (
-                (q_mod == Modality.SPATIAL) |
-                (q_mod == Modality.REGISTER) |
-                (q_mod == Modality.SHORTCUT_SIGNAL) |
-                (q_mod == Modality.SHORTCUT_STEP)
-            )
-
-            # Agent queries:
-            #  - wm_agent: agent reads all (obs ∪ action ∪ agent)
-            #  - wm_agent_isolated: agent reads nobody
-            allow_for_agent_q = jnp.where(
-                self.mode == "wm_agent",
-                jnp.ones((S, S), dtype=bool),
-                jnp.zeros((S, S), dtype=bool)
-            )
-
-            # Non-agent queries (route by query modality)
-            allow_for_action_q = is_action_k                                  # action -> action only  (1,S)
-            allow_for_obs_q    = (is_obs_k | is_action_k)                     # obs -> obs ∪ action    (1,S)
-
-            # Build per-query row permissions with broadcasting from (1,S) to (S,S)
-            allow_nonagent = jnp.where(
-                is_action_q, allow_for_action_q,
-                jnp.where(is_obs_q, allow_for_obs_q, jnp.zeros((S, S), dtype=bool))
-            )
-
-            # Nobody can read agent keys except agent q
-            allow_nonagent = jnp.where(is_agent_k, False, allow_nonagent)
-
-            mask = jnp.where(is_agent_q, allow_for_agent_q, allow_nonagent)
+            if self.mode == "wm_agent":
+                # Agent reads all; Non-agent reads non-agent
+                mask = is_agent_q | (~is_agent_k)
+            else: # wm_agent_isolated
+                # Agent reads nobody; Non-agent reads non-agent
+                mask = (~is_agent_q) & (~is_agent_k)
         else:
             raise ValueError(f"Unknown mode {self.mode}")
 
