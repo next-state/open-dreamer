@@ -18,7 +18,7 @@ class Modality(IntEnum):
     SPATIAL = 4
     SHORTCUT_SIGNAL = 5
     SHORTCUT_STEP = 6
-    AGENT = 100
+    AGENT = 7
     # add more as needed
 
 @flax.struct.dataclass  # immutable, PyTree-friendly
@@ -185,7 +185,7 @@ class SpaceSelfAttentionModality(nn.Module):
     n_heads: int
     modality_ids: jnp.ndarray  # (S,)
     n_latents: int
-    mode: str = "encoder"      # or "decoder"
+    mode: str = "encoder"      # or "decoder", "wm_agent"
     dropout: float = 0.0
 
     def setup(self):
@@ -205,17 +205,11 @@ class SpaceSelfAttentionModality(nn.Module):
         elif self.mode == "decoder":
             # latents -> latents only; non-latents -> same modality + latents
             mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
-        elif self.mode in ["wm_agent", "wm_agent_isolated"]:
+        elif self.mode in ["wm_agent"]:
             # wm_agent: agent reads all; all non-agent tokens read all *except* agent.
-            # wm_agent_isolated: agent reads nobody; all non-agent tokens read all *except* agent.
             is_agent_q = (q_mod == Modality.AGENT)
             is_agent_k = (k_mod == Modality.AGENT)
-            if self.mode == "wm_agent":
-                # Agent reads all; Non-agent reads non-agent
-                mask = is_agent_q | (~is_agent_k)
-            else: # wm_agent_isolated
-                # Agent reads nobody; Non-agent reads non-agent
-                mask = (~is_agent_q) & (~is_agent_k)
+            mask = is_agent_q<=is_agent_k
         else:
             raise ValueError(f"Unknown mode {self.mode}")
 
@@ -227,7 +221,7 @@ class SpaceSelfAttentionModality(nn.Module):
     def __call__(self, x, *, deterministic: bool):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
         B, T, S, D = x.shape
-        x_ = x.reshape(B*T, S, D)
+        x_ = rearrange(x, "B T S D -> (B T) S D")
 
         # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
         mask = jnp.broadcast_to(self.modality_mask.value, (B*T, 1, S, S))   # (B*T,1,S,S)
@@ -239,7 +233,7 @@ class SpaceSelfAttentionModality(nn.Module):
             deterministic=deterministic,
         )(x_, x_, mask=mask)
 
-        y = y_.reshape(B, T, S, D)
+        y = rearrange(y_, "(B T) S D -> B T S D", B=B, T=T)
         return y
 
 class TimeSelfAttention(nn.Module):
@@ -285,7 +279,7 @@ class BlockCausalLayer(nn.Module):
     n_heads: int
     n_latents: int
     modality_ids: jnp.ndarray     # (S,)
-    space_mode: str               # "encoder", "decoder", "wm_agent", "wm_agent_isolated"
+    space_mode: str               # "encoder", "decoder", "wm"
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     layer_index: int = 0
