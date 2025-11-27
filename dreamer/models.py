@@ -240,38 +240,21 @@ class TimeSelfAttention(nn.Module):
     d_model: int
     n_heads: int
     dropout: float = 0.0
-    latents_only: bool = True
-    n_latents: int = 0   # required if latents_only
 
     @nn.compact
     def __call__(self, x, *, deterministic: bool):
         # x: (B, T, S, D) -> attend across T, causal
         B, T, S, D = x.shape
-        if self.latents_only:
-            assert 0 < self.n_latents <= S
-            lat = x[:, :, :self.n_latents, :]                # (B, T, L, D)
-            lat_btld = lat.transpose(0, 2, 1, 3).reshape(B*self.n_latents, T, D)  # (B*L, T, D)
-            causal = nn.attention.make_causal_mask(jnp.ones((B*self.n_latents, T), dtype=bool))
-            out = nn.MultiHeadDotProductAttention(
-                num_heads=self.n_heads,
-                qkv_features=self.d_model,
-                dropout_rate=self.dropout,
-                deterministic=deterministic,
-            )(lat_btld, lat_btld, mask=causal)
-            out = out.reshape(B, self.n_latents, T, D).transpose(0, 2, 1, 3)      # back to (B, T, L, D)
-            x = x.at[:, :, :self.n_latents, :].set(out)
-            return x
-        else:
-            x_bstd = x.transpose(0, 2, 1, 3).reshape(B*S, T, D)  # (B*S, T, D)
-            causal = nn.attention.make_causal_mask(jnp.ones((B*S, T), dtype=bool))
-            out = nn.MultiHeadDotProductAttention(
-                num_heads=self.n_heads,
-                qkv_features=self.d_model,
-                dropout_rate=self.dropout,
-                deterministic=deterministic,
-            )(x_bstd, x_bstd, mask=causal)
-            out = out.reshape(B, S, T, D).transpose(0, 2, 1, 3)  # back to (B, T, S, D)
-            return out
+        x_bstd = rearrange(x, "B T S D -> (B S) T D")
+        causal = nn.attention.make_causal_mask(jnp.ones((B*S, T), dtype=bool))
+        out = nn.MultiHeadDotProductAttention(
+            num_heads=self.n_heads,
+            qkv_features=self.d_model,
+            dropout_rate=self.dropout,
+            deterministic=deterministic,
+        )(x_bstd, x_bstd, mask=causal)
+        out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
+        return out
 
 # ---------- a single block-causal layer ----------
 class BlockCausalLayer(nn.Module):
