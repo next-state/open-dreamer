@@ -6,20 +6,11 @@ from flax.core import FrozenDict
 import flax
 from enum import IntEnum
 from typing import Optional, Tuple, Any
-from einops import rearrange
+from einops import rearrange, repeat
 import math
+from .utils import make_mask, Modality
 
-class Modality(IntEnum):
-    LATENT   = -1
-    IMAGE    = 0
-    ACTION   = 1
-    PROPRIO  = 2
-    REGISTER = 3
-    SPATIAL = 4
-    SHORTCUT_SIGNAL = 5
-    SHORTCUT_STEP = 6
-    AGENT = 7
-    # add more as needed
+
 
 @flax.struct.dataclass  # immutable, PyTree-friendly
 class TokenLayout:
@@ -165,64 +156,16 @@ class MLP(nn.Module):
         return y
 # ---------- axial attention layers ----------
 class SpaceSelfAttentionModality(nn.Module):
-    """
-    Space self-attention with modality routing.
-
-    Args:
-      d_model: int
-      n_heads: int
-      modality_ids: jnp.ndarray with shape (S,), per-token modality id for the S tokens.
-                    Convention: latents are the first `n_latents` tokens; you can set their id to -1.
-      n_latents: int, number of latent tokens at the beginning of S.
-      mode: str in {"encoder", "decoder", "wm_agent"}.
-            - "encoder": latents→all; non-latents→same-modality only.
-            - "decoder": latents→latents-only; non-latents→same-modality + latents.
-            - "wm_agent": agent reads all; all non-agent tokens read all *except* agent.
-      dropout: float
-    """
+    """Space self-attention with modality routing."""
     d_model: int
     n_heads: int
-    modality_ids: jnp.ndarray  # (S,)
-    mode: str = "encoder"      # or "decoder", "wm_agent"
     dropout: float = 0.0
 
-    def setup(self):
-        # Cache a (S,S) boolean mask indicating allowed key for each query index, per mode.
-        S = int(self.modality_ids.shape[0])
-
-        # Broadcast helpers
-        q_idx = jnp.arange(S)[:, None]       # (S,1)
-        k_idx = jnp.arange(S)[None, :]       # (1,S)
-
-        q_mod = self.modality_ids[q_idx]      # (S,1)
-        k_mod = self.modality_ids[k_idx]      # (1,S)
-
-        if self.mode == "encoder":
-            # latents -> all; non-latents -> same modality only
-            mask = (q_mod == k_mod) | (q_mod == Modality.LATENT)
-        elif self.mode == "decoder":
-            # latents -> latents only; non-latents -> same modality + latents
-            mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
-        elif self.mode in ["wm_agent"]:
-            # wm_agent: agent reads all; all non-agent tokens read all *except* agent.
-            is_agent_q = (q_mod == Modality.AGENT)
-            is_agent_k = (k_mod == Modality.AGENT)
-            mask = is_agent_q<=is_agent_k
-        else:
-            raise ValueError(f"Unknown mode {self.mode}")
-
-        # Save (1,1,S,S) so it broadcasts over batch*time and heads -> (B*T, 1, S, S)
-        modality_mask = mask[None, None, :, :]                   # (1,1,S,S)
-        self.modality_mask = self.variable("constants", "modality_mask", lambda: modality_mask)
-
     @nn.compact
-    def __call__(self, x, *, deterministic: bool):
+    def __call__(self, x, mask, *, deterministic: bool):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
         B, T, S, D = x.shape
         x_ = rearrange(x, "B T S D -> (B T) S D")
-
-        # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
-        mask = jnp.broadcast_to(self.modality_mask.value, (B*T, 1, S, S))   # (B*T,1,S,S)
 
         y_ = nn.MultiHeadDotProductAttention(
             num_heads=self.n_heads,
@@ -235,6 +178,7 @@ class SpaceSelfAttentionModality(nn.Module):
         return y
 
 class TimeSelfAttention(nn.Module):
+    """Time self-attention."""
     d_model: int
     n_heads: int
     dropout: float = 0.0
@@ -258,24 +202,20 @@ class TimeSelfAttention(nn.Module):
 class BlockCausalLayer(nn.Module):
     d_model: int
     n_heads: int
-    modality_ids: jnp.ndarray     # (S,)
-    space_mode: str               # "encoder", "decoder", "wm"
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     layer_index: int = 0
     time_every: int = 4
 
     @nn.compact
-    def __call__(self, x, *, deterministic: bool):
+    def __call__(self, x, mask, *, deterministic: bool):
         # --- Space attention (within timestep, modality-aware) ---
         y = RMSNorm()(x)
         y = SpaceSelfAttentionModality(
             d_model=self.d_model,
             n_heads=self.n_heads,
-            modality_ids=self.modality_ids,
-            mode=self.space_mode,
             dropout=self.dropout,
-        )(y, deterministic=deterministic)
+        )(y, mask=mask, deterministic=deterministic)
         x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
 
         # --- Time attention (causal across timesteps), only on some layers ---
@@ -297,22 +237,18 @@ class BlockCausalTransformer(nn.Module):
     d_model: int
     n_heads: int
     depth: int
-    modality_ids: jnp.ndarray   # (S,)
-    space_mode: str             # "encoder" or "decoder"
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     time_every: int = 4
 
     @nn.compact
-    def __call__(self, x, *, deterministic: bool):
+    def __call__(self, x, mask, *, deterministic: bool):
         for i in range(self.depth):
             x = BlockCausalLayer(
                 self.d_model, self.n_heads,
-                modality_ids=self.modality_ids,
-                space_mode=self.space_mode,
                 dropout=self.dropout, mlp_ratio=self.mlp_ratio,
                 layer_index=i, time_every=self.time_every,
-            )(x, deterministic=deterministic)
+            )(x, mask=mask, deterministic=deterministic)
         return x
 
 class Encoder(nn.Module):
@@ -337,12 +273,12 @@ class Encoder(nn.Module):
             d_model=self.d_model,
             n_heads=self.n_heads,
             depth=self.depth,
-            modality_ids=self.modality_ids,
-            space_mode="encoder",                 # << encoder routing
             dropout=self.dropout, mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
         )
         self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
+        mask = make_mask(self.modality_ids, "encoder")
+        self.mask = self.variable("constants", "mask", lambda: mask)
 
     @nn.compact
     def __call__(self, patch_tokens, *, deterministic: bool = True) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
@@ -365,8 +301,10 @@ class Encoder(nn.Module):
         # 4) Add sinusoidal positions (param-free)
         tokens = add_sinusoidal_positions(tokens)
 
+        # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
+        mask = repeat(self.mask.value, " ... -> bt ...", bt=B*T)
         # 5) Feed tokens into transformer
-        encoded_tokens = self.transformer(tokens, deterministic=deterministic)
+        encoded_tokens = self.transformer(tokens, mask=mask, deterministic=deterministic)
         # print(f"encoded_tokens_btSd.shape: {encoded_tokens_btSd.shape}")
 
         # 6) Project latent tokens to bottleneck and tanh
@@ -413,12 +351,12 @@ class Decoder(nn.Module):
             d_model=self.d_model,
             n_heads=self.n_heads,
             depth=self.depth,
-            modality_ids=self.modality_ids,
-            space_mode="decoder",                 # << decoder routing
             dropout=self.dropout,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
         )
+        mask = make_mask(self.modality_ids, "decoder")
+        self.mask = self.variable("constants", "mask", lambda: mask)
 
     @nn.compact
     def __call__(self, z: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
@@ -442,7 +380,8 @@ class Decoder(nn.Module):
         # 5) Axial block-causal transformer
         #    - SpaceSelfAttention over all S tokens (latents + queries)
         #    - TimeSelfAttention only over the first N_l latent tokens
-        x = self.transformer(tokens, deterministic=deterministic)
+        mask = repeat(self.mask.value, " ... -> bt ...", bt=B*T)
+        x = self.transformer(tokens, mask=mask, deterministic=deterministic)
         # 6) Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
         pred_btnd = nn.sigmoid(self.patch_head(x_patches))  # (B,T,Np,D_patch)
@@ -767,6 +706,10 @@ class ValueHead(nn.Module):
         centers_log = self.centers_var.value                   # (K,)
         return logits, centers_log
 
+
+
+
+# ---------- test encoder/decoder ----------
 
 def test_encoder_decoder():
     rng = jax.random.PRNGKey(0)

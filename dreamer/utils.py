@@ -1,10 +1,25 @@
 import jax
 import jax.numpy as jnp
+from functools import lru_cache
 from dreamer.data import patchify, unpatchify
 import orbax.checkpoint as ocp
 from pathlib import Path
 from flax.core import freeze, unfreeze, FrozenDict
 from einops import rearrange
+from enum import IntEnum
+
+class Modality(IntEnum):
+    LATENT   = -1
+    IMAGE    = 0
+    ACTION   = 1
+    PROPRIO  = 2
+    REGISTER = 3
+    SPATIAL = 4
+    SHORTCUT_SIGNAL = 5
+    SHORTCUT_STEP = 6
+    AGENT = 7
+    # add more as needed
+
 
 
 # --- helpers ---
@@ -94,3 +109,38 @@ def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict |
         meta=ocp.args.JsonSave(meta) if meta is not None else None
     )
     mngr.save(step, args=save_args)  # async by default; runs in a background thread. :contentReference[oaicite:6]{index=6}
+
+
+
+def make_mask(modality_ids:jnp.ndarray, mode: str):
+    # Returns a (S,S) boolean mask indicating allowed key for each query index, per mode.
+    # S = number of tokens in a single frame.
+    S = int(modality_ids.shape[0])
+
+    # Broadcast helpers
+    q_idx = jnp.arange(S)[:, None]       # (S,1)
+    k_idx = jnp.arange(S)[None, :]       # (1,S)
+
+    q_mod = modality_ids[q_idx]      # (S,1)
+    k_mod = modality_ids[k_idx]      # (1,S)
+
+    if mode == "encoder":
+        # latents -> all; non-latents -> same modality only
+        mask = (q_mod == k_mod) | (q_mod == Modality.LATENT)
+    elif mode == "decoder":
+        # latents -> latents only; non-latents -> same modality + latents
+        mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
+    elif mode in ["wm_agent"]:
+        # wm_agent: agent reads all; all non-agent tokens read all *except* agent.
+        is_agent_q = (q_mod == Modality.AGENT)
+        is_agent_k = (k_mod == Modality.AGENT)
+        mask = is_agent_q<=is_agent_k
+    else:
+        raise ValueError(f"Unknown mode {mode}")
+
+    # Save (1,1,S,S) so it broadcasts over batch*time and heads -> (B*T, 1, S, S)
+    modality_mask = mask[None, :, :]                   # (1,S,S)
+    modality_mask = jax.lax.stop_gradient(modality_mask)
+    return modality_mask
+
+    
