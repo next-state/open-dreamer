@@ -8,7 +8,8 @@ dependencies = [
     "einops>=0.8.1",
     "flax>=0.12.0",
     "imageio>=2.37.0",
-    "jax>=0.7.2",
+    "jax[cuda12]>=0.7.2",
+    "jaxlpips>=1.2.0",
     "optax>=0.2.6",
 ]
 
@@ -17,8 +18,6 @@ dev = [
     "ipdb>=0.13.13",
 ]
 
-[tool.setuptools]
-package-dir = {"" = "."}
 
 [tool.setuptools.packages.find]
 where = ["."]
