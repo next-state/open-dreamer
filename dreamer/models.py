@@ -174,17 +174,15 @@ class SpaceSelfAttentionModality(nn.Module):
       modality_ids: jnp.ndarray with shape (S,), per-token modality id for the S tokens.
                     Convention: latents are the first `n_latents` tokens; you can set their id to -1.
       n_latents: int, number of latent tokens at the beginning of S.
-      mode: str in {"encoder", "decoder", "wm_agent", "wm_agent_isolated"}.
+      mode: str in {"encoder", "decoder", "wm_agent"}.
             - "encoder": latents→all; non-latents→same-modality only.
             - "decoder": latents→latents-only; non-latents→same-modality + latents.
             - "wm_agent": agent reads all; all non-agent tokens read all *except* agent.
-            - "wm_agent_isolated": agent reads nobody; all non-agent tokens read all *except* agent.
       dropout: float
     """
     d_model: int
     n_heads: int
     modality_ids: jnp.ndarray  # (S,)
-    n_latents: int
     mode: str = "encoder"      # or "decoder", "wm_agent"
     dropout: float = 0.0
 
@@ -260,14 +258,12 @@ class TimeSelfAttention(nn.Module):
 class BlockCausalLayer(nn.Module):
     d_model: int
     n_heads: int
-    n_latents: int
     modality_ids: jnp.ndarray     # (S,)
     space_mode: str               # "encoder", "decoder", "wm"
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     layer_index: int = 0
     time_every: int = 4
-    latents_only_time: bool = True
 
     @nn.compact
     def __call__(self, x, *, deterministic: bool):
@@ -277,7 +273,6 @@ class BlockCausalLayer(nn.Module):
             d_model=self.d_model,
             n_heads=self.n_heads,
             modality_ids=self.modality_ids,
-            n_latents=self.n_latents,
             mode=self.space_mode,
             dropout=self.dropout,
         )(y, deterministic=deterministic)
@@ -288,7 +283,6 @@ class BlockCausalLayer(nn.Module):
             y = RMSNorm()(x)
             y = TimeSelfAttention(
                 self.d_model, self.n_heads, self.dropout,
-                latents_only=self.latents_only_time, n_latents=self.n_latents
             )(y, deterministic=deterministic)
             x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
 
@@ -303,24 +297,21 @@ class BlockCausalTransformer(nn.Module):
     d_model: int
     n_heads: int
     depth: int
-    n_latents: int
     modality_ids: jnp.ndarray   # (S,)
     space_mode: str             # "encoder" or "decoder"
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     time_every: int = 4
-    latents_only_time: bool = True
 
     @nn.compact
     def __call__(self, x, *, deterministic: bool):
         for i in range(self.depth):
             x = BlockCausalLayer(
-                self.d_model, self.n_heads, self.n_latents,
+                self.d_model, self.n_heads,
                 modality_ids=self.modality_ids,
                 space_mode=self.space_mode,
                 dropout=self.dropout, mlp_ratio=self.mlp_ratio,
                 layer_index=i, time_every=self.time_every,
-                latents_only_time=self.latents_only_time,
             )(x, deterministic=deterministic)
         return x
 
@@ -334,7 +325,6 @@ class Encoder(nn.Module):
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     time_every: int = 4
-    latents_only_time: bool = True
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
     
@@ -347,12 +337,10 @@ class Encoder(nn.Module):
             d_model=self.d_model,
             n_heads=self.n_heads,
             depth=self.depth,
-            n_latents=self.n_latents,
             modality_ids=self.modality_ids,
             space_mode="encoder",                 # << encoder routing
             dropout=self.dropout, mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
-            latents_only_time=self.latents_only_time,
         )
         self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
 
@@ -410,7 +398,6 @@ class Decoder(nn.Module):
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     time_every: int = 4
-    latents_only_time: bool = True
 
     def setup(self):
         self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
@@ -426,13 +413,11 @@ class Decoder(nn.Module):
             d_model=self.d_model,
             n_heads=self.n_heads,
             depth=self.depth,
-            n_latents=self.n_latents,
             modality_ids=self.modality_ids,
             space_mode="decoder",                 # << decoder routing
             dropout=self.dropout,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
-            latents_only_time=self.latents_only_time,
         )
 
     @nn.compact
@@ -508,7 +493,7 @@ class Dynamics(nn.Module):
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     time_every: int = 4
-    space_mode: str = "wm_agent_isolated" # or "wm_agent"
+    space_mode: str = "wm_agent" # or "wm_agent"
 
     def setup(self):
         # Want to transform bottleneck inputs (B, T, N_b, D_b) to (B, T, N_b/packing_factor, D_b*packing_factor)
@@ -540,13 +525,11 @@ class Dynamics(nn.Module):
             d_model=self.d_model,
             n_heads=self.n_heads,
             depth=self.depth,
-            n_latents=0,
             modality_ids=self.modality_ids,
             space_mode=self.space_mode,
             dropout=self.dropout,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
-            latents_only_time=False,
         )
 
         # -------- Discrete embeddings for shortcut conditioning --------
@@ -573,7 +556,7 @@ class Dynamics(nn.Module):
         deterministic: bool = True,
     ):
         """
-        Pretrain script: instantiate with space_mode="wm_agent_isolated" and pass agent_tokens=None (dummy).
+        Pretrain script: instantiate with space_mode="wm_agent" and pass agent_tokens=None (dummy).
         Fine-tune script: instantiate with space_mode="wm_agent" and pass real agent_tokens from task embedding.
         Args:
           packed_enc_tokens:      (B, T, n_spatial, d_spatial) packed encoder tokens
@@ -895,7 +878,7 @@ def _build_modality_mask(modality_ids, mode: str, n_latents=0, d_model=16, n_hea
         def __call__(self, x):
             att = SpaceSelfAttentionModality(
                 d_model=d_model, n_heads=n_heads,
-                modality_ids=modality_ids, n_latents=n_latents,
+                modality_ids=modality_ids,
                 mode=mode, dropout=0.0)
             y = att(x, deterministic=True)
             # expose stored mask
@@ -973,30 +956,7 @@ def test_agent_firewall():
     if agent_q_idx >= 0:
         assert jnp.all(mask[agent_q_idx, :]), "Agent query cannot read some token in wm_agent"
 
-    # ----- wm_agent_isolated -----
-    mask_iso = _build_modality_mask(modality_ids, "wm_agent_isolated")[0,0]
-    _print_mask_summary("wm_agent_isolated", modality_ids, mask_iso)
 
-    # Others still never see agent
-    bad_q_iso = []
-    for q in range(S):
-        if not bool(agent_row[q]):
-            if bool(mask_iso[q, agent_col].sum()):
-                bad_q_iso.append(q)
-    if bad_q_iso:
-        print("Violations in wm_agent_isolated (non-agent reads agent) at query rows:", bad_q_iso)
-
-    # Agent reads nobody in isolated
-    if agent_q_idx >= 0:
-        agent_reads_iso = int(mask_iso[agent_q_idx, :].sum())
-        print("Agent read-count in isolated mode:", agent_reads_iso)
-
-    # Assertions
-    for q in range(S):
-        if not bool(agent_row[q]):
-            assert mask_iso[q, agent_col].sum() == 0, "Non-agent query can attend to agent in isolated!"
-    if agent_q_idx >= 0:
-        assert mask_iso[agent_q_idx, :].sum() == 0, "Agent should read nobody in wm_agent_isolated"
 
 
 def test_x1hat_invariant_to_agent_tokens():
@@ -1067,7 +1027,7 @@ def test_wm_routed():
       - Action q -> {Action k}
       - Obs q    -> {Obs k ∪ Action k} and never Agent k
       - Agent q  -> {Obs k ∪ Action k ∪ Agent k}    (wm_agent)
-                  -> {}                              (wm_agent_isolated)
+
       - For any non-agent q, Agent k is disallowed.
     """
     # Shorthand modality ints
@@ -1132,13 +1092,11 @@ def test_wm_routed():
             if mode == "wm_agent":
                 # Agent reads everyone (including agent)
                 assert bool(mask[q].all()), "[wm_agent] agent q cannot read all keys!"
-            else:
-                # Isolated: agent reads nobody
-                assert int(mask[q].sum()) == 0, "[wm_agent_isolated] agent q should read nobody!"
+
 
     # Run both modes
     assert_mask("wm_agent")
-    assert_mask("wm_agent_isolated")
+
     print("\n[test_wm_routed] All routing assertions passed ✅")
 
 
