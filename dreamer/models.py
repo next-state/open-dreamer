@@ -464,7 +464,7 @@ class Dynamics(nn.Module):
         self.spatial_slice = self.layout.slices()[Modality.SPATIAL]
         self.agent_slice  = self.layout.slices().get(Modality.AGENT, slice(0,0))  # safe if n_agent==0
         self.modality_ids = self.layout.modality_ids()
-        mask = make_mask(self.modality_ids, "encoder")
+        mask = make_mask(self.modality_ids, "wm_agent")
         self.mask = self.variable("constants", "mask", lambda: mask)
 
         self.transformer = BlockCausalTransformer(
