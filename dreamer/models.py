@@ -221,7 +221,7 @@ class BlockCausalLayer(nn.Module):
         )
 
         # --- MLP ---
-        self.norm_mlp = RMSNorm(name="norm_mlp")
+        self.norm_mlp = RMSNorm()
         self.mlp = MLP(self.d_model, self.mlp_ratio, self.dropout)
 
     @nn.compact
@@ -274,6 +274,9 @@ class Encoder(nn.Module):
         self.bottleneck_proj = nn.Dense(self.d_bottleneck, name="bottleneck_proj")
         self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
         self.modality_ids = self.layout.modality_ids()            # (S,)
+        mask = make_mask(self.modality_ids, "encoder")
+        self.mask = self.variable("constants", "mask", lambda: mask)
+
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
@@ -282,8 +285,6 @@ class Encoder(nn.Module):
             time_every=self.time_every,
         )
         self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
-        mask = make_mask(self.modality_ids, "encoder")
-        self.mask = self.variable("constants", "mask", lambda: mask)
 
     @nn.compact
     def __call__(self, patch_tokens, *, deterministic: bool = True) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
@@ -437,7 +438,6 @@ class Dynamics(nn.Module):
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     time_every: int = 4
-    space_mode: str = "wm_agent" # or "wm_agent"
 
     def setup(self):
         # Want to transform bottleneck inputs (B, T, N_b, D_b) to (B, T, N_b/packing_factor, D_b*packing_factor)
@@ -464,13 +464,13 @@ class Dynamics(nn.Module):
         self.spatial_slice = self.layout.slices()[Modality.SPATIAL]
         self.agent_slice  = self.layout.slices().get(Modality.AGENT, slice(0,0))  # safe if n_agent==0
         self.modality_ids = self.layout.modality_ids()
+        mask = make_mask(self.modality_ids, "encoder")
+        self.mask = self.variable("constants", "mask", lambda: mask)
 
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
             depth=self.depth,
-            modality_ids=self.modality_ids,
-            space_mode=self.space_mode,
             dropout=self.dropout,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
@@ -500,11 +500,9 @@ class Dynamics(nn.Module):
         deterministic: bool = True,
     ):
         """
-        Pretrain script: instantiate with space_mode="wm_agent" and pass agent_tokens=None (dummy).
-        Fine-tune script: instantiate with space_mode="wm_agent" and pass real agent_tokens from task embedding.
         Args:
           packed_enc_tokens:      (B, T, n_spatial, d_spatial) packed encoder tokens
-          actions:    (B, T, N_a, D_a) raw action tokens
+          actions:    (B, T) int32 in [0, n_keyboard) raw action tokens
           steps:      (B, T) float32 — step sizes, 1/2^x
           signals:    (B, T) float32 - signal values, grid that is reachable by current step size
 
@@ -541,7 +539,8 @@ class Dynamics(nn.Module):
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
         tokens = add_sinusoidal_positions(tokens)      # (B, T, N_total, d_model)
-        x = self.transformer(tokens, deterministic=deterministic)
+        mask = repeat(self.mask.value, " ... -> bt ...", bt=B*T)
+        x = self.transformer(tokens, mask, deterministic=deterministic)
         spatial_tokens = x[:, :, self.spatial_slice, :]
         x1_hat = self.flow_x_head(spatial_tokens)
         h_t = x[:, :, self.agent_slice, :] if self.n_agent > 0 else None  # (B,T,n_agent,D) or None
