@@ -184,7 +184,8 @@ class TimeSelfAttention(nn.Module):
     dropout: float = 0.0
 
     @nn.compact
-    def __call__(self, x, *, deterministic: bool):
+    def __call__(self, x, mask, *, deterministic: bool):
+        # mask does nothing, but is required for API consistency
         # x: (B, T, S, D) -> attend across T, causal
         B, T, S, D = x.shape
         x_bstd = rearrange(x, "B T S D -> (B S) T D")
@@ -207,28 +208,32 @@ class BlockCausalLayer(nn.Module):
     layer_index: int = 0
     time_every: int = 4
 
-    @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool):
-        # --- Space attention (within timestep, modality-aware) ---
-        y = RMSNorm()(x)
-        y = SpaceSelfAttentionModality(
+    def setup(self):
+        self.norm = RMSNorm()
+
+        # --- Time or space attention ---
+        self.use_time = (self.layer_index + 1) % self.time_every == 0
+        attention_module = TimeSelfAttention if self.use_time else SpaceSelfAttentionModality
+        self.attn = attention_module(
             d_model=self.d_model,
             n_heads=self.n_heads,
             dropout=self.dropout,
-        )(y, mask=mask, deterministic=deterministic)
-        x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
-
-        # --- Time attention (causal across timesteps), only on some layers ---
-        if (self.layer_index + 1) % self.time_every == 0:
-            y = RMSNorm()(x)
-            y = TimeSelfAttention(
-                self.d_model, self.n_heads, self.dropout,
-            )(y, deterministic=deterministic)
-            x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
+        )
 
         # --- MLP ---
-        y = RMSNorm()(x)
-        y = MLP(self.d_model, self.mlp_ratio, self.dropout)(y, deterministic=deterministic)
+        self.norm_mlp = RMSNorm(name="norm_mlp")
+        self.mlp = MLP(self.d_model, self.mlp_ratio, self.dropout)
+
+    @nn.compact
+    def __call__(self, x, mask, *, deterministic: bool):
+        # --- Space attention (within timestep, modality-aware) ---
+        y = self.norm(x)
+        y = self.attn(y, mask=mask, deterministic=deterministic)
+        x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
+
+        # --- MLP ---
+        y = self.norm_mlp(x)
+        y = self.mlp(y, deterministic=deterministic)
         x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
         return x
 # ---------- the transformer stack ----------
