@@ -8,6 +8,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Any
 from functools import partial
+from tqdm import tqdm
 import json
 import time
 import math
@@ -442,10 +443,12 @@ def save_evaluation_video(
     Returns:
         True if successful, False otherwise
     """
+    print(f"[eval:{tag}] MP4 write started...")
     try:
         with imageio.get_writer(output_path, fps=25, codec="libx264", quality=8) as w:
             for fr in grid_frames:
                 w.append_data(fr)
+        print(f"[eval:{tag}] MP4 write completed successfully.")
         return True
     except Exception as e:
         print(f"[eval:{tag}] MP4 write skipped ({e})")
@@ -790,7 +793,8 @@ def run(cfg: RealismConfig):
     data_rng = jax.random.PRNGKey(12345)
 
     start_wall = time.time()
-    for step in range(start_step, cfg.max_steps + 1):
+    pbar = tqdm(range(start_step, cfg.max_steps), initial=start_step, total=cfg.max_steps)
+    for step in pbar:
         # Data
         data_rng, batch_key = jax.random.split(data_rng)
         _, (frames, actions, _) = next_batch(batch_key)
@@ -814,21 +818,20 @@ def run(cfg: RealismConfig):
         )
 
         # Logging
+        flow_mse = float(aux['flow_mse'])
+        boot_mse = float(aux['bootstrap_mse'])
+        step_time = time.time() - train_step_start_time
+        total_time = time.time() - start_wall
+
+        pieces = [
+            f"flow_mse={flow_mse:.3f}",
+            f"boot_mse={boot_mse:.3f}",
+            f"t={step_time:.3f}s",
+            f"total_t={total_time:.3f}s",
+        ]
+        pbar.set_description(" | ".join(pieces))
+
         if (step % cfg.log_every == 0) or (step == cfg.max_steps):
-            flow_mse = float(aux['flow_mse'])
-            boot_mse = float(aux['bootstrap_mse'])
-            step_time = time.time() - train_step_start_time
-            total_time = time.time() - start_wall
-
-            pieces = [
-                f"[train] step={step:06d}",
-                f"flow_mse={flow_mse:.6g}",
-                f"boot_mse={boot_mse:.6g}",
-                f"t={step_time:.4f}s",
-                f"total_t={total_time:.1f}s",
-            ]
-            print(" | ".join(pieces))
-
             # Log to wandb
             if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log({
@@ -876,7 +879,7 @@ if __name__ == "__main__":
         max_steps=1_000_000_000,
         log_every=5_000,
         lr=1e-4,
-        write_video_every=50_000,
+        write_video_every=1_000,
         ckpt_save_every=50_000,
         ckpt_max_to_keep=2,
     )
