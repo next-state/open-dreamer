@@ -22,7 +22,7 @@ from dreamer.utils import (
     with_params, make_state, make_manager, pack_mae_params,
 )
 
-from dreamer.sampler_old import SamplerConfig, sample_video
+from dreamer.sampler import SamplerConfig, sample_video
 
 
 # ---------------------------
