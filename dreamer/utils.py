@@ -112,9 +112,23 @@ def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict |
 
 
 
-def make_mask(modality_ids:jnp.ndarray, mode: str):
-    # Returns a (S,S) boolean mask indicating allowed key for each query index, per mode.
-    # S = number of tokens in a single frame.
+def make_mask(modality_ids: jnp.ndarray, mode: str):
+    """
+    Returns a (S,S) boolean mask indicating allowed key for each query index, per mode.
+    S = number of tokens in a single frame.
+
+    Modes:
+    - "encoder":
+        - Latent tokens (query) can attend to ALL tokens (key).
+        - Non-latent tokens (query) can ONLY attend to tokens of the SAME modality (key).
+    - "decoder":
+        - Latent tokens (query) can ONLY attend to Latent tokens (key).
+        - Non-latent tokens (query) can attend to tokens of the SAME modality AND Latent tokens (key).
+    - "wm_agent":
+        - Agent tokens (query) can attend to ALL tokens (key).
+        - Non-agent tokens (query) can attend to ALL tokens EXCEPT Agent tokens (key).
+        - This prevents causal confusion where future predictions are influenced by the current task.
+    """
     S = int(modality_ids.shape[0])
 
     # Broadcast helpers
@@ -134,7 +148,7 @@ def make_mask(modality_ids:jnp.ndarray, mode: str):
         # wm_agent: agent reads all; all non-agent tokens read all *except* agent.
         is_agent_q = (q_mod == Modality.AGENT)
         is_agent_k = (k_mod == Modality.AGENT)
-        mask = is_agent_q<=is_agent_k
+        mask = is_agent_q >= is_agent_k
     else:
         raise ValueError(f"Unknown mode {mode}")
 
