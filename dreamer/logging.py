@@ -1,5 +1,4 @@
 from typing import Any, Dict, Optional
-import jax.numpy as jnp
 
 
 class MetricLogger:

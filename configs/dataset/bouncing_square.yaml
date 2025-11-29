@@ -1,4 +1,4 @@
-name: moving_sprites
+name: bouncing_square
 B: 32
 T: 64
 H: 32
