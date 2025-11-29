@@ -1,12 +1,14 @@
 from functools import partial
 from tqdm import tqdm
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Dict, Any, Optional
+import hydra
+from omegaconf import DictConfig, OmegaConf
 import jax
 import jax.numpy as jnp
 import optax
 from dreamer.models import Encoder, Decoder
-from dreamer.data import make_iterator
+from dreamer.data import make_iterator, DatasetConfig
 import imageio
 from jaxlpips import LPIPS
 from pathlib import Path
@@ -18,6 +20,30 @@ from dreamer.logging import MetricLogger
 # ---------------------------
 # Config
 # ---------------------------
+
+@dataclass
+class EncoderConfig:
+    n_latents: int = 16
+    d_bottleneck: int = 32
+    d_model: int = 64
+    n_heads: int = 4
+    n_patches: int = 64  # Will be computed from H, W, patch_size
+    depth: int = 8
+    dropout: float = 0.05
+    time_every: int = 4
+    mae_p_min: float = 0.0
+    mae_p_max: float = 0.9
+
+@dataclass
+class DecoderConfig:
+    d_model: int = 64
+    n_heads: int = 4
+    n_latents: int = 16
+    n_patches: int = 64  # Will be computed from H, W, patch_size
+    d_patch: int = 48    # Will be computed from patch_size, C
+    depth: int = 8
+    dropout: float = 0.05
+    time_every: int = 4
 
 @dataclass(frozen=True)
 class TokenizerConfig:
@@ -32,35 +58,13 @@ class TokenizerConfig:
     wandb_entity: str | None = None
     wandb_project: str | None = None
 
-    # data (FIXME: remove this once we don't have to generate the dataset here)
-    B: int = 32
-    T: int = 64
-    H: int = 32
-    W: int = 32
-    C: int = 3
-    pixels_per_step: int = 2
-    size_min: int = 6
-    size_max: int = 14
-    hold_min: int = 4
-    hold_max: int = 9
+    # dataset config
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
 
     # model parameters
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    enc_heads: int = 4
-    enc_depth: int = 8
-    enc_dropout: float = 0.05
-    enc_time_every: int = 4
-    mae_p_min: float = 0.0
-    mae_p_max: float = 0.9
-    
-    dec_d_model: int = 64
-    dec_heads: int = 4
-    dec_depth: int = 8
-    dec_dropout: float = 0.05
-    dec_time_every: int = 4
+    patch_size: int = 4
+    encoder: EncoderConfig = field(default_factory=EncoderConfig)
+    decoder: DecoderConfig = field(default_factory=DecoderConfig)
 
     # training
     lr: float = 1e-4
@@ -259,8 +263,8 @@ def run(cfg: TokenizerConfig):
 
     rng = jax.random.PRNGKey(0)
     
-    num_patches = (cfg.H // cfg.patch) * (cfg.W // cfg.patch)
-    D_patch = cfg.patch * cfg.patch * cfg.C
+    num_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
+    D_patch = cfg.patch_size * cfg.patch_size * cfg.dataset.C
 
     # instantiate once
     global lpips_loss_fn
@@ -269,8 +273,9 @@ def run(cfg: TokenizerConfig):
 
     # data
     _next_batch = make_iterator(
-        cfg.B, cfg.T, cfg.H, cfg.W, cfg.C, 
-        cfg.pixels_per_step, cfg.size_min, cfg.size_max, cfg.hold_min, cfg.hold_max
+        cfg.dataset.B, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, 
+        cfg.dataset.pixels_per_step, cfg.dataset.size_min, cfg.dataset.size_max, 
+        cfg.dataset.hold_min, cfg.dataset.hold_max
     )
     def next_batch(rng):
         rng, (videos, actions, rewards) = _next_batch(rng)
@@ -280,35 +285,24 @@ def run(cfg: TokenizerConfig):
     rng, first_batch = next_batch(rng)  # warmup
 
     # models
-    enc_kwargs = {
-        "d_model": cfg.d_model_enc, 
-        "n_latents": cfg.enc_n_latents, 
-        "n_patches": num_patches, 
-        "n_heads": cfg.enc_heads, 
-        "depth": cfg.enc_depth, 
-        "dropout": cfg.enc_dropout,
-        "d_bottleneck": cfg.enc_d_bottleneck, 
-        "mae_p_min": cfg.mae_p_min, 
-        "mae_p_max": cfg.mae_p_max, 
-        "time_every": cfg.enc_time_every,
-    }
-    dec_kwargs = {
-        "d_model": cfg.dec_d_model, 
-        "n_heads": cfg.dec_heads, 
-        "n_patches": num_patches, 
-        "n_latents": cfg.enc_n_latents, 
-        "depth": cfg.dec_depth,
-        "d_patch": D_patch, 
-        "dropout": cfg.dec_dropout, 
-        "time_every": cfg.dec_time_every,
-    }
+    enc_kwargs = asdict(cfg.encoder)
+    enc_kwargs.update({
+        "n_patches": num_patches,
+    })
+    
+    dec_kwargs = asdict(cfg.decoder)
+    dec_kwargs.update({
+        "n_patches": num_patches,
+        "d_patch": D_patch,
+    })
+
     encoder = Encoder(**enc_kwargs)
     decoder = Decoder(**dec_kwargs)
 
-    first_patches = temporal_patchify(first_batch, cfg.patch)
+    first_patches = temporal_patchify(first_batch, cfg.patch_size)
     rng, enc_vars, dec_vars = init_models(
         rng, encoder, decoder, first_patches, 
-        cfg.B, cfg.T, cfg.enc_n_latents, cfg.enc_d_bottleneck
+        cfg.dataset.B, cfg.dataset.T, cfg.encoder.n_latents, cfg.encoder.d_bottleneck
     )
 
     # optim
@@ -325,7 +319,7 @@ def run(cfg: TokenizerConfig):
     meta_example = {
         "enc_kwargs": enc_kwargs, 
         "dec_kwargs": dec_kwargs,
-        "H": cfg.H, "W": cfg.W, "C": cfg.C, "patch": cfg.patch
+        "H": cfg.dataset.H, "W": cfg.dataset.W, "C": cfg.dataset.C, "patch_size": cfg.patch_size
     }
 
     restored = try_restore(mngr, state_example, meta_example)
@@ -364,7 +358,7 @@ def run(cfg: TokenizerConfig):
             rng, master_key = jax.random.split(rng)
             params, opt_state, enc_vars, dec_vars, aux = train_step(
                 encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch,
-                patch=cfg.patch, H=cfg.H, W=cfg.W, C=cfg.C, 
+                patch=cfg.patch_size, H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, 
                 master_key=master_key, step=step, 
                 lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
             )
@@ -398,11 +392,11 @@ def run(cfg: TokenizerConfig):
                 _, viz_batch = next_batch(vis_batch_key)
                 viz_batch = viz_batch[:8, :1]
                 out = viz_step(encoder, decoder, enc_vars, dec_vars, viz_batch,
-                               patch=cfg.patch, mae_key=mae_key, drop_key=drop_key)
-                target = jnp.concatenate(temporal_unpatchify(out["target"], cfg.H, cfg.W, cfg.C, cfg.patch).squeeze(), axis=1)
-                masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], cfg.H, cfg.W, cfg.C, cfg.patch).squeeze(), axis=1)
-                rec_masked  = jnp.concatenate(temporal_unpatchify(out["recon_masked"], cfg.H, cfg.W, cfg.C, cfg.patch).squeeze(), axis=1)
-                rec_unmasked  = jnp.concatenate(temporal_unpatchify(out["recon_full"], cfg.H, cfg.W, cfg.C, cfg.patch).squeeze(), axis=1)
+                               patch=cfg.patch_size, mae_key=mae_key, drop_key=drop_key)
+                target = jnp.concatenate(temporal_unpatchify(out["target"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
+                masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
+                rec_masked  = jnp.concatenate(temporal_unpatchify(out["recon_masked"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
+                rec_unmasked  = jnp.concatenate(temporal_unpatchify(out["recon_full"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
                 grid = jnp.concatenate([target, masked_in, rec_masked, rec_unmasked])
                 grid = jnp.asarray(grid * 255.0, dtype=jnp.uint8)
                 vis_path = run_dir / "viz"
@@ -418,19 +412,13 @@ def run(cfg: TokenizerConfig):
             wandb.finish()
             print("[wandb] Finished logging.")
 
+@hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
+def main(cfg: DictConfig):
+    schema = OmegaConf.structured(TokenizerConfig)
+    cfg = OmegaConf.merge(schema, cfg)
+    tokenizer_cfg = OmegaConf.to_object(cfg)
+    
+    run(tokenizer_cfg)
+
 if __name__ == "__main__":
-    cfg = TokenizerConfig(
-        run_name="tokenizer",
-        use_wandb=True,
-        wandb_entity="diego-marti",
-        wandb_project="tiny_dreamer_4",
-        log_dir="./logs",
-        max_steps=1_000_000_000,
-        log_every=100,
-        lr=1e-4,
-        ckpt_save_every=10_000,
-        ckpt_max_to_keep=5,
-        visualize_every=10_000,
-    )
-    print("Running tokenizer config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
-    run(cfg)
+    main()

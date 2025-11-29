@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "einops>=0.8.1",
     "flax>=0.12.0",
+    "hydra-core>=1.3.2",
     "imageio[ffmpeg]>=2.37.0",
     "jax[cuda12]>=0.7.2",
     "jaxlpips>=1.2.0",

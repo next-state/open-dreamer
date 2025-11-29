@@ -18,13 +18,15 @@ High-level outline (from the docstring plan):
     - Train policy head on (s0…s{T-1}, a1…aT, G0…G{T-1}, V0…V{T-1}) using PMPO.
 """
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Any
 from functools import partial
 from tqdm import tqdm
 import math
 
+import hydra
+from omegaconf import DictConfig, OmegaConf
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -45,7 +47,7 @@ from dreamer.models import (
     RewardHeadMTP,
     ValueHead,
 )
-from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn
+from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn, DatasetConfig
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -84,18 +86,8 @@ class RLConfig:
     wandb_entity: str | None = None
     wandb_project: str | None = None
 
-    # data
-    B: int = 64
-    T: int = 64
-    H: int = 32
-    W: int = 32
-    C: int = 3
-    pixels_per_step: int = 2
-    size_min: int = 6
-    size_max: int = 14
-    hold_min: int = 4
-    hold_max: int = 9
-    diversify_data: bool = True
+    # dataset config
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
     action_dim: int = 4
 
     # tokenizer / dynamics config
@@ -533,8 +525,8 @@ def initialize_models(
     Initialize all models and load pretrained checkpoints.
     """
     patch = cfg.patch
-    num_patches = (cfg.H // patch) * (cfg.W // patch)
-    D_patch = patch * patch * cfg.C
+    num_patches = (cfg.dataset.H // patch) * (cfg.dataset.W // patch)
+    D_patch = patch * patch * cfg.dataset.C
     k_max = cfg.k_max
 
     enc_kwargs = dict(
@@ -618,7 +610,7 @@ def initialize_models(
         deterministic=True,
     )
     fake_z = jnp.zeros(
-        (cfg.B, cfg.T, cfg.enc_n_latents, cfg.enc_d_bottleneck),
+        (cfg.dataset.B, cfg.dataset.T, cfg.enc_n_latents, cfg.enc_d_bottleneck),
         dtype=jnp.float32,
     )
     dec_vars = decoder.init(
@@ -668,8 +660,8 @@ def initialize_models(
         k=cfg.packing_factor,
     )
     emax = jnp.log2(k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.B, cfg.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.B, cfg.T), k_max - 1, dtype=jnp.int32)
+    step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
+    sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), k_max - 1, dtype=jnp.int32)
     dyn_vars = dynamics.init(
         {"params": rng, "dropout": rng},
         actions_init,
@@ -679,16 +671,16 @@ def initialize_models(
     )
 
     rng_task, rng_pi_bc, rng_rw = jax.random.split(jax.random.PRNGKey(1), 3)
-    dummy_task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
+    dummy_task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
     task_vars = task_embedder.init(
         {"params": rng_task},
         dummy_task_ids,
-        cfg.B,
-        cfg.T,
+        cfg.dataset.B,
+        cfg.dataset.T,
     )
 
     fake_h = jnp.zeros(
-        (cfg.B, cfg.T, cfg.d_model_dyn),
+        (cfg.dataset.B, cfg.dataset.T, cfg.d_model_dyn),
         dtype=jnp.float32,
     )
     pi_bc_vars = policy_head_bc.init(
@@ -1547,20 +1539,20 @@ def run(cfg: RLConfig):
 
     # Data iterator
     next_batch = make_iterator(
-        cfg.B,
-        cfg.T,
-        cfg.H,
-        cfg.W,
-        cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min,
-        size_max=cfg.size_max,
-        hold_min=cfg.hold_min,
-        hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
+        cfg.dataset.B,
+        cfg.dataset.T,
+        cfg.dataset.H,
+        cfg.dataset.W,
+        cfg.dataset.C,
+        pixels_per_step=cfg.dataset.pixels_per_step,
+        size_min=cfg.dataset.size_min,
+        size_max=cfg.dataset.size_max,
+        hold_min=cfg.dataset.hold_min,
+        hold_max=cfg.dataset.hold_max,
+        fg_min_color=0 if cfg.dataset.diversify_data else 128,
+        fg_max_color=255 if cfg.dataset.diversify_data else 128,
+        bg_min_color=0 if cfg.dataset.diversify_data else 255,
+        bg_max_color=255 if cfg.dataset.diversify_data else 255,
     )
 
     # Initialize models and load checkpoints
@@ -1590,21 +1582,21 @@ def run(cfg: RLConfig):
     # Real-environment evaluation env fns.
     env_reset_fn = make_env_reset_fn(
         batch_size=cfg.eval_batch_size,
-        height=cfg.H,
-        width=cfg.W,
-        channels=cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min,
-        size_max=cfg.size_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
+        height=cfg.dataset.H,
+        width=cfg.dataset.W,
+        channels=cfg.dataset.C,
+        pixels_per_step=cfg.dataset.pixels_per_step,
+        size_min=cfg.dataset.size_min,
+        size_max=cfg.dataset.size_max,
+        fg_min_color=0 if cfg.dataset.diversify_data else 128,
+        fg_max_color=255 if cfg.dataset.diversify_data else 128,
+        bg_min_color=0 if cfg.dataset.diversify_data else 255,
+        bg_max_color=255 if cfg.dataset.diversify_data else 255,
     )
     env_step_fn = make_env_step_fn(
-        height=cfg.H,
-        width=cfg.W,
-        channels=cfg.C,
+        height=cfg.dataset.H,
+        width=cfg.dataset.W,
+        channels=cfg.dataset.C,
     )
 
     # Checkpoint manager and optional restore
@@ -1617,9 +1609,9 @@ def run(cfg: RLConfig):
         enc_kwargs=train_state.enc_kwargs,
         dec_kwargs=train_state.dec_kwargs,
         dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.H,
-        W=cfg.W,
-        C=cfg.C,
+        H=cfg.dataset.H,
+        W=cfg.dataset.W,
+        C=cfg.dataset.C,
         patch=patch,
         k_max=k_max,
         packing_factor=cfg.packing_factor,
@@ -1673,7 +1665,7 @@ def run(cfg: RLConfig):
         _, (videos, actions_full, rewards_full) = next_batch(batch_key)
 
         # Task IDs (currently dummy zeros)
-        task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
+        task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
 
         # JITted train step
         train_rng, step_key = jax.random.split(train_rng)
@@ -1847,29 +1839,14 @@ def run(cfg: RLConfig):
         print("[wandb] Finished logging.")
 
 
+@hydra.main(version_base=None, config_path="../configs", config_name="policy")
+def main(cfg: DictConfig):
+    schema = OmegaConf.structured(RLConfig)
+    cfg = OmegaConf.merge(schema, cfg)
+    rl_cfg = OmegaConf.to_object(cfg)
+    
+    run(rl_cfg)
+
+
 if __name__ == "__main__":
-    cfg = RLConfig(
-        run_name="train_policy_jit_flippedrew2",
-        bc_rew_ckpt="./logs/train_bc_rew_flippedrew/checkpoints",
-        use_wandb=False,
-        wandb_entity="diego-marti",
-        wandb_project="tiny_dreamer_4",
-        log_dir="./logs",
-        max_steps=100_000,
-        log_every=100,
-        lr=1e-4,
-        ckpt_save_every=100_000,
-        ckpt_max_to_keep=2,
-        write_video_every=1,
-        visualize_every=1,
-        eval_every=5000,
-        eval_episodes=64,
-        eval_horizon=32,
-        eval_batch_size=64,
-        gamma=0.9,
-    )
-    print(
-        "Running RL config:\n  "
-        + "\n  ".join([f"{k}={v}" for k, v in asdict(cfg).items()])
-    )
-    run(cfg)
+    main()

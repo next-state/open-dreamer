@@ -1,11 +1,13 @@
 # eval_bc_rew_heads.py
 # Evaluate dynamics + policy/reward heads in teacher-forced and autoregressive modes.
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Any, Tuple
 import math
 import csv
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
 import jax
 import jax.numpy as jnp
@@ -16,7 +18,7 @@ import orbax.checkpoint as ocp
 
 # Project imports
 from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
-from dreamer.data import make_iterator
+from dreamer.data import make_iterator, DatasetConfig
 from dreamer.utils import (
     temporal_patchify, pack_bottleneck_to_spatial, 
     with_params, make_state, make_manager, pack_mae_params,
@@ -36,18 +38,8 @@ class EvalConfig:
     tokenizer_ckpt: str                       # tokenizer ckpt (for enc/dec)
     out_dir: str = "./eval_out"
 
-    # Data
-    B: int = 8
-    T: int = 64
-    H: int = 32
-    W: int = 32
-    C: int = 3
-    pixels_per_step: int = 2
-    size_min: int = 6
-    size_max: int = 14
-    hold_min: int = 4
-    hold_max: int = 9
-    diversify_data: bool = True
+    # dataset config
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
     action_dim: int = 4
 
     # Tokenizer / dynamics
@@ -338,8 +330,8 @@ def restore_run_params(run_ckpt_dir: str, params_example: dict, opt_state_exampl
 
 def init_models_and_restore(cfg: EvalConfig):
     patch = cfg.patch
-    num_patches = (cfg.H // patch) * (cfg.W // patch)
-    D_patch = patch * patch * cfg.C
+    num_patches = (cfg.dataset.H // patch) * (cfg.dataset.W // patch)
+    D_patch = patch * patch * cfg.dataset.C
     k_max = cfg.k_max
 
     enc_kwargs = dict(
@@ -387,20 +379,20 @@ def init_models_and_restore(cfg: EvalConfig):
     # shape init
     rng = jax.random.PRNGKey(0)
     next_batch = make_iterator(
-        cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min, size_max=cfg.size_max,
-        hold_min=cfg.hold_min, hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
+        cfg.dataset.B, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C,
+        pixels_per_step=cfg.dataset.pixels_per_step,
+        size_min=cfg.dataset.size_min, size_max=cfg.dataset.size_max,
+        hold_min=cfg.dataset.hold_min, hold_max=cfg.dataset.hold_max,
+        fg_min_color=0 if cfg.dataset.diversify_data else 128,
+        fg_max_color=255 if cfg.dataset.diversify_data else 128,
+        bg_min_color=0 if cfg.dataset.diversify_data else 255,
+        bg_max_color=255 if cfg.dataset.diversify_data else 255,
     )
     _, (frames_init, actions_init, _) = next_batch(rng)
 
     patches_btnd = temporal_patchify(frames_init, cfg.patch)
     enc_vars = encoder.init({"params": rng, "mae": rng, "dropout": rng}, patches_btnd, deterministic=True)
-    fake_z = jnp.zeros((cfg.B, cfg.T, cfg.enc_n_latents, cfg.enc_d_bottleneck))
+    fake_z = jnp.zeros((cfg.dataset.B, cfg.dataset.T, cfg.enc_n_latents, cfg.enc_d_bottleneck))
     dec_vars = decoder.init({"params": rng, "dropout": rng}, fake_z, deterministic=True)
 
     # restore tokenizer
@@ -414,15 +406,15 @@ def init_models_and_restore(cfg: EvalConfig):
     z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True)
     z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
     emax = jnp.log2(cfg.k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.B, cfg.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.B, cfg.T), cfg.k_max - 1, dtype=jnp.int32)
+    step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
+    sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), cfg.k_max - 1, dtype=jnp.int32)
     dyn_vars = dynamics.init({"params": rng, "dropout": rng}, actions_init, step_idx, sigma_idx, z1)
 
     # init heads/task
     rng_task, rng_pi, rng_rw = jax.random.split(jax.random.PRNGKey(1), 3)
-    dummy_task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
-    task_vars = task_embedder.init({"params": rng_task}, dummy_task_ids, cfg.B, cfg.T)
-    fake_h = jnp.zeros((cfg.B, cfg.T, cfg.d_model_dyn), dtype=jnp.float32)
+    dummy_task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
+    task_vars = task_embedder.init({"params": rng_task}, dummy_task_ids, cfg.dataset.B, cfg.dataset.T)
+    fake_h = jnp.zeros((cfg.dataset.B, cfg.dataset.T, cfg.d_model_dyn), dtype=jnp.float32)
     pi_vars  = policy_head.init({"params": rng_pi, "dropout": rng_pi}, fake_h, deterministic=True)
     rew_vars = reward_head.init({"params": rng_rw, "dropout": rng_rw}, fake_h, deterministic=True)
 
@@ -477,13 +469,13 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
 
     # run dynamics once per timestep with "pure/clean" inputs: sigma=1 → z_tilde=z1, sigma_idx=k_max-1
     emax = jnp.log2(cfg.k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.B, cfg.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.B, cfg.T), cfg.k_max - 1, dtype=jnp.int32)
+    step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
+    sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), cfg.k_max - 1, dtype=jnp.int32)
     z_tilde = z_all  # tau=1 ⇒ z_tilde=z1
 
     # agent tokens
-    dummy_task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
-    agents = task.apply(task_vars, dummy_task_ids, cfg.B, cfg.T)
+    dummy_task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
+    agents = task.apply(task_vars, dummy_task_ids, cfg.dataset.B, cfg.dataset.T)
 
     z1_hat_full, h = dyn.apply(
         dyn_vars, actions, step_idx, sigma_idx, z_tilde,
@@ -491,25 +483,25 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
     )
         # run dynamics once per timestep with "pure/clean" inputs: sigma=1 → z_tilde=z1, sigma_idx=k_max-1
     emax = jnp.log2(cfg.k_max).astype(jnp.int32)
-    step_idx_full = jnp.full((cfg.B, cfg.T), emax, dtype=jnp.int32)
-    sigma_idx_full = jnp.full((cfg.B, cfg.T), cfg.k_max - 1, dtype=jnp.int32)
+    step_idx_full = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
+    sigma_idx_full = jnp.full((cfg.dataset.B, cfg.dataset.T), cfg.k_max - 1, dtype=jnp.int32)
     z_tilde_full = z_all  # tau=1 ⇒ z_tilde=z1
 
     # agent tokens
-    dummy_task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
-    agents_full = task.apply(task_vars, dummy_task_ids, cfg.B, cfg.T)
+    dummy_task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
+    agents_full = task.apply(task_vars, dummy_task_ids, cfg.dataset.B, cfg.dataset.T)
 
     # ---- Fast bulk pass (may leak if the dynamics weren't strictly causal) ----
     z1_hat_full_bulk, h_bulk = dyn.apply(
         dyn_vars, actions, step_idx_full, sigma_idx_full, z_tilde_full,
         agent_tokens=agents_full, deterministic=True
     )
-    h_pooled_bulk = jnp.mean(h_bulk, axis=2) if h_bulk is not None else jnp.zeros((cfg.B, cfg.T, cfg.d_model_dyn), z_all.dtype)
+    h_pooled_bulk = jnp.mean(h_bulk, axis=2) if h_bulk is not None else jnp.zeros((cfg.dataset.B, cfg.dataset.T, cfg.d_model_dyn), z_all.dtype)
 
     # ---- Paranoid no-leak pass: compute h_t with prefix [0..t] only ----
     if cfg.paranoid_no_leak:
         h_collect = []
-        for t in range(cfg.T):
+        for t in range(cfg.dataset.T):
             Tt = t + 1
             z_slice = z_tilde_full[:, :Tt, :, :]
             a_slice = actions[:, :Tt]
@@ -579,7 +571,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
         horizon=cfg.horizon, ctx_length=cfg.ctx_length,
         ctx_signal_tau=cfg.ctx_signal_tau, match_ctx_tau=cfg.match_ctx_tau,
         rng_key=jax.random.PRNGKey(4242), mae_eval_key=env["mae_eval_key"],
-        H=cfg.H, W=cfg.W, C=cfg.C, patch=cfg.patch,
+        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=n_spatial, packing_factor=cfg.packing_factor,
     )
     pred_frames, floor_frames, gt_frames = sample_video(
@@ -595,8 +587,8 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
         trip_list = [_stack_wide(_to_uint8(gt_frames[b, t]),
                                  _to_uint8(floor_frames[b, t]),
                                  _to_uint8(pred_frames[b, t]))
-                     for b in range(cfg.B)]
-        grid_frames.append(_tile_videos(trip_list, ncols=min(2, cfg.B)))
+                     for b in range(cfg.dataset.B)]
+        grid_frames.append(_tile_videos(trip_list, ncols=min(2, cfg.dataset.B)))
     out_mp4 = out_dir / "tf_frames_grid.mp4"
     with imageio.get_writer(out_mp4, fps=25, codec="libx264", quality=8) as w:
         for fr in grid_frames:
@@ -622,7 +614,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
     gt_rewards_h = rewards[:, cfg.ctx_length : cfg.ctx_length + cfg.horizon]  # (B, horizon)
 
     # Strips: use horizon-length GT aligned to current timestep
-    for ei in range(min(cfg.max_examples_to_plot, cfg.B)):
+    for ei in range(min(cfg.max_examples_to_plot, cfg.dataset.B)):
         fig_path = out_dir / f"tf_strip_b{ei}.png"
         _save_strip(
             fig_path, np.asarray(gt_frames), cfg.ctx_length, cfg.horizon,
@@ -636,7 +628,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
         print(f"[eval:TF] wrote {fig_path}")
 
     # Reward line plots (GT vs Pred) over the horizon, aligned to current timestep
-    for ei in range(min(cfg.max_examples_to_plot, cfg.B)):
+    for ei in range(min(cfg.max_examples_to_plot, cfg.dataset.B)):
         gt_line = np.asarray(gt_rewards_h[ei])
         pred_line = np.asarray(pred_rewards_h[ei])
         plot_path = out_dir / f"tf_reward_line_b{ei}.png"
@@ -674,7 +666,7 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
         horizon=cfg.horizon, ctx_length=cfg.ctx_length,
         ctx_signal_tau=cfg.ctx_signal_tau, match_ctx_tau=cfg.match_ctx_tau,
         rng_key=jax.random.PRNGKey(101010), mae_eval_key=env["mae_eval_key"],
-        H=cfg.H, W=cfg.W, C=cfg.C, patch=cfg.patch,
+        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=n_spatial, packing_factor=cfg.packing_factor,
     )
     pred_frames, floor_frames, gt_frames = sample_video(
@@ -702,7 +694,7 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
         e = int(round(np.log2(1.0 / d_used)))
 
     # Build actions windows and compute h per future step
-    B = cfg.B
+    B = cfg.dataset.B
     Lh = cfg.horizon
     pred_act_top1 = []
     pred_rew_real = []
@@ -761,8 +753,8 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
         trip_list = [_stack_wide(_to_uint8(gt_frames[b, t]),
                                  _to_uint8(floor_frames[b, t]),
                                  _to_uint8(pred_frames[b, t]))
-                     for b in range(cfg.B)]
-        grid_frames.append(_tile_videos(trip_list, ncols=min(2, cfg.B)))
+                     for b in range(cfg.dataset.B)]
+        grid_frames.append(_tile_videos(trip_list, ncols=min(2, cfg.dataset.B)))
     out_mp4 = out_dir / "ar_frames_grid.mp4"
     with imageio.get_writer(out_mp4, fps=25, codec="libx264", quality=8) as w:
         for fr in grid_frames:
@@ -779,7 +771,7 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
     acc = jnp.mean((pred_for_acc == gt_for_acc).astype(jnp.float32))
 
     # Save strips using +1-shifted GT (so column i shows GT/Pred for a_{ctx+i+1})
-    for ei in range(min(cfg.max_examples_to_plot, cfg.B)):
+    for ei in range(min(cfg.max_examples_to_plot, cfg.dataset.B)):
         fig_path = out_dir / f"ar_strip_b{ei}.png"
         _save_strip(
             fig_path, np.asarray(gt_frames), cfg.ctx_length, cfg.horizon,
@@ -814,18 +806,23 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
 # Main
 # ---------------------------
 
-def main(cfg: EvalConfig):
-    out_dir = _ensure_dir(Path(cfg.out_dir))
-    print("Eval config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
+@hydra.main(version_base=None, config_path="../configs", config_name="eval_bc_rew")
+def main(cfg: DictConfig):
+    schema = OmegaConf.structured(EvalConfig)
+    cfg = OmegaConf.merge(schema, cfg)
+    eval_cfg = OmegaConf.to_object(cfg)
 
-    env = init_models_and_restore(cfg)
+    out_dir = _ensure_dir(Path(eval_cfg.out_dir))
+    print("Eval config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(eval_cfg).items()]))
+
+    env = init_models_and_restore(eval_cfg)
 
     # Create separate subdirs
     tf_dir = _ensure_dir(out_dir / "teacher_forced")
     ar_dir = _ensure_dir(out_dir / "autoregressive")
 
-    tf_metrics = eval_teacher_forced(cfg, env, tf_dir)
-    ar_metrics = eval_autoregressive(cfg, env, ar_dir)
+    tf_metrics = eval_teacher_forced(eval_cfg, env, tf_dir)
+    ar_metrics = eval_autoregressive(eval_cfg, env, ar_dir)
 
     # summary
     (out_dir / "SUMMARY.txt").write_text(
@@ -842,17 +839,4 @@ def main(cfg: EvalConfig):
     print(f"[eval] Wrote summary to {out_dir/'SUMMARY.txt'}")
 
 if __name__ == "__main__":
-    # EXAMPLE PATHS — adjust to your environment
-    cfg = EvalConfig(
-        run_ckpt_dir="./logs/train_bc_rew_flippedrew/checkpoints",
-        tokenizer_ckpt="./logs/tokenizer/checkpoints",
-        out_dir="./logs/eval_bc_rew_heads_shortcut_flippedrew",
-        B=8, T=64, H=32, W=32, C=3,
-        action_dim=4,
-        ctx_length=32, horizon=16,
-        schedule="shortcut", d=1/4,           # or schedule="shortcut", d=0.25
-        ctx_signal_tau=1.0, match_ctx_tau=False,
-        max_examples_to_plot=4,
-        paranoid_no_leak=False,
-    )
-    main(cfg)
+    main()

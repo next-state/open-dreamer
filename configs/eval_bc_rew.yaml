@@ -1,0 +1,43 @@
+defaults:
+  - common
+
+run_ckpt_dir: ./logs/train_bc_rew_flippedrew/checkpoints
+tokenizer_ckpt: ./logs/tokenizer/checkpoints
+out_dir: ./logs/eval_bc_rew_heads_shortcut_flippedrew
+
+dataset:
+  B: 8
+  diversify_data: true
+
+action_dim: 4
+
+patch: 4
+enc_n_latents: 16
+enc_d_bottleneck: 32
+d_model_enc: 64
+d_model_dyn: 128
+enc_depth: 8
+dec_depth: 8
+dyn_depth: 8
+n_heads: 4
+packing_factor: 2
+n_register: 4
+n_agent: 1
+agent_space_mode: wm_agent
+k_max: 8
+
+L: 2
+num_reward_bins: 101
+reward_log_low: -3.0
+reward_log_high: 3.0
+n_tasks: 128
+use_task_ids: true
+
+ctx_length: 32
+horizon: 16
+schedule: shortcut
+d: 0.25
+ctx_signal_tau: 1.0
+match_ctx_tau: false
+max_examples_to_plot: 4
+paranoid_no_leak: false

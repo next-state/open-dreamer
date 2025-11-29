@@ -1,8 +1,39 @@
 from functools import partial
+from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import imageio.v2 as imageio
 from einops import rearrange
+
+
+# ============================================================
+# Dataset Configuration
+# ============================================================
+
+@dataclass
+class DatasetConfig:
+    """Configuration for dataset parameters.
+    
+    This config is shared across all experiments (tokenizer, dynamics, policy)
+    to ensure consistent data loading.
+    """
+    name: str = "moving_sprites"
+    
+    # Batch and sequence dimensions
+    B: int = 32  # batch size
+    T: int = 64  # sequence length
+    H: int = 32  # height
+    W: int = 32  # width
+    C: int = 3   # channels
+    
+    # Moving sprites specific parameters
+    pixels_per_step: int = 2
+    size_min: int = 6
+    size_max: int = 14
+    hold_min: int = 4
+    hold_max: int = 9
+    diversify_data: bool = False
+
 
 # ============================================================
 # Constants

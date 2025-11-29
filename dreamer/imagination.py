@@ -638,11 +638,11 @@ def _make_real_world_models_and_batch():
     # adjust the batch/time dimensions here if desired.
     cfg = RLConfig(
         run_name="jit_sampler_test",
-        bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_4actions/checkpoints",
+        bc_rew_ckpt="./train_bc_rew_4actions/checkpoints",
         use_wandb=False,
-        wandb_entity="edhu",
+        wandb_entity="edhu",  # FIXME
         wandb_project="tiny_dreamer_4",
-        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
+        log_dir="./logs",
     )
 
     next_batch = make_iterator(

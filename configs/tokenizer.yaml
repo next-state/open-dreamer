@@ -1,0 +1,34 @@
+defaults:
+  - common
+
+run_name: tokenizer
+ckpt_max_to_keep: 5
+ckpt_save_every: 1e4
+
+patch_size: 4
+
+encoder:
+  n_latents: 16
+  d_bottleneck: 32
+  d_model: 64
+  n_heads: 4
+  depth: 8
+  dropout: 0.05
+  time_every: 4
+  mae_p_min: 0.0
+  mae_p_max: 0.9
+
+decoder:
+  d_model: ${encoder.d_model}
+  n_heads: ${encoder.n_heads}
+  n_latents: ${encoder.n_latents}
+  depth: 8
+  dropout: 0.05
+  time_every: 4
+
+lr: 1e-4
+max_steps: 1e9
+log_every: 100
+lpips_weight: 0.2
+lpips_frac: 0.5
+visualize_every: 1e4
