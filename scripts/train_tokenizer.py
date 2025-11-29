@@ -342,7 +342,7 @@ def run(cfg: TokenizerConfig):
             max_steps=cfg.max_steps,
             wandb_obj=wandb
         )
-        pbar = tqdm(range(start_step, cfg.max_steps), 
+        pbar = tqdm(range(start_step, cfg.max_steps + 1), 
                     initial=start_step, 
                     total=cfg.max_steps, 
                     desc="Training Tokenizer", 
