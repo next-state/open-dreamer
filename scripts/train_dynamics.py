@@ -82,7 +82,6 @@ class RealismConfig:
     packing_factor: int = 2
     n_register: int = 4 # number of register tokens for dynamics
     n_agent: int = 1 # number of agent tokens for dynamics
-    agent_space_mode: str = "wm_agent"
 
     # schedule
     k_max: int = 8
