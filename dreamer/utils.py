@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-from functools import lru_cache
 from dreamer.data import patchify, unpatchify
 import orbax.checkpoint as ocp
 from pathlib import Path
@@ -144,7 +143,7 @@ def make_mask(modality_ids: jnp.ndarray, mode: str):
     elif mode == "decoder":
         # latents -> latents only; non-latents -> same modality + latents
         mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
-    elif mode in ["wm_agent"]:
+    elif mode == "wm_agent":
         # wm_agent: agent reads all; all non-agent tokens read all *except* agent.
         is_agent_q = (q_mod == Modality.AGENT)
         is_agent_k = (k_mod == Modality.AGENT)
@@ -152,9 +151,6 @@ def make_mask(modality_ids: jnp.ndarray, mode: str):
     else:
         raise ValueError(f"Unknown mode {mode}")
 
-    # Save (1,1,S,S) so it broadcasts over batch*time and heads -> (B*T, 1, S, S)
-    modality_mask = mask[None, :, :]                   # (1,S,S)
-    modality_mask = jax.lax.stop_gradient(modality_mask)
+    # Save (S,S)
+    modality_mask = jax.lax.stop_gradient(mask)
     return modality_mask
-
-    

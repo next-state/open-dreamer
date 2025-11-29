@@ -308,7 +308,7 @@ class Encoder(nn.Module):
         tokens = add_sinusoidal_positions(tokens)
 
         # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
-        mask = repeat(self.mask.value, " ... -> bt ...", bt=B*T)
+        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
         # 5) Feed tokens into transformer
         encoded_tokens = self.transformer(tokens, mask=mask, deterministic=deterministic)
         # print(f"encoded_tokens_btSd.shape: {encoded_tokens_btSd.shape}")
@@ -386,7 +386,7 @@ class Decoder(nn.Module):
         # 5) Axial block-causal transformer
         #    - SpaceSelfAttention over all S tokens (latents + queries)
         #    - TimeSelfAttention only over the first N_l latent tokens
-        mask = repeat(self.mask.value, " ... -> bt ...", bt=B*T)
+        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
         x = self.transformer(tokens, mask=mask, deterministic=deterministic)
         # 6) Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
@@ -539,7 +539,7 @@ class Dynamics(nn.Module):
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
         tokens = add_sinusoidal_positions(tokens)      # (B, T, N_total, d_model)
-        mask = repeat(self.mask.value, " ... -> bt ...", bt=B*T)
+        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
         x = self.transformer(tokens, mask, deterministic=deterministic)
         spatial_tokens = x[:, :, self.spatial_slice, :]
         x1_hat = self.flow_x_head(spatial_tokens)
