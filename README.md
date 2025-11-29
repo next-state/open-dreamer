@@ -56,12 +56,6 @@ source .venv/bin/activate # activate venv
 uv pip install -e . # install this project as an editable package
 ```
 
-By default, this installs the **CPU** version of JAX. For GPUs, follow the official JAX instructions, for example:
-
-```bash
-uv pip install "jax[cuda12]"
-```
-
 The code should run on any relatively recent GPU, but all logic should also run (more slowly) on CPU.
 
 ## Training Pipeline
@@ -80,19 +74,16 @@ To run the training pipeline, edit the configs in each script's `__main__` block
 python scripts/train_tokenizer.py
 
 # Phase 2: Train the dynamics model (requires tokenizer checkpoint)
-python scripts/train_dynamics.py
-# Edit tokenizer_ckpt in the config to point to your Phase 1 checkpoint
+python scripts/train_dynamics.py tokenizer_ckpt=./logs/tokenizer/checkpoints
 
 # Phase 3: Train BC/reward heads (requires tokenizer + dynamics checkpoints)
-python scripts/train_bc_rew_heads.py
-# Edit tokenizer_ckpt and pretrained_dyn_ckpt in the config
+python scripts/train_bc_rew_heads.py tokenizer_ckpt=./logs/tokenizer/checkpoints dynamics_ckpt=./logs/train_dynamics/checkpoints
 
 # Phase 4: Train policy in imagination (requires BC/reward checkpoint)
-python scripts/train_policy.py
-# Edit bc_rew_ckpt in the config to point to your Phase 3 checkpoint
+python scripts/train_policy.py bc_rew_ckpt=./logs/bc_rew/checkpoints
 ```
 
-All scripts save checkpoints under `logs/{run_name}/checkpoints/` by default. You can also enable wandb logging by setting `use_wandb=True` in the configs.
+All scripts save checkpoints under `logs/{run_name}/checkpoints/` by default. You can also enable wandb logging by adding `use_wandb=True` to the launch command. We use hydra to manage the configurations in `/configs`.
 
 ## Experimental Results
 A log of the training process.
