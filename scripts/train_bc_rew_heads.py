@@ -46,7 +46,7 @@ class RealismConfig:
     # IO / ckpt
     run_name: str
     tokenizer_ckpt: str
-    pretrained_dyn_ckpt: str
+    dynamics_ckpt: str
     ckpt_max_to_keep: int = 2
     ckpt_save_every: int = 10_000
 
@@ -757,8 +757,8 @@ def initialize_models_and_tokenizer(
     step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
     sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), k_max - 1, dtype=jnp.int32)
     dyn_vars = dynamics.init({"params": rng, "dropout": rng}, actions_init, step_idx, sigma_idx, z1)
-    print(f"[dynamics] Loading pretrained params from {cfg.pretrained_dyn_ckpt}")
-    dyn_pre = load_pretrained_dynamics_params(cfg.pretrained_dyn_ckpt, dyn_vars)
+    print(f"[dynamics] Loading pretrained params from {cfg.dynamics_ckpt}")
+    dyn_pre = load_pretrained_dynamics_params(cfg.dynamics_ckpt, dyn_vars)
     dyn_vars = with_params(dyn_vars, dyn_pre)
 
     # NEW: heads & task embedder

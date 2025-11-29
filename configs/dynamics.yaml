@@ -2,7 +2,7 @@ defaults:
   - common
   - _self_
 
-run_name: train_dynamics
+run_name: dynamics
 tokenizer_ckpt: null
 ckpt_save_every: 50_000
 

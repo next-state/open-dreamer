@@ -1,5 +1,5 @@
 defaults:
-  - dataset: moving_sprites
+  - dataset: bouncing_square
   - _self_
 
 # Logging / Checkpointing

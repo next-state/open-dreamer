@@ -37,7 +37,6 @@ class EvalConfig:
     # Paths
     run_ckpt_dir: str                         # training run checkpoints dir to restore params from
     tokenizer_ckpt: str                       # tokenizer ckpt (for enc/dec)
-    out_dir: str = "./eval_out"
 
     # dataset config
     dataset: DatasetConfig = field(default_factory=DatasetConfig)

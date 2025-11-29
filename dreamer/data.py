@@ -17,7 +17,7 @@ class DatasetConfig:
     This config is shared across all experiments (tokenizer, dynamics, policy)
     to ensure consistent data loading.
     """
-    name: str = "moving_sprites"
+    name: str = "bouncing_square"
     
     # Batch and sequence dimensions
     B: int = 32  # batch size
@@ -26,7 +26,7 @@ class DatasetConfig:
     W: int = 32  # width
     C: int = 3   # channels
     
-    # Moving sprites specific parameters
+    # Bouncing square specific parameters
     pixels_per_step: int = 2
     size_min: int = 6
     size_max: int = 14
