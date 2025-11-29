@@ -8,6 +8,7 @@ import math
 import csv
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from hydra.core.hydra_config import HydraConfig
 
 import jax
 import jax.numpy as jnp
@@ -812,7 +813,7 @@ def main(cfg: DictConfig):
     cfg = OmegaConf.merge(schema, cfg)
     eval_cfg = OmegaConf.to_object(cfg)
 
-    out_dir = _ensure_dir(Path(eval_cfg.out_dir))
+    out_dir = _ensure_dir(Path(HydraConfig.get().runtime.output_dir))
     print("Eval config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(eval_cfg).items()]))
 
     env = init_models_and_restore(eval_cfg)

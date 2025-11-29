@@ -27,6 +27,7 @@ import math
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from hydra.core.hydra_config import HydraConfig
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -77,7 +78,6 @@ class RLConfig:
     # IO / ckpt
     run_name: str
     bc_rew_ckpt: str  # checkpoint from train_bc_rew_heads.py
-    log_dir: str = "./logs"
     ckpt_max_to_keep: int = 2
     ckpt_save_every: int = 10_000
 
@@ -1519,6 +1519,11 @@ def train_step(
 
 
 def run(cfg: RLConfig):
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
+    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
+    vis_dir = _ensure_dir(run_dir / "viz")
+    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+
     # Initialize wandb if enabled
     if cfg.use_wandb:
         wandb_project = cfg.wandb_project or cfg.run_name
@@ -1527,15 +1532,8 @@ def run(cfg: RLConfig):
             project=wandb_project,
             name=cfg.run_name,
             config=asdict(cfg),
-            dir=str(Path(cfg.log_dir).resolve()),
+            dir=str(run_dir),
         )
-
-    # Output dirs
-    root = _ensure_dir(Path(cfg.log_dir))
-    run_dir = _ensure_dir(root / cfg.run_name)
-    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
-    vis_dir = _ensure_dir(run_dir / "viz")
-    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
     # Data iterator
     next_batch = make_iterator(

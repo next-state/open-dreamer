@@ -9,6 +9,7 @@ from functools import partial
 from tqdm import tqdm
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from hydra.core.hydra_config import HydraConfig
 import json
 import time
 import math
@@ -46,10 +47,8 @@ class RealismConfig:
     run_name: str
     tokenizer_ckpt: str
     pretrained_dyn_ckpt: str
-    log_dir: str = "./logs"
     ckpt_max_to_keep: int = 2
     ckpt_save_every: int = 10_000
-
 
     # wandb config
     use_wandb: bool = False
@@ -880,6 +879,11 @@ def run_evaluation(
 # ---------------------------
 
 def run(cfg: RealismConfig):
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
+    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
+    vis_dir = _ensure_dir(run_dir / "viz")
+    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+
     # Initialize wandb if enabled
     if cfg.use_wandb:
         wandb_project = cfg.wandb_project or cfg.run_name
@@ -888,16 +892,9 @@ def run(cfg: RealismConfig):
             project=wandb_project,
             name=cfg.run_name,
             config=asdict(cfg),
-            dir=str(Path(cfg.log_dir).resolve()),
+            dir=str(run_dir),
         )
         print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
-
-    # Output dirs
-    root = _ensure_dir(Path(cfg.log_dir))
-    run_dir = _ensure_dir(root / cfg.run_name)
-    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
-    vis_dir = _ensure_dir(run_dir / "viz")
-    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
     # Data iterator (streaming)
     next_batch = make_iterator(

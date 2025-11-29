@@ -13,6 +13,7 @@ import imageio
 from jaxlpips import LPIPS
 from pathlib import Path
 import wandb
+from hydra.core.hydra_config import HydraConfig
 from dreamer.utils import temporal_patchify, temporal_unpatchify, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
 from dreamer.logging import MetricLogger
 
@@ -49,7 +50,6 @@ class DecoderConfig:
 class TokenizerConfig:
     # IO / ckpt
     run_name: str
-    log_dir: str = "./logs"
     ckpt_max_to_keep: int = 5
     ckpt_save_every: int = 10_000
 
@@ -244,6 +244,9 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
     return new_params, opt_state, new_enc_vars, new_dec_vars, aux
 
 def run(cfg: TokenizerConfig):
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
+    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+
     # Initialize wandb if enabled
     if cfg.use_wandb:
         wandb_project = cfg.wandb_project or cfg.run_name
@@ -252,14 +255,8 @@ def run(cfg: TokenizerConfig):
             project=wandb_project,
             name=cfg.run_name,
             config=asdict(cfg),
-            dir=str(Path(cfg.log_dir).resolve()),
+            dir=str(run_dir),
         )
-
-    log_dir = Path(cfg.log_dir)
-    _ensure_dir(log_dir)
-    run_dir = log_dir / cfg.run_name
-    _ensure_dir(run_dir)
-    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
     rng = jax.random.PRNGKey(0)
     
