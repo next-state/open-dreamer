@@ -8,6 +8,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Any
 from functools import partial
+from tqdm import tqdm
 import json
 import time
 import math
@@ -787,8 +788,13 @@ def run(cfg: RealismConfig):
     train_rng = jax.random.PRNGKey(2025)
     data_rng = jax.random.PRNGKey(12345)
 
-    start_wall = time.time()
-    for step in range(start_step, cfg.max_steps + 1):
+    pbar = tqdm(range(start_step, cfg.max_steps + 1), 
+                initial=start_step,
+                total=cfg.max_steps,
+                desc="Training Dynamics",
+                dynamic_ncols=True)
+    
+    for step in pbar:
         # Data
         data_rng, batch_key = jax.random.split(data_rng)
         _, (frames, actions, _) = next_batch(batch_key)
@@ -800,7 +806,6 @@ def run(cfg: RealismConfig):
         # and gate its contribution inside the jit via bootstrap_start masking).
         B_self = max(0, int(round(cfg.self_fraction * cfg.B)))
 
-        train_step_start_time = time.time()
         train_state.params, train_state.opt_state, aux = train_step_efficient(
             train_state.encoder, train_state.dynamics, train_state.tx,
             train_state.params, train_state.opt_state,
@@ -815,26 +820,15 @@ def run(cfg: RealismConfig):
         if (step % cfg.log_every == 0) or (step == cfg.max_steps):
             flow_mse = float(aux['flow_mse'])
             boot_mse = float(aux['bootstrap_mse'])
-            step_time = time.time() - train_step_start_time
-            total_time = time.time() - start_wall
 
-            pieces = [
-                f"[train] step={step:06d}",
-                f"flow_mse={flow_mse:.6g}",
-                f"boot_mse={boot_mse:.6g}",
-                f"t={step_time:.4f}s",
-                f"total_t={total_time:.1f}s",
-            ]
-            print(" | ".join(pieces))
+            pbar.set_postfix(flow_mse=f"{flow_mse:.6g}", boot_mse=f"{boot_mse:.6g}")
 
             # Log to wandb
             if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log({
                     "train/flow_mse": flow_mse,
                     "train/bootstrap_mse": boot_mse,
-                    "train/step_time": step_time,
-                    "train/total_time": total_time,
-                    "step": step,
+                    "train/step": step,
                 }, step=step)
 
         # Save (async) when policy says we should
@@ -865,12 +859,12 @@ def run(cfg: RealismConfig):
 
 if __name__ == "__main__":
     cfg = RealismConfig(
-        run_name="train_dynamics_test",
-        tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
+        run_name="train_dynamics",
+        tokenizer_ckpt="./logs/tokenizer/checkpoints",
         use_wandb=False,
-        wandb_entity="edhu",
+        wandb_entity="diego-marti",
         wandb_project="tiny_dreamer_4",
-        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
+        log_dir="./logs",
         max_steps=1_000_000_000,
         log_every=5_000,
         lr=1e-4,

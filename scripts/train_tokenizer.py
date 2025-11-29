@@ -1,4 +1,5 @@
 from functools import partial
+from tqdm import tqdm
 import jax
 import jax.numpy as jnp
 import optax
@@ -7,7 +8,6 @@ from dreamer.data import make_iterator
 import imageio
 from jaxlpips import LPIPS
 from pathlib import Path
-from time import time
 from dreamer.utils import temporal_patchify, temporal_unpatchify, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
 
 
@@ -262,19 +262,21 @@ if __name__ == "__main__":
 
     # ---------- Train loop ----------
     try:
-        for step in range(start_step, max_steps):
+        pbar = tqdm(range(start_step, max_steps), 
+                    initial=start_step, 
+                    total=max_steps, 
+                    desc="Training Tokenizer", 
+                    dynamic_ncols=True)
+        
+        for step in pbar:
             # use a fixed batch for debugging
             # _, batch = next_batch(jax.random.PRNGKey(0))
-            data_start_t = time()
             rng, batch = next_batch(rng)
-            data_t = time() - data_start_t
-            train_start_t = time()
             rng, master_key = jax.random.split(rng)
             params, opt_state, enc_vars, dec_vars, aux = train_step(
                 encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch,
                 patch=patch, H=H, W=W, C=C, master_key=master_key, step=step, lpips_weight=lpips_weight, lpips_frac=lpips_frac,
             )
-            train_t = time() - train_start_t
 
             # Log
             if step % 100 == 0:
@@ -282,8 +284,11 @@ if __name__ == "__main__":
                 lpips_loss = float(aux['loss_lpips'])
                 total_loss = float(aux['loss_total'])
                 psnr = 10 * jnp.log10(1.0 / jnp.maximum(mse_loss, 1e-10))
-                total_t = data_t + train_t
-                print(f"step {step:03d} |  total={total_loss:.6f} | rmse={jnp.sqrt(mse_loss):.6f} | lpips={lpips_loss:.4f} | psnr={psnr:.4f} | time={total_t:.3f}s")
+                
+                pbar.set_postfix(total=f"{total_loss:.6f}", 
+                                 rmse=f"{jnp.sqrt(mse_loss):.6f}", 
+                                 lpips=f"{lpips_loss:.4f}", 
+                                 psnr=f"{psnr:.4f}")
 
             # Save (async)
             state = make_state(params, opt_state, rng, step)

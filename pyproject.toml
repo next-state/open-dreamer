@@ -11,6 +11,8 @@ dependencies = [
     "jax[cuda12]>=0.7.2",
     "jaxlpips>=1.2.0",
     "optax>=0.2.6",
+    "tqdm>=4.67.1",
+    "wandb>=0.23.0",
 ]
 
 [dependency-groups]

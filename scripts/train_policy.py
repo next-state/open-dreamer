@@ -22,7 +22,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Any
 from functools import partial
-import time
+from tqdm import tqdm
 import math
 
 import jax
@@ -1671,8 +1671,13 @@ def run(cfg: RLConfig):
     data_rng = jax.random.PRNGKey(12345)
     eval_rng = jax.random.PRNGKey(98765)
 
-    start_wall = time.time()
-    for step in range(start_step, cfg.max_steps + 1):
+    pbar = tqdm(range(start_step, cfg.max_steps + 1), 
+                initial=start_step, 
+                total=cfg.max_steps,
+                desc="Training Policy",
+                dynamic_ncols=True)
+
+    for step in pbar:
         # Sample batch
         data_rng, batch_key = jax.random.split(data_rng)
         _, (videos, actions_full, rewards_full) = next_batch(batch_key)
@@ -1725,7 +1730,6 @@ def run(cfg: RLConfig):
             packing_factor=cfg.packing_factor,
             rng_key=step_key,
         )
-        train_step_end = time.time()
         train_state.params = new_params
         train_state.opt_state = new_opt_state
         train_state.val_vars = new_val_vars
@@ -1822,34 +1826,41 @@ def run(cfg: RLConfig):
                 wandb.log(log_payload, step=step)
 
         if step % cfg.log_every == 0:
-            elapsed = time.time() - start_wall
-            print(
-                f"[train] step={step:06d} | "
-                f"val_loss={aux['val_loss']:.4f} | "
-                f"pi_loss={aux['pi_loss']:.4f} | "
-                f"pi_neg={aux['pi_loss_negative']:.4f} | "
-                f"pi_pos={aux['pi_loss_positive']:.4f} | "
-                f"pi_kl={aux['pi_kl_loss']:.4f} | "
-                f"mean_adv={aux['mean_advantage']:.4f} | "
-                f"mean_td_return={aux['mean_td_return']:.4f} | "
-                f"n_pos={int(aux['n_positive'])}/"
-                f"{int(aux['n_positive'] + aux['n_negative'])} | "
-                f"train_step_t={(train_step_end - train_step_start):.4f}s"
+            val_loss = float(aux['val_loss'])
+            pi_loss = float(aux['pi_loss'])
+            pi_neg = float(aux['pi_loss_negative'])
+            pi_pos = float(aux['pi_loss_positive'])
+            pi_kl = float(aux['pi_kl_loss'])
+            mean_adv = float(aux['mean_advantage'])
+            mean_td = float(aux['mean_td_return'])
+            n_pos = int(aux['n_positive'])
+            n_neg = int(aux['n_negative'])
+
+            pbar.set_postfix(
+                val_loss=f"{val_loss:.4f}",
+                pi_loss=f"{pi_loss:.4f}",
+                pi_neg=f"{pi_neg:.4f}",
+                pi_pos=f"{pi_pos:.4f}",
+                pi_kl=f"{pi_kl:.4f}",
+                mean_adv=f"{mean_adv:.4f}",
+                mean_td=f"{mean_td:.4f}",
+                n_pos=f"{n_pos}",
+                n_neg=f"{n_neg}",
             )
 
             if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log(
                     {
-                        "step": step,
-                        "val_loss": float(aux["val_loss"]),
-                        "pi_loss": float(aux["pi_loss"]),
-                        "pi_loss_negative": float(aux["pi_loss_negative"]),
-                        "pi_loss_positive": float(aux["pi_loss_positive"]),
-                        "pi_kl_loss": float(aux["pi_kl_loss"]),
-                        "mean_advantage": float(aux["mean_advantage"]),
-                        "mean_td_return": float(aux["mean_td_return"]),
-                        "n_positive": int(aux["n_positive"]),
-                        "n_negative": int(aux["n_negative"]),
+                        "train/step": step,
+                        "train/val_loss": val_loss,
+                        "train/pi_loss": pi_loss,
+                        "train/pi_loss_negative": pi_neg,
+                        "train/pi_loss_positive": pi_pos,
+                        "train/pi_kl_loss": pi_kl,
+                        "train/mean_advantage": mean_adv,
+                        "train/mean_td_return": mean_td,
+                        "train/n_positive": n_pos,
+                        "train/n_negative": n_neg,
                     },
                     step=step,
                 )
@@ -1872,12 +1883,12 @@ def run(cfg: RLConfig):
 
 if __name__ == "__main__":
     cfg = RLConfig(
-        run_name="train_policy_jit_flippedrew2_test",
-        bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_flippedrew/checkpoints",
+        run_name="train_policy_jit_flippedrew2",
+        bc_rew_ckpt="./logs/train_bc_rew_flippedrew/checkpoints",
         use_wandb=False,
-        wandb_entity="edhu",
+        wandb_entity="diego-marti",
         wandb_project="tiny_dreamer_4",
-        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
+        log_dir="./logs",
         max_steps=100_000,
         log_every=100,
         lr=1e-4,

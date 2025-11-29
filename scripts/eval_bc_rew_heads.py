@@ -844,9 +844,9 @@ def main(cfg: EvalConfig):
 if __name__ == "__main__":
     # EXAMPLE PATHS — adjust to your environment
     cfg = EvalConfig(
-        run_ckpt_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_flippedrew/checkpoints",
-        tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
-        out_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/eval_bc_rew_heads_shortcut_flippedrew",
+        run_ckpt_dir="./logs/train_bc_rew_flippedrew/checkpoints",
+        tokenizer_ckpt="./logs/tokenizer/checkpoints",
+        out_dir="./logs/eval_bc_rew_heads_shortcut_flippedrew",
         B=8, T=64, H=32, W=32, C=3,
         action_dim=4,
         ctx_length=32, horizon=16,
