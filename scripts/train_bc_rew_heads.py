@@ -719,7 +719,7 @@ def initialize_models_and_tokenizer(
         dropout=0.0,
         d_bottleneck=cfg.enc_d_bottleneck,
         mae_p_min=0.0, mae_p_max=0.0,
-        time_every=4, latents_only_time=True,
+        time_every=4,
     )
     dec_kwargs = dict(
         d_model=cfg.d_model_enc,
@@ -729,7 +729,7 @@ def initialize_models_and_tokenizer(
         n_patches=num_patches,
         d_patch=D_patch,
         dropout=0.0,
-        mlp_ratio=4.0, time_every=4, latents_only_time=True,
+        mlp_ratio=4.0, time_every=4,
     )
     n_spatial = cfg.enc_n_latents // cfg.packing_factor # number of spatial tokens for dynamics
     dyn_kwargs = dict(
@@ -738,7 +738,7 @@ def initialize_models_and_tokenizer(
         d_spatial=cfg.enc_d_bottleneck * cfg.packing_factor,
         n_spatial=n_spatial, n_register=cfg.n_register,
         n_heads=cfg.n_heads, depth=cfg.dyn_depth,
-        space_mode=cfg.agent_space_mode, n_agent=cfg.n_agent,
+        n_agent=cfg.n_agent,
         dropout=0.0, k_max=k_max, 
         time_every=4,
     )
@@ -1068,12 +1068,12 @@ def run(cfg: RealismConfig):
 if __name__ == "__main__":
     cfg = RealismConfig(
         run_name="train_bc_rew_flippedrew_test",
-        tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
-        pretrained_dyn_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_ndynamics_newattn/checkpoints",
+        tokenizer_ckpt="./logs/test/checkpoints",
+        pretrained_dyn_ckpt="./logs/dynamics/train_dynamics_test/checkpoints",
         use_wandb=False,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",
-        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
+        log_dir="./logs/behaviour/cloning",
         max_steps=1_000_000_000,
         log_every=5_000,
         lr=1e-4,

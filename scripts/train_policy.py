@@ -554,7 +554,6 @@ def initialize_models(
         mae_p_min=0.0,
         mae_p_max=0.0,
         time_every=4,
-        latents_only_time=True,
     )
     dec_kwargs = dict(
         d_model=cfg.d_model_enc,
@@ -566,7 +565,6 @@ def initialize_models(
         dropout=0.0,
         mlp_ratio=4.0,
         time_every=4,
-        latents_only_time=True,
     )
     n_spatial = cfg.enc_n_latents // cfg.packing_factor
     dyn_kwargs = dict(
@@ -577,11 +575,10 @@ def initialize_models(
         n_register=cfg.n_register,
         n_heads=cfg.n_heads,
         depth=cfg.dyn_depth,
-        space_mode=cfg.agent_space_mode,
-        n_agent=cfg.n_agent,
         dropout=0.0,
         k_max=k_max,
         time_every=4,
+        n_agent=cfg.n_agent,
     )
 
     encoder = Encoder(**enc_kwargs)
@@ -589,7 +586,6 @@ def initialize_models(
     dynamics = Dynamics(**dyn_kwargs)
     task_embedder = TaskEmbedder(
         d_model=cfg.d_model_dyn,
-        n_agent=cfg.n_agent,
         use_ids=cfg.use_task_ids,
         n_tasks=cfg.n_tasks,
     )
@@ -1873,11 +1869,11 @@ def run(cfg: RLConfig):
 if __name__ == "__main__":
     cfg = RLConfig(
         run_name="train_policy_jit_flippedrew2_test",
-        bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_flippedrew/checkpoints",
+        bc_rew_ckpt="./logs/behaviour/cloning/train_bc_rew_flippedrew_test/checkpoints",
         use_wandb=False,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",
-        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
+        log_dir="./logs/policy",
         max_steps=100_000,
         log_every=100,
         lr=1e-4,
