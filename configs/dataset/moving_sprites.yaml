@@ -1,15 +1,14 @@
-dataset:
-  name: moving_sprites
-  B: 32
-  T: 64
-  H: 32
-  W: 32
-  C: 3
-  
-  pixels_per_step: 2
-  size_min: 6
-  size_max: 14
-  hold_min: 4
-  hold_max: 9
-  
-  diversify_data: false
+name: moving_sprites
+B: 32
+T: 64
+H: 32
+W: 32
+C: 3
+
+pixels_per_step: 2
+size_min: 6
+size_max: 14
+hold_min: 4
+hold_max: 9
+
+diversify_data: false

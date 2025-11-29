@@ -1,9 +1,10 @@
 defaults:
   - common
+  - _self_
 
-run_ckpt_dir: ./logs/train_bc_rew_flippedrew/checkpoints
-tokenizer_ckpt: ./logs/tokenizer/checkpoints
-out_dir: ./logs/eval_bc_rew_heads_shortcut_flippedrew
+run_ckpt_dir: null
+tokenizer_ckpt: null
+out_dir: ./eval_outputs/eval_bc_rew_heads_shortcut_flippedrew
 
 dataset:
   B: 8

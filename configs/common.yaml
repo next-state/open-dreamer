@@ -1,13 +1,16 @@
-# Common configuration defaults
-
 defaults:
   - dataset: moving_sprites
+  - _self_
 
 # Logging / Checkpointing
-log_dir: ./logs
 ckpt_max_to_keep: 2
 
 # WandB
 use_wandb: true
 wandb_entity: null # add your wandb entity by adding `wandb_entity=<your_entity>` to the launch command
 wandb_project: tiny_dreamer_4
+
+# Hydra
+hydra:
+  run:
+    dir: logs/${run_name}
