@@ -402,9 +402,6 @@ def run(cfg: TokenizerConfig):
     finally:
         # Make sure any background saves finish before exit.
         mngr.wait_until_finished()
-        # Save final config
-        (run_dir / "config.txt").write_text("\n".join([f"{k}={v}" for k, v in asdict(cfg).items()]))
-        
         if cfg.use_wandb and wandb.run is not None:
             wandb.finish()
             print("[wandb] Finished logging.")

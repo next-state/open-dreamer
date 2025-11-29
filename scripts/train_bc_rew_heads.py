@@ -1029,9 +1029,6 @@ def run(cfg: RealismConfig):
     # Ensure all writes finished
     mngr.wait_until_finished()
 
-    # Save final config
-    (run_dir / "config.txt").write_text("\n".join([f"{k}={v}" for k, v in asdict(cfg).items()]))
-
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:
         wandb.finish()
