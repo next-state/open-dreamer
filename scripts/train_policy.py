@@ -34,14 +34,7 @@ from einops import rearrange
 from flax import struct
 import imageio.v2 as imageio
 import matplotlib.pyplot as plt
-
-try:
-    import wandb
-
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    wandb = None
+import wandb
 
 from dreamer.models import (
     Encoder,
@@ -1536,25 +1529,14 @@ def train_step(
 def run(cfg: RLConfig):
     # Initialize wandb if enabled
     if cfg.use_wandb:
-        if not WANDB_AVAILABLE:
-            print(
-                "[warning] wandb requested but not installed. "
-                "Install with: pip install wandb"
-            )
-            print("[warning] Continuing without wandb logging.")
-        else:
-            wandb_project = cfg.wandb_project or cfg.run_name
-            wandb.init(
-                entity=cfg.wandb_entity,
-                project=wandb_project,
-                name=cfg.run_name,
-                config=asdict(cfg),
-                dir=str(Path(cfg.log_dir).resolve()),
-            )
-            print(
-                f"[wandb] Initialized run: "
-                f"{wandb.run.name if wandb.run else 'N/A'}"
-            )
+        wandb_project = cfg.wandb_project or cfg.run_name
+        wandb.init(
+            entity=cfg.wandb_entity,
+            project=wandb_project,
+            name=cfg.run_name,
+            config=asdict(cfg),
+            dir=str(Path(cfg.log_dir).resolve()),
+        )
 
     # Output dirs
     root = _ensure_dir(Path(cfg.log_dir))
@@ -1810,7 +1792,7 @@ def run(cfg: RLConfig):
                             f"[viz:eval] Saved real-env eval video/strips to {vis_dir}"
                         )
 
-            if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+            if cfg.use_wandb and wandb.run is not None:
                 log_payload: Dict[str, Any] = {
                     "eval/return_mean": metrics_eval["eval/return_mean"],
                     "eval/return_std": metrics_eval["eval/return_std"],
@@ -1860,7 +1842,7 @@ def run(cfg: RLConfig):
         "\n".join([f"{k}={v}" for k, v in asdict(cfg).items()])
     )
 
-    if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+    if cfg.use_wandb and wandb.run is not None:
         wandb.finish()
         print("[wandb] Finished logging.")
 

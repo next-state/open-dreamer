@@ -18,12 +18,7 @@ import numpy as np
 import optax
 import imageio.v2 as imageio
 import orbax.checkpoint as ocp
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    wandb = None
+import wandb
 
 # UPDATED: bring in heads + task embedder
 from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
@@ -876,7 +871,7 @@ def run_evaluation(
         save_evaluation_video(grid_frames, mp4_path, tag)
         print(f"[eval:{tag}] wrote {mp4_path.name} in {tag_dir}")
 
-        if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+        if cfg.use_wandb and wandb.run is not None:
             wandb.log({
                 f"eval/{tag}/mse": mse,
                 f"eval/{tag}/psnr": psnr,
@@ -895,19 +890,15 @@ def run_evaluation(
 def run(cfg: RealismConfig):
     # Initialize wandb if enabled
     if cfg.use_wandb:
-        if not WANDB_AVAILABLE:
-            print("[warning] wandb requested but not installed. Install with: pip install wandb")
-            print("[warning] Continuing without wandb logging.")
-        else:
-            wandb_project = cfg.wandb_project or cfg.run_name
-            wandb.init(
-                entity=cfg.wandb_entity,
-                project=wandb_project,
-                name=cfg.run_name,
-                config=asdict(cfg),
-                dir=str(Path(cfg.log_dir).resolve()),
-            )
-            print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
+        wandb_project = cfg.wandb_project or cfg.run_name
+        wandb.init(
+            entity=cfg.wandb_entity,
+            project=wandb_project,
+            name=cfg.run_name,
+            config=asdict(cfg),
+            dir=str(Path(cfg.log_dir).resolve()),
+        )
+        print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
 
     # Output dirs
     root = _ensure_dir(Path(cfg.log_dir))
@@ -1053,7 +1044,7 @@ def run(cfg: RealismConfig):
     (run_dir / "config.txt").write_text("\n".join([f"{k}={v}" for k, v in asdict(cfg).items()]))
 
     # Finish wandb run
-    if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+    if cfg.use_wandb and wandb.run is not None:
         wandb.finish()
         print("[wandb] Finished logging.")
 

@@ -19,12 +19,7 @@ import numpy as np
 import optax
 import imageio.v2 as imageio
 import orbax.checkpoint as ocp
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    wandb = None
+import wandb
 
 from dreamer.models import Encoder, Decoder, Dynamics
 from dreamer.data import make_iterator
@@ -695,7 +690,7 @@ def run_evaluation(
         print(f"[eval:{tag}] wrote {mp4_path.name} and {plan_path.name} in {tag_dir}")
 
         # Log to wandb
-        if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+        if cfg.use_wandb and wandb.run is not None:
             # Log metrics
             wandb.log({
                 f"eval/{tag}/mse": mse,
@@ -715,19 +710,14 @@ def run_evaluation(
 def run(cfg: RealismConfig):
     # Initialize wandb if enabled
     if cfg.use_wandb:
-        if not WANDB_AVAILABLE:
-            print("[warning] wandb requested but not installed. Install with: pip install wandb")
-            print("[warning] Continuing without wandb logging.")
-        else:
-            wandb_project = cfg.wandb_project or cfg.run_name
-            wandb.init(
-                entity=cfg.wandb_entity,
-                project=wandb_project,
-                name=cfg.run_name,
-                config=asdict(cfg),
-                dir=str(Path(cfg.log_dir).resolve()),
-            )
-            print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
+        wandb_project = cfg.wandb_project or cfg.run_name
+        wandb.init(
+            entity=cfg.wandb_entity,
+            project=wandb_project,
+            name=cfg.run_name,
+            config=asdict(cfg),
+            dir=str(Path(cfg.log_dir).resolve()),
+        )
 
     # Output dirs
     root = _ensure_dir(Path(cfg.log_dir))
@@ -856,7 +846,7 @@ def run(cfg: RealismConfig):
     (run_dir / "config.txt").write_text("\n".join([f"{k}={v}" for k, v in asdict(cfg).items()]))
 
     # Finish wandb run
-    if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+    if cfg.use_wandb and wandb.run is not None:
         wandb.finish()
         print("[wandb] Finished logging.")
 
@@ -865,7 +855,7 @@ if __name__ == "__main__":
     cfg = RealismConfig(
         run_name="train_dynamics",
         tokenizer_ckpt="./logs/tokenizer/checkpoints",
-        use_wandb=False,
+        use_wandb=True,
         wandb_entity="diego-marti",
         wandb_project="tiny_dreamer_4",
         log_dir="./logs",
