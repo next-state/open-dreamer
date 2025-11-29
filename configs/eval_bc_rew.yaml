@@ -4,7 +4,6 @@ defaults:
 
 run_ckpt_dir: null
 tokenizer_ckpt: null
-out_dir: ./eval_outputs/eval_bc_rew_heads_shortcut_flippedrew
 
 dataset:
   B: 8
