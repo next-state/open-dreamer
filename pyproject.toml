@@ -21,3 +21,6 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.setuptools]
+package-dir = {"" = "."}
