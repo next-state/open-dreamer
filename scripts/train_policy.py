@@ -69,6 +69,7 @@ from dreamer.imagination import (
     _build_static_schedule,
     imagine_rollouts_core,
 )
+from dreamer.logging import MetricLogger
 
 
 # ---------------------------
@@ -1671,6 +1672,13 @@ def run(cfg: RLConfig):
     data_rng = jax.random.PRNGKey(12345)
     eval_rng = jax.random.PRNGKey(98765)
 
+    logger = MetricLogger(
+        use_wandb=cfg.use_wandb,
+        log_every=cfg.log_every,
+        max_steps=cfg.max_steps,
+        wandb_obj=wandb,
+    )
+
     pbar = tqdm(range(start_step, cfg.max_steps + 1), 
                 initial=start_step, 
                 total=cfg.max_steps,
@@ -1687,7 +1695,6 @@ def run(cfg: RLConfig):
 
         # JITted train step
         train_rng, step_key = jax.random.split(train_rng)
-        train_step_start = time.time()
         (
             new_params,
             new_opt_state,
@@ -1825,45 +1832,22 @@ def run(cfg: RLConfig):
 
                 wandb.log(log_payload, step=step)
 
-        if step % cfg.log_every == 0:
-            val_loss = float(aux['val_loss'])
-            pi_loss = float(aux['pi_loss'])
-            pi_neg = float(aux['pi_loss_negative'])
-            pi_pos = float(aux['pi_loss_positive'])
-            pi_kl = float(aux['pi_kl_loss'])
-            mean_adv = float(aux['mean_advantage'])
-            mean_td = float(aux['mean_td_return'])
-            n_pos = int(aux['n_positive'])
-            n_neg = int(aux['n_negative'])
-
-            pbar.set_postfix(
-                val_loss=f"{val_loss:.4f}",
-                pi_loss=f"{pi_loss:.4f}",
-                pi_neg=f"{pi_neg:.4f}",
-                pi_pos=f"{pi_pos:.4f}",
-                pi_kl=f"{pi_kl:.4f}",
-                mean_adv=f"{mean_adv:.4f}",
-                mean_td=f"{mean_td:.4f}",
-                n_pos=f"{n_pos}",
-                n_neg=f"{n_neg}",
+        if logger.should_log(step):
+            logger.log(
+                step,
+                metrics={
+                    "val_loss": aux["val_loss"],
+                    "pi_loss": aux["pi_loss"],
+                    "pi_neg": aux["pi_loss_negative"],
+                    "pi_pos": aux["pi_loss_positive"],
+                    "pi_kl": aux["pi_kl_loss"],
+                    "mean_adv": aux["mean_advantage"],
+                    "mean_td": aux["mean_td_return"],
+                    "n_pos": aux["n_positive"],
+                    "n_neg": aux["n_negative"],
+                },
+                pbar=pbar,
             )
-
-            if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
-                wandb.log(
-                    {
-                        "train/step": step,
-                        "train/val_loss": val_loss,
-                        "train/pi_loss": pi_loss,
-                        "train/pi_loss_negative": pi_neg,
-                        "train/pi_loss_positive": pi_pos,
-                        "train/pi_kl_loss": pi_kl,
-                        "train/mean_advantage": mean_adv,
-                        "train/mean_td_return": mean_td,
-                        "train/n_positive": n_pos,
-                        "train/n_negative": n_neg,
-                    },
-                    step=step,
-                )
 
         # Save checkpoint
         state = make_state(train_state.params, train_state.opt_state, train_rng, step)

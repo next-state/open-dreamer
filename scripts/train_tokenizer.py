@@ -9,6 +9,7 @@ import imageio
 from jaxlpips import LPIPS
 from pathlib import Path
 from dreamer.utils import temporal_patchify, temporal_unpatchify, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
+from dreamer.logging import MetricLogger
 
 
 
@@ -262,6 +263,7 @@ if __name__ == "__main__":
 
     # ---------- Train loop ----------
     try:
+        logger = MetricLogger(use_wandb=False, log_every=100, max_steps=max_steps) # FIXME: add wandb, add cfg
         pbar = tqdm(range(start_step, max_steps), 
                     initial=start_step, 
                     total=max_steps, 
@@ -279,16 +281,22 @@ if __name__ == "__main__":
             )
 
             # Log
-            if step % 100 == 0:
-                mse_loss = float(aux['loss_mse'])
-                lpips_loss = float(aux['loss_lpips'])
-                total_loss = float(aux['loss_total'])
+            if logger.should_log(step):
+                mse_loss = aux['loss_mse']
                 psnr = 10 * jnp.log10(1.0 / jnp.maximum(mse_loss, 1e-10))
+                rmse = jnp.sqrt(mse_loss)
                 
-                pbar.set_postfix(total=f"{total_loss:.6f}", 
-                                 rmse=f"{jnp.sqrt(mse_loss):.6f}", 
-                                 lpips=f"{lpips_loss:.4f}", 
-                                 psnr=f"{psnr:.4f}")
+                logger.log(
+                    step,
+                    metrics={
+                        "total": aux['loss_total'],
+                        "rmse": rmse,
+                        "lpips": aux['loss_lpips'],
+                        "psnr": psnr
+                    },
+                    pbar=pbar,
+                    float_fmt=".6f"
+                )
 
             # Save (async)
             state = make_state(params, opt_state, rng, step)

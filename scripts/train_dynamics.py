@@ -35,6 +35,7 @@ from dreamer.utils import (
     make_state, make_manager, try_restore, maybe_save,
     pack_mae_params,
 )
+from dreamer.logging import MetricLogger
 
 from dreamer.sampler import SamplerConfig, sample_video
 
@@ -788,6 +789,13 @@ def run(cfg: RealismConfig):
     train_rng = jax.random.PRNGKey(2025)
     data_rng = jax.random.PRNGKey(12345)
 
+    logger = MetricLogger(
+        use_wandb=cfg.use_wandb,
+        log_every=cfg.log_every,
+        max_steps=cfg.max_steps,
+        wandb_obj=wandb,
+    )
+
     pbar = tqdm(range(start_step, cfg.max_steps + 1), 
                 initial=start_step,
                 total=cfg.max_steps,
@@ -817,19 +825,15 @@ def run(cfg: RealismConfig):
         )
 
         # Logging
-        if (step % cfg.log_every == 0) or (step == cfg.max_steps):
-            flow_mse = float(aux['flow_mse'])
-            boot_mse = float(aux['bootstrap_mse'])
-
-            pbar.set_postfix(flow_mse=f"{flow_mse:.6g}", boot_mse=f"{boot_mse:.6g}")
-
-            # Log to wandb
-            if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
-                wandb.log({
-                    "train/flow_mse": flow_mse,
-                    "train/bootstrap_mse": boot_mse,
-                    "train/step": step,
-                }, step=step)
+        if logger.should_log(step):
+            logger.log(
+                step,
+                metrics={
+                    "flow_mse": aux["flow_mse"],
+                    "boot_mse": aux["bootstrap_mse"],
+                },
+                pbar=pbar
+            )
 
         # Save (async) when policy says we should
         state = make_state(train_state.params, train_state.opt_state, train_rng, step)

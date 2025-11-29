@@ -35,6 +35,7 @@ from dreamer.utils import (
     make_state, make_manager, try_restore, maybe_save,
     pack_mae_params,
 )
+from dreamer.logging import MetricLogger
 
 from dreamer.sampler import SamplerConfig, sample_video
 
@@ -972,6 +973,13 @@ def run(cfg: RealismConfig):
     train_rng = jax.random.PRNGKey(2025)
     data_rng = jax.random.PRNGKey(12345)
 
+    logger = MetricLogger(
+        use_wandb=cfg.use_wandb,
+        log_every=cfg.log_every,
+        max_steps=cfg.max_steps,
+        wandb_obj=wandb,
+    )
+
     pbar = tqdm(range(start_step, cfg.max_steps + 1), 
                 initial=start_step, 
                 total=cfg.max_steps,
@@ -1008,34 +1016,21 @@ def run(cfg: RealismConfig):
         )
 
         # Logging
-        if (step % cfg.log_every == 0) or (step == cfg.max_steps):
-            flow_mse = float(aux['flow_mse'])
-            boot_mse = float(aux['bootstrap_mse'])
-            pi_ce    = float(aux['pi_ce'])   
-            rw_ce   = float(aux['rw_ce'])
-            w_shortcut = float(aux['w_shortcut'])
-            w_pi_ce = float(aux['w_pi_ce'])
-            w_rw_ce = float(aux['w_rw_ce'])
-
-            pbar.set_postfix(
-                flow_mse=f"{flow_mse:.4f}",
-                boot_mse=f"{boot_mse:.4f}",
-                w_pi_ce=f"{w_pi_ce:.4f}",
-                w_rw_ce=f"{w_rw_ce:.4f}"
+        if logger.should_log(step):
+            logger.log(
+                step,
+                metrics={
+                    "flow_mse": aux["flow_mse"],
+                    "boot_mse": aux["bootstrap_mse"],
+                    "pi_ce": aux["pi_ce"],
+                    "rw_ce": aux["rw_ce"],
+                    "w_shortcut": aux["w_shortcut"],
+                    "w_pi_ce": aux["w_pi_ce"],
+                    "w_rw_ce": aux["w_rw_ce"],
+                },
+                pbar=pbar,
+                float_fmt=".4f",
             )
-
-            # Log to wandb
-            if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
-                wandb.log({
-                    "train/flow_mse": flow_mse,
-                    "train/bootstrap_mse": boot_mse,
-                    "train/pi_ce": pi_ce,
-                    "train/rw_ce": rw_ce,
-                    "train/w_shortcut": w_shortcut,
-                    "train/w_pi_ce": w_pi_ce,
-                    "train/w_rw_ce": w_rw_ce,
-                    "train/step": step,
-                }, step=step)
 
         # Save (async) when policy says we should
         state = make_state(train_state.params, train_state.opt_state, train_rng, step)
