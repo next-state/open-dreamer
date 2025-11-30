@@ -1,0 +1,35 @@
+defaults:
+  - common
+  - _self_
+
+run_name: dynamics
+tokenizer_ckpt: null
+ckpt_save_every: 50_000
+
+dataset:
+  B: 64
+  diversify_data: true
+
+patch: 4
+enc_n_latents: 16
+enc_d_bottleneck: 32
+d_model_enc: 64
+d_model_dyn: 128
+enc_depth: 8
+dec_depth: 8
+dyn_depth: 8
+n_heads: 4
+packing_factor: 2
+n_register: 4
+n_agent: 1
+agent_space_mode: wm_agent_isolated
+
+k_max: 8
+bootstrap_start: 5_000
+self_fraction: 0.25
+
+max_steps: 1_000_000_000
+log_every: 500
+lr: 1e-4
+
+write_video_every: 50_000

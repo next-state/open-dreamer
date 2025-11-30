@@ -1,0 +1,16 @@
+defaults:
+  - dataset: bouncing_square
+  - _self_
+
+# Logging / Checkpointing
+ckpt_max_to_keep: 2
+
+# WandB
+use_wandb: False
+wandb_entity: Null
+wandb_project: dreamer
+
+# Hydra
+hydra:
+  run:
+    dir: logs/${run_name}

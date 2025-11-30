@@ -1,7 +1,9 @@
 logs/
+outputs/
 overfit_exps/
 *.out
 slurm_outs/
+wandb/
 run_job.sh
 
 # Byte-compiled / optimized / DLL files

@@ -1,16 +1,82 @@
 from functools import partial
+from tqdm import tqdm
+from dataclasses import dataclass, asdict, field
+import time
+import hydra
+from omegaconf import DictConfig, OmegaConf
 import jax
 import jax.numpy as jnp
 import optax
 from dreamer.models import Encoder, Decoder
-from dreamer.data import make_iterator
+from dreamer.data import make_iterator, DatasetConfig
 import imageio
 from jaxlpips import LPIPS
 from pathlib import Path
-from time import time
+import wandb
+from hydra.core.hydra_config import HydraConfig
 from dreamer.utils import temporal_patchify, temporal_unpatchify, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
+from dreamer.logging import MetricLogger
 
 
+# ---------------------------
+# Config
+# ---------------------------
+
+@dataclass
+class EncoderConfig:
+    n_latents: int = 16
+    d_bottleneck: int = 32
+    d_model: int = 64
+    n_heads: int = 4
+    n_patches: int = 64  # Will be computed from H, W, patch_size
+    depth: int = 8
+    dropout: float = 0.05
+    time_every: int = 4
+    mae_p_min: float = 0.0
+    mae_p_max: float = 0.9
+
+@dataclass
+class DecoderConfig:
+    d_model: int = 64
+    n_heads: int = 4
+    n_latents: int = 16
+    n_patches: int = 64  # Will be computed from H, W, patch_size
+    d_patch: int = 48    # Will be computed from patch_size, C
+    depth: int = 8
+    dropout: float = 0.05
+    time_every: int = 4
+
+@dataclass(frozen=True)
+class TokenizerConfig:
+    # IO / ckpt
+    run_name: str
+    ckpt_max_to_keep: int = 5
+    ckpt_save_every: int = 10_000
+
+    # wandb config
+    use_wandb: bool = False
+    wandb_entity: str | None = None
+    wandb_project: str | None = None
+
+    # dataset config
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+
+    # model parameters
+    patch_size: int = 4
+    encoder: EncoderConfig = field(default_factory=EncoderConfig)
+    decoder: DecoderConfig = field(default_factory=DecoderConfig)
+
+    # training
+    lr: float = 1e-4
+    max_steps: int = 1_000_000_000
+    log_every: int = 100
+    lpips_weight: float = 0.2
+    lpips_frac: float = 0.5
+    visualize_every: int = 10_000
+
+def _ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 def init_models(rng, encoder, decoder, patch_tokens, B, T, enc_n_latents, enc_d_bottleneck):
     rng, params_rng, mae_rng, dropout_rng = jax.random.split(rng, 4)
@@ -177,36 +243,37 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
     new_enc_vars, new_dec_vars = unpack_mae_params(new_params, enc_vars, dec_vars)
     return new_params, opt_state, new_enc_vars, new_dec_vars, aux
 
-if __name__ == "__main__":
+def run(cfg: TokenizerConfig):
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
+    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
-    log_dir = Path("./logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
-    run_name = "test"
-    run_dir = log_dir / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
-
+    # Initialize wandb if enabled
+    if cfg.use_wandb:
+        wandb_project = cfg.wandb_project or cfg.run_name
+        wandb.init(
+            entity=cfg.wandb_entity,
+            project=wandb_project,
+            name=cfg.run_name,
+            config=asdict(cfg),
+            dir=str(run_dir),
+        )
 
     rng = jax.random.PRNGKey(0)
-    # dataset parameters
-    B, T, H, W, C = 32, 64, 32, 32, 3
-    pixels_per_step = 2 # how many pixels the agent moves per step
-    size_min = 6 # minimum size of the square
-    size_max = 14 # maximum size of the square
-    hold_min = 4 # how long the agent holds a direction for
-    hold_max = 9 # how long the agent holds a direction for
+    
+    num_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
+    D_patch = cfg.patch_size * cfg.patch_size * cfg.dataset.C
 
-    patch = 4
-    num_patches = (H // patch) * (W // patch)
-    D_patch = patch * patch * C
-
-    # losses and optimization
-    lpips_weight = 0.2
-    if lpips_weight > 0.0:
-        lpips_loss_fn = LPIPS(pretrained_network="alexnet")  # or "vgg", "squeeze"
-    lpips_frac = 0.5
+    # instantiate once
+    global lpips_loss_fn
+    if cfg.lpips_weight > 0.0:
+        lpips_loss_fn = LPIPS(pretrained_network="alexnet")
 
     # data
-    _next_batch = make_iterator(B, T, H, W, C, pixels_per_step, size_min, size_max, hold_min, hold_max)
+    _next_batch = make_iterator(
+        cfg.dataset.B, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, 
+        cfg.dataset.pixels_per_step, cfg.dataset.size_min, cfg.dataset.size_max, 
+        cfg.dataset.hold_min, cfg.dataset.hold_max
+    )
     def next_batch(rng):
         rng, (videos, actions, rewards) = _next_batch(rng)
         return rng, videos
@@ -215,35 +282,42 @@ if __name__ == "__main__":
     rng, first_batch = next_batch(rng)  # warmup
 
     # models
-    enc_n_latents, enc_d_bottleneck = 16, 32
-    enc_kwargs = {
-        "d_model": 64, "n_latents": enc_n_latents, "n_patches": num_patches, "n_heads": 4, "depth": 8, "dropout": 0.05,
-        "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.0, "mae_p_max": 0.9, "time_every": 4,
-    }
-    dec_kwargs = {
-        "d_model": 64, "n_heads": 4, "n_patches": num_patches, "n_latents": enc_n_latents, "depth": 8,
-        "d_patch": D_patch, "dropout": 0.05, "time_every": 4,
-    }
+    enc_kwargs = asdict(cfg.encoder)
+    enc_kwargs.update({
+        "n_patches": num_patches,
+    })
+    
+    dec_kwargs = asdict(cfg.decoder)
+    dec_kwargs.update({
+        "n_patches": num_patches,
+        "d_patch": D_patch,
+    })
+
     encoder = Encoder(**enc_kwargs)
     decoder = Decoder(**dec_kwargs)
 
-    first_patches = temporal_patchify(first_batch, patch)
-    rng, enc_vars, dec_vars = init_models(rng, encoder, decoder, first_patches, B, T, enc_n_latents, enc_d_bottleneck)
+    first_patches = temporal_patchify(first_batch, cfg.patch_size)
+    rng, enc_vars, dec_vars = init_models(
+        rng, encoder, decoder, first_patches, 
+        cfg.dataset.B, cfg.dataset.T, cfg.encoder.n_latents, cfg.encoder.d_bottleneck
+    )
 
     # optim
     params = pack_mae_params(enc_vars, dec_vars)
-    tx = optax.adamw(1e-4)
+    tx = optax.adamw(cfg.lr)
     opt_state = tx.init(params)
-    max_steps = 1_000_000_000
 
     # ---------- ORBAX: manager + (optional) restore ----------
     ckpt_dir = run_dir / "checkpoints"
-    mngr = make_manager(ckpt_dir, max_to_keep=5, save_interval_steps=10_000)
+    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
 
     # Build example trees for safe restore (use live shapes/dtypes).
     state_example = make_state(params, opt_state, rng, step=0)
-    meta_example = {"enc_kwargs": enc_kwargs, "dec_kwargs": dec_kwargs,
-                    "H": H, "W": W, "C": C, "patch": patch}
+    meta_example = {
+        "enc_kwargs": enc_kwargs, 
+        "dec_kwargs": dec_kwargs,
+        "H": cfg.dataset.H, "W": cfg.dataset.W, "C": cfg.dataset.C, "patch_size": cfg.patch_size
+    }
 
     restored = try_restore(mngr, state_example, meta_example)
     start_step = 0
@@ -262,48 +336,92 @@ if __name__ == "__main__":
 
     # ---------- Train loop ----------
     try:
-        for step in range(start_step, max_steps):
+        logger = MetricLogger(
+            use_wandb=cfg.use_wandb, 
+            log_every=cfg.log_every, 
+            max_steps=cfg.max_steps,
+            wandb_obj=wandb
+        )
+        pbar = tqdm(range(start_step, cfg.max_steps + 1), 
+                    initial=start_step, 
+                    total=cfg.max_steps, 
+                    desc="Training Tokenizer", 
+                    dynamic_ncols=True)
+        
+        for step in pbar:
             # use a fixed batch for debugging
             # _, batch = next_batch(jax.random.PRNGKey(0))
-            data_start_t = time()
+            data_start_t = time.perf_counter()
             rng, batch = next_batch(rng)
-            data_t = time() - data_start_t
-            train_start_t = time()
+            data_t = time.perf_counter() - data_start_t
+
             rng, master_key = jax.random.split(rng)
+            train_start_t = time.perf_counter()
             params, opt_state, enc_vars, dec_vars, aux = train_step(
                 encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch,
-                patch=patch, H=H, W=W, C=C, master_key=master_key, step=step, lpips_weight=lpips_weight, lpips_frac=lpips_frac,
+                patch=cfg.patch_size, H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, 
+                master_key=master_key, step=step, 
+                lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
             )
-            train_t = time() - train_start_t
+            train_t = time.perf_counter() - train_start_t
+            total_t = data_t + train_t
 
             # Log
-            if step % 100 == 0:
-                mse_loss = float(aux['loss_mse'])
-                lpips_loss = float(aux['loss_lpips'])
-                total_loss = float(aux['loss_total'])
+            if logger.should_log(step):
+                mse_loss = aux['loss_mse']
                 psnr = 10 * jnp.log10(1.0 / jnp.maximum(mse_loss, 1e-10))
-                total_t = data_t + train_t
-                print(f"step {step:03d} |  total={total_loss:.6f} | rmse={jnp.sqrt(mse_loss):.6f} | lpips={lpips_loss:.4f} | psnr={psnr:.4f} | time={total_t:.3f}s")
+                rmse = jnp.sqrt(mse_loss)
+                
+                logger.log(
+                    step,
+                    metrics={
+                        "total": aux['loss_total'],
+                        "rmse": rmse,
+                        "lpips": aux['loss_lpips'],
+                        "psnr": psnr,
+                        "time/data": data_t,
+                        "time/train": train_t,
+                        "time/total": total_t,
+                    },
+                    pbar=pbar,
+                    float_fmt=".6f"
+                )
 
             # Save (async)
             state = make_state(params, opt_state, rng, step)
             maybe_save(mngr, step, state, meta_example)
 
             # Viz
-            if step % 10000 == 0:
+            if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                 rng, viz_key = jax.random.split(rng)
                 mae_key, drop_key, vis_batch_key = jax.random.split(viz_key, 3)
                 _, viz_batch = next_batch(vis_batch_key)
                 viz_batch = viz_batch[:8, :1]
                 out = viz_step(encoder, decoder, enc_vars, dec_vars, viz_batch,
-                               patch=patch, mae_key=mae_key, drop_key=drop_key)
-                target = jnp.concatenate(temporal_unpatchify(out["target"], H, W, C, patch).squeeze(), axis=1)
-                masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], H, W, C, patch).squeeze(), axis=1)
-                rec_masked  = jnp.concatenate(temporal_unpatchify(out["recon_masked"], H, W, C, patch).squeeze(), axis=1)
-                rec_unmasked  = jnp.concatenate(temporal_unpatchify(out["recon_full"], H, W, C, patch).squeeze(), axis=1)
+                               patch=cfg.patch_size, mae_key=mae_key, drop_key=drop_key)
+                target = jnp.concatenate(temporal_unpatchify(out["target"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
+                masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
+                rec_masked  = jnp.concatenate(temporal_unpatchify(out["recon_masked"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
+                rec_unmasked  = jnp.concatenate(temporal_unpatchify(out["recon_full"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
                 grid = jnp.concatenate([target, masked_in, rec_masked, rec_unmasked])
                 grid = jnp.asarray(grid * 255.0, dtype=jnp.uint8)
-                imageio.imwrite(run_dir / f"step_{step:03d}.png", grid)
+                vis_path = run_dir / "viz"
+                _ensure_dir(vis_path)
+                imageio.imwrite(vis_path / f"step_{step:03d}.png", grid)
     finally:
         # Make sure any background saves finish before exit.
         mngr.wait_until_finished()
+        if cfg.use_wandb and wandb.run is not None:
+            wandb.finish()
+            print("[wandb] Finished logging.")
+
+@hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
+def main(cfg: DictConfig):
+    schema = OmegaConf.structured(TokenizerConfig)
+    cfg = OmegaConf.merge(schema, cfg)
+    tokenizer_cfg = OmegaConf.to_object(cfg)
+    
+    run(tokenizer_cfg)
+
+if __name__ == "__main__":
+    main()

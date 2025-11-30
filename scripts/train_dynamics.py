@@ -4,10 +4,13 @@
 # It restores the pretrained tokenizer (enc/dec) and trains the dynamics model.
 
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Any
 from functools import partial
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from hydra.core.hydra_config import HydraConfig
 from tqdm import tqdm
 import json
 import time
@@ -19,15 +22,10 @@ import numpy as np
 import optax
 import imageio.v2 as imageio
 import orbax.checkpoint as ocp
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    wandb = None
+import wandb
 
 from dreamer.models import Encoder, Decoder, Dynamics
-from dreamer.data import make_iterator
+from dreamer.data import make_iterator, DatasetConfig
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -35,6 +33,7 @@ from dreamer.utils import (
     make_state, make_manager, try_restore, maybe_save,
     pack_mae_params,
 )
+from dreamer.logging import MetricLogger
 
 from dreamer.sampler import SamplerConfig, sample_video
 
@@ -47,7 +46,6 @@ class RealismConfig:
     # IO / ckpt
     run_name: str
     tokenizer_ckpt: str
-    log_dir: str = "./logs"
     ckpt_max_to_keep: int = 2
     ckpt_save_every: int = 10_000
 
@@ -56,18 +54,8 @@ class RealismConfig:
     wandb_entity: str | None = None  # if None, uses default entity
     wandb_project: str | None = None  # if None, uses run_name as project
 
-    # data
-    B: int = 64
-    T: int = 64
-    H: int = 32
-    W: int = 32
-    C: int = 3
-    pixels_per_step: int = 2
-    size_min: int = 6
-    size_max: int = 14
-    hold_min: int = 4
-    hold_max: int = 9
-    diversify_data: bool = True
+    # dataset config
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
 
     # tokenizer / dynamics config
     patch: int = 4
@@ -332,10 +320,10 @@ def train_step_efficient(
 def _eval_regimes_for_realism(cfg, *, ctx_length: int):
     common = dict(
         k_max=cfg.k_max,
-        horizon=min(32, cfg.T - ctx_length),
+        horizon=min(32, cfg.dataset.T - ctx_length),
         ctx_length=ctx_length,
         ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
-        H=cfg.H, W=cfg.W, C=cfg.C, patch=cfg.patch,
+        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=cfg.enc_n_latents // cfg.packing_factor,
         packing_factor=cfg.packing_factor,
         start_mode="pure",
@@ -544,8 +532,8 @@ def initialize_models_and_tokenizer(
         TrainState containing all initialized models, variables, and optimizer state.
     """
     patch = cfg.patch
-    num_patches = (cfg.H // patch) * (cfg.W // patch)
-    D_patch = patch * patch * cfg.C
+    num_patches = (cfg.dataset.H // patch) * (cfg.dataset.W // patch)
+    D_patch = patch * patch * cfg.dataset.C
     k_max = cfg.k_max
 
     enc_kwargs = dict(
@@ -590,7 +578,7 @@ def initialize_models_and_tokenizer(
     patches_btnd = temporal_patchify(frames_init, patch)
     rng = jax.random.PRNGKey(0)
     enc_vars = encoder.init({"params": rng, "mae": rng, "dropout": rng}, patches_btnd, deterministic=True)
-    fake_z = jnp.zeros((cfg.B, cfg.T, cfg.enc_n_latents, cfg.enc_d_bottleneck))
+    fake_z = jnp.zeros((cfg.dataset.B, cfg.dataset.T, cfg.enc_n_latents, cfg.enc_d_bottleneck))
     dec_vars = decoder.init({"params": rng, "dropout": rng}, fake_z, deterministic=True)
 
     # Restore tokenizer
@@ -606,8 +594,8 @@ def initialize_models_and_tokenizer(
     z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True)
     z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
     emax = jnp.log2(k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.B, cfg.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.B, cfg.T), k_max - 1, dtype=jnp.int32)
+    step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
+    sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), k_max - 1, dtype=jnp.int32)
     dyn_vars = dynamics.init({"params": rng, "dropout": rng}, actions_init, step_idx, sigma_idx, z1)
     params = dyn_vars["params"]
 
@@ -654,7 +642,7 @@ def run_evaluation(
     val_rng = jax.random.PRNGKey(9999)
     _, (val_frames, val_actions, _) = next_batch(val_rng)
     dyn_vars_eval = with_params(train_state.dyn_vars, train_state.params)
-    ctx_length = min(32, cfg.T - 1)
+    ctx_length = min(32, cfg.dataset.T - 1)
     regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length)
 
     for tag, sampler_conf in regimes:
@@ -683,7 +671,7 @@ def run_evaluation(
             gt_frames=gt_frames,
             floor_frames=floor_frames,
             pred_frames=pred_frames,
-            batch_size=cfg.B,
+            batch_size=cfg.dataset.B,
         )
 
         # Save video and plan
@@ -697,7 +685,7 @@ def run_evaluation(
         print(f"[eval:{tag}] wrote {mp4_path.name} and {plan_path.name} in {tag_dir}")
 
         # Log to wandb
-        if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+        if cfg.use_wandb and wandb.run is not None:
             # Log metrics
             wandb.log({
                 f"eval/{tag}/mse": mse,
@@ -715,39 +703,32 @@ def run_evaluation(
 # ---------------------------
 
 def run(cfg: RealismConfig):
-    # Initialize wandb if enabled
-    if cfg.use_wandb:
-        if not WANDB_AVAILABLE:
-            print("[warning] wandb requested but not installed. Install with: pip install wandb")
-            print("[warning] Continuing without wandb logging.")
-        else:
-            wandb_project = cfg.wandb_project or cfg.run_name
-            wandb.init(
-                entity=cfg.wandb_entity,
-                project=wandb_project,
-                name=cfg.run_name,
-                config=asdict(cfg),
-                dir=str(Path(cfg.log_dir).resolve()),
-            )
-            print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
-
-    # Output dirs
-    root = _ensure_dir(Path(cfg.log_dir))
-    run_dir = _ensure_dir(root / cfg.run_name)
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
+    # Initialize wandb if enabled
+    if cfg.use_wandb:
+        wandb_project = cfg.wandb_project or cfg.run_name
+        wandb.init(
+            entity=cfg.wandb_entity,
+            project=wandb_project,
+            name=cfg.run_name,
+            config=asdict(cfg),
+            dir=str(run_dir),
+        )
+
     # Data iterator (streaming)
     next_batch = make_iterator(
-        cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min, size_max=cfg.size_max,
-        hold_min=cfg.hold_min, hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
+        cfg.dataset.B, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C,
+        pixels_per_step=cfg.dataset.pixels_per_step,
+        size_min=cfg.dataset.size_min, size_max=cfg.dataset.size_max,
+        hold_min=cfg.dataset.hold_min, hold_max=cfg.dataset.hold_max,
+        fg_min_color=0 if cfg.dataset.diversify_data else 128,
+        fg_max_color=255 if cfg.dataset.diversify_data else 128,
+        bg_min_color=0 if cfg.dataset.diversify_data else 255,
+        bg_max_color=255 if cfg.dataset.diversify_data else 255,
     )
 
     # Initialize models and restore tokenizer
@@ -767,7 +748,7 @@ def run(cfg: RealismConfig):
         enc_kwargs=train_state.enc_kwargs,
         dec_kwargs=train_state.dec_kwargs,
         dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.H, W=cfg.W, C=cfg.C, patch=patch,
+        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=patch,
         k_max=k_max, packing_factor=cfg.packing_factor, n_spatial=n_spatial,
         tokenizer_ckpt_dir=cfg.tokenizer_ckpt,
         cfg=asdict(cfg),
@@ -791,55 +772,59 @@ def run(cfg: RealismConfig):
     train_rng = jax.random.PRNGKey(2025)
     data_rng = jax.random.PRNGKey(12345)
 
-    start_wall = time.time()
-    pbar = tqdm(range(start_step, cfg.max_steps), initial=start_step, total=cfg.max_steps)
+    logger = MetricLogger(
+        use_wandb=cfg.use_wandb,
+        log_every=cfg.log_every,
+        max_steps=cfg.max_steps,
+        wandb_obj=wandb,
+    )
+
+    pbar = tqdm(range(start_step, cfg.max_steps + 1), 
+                initial=start_step,
+                total=cfg.max_steps,
+                desc="Training Dynamics",
+                dynamic_ncols=True)
+    
     for step in pbar:
         # Data
+        data_start_t = time.perf_counter()
         data_rng, batch_key = jax.random.split(data_rng)
         _, (frames, actions, _) = next_batch(batch_key)
+        data_t = time.perf_counter() - data_start_t
 
         # RNG for this step
         train_rng, master_key = jax.random.split(train_rng)
 
         # Decide current B_self based on warm-up (static arg requires a single value; we keep B_self fixed
         # and gate its contribution inside the jit via bootstrap_start masking).
-        B_self = max(0, int(round(cfg.self_fraction * cfg.B)))
+        B_self = max(0, int(round(cfg.self_fraction * cfg.dataset.B)))
 
-        train_step_start_time = time.time()
+        train_start_t = time.perf_counter()
         train_state.params, train_state.opt_state, aux = train_step_efficient(
             train_state.encoder, train_state.dynamics, train_state.tx,
             train_state.params, train_state.opt_state,
             train_state.enc_vars, train_state.dyn_vars,
             frames, actions,
-            patch=cfg.patch, B=cfg.B, T=cfg.T, B_self=B_self,
+            patch=cfg.patch, B=cfg.dataset.B, T=cfg.dataset.T, B_self=B_self,
             n_spatial=n_spatial, k_max=k_max, packing_factor=cfg.packing_factor,
             master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
         )
+        train_t = time.perf_counter() - train_start_t
+        total_t = data_t + train_t
 
         # Logging
-        flow_mse = float(aux['flow_mse'])
-        boot_mse = float(aux['bootstrap_mse'])
-        step_time = time.time() - train_step_start_time
-        total_time = time.time() - start_wall
-
-        pieces = [
-            f"flow_mse={flow_mse:.3f}",
-            f"boot_mse={boot_mse:.3f}",
-            f"t={step_time:.3f}s",
-            f"total_t={total_time:.3f}s",
-        ]
-        pbar.set_description(" | ".join(pieces))
-
-        if (step % cfg.log_every == 0) or (step == cfg.max_steps):
-            # Log to wandb
-            if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
-                wandb.log({
-                    "train/flow_mse": flow_mse,
-                    "train/bootstrap_mse": boot_mse,
-                    "train/step_time": step_time,
-                    "train/total_time": total_time,
-                    "step": step,
-                }, step=step)
+        if logger.should_log(step):
+            logger.log(
+                step,
+                metrics={
+                    "flow_mse": aux["flow_mse"],
+                    "boot_mse": aux["bootstrap_mse"],
+                    "time/data": data_t,
+                    "time/train": train_t,
+                    "time/total": total_t,
+                },
+                pbar=pbar
+            )
 
         # Save (async) when policy says we should
         state = make_state(train_state.params, train_state.opt_state, train_rng, step)
@@ -858,29 +843,20 @@ def run(cfg: RealismConfig):
     # Ensure all writes finished
     mngr.wait_until_finished()
 
-    # Save final config
-    (run_dir / "config.txt").write_text("\n".join([f"{k}={v}" for k, v in asdict(cfg).items()]))
-
     # Finish wandb run
-    if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+    if cfg.use_wandb and wandb.run is not None:
         wandb.finish()
         print("[wandb] Finished logging.")
 
 
+@hydra.main(version_base=None, config_path="../configs", config_name="dynamics")
+def main(cfg: DictConfig):
+    schema = OmegaConf.structured(RealismConfig)
+    cfg = OmegaConf.merge(schema, cfg)
+    realism_cfg = OmegaConf.to_object(cfg)
+    
+    run(realism_cfg)
+
+
 if __name__ == "__main__":
-    cfg = RealismConfig(
-        run_name="train_dynamics_test",
-        tokenizer_ckpt="./logs/test/checkpoints",
-        use_wandb=False,
-        wandb_entity="edhu",
-        wandb_project="tiny_dreamer_4",
-        log_dir="./logs/dynamics",
-        max_steps=1_000_000_000,
-        log_every=5_000,
-        lr=1e-4,
-        write_video_every=1_000,
-        ckpt_save_every=50_000,
-        ckpt_max_to_keep=2,
-    )
-    print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
-    run(cfg)
+    main()

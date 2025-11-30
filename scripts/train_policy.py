@@ -18,13 +18,17 @@ High-level outline (from the docstring plan):
     - Train policy head on (s0…s{T-1}, a1…aT, G0…G{T-1}, V0…V{T-1}) using PMPO.
 """
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Any
 from functools import partial
-import time
+from tqdm import tqdm
 import math
+import time
 
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from hydra.core.hydra_config import HydraConfig
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -34,14 +38,7 @@ from einops import rearrange
 from flax import struct
 import imageio.v2 as imageio
 import matplotlib.pyplot as plt
-
-try:
-    import wandb
-
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    wandb = None
+import wandb
 
 from dreamer.models import (
     Encoder,
@@ -52,7 +49,7 @@ from dreamer.models import (
     RewardHeadMTP,
     ValueHead,
 )
-from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn
+from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn, DatasetConfig
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -69,6 +66,7 @@ from dreamer.imagination import (
     _build_static_schedule,
     imagine_rollouts_core,
 )
+from dreamer.logging import MetricLogger
 
 
 # ---------------------------
@@ -81,7 +79,6 @@ class RLConfig:
     # IO / ckpt
     run_name: str
     bc_rew_ckpt: str  # checkpoint from train_bc_rew_heads.py
-    log_dir: str = "./logs"
     ckpt_max_to_keep: int = 2
     ckpt_save_every: int = 10_000
 
@@ -90,18 +87,8 @@ class RLConfig:
     wandb_entity: str | None = None
     wandb_project: str | None = None
 
-    # data
-    B: int = 64
-    T: int = 64
-    H: int = 32
-    W: int = 32
-    C: int = 3
-    pixels_per_step: int = 2
-    size_min: int = 6
-    size_max: int = 14
-    hold_min: int = 4
-    hold_max: int = 9
-    diversify_data: bool = True
+    # dataset config
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
     action_dim: int = 4
 
     # tokenizer / dynamics config
@@ -539,8 +526,8 @@ def initialize_models(
     Initialize all models and load pretrained checkpoints.
     """
     patch = cfg.patch
-    num_patches = (cfg.H // patch) * (cfg.W // patch)
-    D_patch = patch * patch * cfg.C
+    num_patches = (cfg.dataset.H // patch) * (cfg.dataset.W // patch)
+    D_patch = patch * patch * cfg.dataset.C
     k_max = cfg.k_max
 
     enc_kwargs = dict(
@@ -620,7 +607,7 @@ def initialize_models(
         deterministic=True,
     )
     fake_z = jnp.zeros(
-        (cfg.B, cfg.T, cfg.enc_n_latents, cfg.enc_d_bottleneck),
+        (cfg.dataset.B, cfg.dataset.T, cfg.enc_n_latents, cfg.enc_d_bottleneck),
         dtype=jnp.float32,
     )
     dec_vars = decoder.init(
@@ -670,8 +657,8 @@ def initialize_models(
         k=cfg.packing_factor,
     )
     emax = jnp.log2(k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.B, cfg.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.B, cfg.T), k_max - 1, dtype=jnp.int32)
+    step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
+    sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), k_max - 1, dtype=jnp.int32)
     dyn_vars = dynamics.init(
         {"params": rng, "dropout": rng},
         actions_init,
@@ -681,16 +668,16 @@ def initialize_models(
     )
 
     rng_task, rng_pi_bc, rng_rw = jax.random.split(jax.random.PRNGKey(1), 3)
-    dummy_task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
+    dummy_task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
     task_vars = task_embedder.init(
         {"params": rng_task},
         dummy_task_ids,
-        cfg.B,
-        cfg.T,
+        cfg.dataset.B,
+        cfg.dataset.T,
     )
 
     fake_h = jnp.zeros(
-        (cfg.B, cfg.T, cfg.d_model_dyn),
+        (cfg.dataset.B, cfg.dataset.T, cfg.d_model_dyn),
         dtype=jnp.float32,
     )
     pi_bc_vars = policy_head_bc.init(
@@ -1529,51 +1516,38 @@ def train_step(
 
 
 def run(cfg: RLConfig):
-    # Initialize wandb if enabled
-    if cfg.use_wandb:
-        if not WANDB_AVAILABLE:
-            print(
-                "[warning] wandb requested but not installed. "
-                "Install with: pip install wandb"
-            )
-            print("[warning] Continuing without wandb logging.")
-        else:
-            wandb_project = cfg.wandb_project or cfg.run_name
-            wandb.init(
-                entity=cfg.wandb_entity,
-                project=wandb_project,
-                name=cfg.run_name,
-                config=asdict(cfg),
-                dir=str(Path(cfg.log_dir).resolve()),
-            )
-            print(
-                f"[wandb] Initialized run: "
-                f"{wandb.run.name if wandb.run else 'N/A'}"
-            )
-
-    # Output dirs
-    root = _ensure_dir(Path(cfg.log_dir))
-    run_dir = _ensure_dir(root / cfg.run_name)
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
+    # Initialize wandb if enabled
+    if cfg.use_wandb:
+        wandb_project = cfg.wandb_project or cfg.run_name
+        wandb.init(
+            entity=cfg.wandb_entity,
+            project=wandb_project,
+            name=cfg.run_name,
+            config=asdict(cfg),
+            dir=str(run_dir),
+        )
+
     # Data iterator
     next_batch = make_iterator(
-        cfg.B,
-        cfg.T,
-        cfg.H,
-        cfg.W,
-        cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min,
-        size_max=cfg.size_max,
-        hold_min=cfg.hold_min,
-        hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
+        cfg.dataset.B,
+        cfg.dataset.T,
+        cfg.dataset.H,
+        cfg.dataset.W,
+        cfg.dataset.C,
+        pixels_per_step=cfg.dataset.pixels_per_step,
+        size_min=cfg.dataset.size_min,
+        size_max=cfg.dataset.size_max,
+        hold_min=cfg.dataset.hold_min,
+        hold_max=cfg.dataset.hold_max,
+        fg_min_color=0 if cfg.dataset.diversify_data else 128,
+        fg_max_color=255 if cfg.dataset.diversify_data else 128,
+        bg_min_color=0 if cfg.dataset.diversify_data else 255,
+        bg_max_color=255 if cfg.dataset.diversify_data else 255,
     )
 
     # Initialize models and load checkpoints
@@ -1603,21 +1577,21 @@ def run(cfg: RLConfig):
     # Real-environment evaluation env fns.
     env_reset_fn = make_env_reset_fn(
         batch_size=cfg.eval_batch_size,
-        height=cfg.H,
-        width=cfg.W,
-        channels=cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min,
-        size_max=cfg.size_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
+        height=cfg.dataset.H,
+        width=cfg.dataset.W,
+        channels=cfg.dataset.C,
+        pixels_per_step=cfg.dataset.pixels_per_step,
+        size_min=cfg.dataset.size_min,
+        size_max=cfg.dataset.size_max,
+        fg_min_color=0 if cfg.dataset.diversify_data else 128,
+        fg_max_color=255 if cfg.dataset.diversify_data else 128,
+        bg_min_color=0 if cfg.dataset.diversify_data else 255,
+        bg_max_color=255 if cfg.dataset.diversify_data else 255,
     )
     env_step_fn = make_env_step_fn(
-        height=cfg.H,
-        width=cfg.W,
-        channels=cfg.C,
+        height=cfg.dataset.H,
+        width=cfg.dataset.W,
+        channels=cfg.dataset.C,
     )
 
     # Checkpoint manager and optional restore
@@ -1630,9 +1604,9 @@ def run(cfg: RLConfig):
         enc_kwargs=train_state.enc_kwargs,
         dec_kwargs=train_state.dec_kwargs,
         dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.H,
-        W=cfg.W,
-        C=cfg.C,
+        H=cfg.dataset.H,
+        W=cfg.dataset.W,
+        C=cfg.dataset.C,
         patch=patch,
         k_max=k_max,
         packing_factor=cfg.packing_factor,
@@ -1667,18 +1641,32 @@ def run(cfg: RLConfig):
     data_rng = jax.random.PRNGKey(12345)
     eval_rng = jax.random.PRNGKey(98765)
 
-    start_wall = time.time()
-    for step in range(start_step, cfg.max_steps + 1):
+    logger = MetricLogger(
+        use_wandb=cfg.use_wandb,
+        log_every=cfg.log_every,
+        max_steps=cfg.max_steps,
+        wandb_obj=wandb,
+    )
+
+    pbar = tqdm(range(start_step, cfg.max_steps + 1), 
+                initial=start_step, 
+                total=cfg.max_steps,
+                desc="Training Policy",
+                dynamic_ncols=True)
+
+    for step in pbar:
         # Sample batch
+        data_start_t = time.perf_counter()
         data_rng, batch_key = jax.random.split(data_rng)
         _, (videos, actions_full, rewards_full) = next_batch(batch_key)
+        data_t = time.perf_counter() - data_start_t
 
         # Task IDs (currently dummy zeros)
-        task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
+        task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
 
         # JITted train step
         train_rng, step_key = jax.random.split(train_rng)
-        train_step_start = time.time()
+        train_start_t = time.perf_counter()
         (
             new_params,
             new_opt_state,
@@ -1721,7 +1709,8 @@ def run(cfg: RLConfig):
             packing_factor=cfg.packing_factor,
             rng_key=step_key,
         )
-        train_step_end = time.time()
+        train_t = time.perf_counter() - train_start_t
+        total_t = data_t + train_t
         train_state.params = new_params
         train_state.opt_state = new_opt_state
         train_state.val_vars = new_val_vars
@@ -1795,7 +1784,7 @@ def run(cfg: RLConfig):
                             f"[viz:eval] Saved real-env eval video/strips to {vis_dir}"
                         )
 
-            if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+            if cfg.use_wandb and wandb.run is not None:
                 log_payload: Dict[str, Any] = {
                     "eval/return_mean": metrics_eval["eval/return_mean"],
                     "eval/return_std": metrics_eval["eval/return_std"],
@@ -1817,38 +1806,25 @@ def run(cfg: RLConfig):
 
                 wandb.log(log_payload, step=step)
 
-        if step % cfg.log_every == 0:
-            elapsed = time.time() - start_wall
-            print(
-                f"[train] step={step:06d} | "
-                f"val_loss={aux['val_loss']:.4f} | "
-                f"pi_loss={aux['pi_loss']:.4f} | "
-                f"pi_neg={aux['pi_loss_negative']:.4f} | "
-                f"pi_pos={aux['pi_loss_positive']:.4f} | "
-                f"pi_kl={aux['pi_kl_loss']:.4f} | "
-                f"mean_adv={aux['mean_advantage']:.4f} | "
-                f"mean_td_return={aux['mean_td_return']:.4f} | "
-                f"n_pos={int(aux['n_positive'])}/"
-                f"{int(aux['n_positive'] + aux['n_negative'])} | "
-                f"train_step_t={(train_step_end - train_step_start):.4f}s"
+        if logger.should_log(step):
+            logger.log(
+                step,
+                metrics={
+                    "val_loss": aux["val_loss"],
+                    "pi_loss": aux["pi_loss"],
+                    "pi_neg": aux["pi_loss_negative"],
+                    "pi_pos": aux["pi_loss_positive"],
+                    "pi_kl": aux["pi_kl_loss"],
+                    "mean_adv": aux["mean_advantage"],
+                    "mean_td": aux["mean_td_return"],
+                    "n_pos": aux["n_positive"],
+                    "n_neg": aux["n_negative"],
+                    "time/data": data_t,
+                    "time/train": train_t,
+                    "time/total": total_t,
+                },
+                pbar=pbar,
             )
-
-            if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
-                wandb.log(
-                    {
-                        "step": step,
-                        "val_loss": float(aux["val_loss"]),
-                        "pi_loss": float(aux["pi_loss"]),
-                        "pi_loss_negative": float(aux["pi_loss_negative"]),
-                        "pi_loss_positive": float(aux["pi_loss_positive"]),
-                        "pi_kl_loss": float(aux["pi_kl_loss"]),
-                        "mean_advantage": float(aux["mean_advantage"]),
-                        "mean_td_return": float(aux["mean_td_return"]),
-                        "n_positive": int(aux["n_positive"]),
-                        "n_negative": int(aux["n_negative"]),
-                    },
-                    step=step,
-                )
 
         # Save checkpoint
         state = make_state(train_state.params, train_state.opt_state, train_rng, step)
@@ -1856,39 +1832,19 @@ def run(cfg: RLConfig):
 
     mngr.wait_until_finished()
 
-    # Save final config
-    (run_dir / "config.txt").write_text(
-        "\n".join([f"{k}={v}" for k, v in asdict(cfg).items()])
-    )
-
-    if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+    if cfg.use_wandb and wandb.run is not None:
         wandb.finish()
         print("[wandb] Finished logging.")
 
 
+@hydra.main(version_base=None, config_path="../configs", config_name="policy")
+def main(cfg: DictConfig):
+    schema = OmegaConf.structured(RLConfig)
+    cfg = OmegaConf.merge(schema, cfg)
+    rl_cfg = OmegaConf.to_object(cfg)
+    
+    run(rl_cfg)
+
+
 if __name__ == "__main__":
-    cfg = RLConfig(
-        run_name="train_policy_jit_flippedrew2_test",
-        bc_rew_ckpt="./logs/behaviour/cloning/train_bc_rew_flippedrew_test/checkpoints",
-        use_wandb=False,
-        wandb_entity="edhu",
-        wandb_project="tiny_dreamer_4",
-        log_dir="./logs/policy",
-        max_steps=100_000,
-        log_every=100,
-        lr=1e-4,
-        ckpt_save_every=100_000,
-        ckpt_max_to_keep=2,
-        write_video_every=1,
-        visualize_every=1,
-        eval_every=5000,
-        eval_episodes=64,
-        eval_horizon=32,
-        eval_batch_size=64,
-        gamma=0.9,
-    )
-    print(
-        "Running RL config:\n  "
-        + "\n  ".join([f"{k}={v}" for k, v in asdict(cfg).items()])
-    )
-    run(cfg)
+    main()

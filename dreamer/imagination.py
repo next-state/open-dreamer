@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, NamedTuple, Tuple
+from hydra.core.hydra_config import HydraConfig
 
 import jax
 import jax.numpy as jnp
@@ -638,28 +639,27 @@ def _make_real_world_models_and_batch():
     # adjust the batch/time dimensions here if desired.
     cfg = RLConfig(
         run_name="jit_sampler_test",
-        bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_4actions/checkpoints",
+        bc_rew_ckpt="./train_bc_rew_4actions/checkpoints",
         use_wandb=False,
-        wandb_entity="edhu",
+        wandb_entity="edhu",  # FIXME
         wandb_project="tiny_dreamer_4",
-        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
     )
 
     next_batch = make_iterator(
-        cfg.B,
-        cfg.T,
-        cfg.H,
-        cfg.W,
-        cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min,
-        size_max=cfg.size_max,
-        hold_min=cfg.hold_min,
-        hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
+        cfg.dataset.B,
+        cfg.dataset.T,
+        cfg.dataset.H,
+        cfg.dataset.W,
+        cfg.dataset.C,
+        pixels_per_step=cfg.dataset.pixels_per_step,
+        size_min=cfg.dataset.size_min,
+        size_max=cfg.dataset.size_max,
+        hold_min=cfg.dataset.hold_min,
+        hold_max=cfg.dataset.hold_max,
+        fg_min_color=0 if cfg.dataset.diversify_data else 128,
+        fg_max_color=255 if cfg.dataset.diversify_data else 128,
+        bg_min_color=0 if cfg.dataset.diversify_data else 255,
+        bg_max_color=255 if cfg.dataset.diversify_data else 255,
     )
 
     rng = jax.random.PRNGKey(0)
@@ -779,10 +779,10 @@ def test_single_step_denoise_real_ckpt(use_jit: bool = False):
     )
 
     gt_frames = temporal_unpatchify(
-        gt_patches, cfg.H, cfg.W, cfg.C, patch
+        gt_patches, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, patch
     )  # (B, 1, H, W, C)
     pred_frames = temporal_unpatchify(
-        pred_patches, cfg.H, cfg.W, cfg.C, patch
+        pred_patches, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, patch
     )
 
     mse, psnr = _compute_mse_psnr(pred_frames, gt_frames)
@@ -790,7 +790,7 @@ def test_single_step_denoise_real_ckpt(use_jit: bool = False):
     print(f"[single-step] MSE={mse:.6f}, PSNR={psnr:.2f} dB")
 
     # ---- Visualization: simple side-by-side PNG for a few examples ----
-    out_dir = Path(cfg.log_dir) / "jit_sampler_single"
+    out_dir = Path(HydraConfig.get().runtime.output_dir) / "jit_sampler_single"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # gt_frames, pred_frames: (B, 1, H, W, C) → treat as T=1 strip
@@ -858,7 +858,7 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
     )
     sampler = ImaginationSampler(imag_cfg)
 
-    task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
+    task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
     rng_imag = jax.random.PRNGKey(321)
 
     # Pick rollout function (JIT vs non-JIT) and log timing.
@@ -982,10 +982,10 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
     )
 
     imagined_frames = temporal_unpatchify(
-        imagined_patches, cfg.H, cfg.W, cfg.C, patch
+        imagined_patches, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, patch
     )  # (B, horizon, H, W, C)
     gt_frames = temporal_unpatchify(
-        gt_patches, cfg.H, cfg.W, cfg.C, patch
+        gt_patches, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, patch
     )
 
     if mode == "policy":
@@ -1003,7 +1003,7 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
 
     # Visualization: MP4 grid (GT | Imagined) and a few strips
     suffix = "policy" if mode == "policy" else "gt_actions"
-    out_dir = Path(cfg.log_dir) / f"jit_sampler_rollout_{suffix}"
+    out_dir = Path(HydraConfig.get().runtime.output_dir) / f"jit_sampler_rollout_{suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     gt_np = np.asarray(gt_frames)          # (B, horizon, H, W, C)
