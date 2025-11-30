@@ -24,6 +24,7 @@ from typing import Dict, Any
 from functools import partial
 from tqdm import tqdm
 import math
+import time
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -1659,14 +1660,17 @@ def run(cfg: RLConfig):
 
     for step in pbar:
         # Sample batch
+        data_start_t = time.perf_counter()
         data_rng, batch_key = jax.random.split(data_rng)
         _, (videos, actions_full, rewards_full) = next_batch(batch_key)
+        data_t = time.perf_counter() - data_start_t
 
         # Task IDs (currently dummy zeros)
         task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
 
         # JITted train step
         train_rng, step_key = jax.random.split(train_rng)
+        train_start_t = time.perf_counter()
         (
             new_params,
             new_opt_state,
@@ -1709,6 +1713,8 @@ def run(cfg: RLConfig):
             packing_factor=cfg.packing_factor,
             rng_key=step_key,
         )
+        train_t = time.perf_counter() - train_start_t
+        total_t = data_t + train_t
         train_state.params = new_params
         train_state.opt_state = new_opt_state
         train_state.val_vars = new_val_vars
@@ -1817,6 +1823,9 @@ def run(cfg: RLConfig):
                     "mean_td": aux["mean_td_return"],
                     "n_pos": aux["n_positive"],
                     "n_neg": aux["n_negative"],
+                    "time/data": data_t,
+                    "time/train": train_t,
+                    "time/total": total_t,
                 },
                 pbar=pbar,
             )

@@ -968,8 +968,10 @@ def run(cfg: RealismConfig):
 
     for step in pbar:
         # Data
+        data_start_t = time.perf_counter()
         data_rng, batch_key = jax.random.split(data_rng)
         _, (frames, actions, rewards) = next_batch(batch_key)
+        data_t = time.perf_counter() - data_start_t
 
         # RNG for this step
         train_rng, master_key = jax.random.split(train_rng)
@@ -978,7 +980,7 @@ def run(cfg: RealismConfig):
         # and gate its contribution inside the jit via bootstrap_start masking).
         B_self = max(0, int(round(cfg.self_fraction * cfg.dataset.B)))
 
-        train_step_start_time = time.time()
+        train_start_t = time.perf_counter()
         train_state.params, train_state.opt_state, aux = train_step_efficient(
             train_state.encoder, train_state.dynamics, train_state.task_embedder,
             train_state.policy_head, train_state.reward_head, train_state.tx,
@@ -994,6 +996,8 @@ def run(cfg: RealismConfig):
             loss_weight_policy=cfg.loss_weight_policy,
             loss_weight_reward=cfg.loss_weight_reward,
         )
+        train_t = time.perf_counter() - train_start_t
+        total_t = data_t + train_t
 
         # Logging
         if logger.should_log(step):
@@ -1007,6 +1011,9 @@ def run(cfg: RealismConfig):
                     "w_shortcut": aux["w_shortcut"],
                     "w_pi_ce": aux["w_pi_ce"],
                     "w_rw_ce": aux["w_rw_ce"],
+                    "time/data": data_t,
+                    "time/train": train_t,
+                    "time/total": total_t,
                 },
                 pbar=pbar,
                 float_fmt=".4f",

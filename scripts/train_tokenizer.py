@@ -1,6 +1,7 @@
 from functools import partial
 from tqdm import tqdm
 from dataclasses import dataclass, asdict, field
+import time
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import jax
@@ -350,14 +351,20 @@ def run(cfg: TokenizerConfig):
         for step in pbar:
             # use a fixed batch for debugging
             # _, batch = next_batch(jax.random.PRNGKey(0))
+            data_start_t = time.perf_counter()
             rng, batch = next_batch(rng)
+            data_t = time.perf_counter() - data_start_t
+
             rng, master_key = jax.random.split(rng)
+            train_start_t = time.perf_counter()
             params, opt_state, enc_vars, dec_vars, aux = train_step(
                 encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch,
                 patch=cfg.patch_size, H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, 
                 master_key=master_key, step=step, 
                 lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
             )
+            train_t = time.perf_counter() - train_start_t
+            total_t = data_t + train_t
 
             # Log
             if logger.should_log(step):
@@ -371,7 +378,10 @@ def run(cfg: TokenizerConfig):
                         "total": aux['loss_total'],
                         "rmse": rmse,
                         "lpips": aux['loss_lpips'],
-                        "psnr": psnr
+                        "psnr": psnr,
+                        "time/data": data_t,
+                        "time/train": train_t,
+                        "time/total": total_t,
                     },
                     pbar=pbar,
                     float_fmt=".6f"
