@@ -124,9 +124,9 @@ def make_mask(modality_ids: jnp.ndarray, mode: str):
         - Latent tokens (query) can ONLY attend to Latent tokens (key).
         - Non-latent tokens (query) can attend to tokens of the SAME modality AND Latent tokens (key).
     - "wm_agent":
+        - Action tokens (query) can ONLY attend to Action tokens (key).
+        - Observation tokens (query) can attend to Observation AND Action tokens (key).
         - Agent tokens (query) can attend to ALL tokens (key).
-        - Non-agent tokens (query) can attend to ALL tokens EXCEPT Agent tokens (key).
-        - This prevents causal confusion where future predictions are influenced by the current task.
     """
     S = int(modality_ids.shape[0])
 
@@ -144,10 +144,23 @@ def make_mask(modality_ids: jnp.ndarray, mode: str):
         # latents -> latents only; non-latents -> same modality + latents
         mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
     elif mode == "wm_agent":
-        # wm_agent: agent reads all; all non-agent tokens read all *except* agent.
-        is_agent_q = (q_mod == Modality.AGENT)
-        is_agent_k = (k_mod == Modality.AGENT)
-        mask = is_agent_q >= is_agent_k
+        # wm_agent:
+
+        # Hierarchy levels: Action=0, Obs=1, Agent=2
+        # mask = level(q) >= level(k)
+        
+        def get_level(mod):
+            # Default to 1 (Obs)
+            lvl = jnp.ones_like(mod, dtype=jnp.int32) # Default to 1 (Obs)
+            lvl = jnp.where(mod == Modality.ACTION, 0, lvl) # Set to 0 if Action
+            lvl = jnp.where(mod == Modality.AGENT, 2, lvl) # Set to 2 if Agent
+            
+            return lvl
+
+        q_level = get_level(q_mod)
+        k_level = get_level(k_mod)
+        
+        mask = q_level >= k_level
     else:
         raise ValueError(f"Unknown mode {mode}")
 
