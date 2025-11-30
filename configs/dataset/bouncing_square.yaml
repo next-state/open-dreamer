@@ -11,4 +11,4 @@ size_max: 14
 hold_min: 4
 hold_max: 9
 
-diversify_data: false
+diversify_data: true

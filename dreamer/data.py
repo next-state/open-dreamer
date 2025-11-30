@@ -32,7 +32,7 @@ class DatasetConfig:
     size_max: int = 14
     hold_min: int = 4
     hold_max: int = 9
-    diversify_data: bool = False
+    diversify_data: bool = True
 
 
 # ============================================================
