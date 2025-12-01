@@ -11,7 +11,6 @@ import math
 from .utils import make_mask, Modality
 
 
-
 @flax.struct.dataclass  # immutable, PyTree-friendly
 class TokenLayout:
     """
@@ -104,18 +103,18 @@ class MLP(nn.Module):
     Transformer MLP with optional SwiGLU gating.
 
     Args:
-      d_model:     input/output width of the block (last-dim of x).
-      mlp_ratio:   expansion factor for hidden size if NOT using 2/3 parity.
-      dropout:     dropout rate applied after activation and after output proj.
-      swiglu:      if True, use SwiGLU; else standard GELU MLP.
+      dim:          input/output width of the block (last-dim of x).
+      mlp_ratio:    expansion factor for hidden size if NOT using 2/3 parity.
+      dropout_rate: dropout rate applied after activation and after output proj.
+      swiglu:       if True, use SwiGLU; else standard GELU MLP.
       parity_2over3:
-                   if True and swiglu=True, set hidden = (2/3)*mlp_ratio*d_model
-                   to roughly match parameter count of a GELU MLP with mlp_ratio.
-      dtype:       param/compute dtype.
+                    if True and swiglu=True, set hidden = (2/3)*mlp_ratio*d_model
+                    to roughly match parameter count of a GELU MLP with mlp_ratio.
+      dtype:        param/compute dtype.
     """
-    d_model: int
+    dim: int
     mlp_ratio: float = 4.0
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
     dtype: Any = jnp.float32
@@ -136,7 +135,7 @@ class MLP(nn.Module):
         if self.swiglu and self.parity_2over3:
             mult = self.mlp_ratio * (2.0 / 3.0)  # param parity with GELU MLP
 
-        hidden = int(self.d_model * mult)
+        hidden = int(self.dim * mult)
 
         if self.swiglu:
             # SwiGLU: Dense -> split -> u * silu(v)
@@ -150,16 +149,57 @@ class MLP(nn.Module):
             h = nn.Dense(hidden, dtype=self.dtype, name="fc_in")(x)
             h = nn.gelu(h)
 
-        h = nn.Dropout(self.dropout)(h, deterministic=deterministic)
-        y = nn.Dense(self.d_model, dtype=self.dtype, name="fc_out")(h)
-        y = nn.Dropout(self.dropout)(y, deterministic=deterministic)
+        h = nn.Dropout(self.dropout_rate)(h, deterministic=deterministic)
+        y = nn.Dense(self.dim, dtype=self.dtype, name="fc_out")(h)
+        y = nn.Dropout(self.dropout_rate)(y, deterministic=deterministic)
         return y
+
 # ---------- axial attention layers ----------
+class GroupedQueryAttention(nn.Module):
+    dim: int
+    num_heads: int
+    num_kv_heads: int
+    dropout_rate: float = 0.0
+    deterministic: bool = True
+
+    def setup(self):
+        assert self.dim % self.num_heads == 0
+        assert self.num_heads % self.num_kv_heads == 0
+
+        head_dim = self.dim // self.num_heads
+        kv_dim = self.num_kv_heads * head_dim
+
+        self.to_q = nn.Dense(self.dim, use_bias=False)
+        self.to_kv = nn.Dense(2 * kv_dim, use_bias=False)
+        self.to_out = nn.Dense(self.dim, use_bias=False)
+        self.dropout = nn.Dropout(self.dropout_rate)
+
+    def __call__(self, x, mask, *, deterministic: bool):
+        """
+        B = batch size
+        S = length of the key/value (source)
+        T = length of the query (target)
+        N = number of attention heads
+        H = dimensions of each attention head
+        K = number of key/value heads
+        G = number of groups, which equals to N // K
+        """
+        q = self.to_q(x)
+        kv = self.to_kv(x)
+        q = rearrange(q, "B T (N H) -> B T N H", N=self.num_heads)
+        k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
+
+        attn = jax.nn.dot_product_attention(q, k, v, mask=mask)  # TODO: try setting implementation="cudnn"
+        attn = rearrange(attn, "B T N H -> B T (N H)")
+
+        out = self.to_out(attn)
+        return self.dropout(out, deterministic=deterministic)
+
 class SpaceSelfAttentionModality(nn.Module):
     """Space self-attention with modality routing."""
-    d_model: int
-    n_heads: int
-    dropout: float = 0.0
+    dim: int
+    num_heads: int
+    dropout_rate: float = 0.0
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool):
@@ -168,9 +208,9 @@ class SpaceSelfAttentionModality(nn.Module):
         x_ = rearrange(x, "B T S D -> (B T) S D")
 
         y_ = nn.MultiHeadDotProductAttention(
-            num_heads=self.n_heads,
-            qkv_features=self.d_model,
-            dropout_rate=self.dropout,
+            num_heads=self.num_heads,
+            qkv_features=self.dim,
+            dropout_rate=self.dropout_rate,
             deterministic=deterministic,
         )(x_, x_, mask=mask)
 
@@ -179,9 +219,9 @@ class SpaceSelfAttentionModality(nn.Module):
 
 class TimeSelfAttention(nn.Module):
     """Time self-attention."""
-    d_model: int
-    n_heads: int
-    dropout: float = 0.0
+    dim: int
+    num_heads: int
+    dropout_rate: float = 0.0
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool):
@@ -191,9 +231,9 @@ class TimeSelfAttention(nn.Module):
         x_bstd = rearrange(x, "B T S D -> (B S) T D")
         causal = nn.attention.make_causal_mask(jnp.ones((B*S, T), dtype=bool))
         out = nn.MultiHeadDotProductAttention(
-            num_heads=self.n_heads,
-            qkv_features=self.d_model,
-            dropout_rate=self.dropout,
+            num_heads=self.num_heads,
+            dim=self.dim,
+            dropout_rate=self.dropout_rate,
             deterministic=deterministic,
         )(x_bstd, x_bstd, mask=causal)
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
@@ -201,9 +241,9 @@ class TimeSelfAttention(nn.Module):
 
 # ---------- a single block-causal layer ----------
 class BlockCausalLayer(nn.Module):
-    d_model: int
-    n_heads: int
-    dropout: float = 0.0
+    dim: int
+    num_heads: int
+    dropout_rate: float = 0.0
     mlp_ratio: float = 4.0
     layer_index: int = 0
     time_every: int = 4
@@ -215,26 +255,26 @@ class BlockCausalLayer(nn.Module):
         self.use_time = (self.layer_index + 1) % self.time_every == 0
         attention_module = TimeSelfAttention if self.use_time else SpaceSelfAttentionModality
         self.attn = attention_module(
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            dropout=self.dropout,
+            dim=self.dim,
+            num_heads=self.num_heads,
+            dropout_rate=self.dropout_rate,
         )
 
         # --- MLP ---
         self.norm_mlp = RMSNorm()
-        self.mlp = MLP(self.d_model, self.mlp_ratio, self.dropout)
+        self.mlp = MLP(self.dim, self.mlp_ratio, self.dropout_rate)
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool):
         # --- Space attention (within timestep, modality-aware) ---
         y = self.norm(x)
         y = self.attn(y, mask=mask, deterministic=deterministic)
-        x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
+        x = x + y
 
         # --- MLP ---
         y = self.norm_mlp(x)
         y = self.mlp(y, deterministic=deterministic)
-        x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
+        x = x + y
         return x
 # ---------- the transformer stack ----------
 
