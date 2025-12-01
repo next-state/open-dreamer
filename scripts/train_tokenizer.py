@@ -31,7 +31,7 @@ class EncoderConfig:
     n_kv_heads: int = 2
     n_patches: int = 64  # Will be computed from H, W, patch_size
     depth: int = 8
-    dropout: float = 0.05
+    dropout_rate: float = 0.05
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
@@ -45,7 +45,7 @@ class DecoderConfig:
     n_patches: int = 64  # Will be computed from H, W, patch_size
     d_patch: int = 48    # Will be computed from patch_size, C
     depth: int = 8
-    dropout: float = 0.05
+    dropout_rate: float = 0.05
     time_every: int = 4
 
 @dataclass(frozen=True)

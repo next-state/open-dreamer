@@ -15,7 +15,7 @@ encoder:
   n_heads: 4
   n_kv_heads: 2
   depth: 8
-  dropout: 0.05
+  dropout_rate: 0.05
   time_every: 4
   mae_p_min: 0.0
   mae_p_max: 0.9
@@ -26,7 +26,7 @@ decoder:
   n_kv_heads: ${encoder.n_kv_heads}
   n_latents: ${encoder.n_latents}
   depth: 8
-  dropout: 0.05
+  dropout_rate: 0.05
   time_every: 4
 
 lr: 1e-4
