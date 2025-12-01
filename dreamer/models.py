@@ -103,7 +103,7 @@ class MLP(nn.Module):
     Transformer MLP with optional SwiGLU gating.
 
     Args:
-      dim:          input/output width of the block (last-dim of x).
+      d_model:          input/output width of the block (last-dim of x).
       mlp_ratio:    expansion factor for hidden size if NOT using 2/3 parity.
       dropout_rate: dropout rate applied after activation and after output proj.
       swiglu:       if True, use SwiGLU; else standard GELU MLP.
@@ -112,7 +112,7 @@ class MLP(nn.Module):
                     to roughly match parameter count of a GELU MLP with mlp_ratio.
       dtype:        param/compute dtype.
     """
-    dim: int
+    d_model: int
     mlp_ratio: float = 4.0
     dropout_rate: float = 0.0
     swiglu: bool = True
@@ -135,7 +135,7 @@ class MLP(nn.Module):
         if self.swiglu and self.parity_2over3:
             mult = self.mlp_ratio * (2.0 / 3.0)  # param parity with GELU MLP
 
-        hidden = int(self.dim * mult)
+        hidden = int(self.d_model * mult)
 
         if self.swiglu:
             # SwiGLU: Dense -> split -> u * silu(v)
@@ -150,7 +150,7 @@ class MLP(nn.Module):
             h = nn.gelu(h)
 
         h = nn.Dropout(self.dropout_rate)(h, deterministic=deterministic)
-        y = nn.Dense(self.dim, dtype=self.dtype, name="fc_out")(h)
+        y = nn.Dense(self.d_model, dtype=self.dtype, name="fc_out")(h)
         y = nn.Dropout(self.dropout_rate)(y, deterministic=deterministic)
         return y
 
@@ -174,8 +174,9 @@ class GroupedQueryAttention(nn.Module):
         self.to_out = nn.Dense(self.dim, use_bias=False)
         self.dropout = nn.Dropout(self.dropout_rate)
 
-    def __call__(self, x, mask, *, deterministic: bool):
+    def __call__(self, x, mask, *args):
         """
+        https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html
         B = batch size
         S = length of the key/value (source)
         T = length of the query (target)
@@ -193,34 +194,37 @@ class GroupedQueryAttention(nn.Module):
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
-        return self.dropout(out, deterministic=deterministic)
+        return self.dropout(out, deterministic=self.deterministic)
 
 class SpaceSelfAttentionModality(nn.Module):
     """Space self-attention with modality routing."""
     dim: int
     num_heads: int
+    num_kv_heads: int
     dropout_rate: float = 0.0
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
         B, T, S, D = x.shape
-        x_ = rearrange(x, "B T S D -> (B T) S D")
+        x = rearrange(x, "B T S D -> (B T) S D")
 
-        y_ = nn.MultiHeadDotProductAttention(
+        out = GroupedQueryAttention(
+            dim=self.dim,
             num_heads=self.num_heads,
-            qkv_features=self.dim,
+            num_kv_heads=self.num_kv_heads,
             dropout_rate=self.dropout_rate,
             deterministic=deterministic,
-        )(x_, x_, mask=mask)
+        )(x, mask=mask)
 
-        y = rearrange(y_, "(B T) S D -> B T S D", B=B, T=T)
-        return y
+        out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
+        return out
 
 class TimeSelfAttention(nn.Module):
     """Time self-attention."""
     dim: int
     num_heads: int
+    num_kv_heads: int
     dropout_rate: float = 0.0
 
     @nn.compact
@@ -228,14 +232,15 @@ class TimeSelfAttention(nn.Module):
         # mask does nothing, but is required for API consistency
         # x: (B, T, S, D) -> attend across T, causal
         B, T, S, D = x.shape
-        x_bstd = rearrange(x, "B T S D -> (B S) T D")
+        x = rearrange(x, "B T S D -> (B S) T D")
         causal = nn.attention.make_causal_mask(jnp.ones((B*S, T), dtype=bool))
-        out = nn.MultiHeadDotProductAttention(
-            num_heads=self.num_heads,
+        out = GroupedQueryAttention(
             dim=self.dim,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
             dropout_rate=self.dropout_rate,
             deterministic=deterministic,
-        )(x_bstd, x_bstd, mask=causal)
+        )(x, mask=causal)
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         return out
 
@@ -243,6 +248,7 @@ class TimeSelfAttention(nn.Module):
 class BlockCausalLayer(nn.Module):
     dim: int
     num_heads: int
+    num_kv_heads: int
     dropout_rate: float = 0.0
     mlp_ratio: float = 4.0
     layer_index: int = 0
@@ -257,6 +263,7 @@ class BlockCausalLayer(nn.Module):
         self.attn = attention_module(
             dim=self.dim,
             num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
             dropout_rate=self.dropout_rate,
         )
 
@@ -281,8 +288,9 @@ class BlockCausalLayer(nn.Module):
 class BlockCausalTransformer(nn.Module):
     d_model: int
     n_heads: int
+    n_kv_heads: int
     depth: int
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     mlp_ratio: float = 4.0
     time_every: int = 4
 
@@ -290,8 +298,8 @@ class BlockCausalTransformer(nn.Module):
     def __call__(self, x, mask, *, deterministic: bool):
         for i in range(self.depth):
             x = BlockCausalLayer(
-                self.d_model, self.n_heads,
-                dropout=self.dropout, mlp_ratio=self.mlp_ratio,
+                self.d_model, self.n_heads, self.n_kv_heads,
+                dropout_rate=self.dropout_rate, mlp_ratio=self.mlp_ratio,
                 layer_index=i, time_every=self.time_every,
             )(x, mask=mask, deterministic=deterministic)
         return x
@@ -301,9 +309,10 @@ class Encoder(nn.Module):
     n_latents: int
     n_patches: int
     n_heads: int
+    n_kv_heads: int
     depth: int
     d_bottleneck: int
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     mlp_ratio: float = 4.0
     time_every: int = 4
     mae_p_min: float = 0.0
@@ -320,8 +329,9 @@ class Encoder(nn.Module):
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
+            n_kv_heads=self.n_kv_heads,
             depth=self.depth,
-            dropout=self.dropout, mlp_ratio=self.mlp_ratio,
+            dropout_rate=self.dropout_rate, mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
         )
         self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
@@ -370,16 +380,17 @@ class Decoder(nn.Module):
     Config:
       - n_patches: number of patch query tokens to use in the decoder
       - d_patch:   dimensionality of each patch to reconstruct (D_patch)
-      - d_model, n_heads, depth, dropout, mlp_ratio, time_every, latents_only_time
+      - d_model, n_heads, depth, dropout_rate, mlp_ratio, time_every, latents_only_time
         typically mirror the encoder.
     """
     d_model: int
     n_heads: int
+    n_kv_heads: int
     depth: int
     n_latents: int
     n_patches: int
     d_patch: int
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     mlp_ratio: float = 4.0
     time_every: int = 4
 
@@ -396,8 +407,9 @@ class Decoder(nn.Module):
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
+            n_kv_heads=self.n_kv_heads,
             depth=self.depth,
-            dropout=self.dropout,
+            dropout_rate=self.dropout_rate,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
         )
@@ -473,9 +485,10 @@ class Dynamics(nn.Module):
     n_register: int           # number of learned register tokens
     n_agent: int              # number of agent tokens
     n_heads: int
+    n_kv_heads: int
     depth: int
     k_max: int                 # maximum number of sampling steps (defines finest step 1/)
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     mlp_ratio: float = 4.0
     time_every: int = 4
 
@@ -510,8 +523,9 @@ class Dynamics(nn.Module):
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
+            n_kv_heads=self.n_kv_heads,
             depth=self.depth,
-            dropout=self.dropout,
+            dropout_rate=self.dropout_rate,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
         )
@@ -628,7 +642,7 @@ class PolicyHeadMTP(nn.Module):
     L: int = 8
     kind: str = "categorical"  # or "vbinary"
     mlp_ratio: float = 2.0
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
     dtype: Any = jnp.float32
@@ -638,7 +652,7 @@ class PolicyHeadMTP(nn.Module):
         self.projector = MLP(
             d_model=self.d_model,
             mlp_ratio=self.mlp_ratio,
-            dropout=self.dropout,
+            dropout_rate=self.dropout_rate,
             swiglu=self.swiglu,
             parity_2over3=self.parity_2over3,
             dtype=self.dtype,
@@ -667,7 +681,7 @@ class RewardHeadMTP(nn.Module):
     L: int = 8
     num_bins: int = 101
     mlp_ratio: float = 2.0
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
     dtype: Any = jnp.float32
@@ -679,7 +693,7 @@ class RewardHeadMTP(nn.Module):
         self.projector = MLP(
             d_model=self.d_model,
             mlp_ratio=self.mlp_ratio,
-            dropout=self.dropout,
+            dropout_rate=self.dropout_rate,
             swiglu=self.swiglu,
             parity_2over3=self.parity_2over3,
             dtype=self.dtype,
@@ -713,7 +727,7 @@ class ValueHead(nn.Module):
     d_model: int
     num_bins: int = 101
     mlp_ratio: float = 2.0
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
     dtype: Any = jnp.float32
@@ -725,7 +739,7 @@ class ValueHead(nn.Module):
         self.projector = MLP(
             d_model=self.d_model,
             mlp_ratio=self.mlp_ratio,
-            dropout=self.dropout,
+            dropout_rate=self.dropout_rate,
             swiglu=self.swiglu,
             parity_2over3=self.parity_2over3,
             dtype=self.dtype,
@@ -765,8 +779,8 @@ def test_encoder_decoder():
     enc_d_bottleneck = 3
     x = jnp.ones((B, T, n_patches, d_patch))  # (B,T,Np,D_patch)
 
-    encoder = Encoder(d_model=8, n_latents=enc_n_latents, n_patches=n_patches, n_heads=2, depth=2, dropout=0.5, d_bottleneck=enc_d_bottleneck)
-    decoder = Decoder(d_model=8, n_heads=2, depth=2, n_patches=n_patches, n_latents=enc_n_latents, d_patch=d_patch, dropout=0.5)
+    encoder = Encoder(d_model=8, n_latents=enc_n_latents, n_patches=n_patches, n_heads=2, n_kv_heads=1, depth=2, dropout_rate=0.5, d_bottleneck=enc_d_bottleneck)
+    decoder = Decoder(d_model=8, n_heads=2, n_kv_heads=1, depth=2, n_patches=n_patches, n_latents=enc_n_latents, d_patch=d_patch, dropout_rate=0.5)
     # init: give both "mae" and "dropout" keys (dropout only needed if deterministic=False)
     enc_vars = encoder.init(
         {"params": rng, "mae": jax.random.PRNGKey(1), "dropout": jax.random.PRNGKey(2)},
@@ -947,7 +961,7 @@ def test_x1hat_invariant_to_agent_tokens():
     dyn = Dynamics(
         d_model=D, d_bottleneck=d_b, d_spatial=d_spatial,
         n_spatial=n_spatial, n_register=2, n_agent=1,
-        n_heads=2, depth=2, k_max=8, dropout=0.0, mlp_ratio=2.0,
+        n_heads=2, n_kv_heads=1, depth=2, k_max=8, dropout_rate=0.0, mlp_ratio=2.0,
         time_every=2
     )
     vars_ = dyn.init({"params": jax.random.PRNGKey(0), "dropout": jax.random.PRNGKey(1)},

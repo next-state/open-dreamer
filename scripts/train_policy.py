@@ -101,6 +101,7 @@ class RLConfig:
     dec_depth: int = 8
     dyn_depth: int = 8
     n_heads: int = 4
+    n_kv_heads: int = 2
     packing_factor: int = 2
     n_register: int = 4
     n_agent: int = 1
@@ -535,6 +536,7 @@ def initialize_models(
         n_latents=cfg.enc_n_latents,
         n_patches=num_patches,
         n_heads=cfg.n_heads,
+        n_kv_heads=cfg.n_kv_heads,
         depth=cfg.enc_depth,
         dropout=0.0,
         d_bottleneck=cfg.enc_d_bottleneck,
@@ -545,6 +547,7 @@ def initialize_models(
     dec_kwargs = dict(
         d_model=cfg.d_model_enc,
         n_heads=cfg.n_heads,
+        n_kv_heads=cfg.n_kv_heads,
         depth=cfg.dec_depth,
         n_latents=cfg.enc_n_latents,
         n_patches=num_patches,
@@ -561,6 +564,7 @@ def initialize_models(
         n_spatial=n_spatial,
         n_register=cfg.n_register,
         n_heads=cfg.n_heads,
+        n_kv_heads=cfg.n_kv_heads,
         depth=cfg.dyn_depth,
         dropout=0.0,
         k_max=k_max,

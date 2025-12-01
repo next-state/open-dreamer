@@ -52,6 +52,7 @@ class EvalConfig:
     dec_depth: int = 8
     dyn_depth: int = 8
     n_heads: int = 4
+    n_kv_heads: int = 2
     packing_factor: int = 2
     n_register: int = 4
     n_agent: int = 1
@@ -339,6 +340,7 @@ def init_models_and_restore(cfg: EvalConfig):
         n_latents=cfg.enc_n_latents,
         n_patches=num_patches,
         n_heads=cfg.n_heads,
+        n_kv_heads=cfg.n_kv_heads,
         depth=cfg.enc_depth,
         dropout=0.0,
         d_bottleneck=cfg.enc_d_bottleneck,
@@ -348,6 +350,7 @@ def init_models_and_restore(cfg: EvalConfig):
     dec_kwargs = dict(
         d_model=cfg.d_model_enc,
         n_heads=cfg.n_heads,
+        n_kv_heads=cfg.n_kv_heads,
         depth=cfg.dec_depth,
         n_latents=cfg.enc_n_latents,
         n_patches=num_patches,
@@ -361,7 +364,7 @@ def init_models_and_restore(cfg: EvalConfig):
         d_bottleneck=cfg.enc_d_bottleneck,
         d_spatial=cfg.enc_d_bottleneck * cfg.packing_factor,
         n_spatial=n_spatial, n_register=cfg.n_register,
-        n_heads=cfg.n_heads, depth=cfg.dyn_depth,
+        n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.dyn_depth,
         space_mode=cfg.agent_space_mode, n_agent=cfg.n_agent,
         dropout=0.0, k_max=k_max,
         time_every=4,

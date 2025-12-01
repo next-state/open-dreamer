@@ -13,6 +13,7 @@ encoder:
   d_bottleneck: 32
   d_model: 64
   n_heads: 4
+  n_kv_heads: 2
   depth: 8
   dropout: 0.05
   time_every: 4
@@ -22,6 +23,7 @@ encoder:
 decoder:
   d_model: ${encoder.d_model}
   n_heads: ${encoder.n_heads}
+  n_kv_heads: ${encoder.n_kv_heads}
   n_latents: ${encoder.n_latents}
   depth: 8
   dropout: 0.05
