@@ -62,6 +62,7 @@ See implementation progress log [here](https://docs.google.com/presentation/d/1H
         - [ ] Dynamics finetuning
     - [ ] Architecture improvements
         - [ ] Imagination KV caching
+        - [ ] QK normalization
         - [ ] Attention logit soft capping
         - [ ] Continue predictor
         - [ ] GQA
