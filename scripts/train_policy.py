@@ -102,6 +102,7 @@ class RLConfig:
     dyn_depth: int = 8
     n_heads: int = 4
     n_kv_heads: int = 2
+    qk_norm_type: str | None = None
     packing_factor: int = 2
     n_register: int = 4
     n_agent: int = 1
@@ -538,7 +539,8 @@ def initialize_models(
         n_heads=cfg.n_heads,
         n_kv_heads=cfg.n_kv_heads,
         depth=cfg.enc_depth,
-        dropout=0.0,
+        dropout_rate=0.0,
+        qk_norm_type=cfg.qk_norm_type,
         d_bottleneck=cfg.enc_d_bottleneck,
         mae_p_min=0.0,
         mae_p_max=0.0,
@@ -552,7 +554,8 @@ def initialize_models(
         n_latents=cfg.enc_n_latents,
         n_patches=num_patches,
         d_patch=D_patch,
-        dropout=0.0,
+        dropout_rate=0.0,
+        qk_norm_type=cfg.qk_norm_type,
         mlp_ratio=4.0,
         time_every=4,
     )
@@ -566,7 +569,8 @@ def initialize_models(
         n_heads=cfg.n_heads,
         n_kv_heads=cfg.n_kv_heads,
         depth=cfg.dyn_depth,
-        dropout=0.0,
+        dropout_rate=0.0,
+        qk_norm_type=cfg.qk_norm_type,
         k_max=k_max,
         time_every=4,
         n_agent=cfg.n_agent,

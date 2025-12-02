@@ -32,6 +32,7 @@ class EncoderConfig:
     n_patches: int = 64  # Will be computed from H, W, patch_size
     depth: int = 8
     dropout_rate: float = 0.05
+    qk_norm_type: str | None = None
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
@@ -46,6 +47,7 @@ class DecoderConfig:
     d_patch: int = 48    # Will be computed from patch_size, C
     depth: int = 8
     dropout_rate: float = 0.05
+    qk_norm_type: str | None = None
     time_every: int = 4
 
 @dataclass(frozen=True)

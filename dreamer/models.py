@@ -161,6 +161,7 @@ class GroupedQueryAttention(nn.Module):
     num_kv_heads: int
     dropout_rate: float = 0.0
     deterministic: bool = True
+    qk_norm_type: str | None = None  # "qknorm", or "quest"
 
     def setup(self):
         assert self.dim % self.num_heads == 0
@@ -173,6 +174,10 @@ class GroupedQueryAttention(nn.Module):
         self.to_kv = nn.Dense(2 * kv_dim, use_bias=False)
         self.to_out = nn.Dense(self.dim, use_bias=False)
         self.dropout = nn.Dropout(self.dropout_rate)
+
+        if self.qk_norm_type == 'qknorm':
+            self.q_ln = nn.LayerNorm(use_bias=True, use_scale=True)
+            self.k_ln = nn.LayerNorm(use_bias=True, use_scale=True)
 
     def __call__(self, x, mask, *args):
         """
@@ -190,7 +195,18 @@ class GroupedQueryAttention(nn.Module):
         q = rearrange(q, "B T (N H) -> B T N H", N=self.num_heads)
         k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
 
-        attn = jax.nn.dot_product_attention(q, k, v, mask=mask)  # TODO: try setting implementation="cudnn"
+        scale = q.shape[-1] ** -0.5
+        if self.attention_type == 'qknorm':
+            q = self.q_ln(q)
+            k = self.k_ln(k)
+        elif self.attention_type == 'quest':
+            # claims to beat qknorm https://openreview.net/pdf?id=HkztQWZfl2
+            k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
+            scale = 1.0 
+
+        mask = mask.astype(jnp.bool_)  # FIXME: the mask is currently float32, we need to fix that bug rather than casting here
+
+        attn = jax.nn.dot_product_attention(q, k, v, mask=mask, scale=scale)  # TODO: try setting implementation="cudnn"
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
@@ -202,6 +218,7 @@ class SpaceSelfAttentionModality(nn.Module):
     num_heads: int
     num_kv_heads: int
     dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool):
@@ -214,6 +231,7 @@ class SpaceSelfAttentionModality(nn.Module):
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
             deterministic=deterministic,
         )(x, mask=mask)
 
@@ -226,6 +244,7 @@ class TimeSelfAttention(nn.Module):
     num_heads: int
     num_kv_heads: int
     dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool):
@@ -239,6 +258,7 @@ class TimeSelfAttention(nn.Module):
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
             deterministic=deterministic,
         )(x, mask=causal)
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
@@ -250,6 +270,7 @@ class BlockCausalLayer(nn.Module):
     num_heads: int
     num_kv_heads: int
     dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     layer_index: int = 0
     time_every: int = 4
@@ -265,6 +286,7 @@ class BlockCausalLayer(nn.Module):
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
         )
 
         # --- MLP ---
@@ -291,6 +313,7 @@ class BlockCausalTransformer(nn.Module):
     n_kv_heads: int
     depth: int
     dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     time_every: int = 4
 
@@ -299,8 +322,8 @@ class BlockCausalTransformer(nn.Module):
         for i in range(self.depth):
             x = BlockCausalLayer(
                 self.d_model, self.n_heads, self.n_kv_heads,
-                dropout_rate=self.dropout_rate, mlp_ratio=self.mlp_ratio,
-                layer_index=i, time_every=self.time_every,
+                dropout_rate=self.dropout_rate, qk_norm_type=self.qk_norm_type,
+                mlp_ratio=self.mlp_ratio, layer_index=i, time_every=self.time_every,
             )(x, mask=mask, deterministic=deterministic)
         return x
 
@@ -313,6 +336,7 @@ class Encoder(nn.Module):
     depth: int
     d_bottleneck: int
     dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     time_every: int = 4
     mae_p_min: float = 0.0
@@ -331,7 +355,9 @@ class Encoder(nn.Module):
             n_heads=self.n_heads,
             n_kv_heads=self.n_kv_heads,
             depth=self.depth,
-            dropout_rate=self.dropout_rate, mlp_ratio=self.mlp_ratio,
+            dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
+            mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
         )
         self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
@@ -391,6 +417,7 @@ class Decoder(nn.Module):
     n_patches: int
     d_patch: int
     dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     time_every: int = 4
 
@@ -410,6 +437,7 @@ class Decoder(nn.Module):
             n_kv_heads=self.n_kv_heads,
             depth=self.depth,
             dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
         )
@@ -489,6 +517,7 @@ class Dynamics(nn.Module):
     depth: int
     k_max: int                 # maximum number of sampling steps (defines finest step 1/)
     dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     time_every: int = 4
 
@@ -526,6 +555,7 @@ class Dynamics(nn.Module):
             n_kv_heads=self.n_kv_heads,
             depth=self.depth,
             dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
         )

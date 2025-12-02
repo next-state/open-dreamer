@@ -20,6 +20,7 @@ dec_depth: 8
 dyn_depth: 8
 n_heads: 4
 n_kv_heads: 2
+qk_norm_type: qknorm  # options: qknorm, quest, null
 packing_factor: 2
 n_register: 4
 n_agent: 1

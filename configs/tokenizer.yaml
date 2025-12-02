@@ -16,6 +16,7 @@ encoder:
   n_kv_heads: 2
   depth: 8
   dropout_rate: 0.05
+  qk_norm_type: qknorm  # options: qknorm, quest, null
   time_every: 4
   mae_p_min: 0.0
   mae_p_max: 0.9
@@ -25,9 +26,10 @@ decoder:
   n_heads: ${encoder.n_heads}
   n_kv_heads: ${encoder.n_kv_heads}
   n_latents: ${encoder.n_latents}
-  depth: 8
-  dropout_rate: 0.05
-  time_every: 4
+  depth: ${encoder.depth}
+  dropout_rate: ${encoder.dropout_rate}
+  qk_norm_type: ${encoder.qk_norm_type}
+  time_every: ${encoder.time_every}
 
 lr: 1e-4
 max_steps: 1_000_000_000
