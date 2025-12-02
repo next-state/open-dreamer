@@ -196,10 +196,10 @@ class GroupedQueryAttention(nn.Module):
         k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
 
         scale = q.shape[-1] ** -0.5
-        if self.attention_type == 'qknorm':
+        if self.qk_norm_type == 'qknorm':
             q = self.q_ln(q)
             k = self.k_ln(k)
-        elif self.attention_type == 'quest':
+        elif self.qk_norm_type == 'quest':
             # claims to beat qknorm https://openreview.net/pdf?id=HkztQWZfl2
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
             scale = 1.0 
