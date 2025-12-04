@@ -16,7 +16,9 @@ encoder:
   n_kv_heads: 2
   depth: 8
   dropout_rate: 0.05
-  qk_norm_type: qknorm  # options: qknorm, quest, null
+  qk_norm_type: null  # options: qknorm, quest, null
+  use_rope: true
+  rope_theta: 10000.0
   time_every: 4
   mae_p_min: 0.0
   mae_p_max: 0.9
@@ -29,6 +31,8 @@ decoder:
   depth: ${encoder.depth}
   dropout_rate: ${encoder.dropout_rate}
   qk_norm_type: ${encoder.qk_norm_type}
+  use_rope: ${encoder.use_rope}
+  rope_theta: ${encoder.rope_theta}
   time_every: ${encoder.time_every}
 
 lr: 1e-3
