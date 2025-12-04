@@ -71,6 +71,8 @@ class RealismConfig:
     n_heads: int = 4
     n_kv_heads: int = 2
     qk_norm_type: str | None = None
+    use_rope: bool = True
+    rope_theta: float = 10000.0
     packing_factor: int = 2
     n_register: int = 4 # number of register tokens for dynamics
     n_agent: int = 1 # number of agent tokens for dynamics
@@ -709,6 +711,8 @@ def initialize_models_and_tokenizer(
         depth=cfg.enc_depth,
         dropout_rate=0.0,
         qk_norm_type=cfg.qk_norm_type,
+        use_rope=cfg.use_rope,
+        rope_theta=cfg.rope_theta,
         d_bottleneck=cfg.enc_d_bottleneck,
         mae_p_min=0.0, mae_p_max=0.0,
         time_every=4,
@@ -723,6 +727,8 @@ def initialize_models_and_tokenizer(
         d_patch=D_patch,
         dropout_rate=0.0,
         qk_norm_type=cfg.qk_norm_type,
+        use_rope=cfg.use_rope,
+        rope_theta=cfg.rope_theta,
         mlp_ratio=4.0, time_every=4,
     )
     n_spatial = cfg.enc_n_latents // cfg.packing_factor # number of spatial tokens for dynamics
@@ -735,6 +741,8 @@ def initialize_models_and_tokenizer(
         n_agent=cfg.n_agent,
         dropout_rate=0.0,
         qk_norm_type=cfg.qk_norm_type,
+        use_rope=cfg.use_rope,
+        rope_theta=cfg.rope_theta,
         k_max=k_max, 
         time_every=4,
     )

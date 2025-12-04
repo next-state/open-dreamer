@@ -33,6 +33,8 @@ class EncoderConfig:
     depth: int = 8
     dropout_rate: float = 0.05
     qk_norm_type: str | None = None
+    use_rope: bool = False
+    rope_theta: float = 10000.0
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
@@ -48,6 +50,8 @@ class DecoderConfig:
     depth: int = 8
     dropout_rate: float = 0.05
     qk_norm_type: str | None = None
+    use_rope: bool = False
+    rope_theta: float = 10000.0
     time_every: int = 4
 
 @dataclass(frozen=True)
