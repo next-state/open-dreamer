@@ -27,7 +27,7 @@ decoder:
   dropout: 0.05
   time_every: 4
 
-lr: 1e-4
+lr: 1e-3
 max_steps: 1_000_000_000
 log_every: 100
 lpips_weight: 0.2
