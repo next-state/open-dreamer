@@ -8,7 +8,7 @@ from enum import IntEnum
 from typing import Optional, Tuple, Any
 from einops import rearrange, repeat
 import math
-from .utils import make_mask, Modality
+from .utils import patch_normalize, make_mask, Modality
 
 
 @flax.struct.dataclass  # immutable, PyTree-friendly
@@ -364,8 +364,9 @@ class Encoder(nn.Module):
 
     @nn.compact
     def __call__(self, patch_tokens, *, deterministic: bool = True) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
-        # 1) Project patches to D_model
-        proj_patches = self.patch_proj(patch_tokens)  # (B,T,Np,D)
+        # 1) Normalize and project patches to D_model
+        patch_tokens, _, _ = patch_normalize(patch_tokens)
+        proj_patches = self.patch_proj(patch_tokens)  # (B, T, Np, D)
 
         # 2) MAE mask-and-replace on patch tokens (encoder input only)
         proj_patches_masked, patch_mask, keep_prob = MAEReplacer(name="mae", p_min=self.mae_p_min, p_max=self.mae_p_max)(proj_patches)
@@ -470,7 +471,7 @@ class Decoder(nn.Module):
         x = self.transformer(tokens, mask=mask, deterministic=deterministic)
         # 6) Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
-        pred_btnd = nn.sigmoid(self.patch_head(x_patches))  # (B,T,Np,D_patch)
+        pred_btnd = self.patch_head(x_patches)  # (B, T, Np, D_patch)
         return pred_btnd
 
 class ActionEncoder(nn.Module):

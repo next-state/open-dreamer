@@ -14,7 +14,7 @@ from jaxlpips import LPIPS
 from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
-from dreamer.utils import temporal_patchify, temporal_unpatchify, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
+from dreamer.utils import temporal_patchify, temporal_unpatchify, patch_normalize, patch_unnormalize, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
 from dreamer.logging import MetricLogger
 
 
@@ -107,11 +107,11 @@ def forward_apply(encoder, decoder, enc_vars, dec_vars, patches_btnd, *, mae_key
     return pred_btnd, mae_info  # mae_info = (mae_mask, keep_prob)
 
 # --- loss ---
-def recon_loss_from_mae(pred_btnd, patches_btnd, mae_mask):
-    masked_pred   = jnp.where(mae_mask, pred_btnd, 0.0)
-    masked_target = jnp.where(mae_mask, patches_btnd, 0.0)
-    num = jnp.maximum(mae_mask.sum(), 1)
-    return jnp.sum((masked_pred - masked_target) ** 2) / (num * pred_btnd.shape[-1])
+def recon_loss_from_mae(pred_btnd, target_btnd, mae_mask):
+    pred_masked   = jnp.where(mae_mask, pred_btnd, 0.0)
+    target_masked = jnp.where(mae_mask, target_btnd, 0.0)
+    num = jnp.maximum(mae_mask.sum(), 1.0)
+    return jnp.sum((pred_masked - target_masked) ** 2) / (num * pred_btnd.shape[-1])
 
 # --- instantiate once (top-level / main) ---
 lpips_loss_fn = None
@@ -159,23 +159,26 @@ def lpips_on_mae_recon(
 @partial(jax.jit, static_argnames=("encoder","decoder","patch"))
 def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, drop_key):
     # Same preprocessing as train
-    patches_btnd = temporal_patchify(batch, patch)  # (B,T,Np,D)
+    target_btnd = temporal_patchify(batch, patch)  # (B, T, Np, D)
+    _, mean, std = patch_normalize(target_btnd)
 
     # Run full model (no dropout during viz)
-    pred_btnd, (mae_mask_btNp1, keep_prob_bt1) = forward_apply(
-        encoder, decoder, enc_vars, dec_vars, patches_btnd,
+    pred_norm, (mae_mask_btNp1, keep_prob_bt1) = forward_apply(
+        encoder, decoder, enc_vars, dec_vars, target_btnd,
         mae_key=mae_key, drop_key=drop_key, train=False
     )
+    pred_btnd = patch_unnormalize(pred_norm, mean=mean, std=std)
+    pred_btnd = jnp.clip(pred_btnd, 0.0, 1.0)
 
     # Compose standard MAE visualization:
-    # - masked_input: what the model actually sees (masked patches)
-    # - recon_masked: inpaint only masked patches (visible patches kept as GT)
-    masked_input_btnd  = jnp.where(mae_mask_btNp1, 0.0, patches_btnd)
-    recon_masked_btnd  = jnp.where(mae_mask_btNp1, pred_btnd, patches_btnd)
+    # - masked_input: what the model actually sees (masked target patches)
+    # - recon_masked: inpaint only masked patches (visible target patches kept as GT)
+    masked_input_btnd  = jnp.where(mae_mask_btNp1, 0.0, target_btnd)
+    recon_masked_btnd  = jnp.where(mae_mask_btNp1, pred_btnd, target_btnd)
     recon_full_btnd    = pred_btnd  # decoder everywhere
 
     return {
-        "target": patches_btnd,
+        "target": target_btnd,
         "masked_input": masked_input_btnd,
         "recon_masked": recon_masked_btnd,
         "recon_full": recon_full_btnd,
@@ -185,9 +188,9 @@ def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, dro
 
 
 # --- train step ---
-@partial(jax.jit, static_argnames=("encoder","decoder","tx","patch","H","W","C", "lpips_weight", "lpips_frac"))
+@partial(jax.jit, static_argnames=("encoder","decoder","tx","patch","H","W","C", "lpips_weight", "lpips_frac", "should_log"))
 def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch, *,
-               patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0):
+               patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0, should_log=False):
     """
     (master_key, params, opt_state, model_state, batch)
         │
@@ -202,7 +205,7 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
     return (new_params, new_opt_state, new_model_state, metrics)
     """
     # 1) Prepare data
-    patches_btnd = temporal_patchify(batch, patch)  # (B,T,Np,Dp)
+    target_btnd = temporal_patchify(batch, patch)  # (B, T, Np, Dp)
 
     # 2) Make per-step RNGs (fold_in ensures different masks per step even if base key repeats)
     step_key  = jax.random.fold_in(master_key, step)
@@ -212,15 +215,26 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
     def loss_fn(packed_params):
         # Replace params in vars
         ev, dv = unpack_mae_params(packed_params, enc_vars, dec_vars)
-        pred, mae_info = forward_apply(encoder, decoder, ev, dv, patches_btnd,
-                                       mae_key=mae_key, drop_key=drop_key, train=True)
+        pred_norm, mae_info = forward_apply(encoder, decoder, ev, dv, target_btnd,
+                                            mae_key=mae_key, drop_key=drop_key, train=True)
         mae_mask, keep_prob = mae_info
-        mse = recon_loss_from_mae(pred, patches_btnd, mae_mask)
+
+        target_norm, mean, std = patch_normalize(target_btnd)
+        mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
+
+        mse_pix = 0.0  # only for logging, to compute PSNR/RMSE
+        pred_btnd = None
+        
+        if should_log or lpips_weight > 0.0:
+            pred_btnd = patch_unnormalize(pred_norm, mean=mean, std=std)
+            
+        if should_log:
+            mse_pix = recon_loss_from_mae(pred_btnd, target_btnd, mae_mask)
 
         # LPIPS on recon_masked vs target (unpatchified frames)
         if lpips_weight > 0.0:
             lpips = lpips_on_mae_recon(
-                pred, patches_btnd, mae_mask,
+                pred_btnd, target_btnd, mae_mask,
                 H=H, W=W, C=C, patch=patch, subsample_frac=lpips_frac
             )
             total = mse + lpips_weight * lpips
@@ -233,6 +247,7 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
             "loss_mse": mse,
             "loss_lpips": lpips,
             "keep_prob": keep_prob,
+            "loss_mse_pix": mse_pix,
         }
 
         return total, aux
@@ -361,20 +376,22 @@ def run(cfg: TokenizerConfig):
 
             rng, master_key = jax.random.split(rng)
             train_start_t = time.perf_counter()
+            should_log = logger.should_log(step)
             params, opt_state, enc_vars, dec_vars, aux = train_step(
                 encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch,
                 patch=cfg.patch_size, H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, 
                 master_key=master_key, step=step, 
                 lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
+                should_log=should_log,
             )
             train_t = time.perf_counter() - train_start_t
             total_t = data_t + train_t
 
             # Log
-            if logger.should_log(step):
-                mse_loss = aux['loss_mse']
-                psnr = 10 * jnp.log10(1.0 / jnp.maximum(mse_loss, 1e-10))
-                rmse = jnp.sqrt(mse_loss)
+            if should_log:
+                mse_loss_pix = aux['loss_mse_pix']
+                psnr = 10 * jnp.log10(1.0 / jnp.maximum(mse_loss_pix, 1e-10))
+                rmse = jnp.sqrt(mse_loss_pix)
                 
                 logger.log(
                     step,

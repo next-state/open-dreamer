@@ -21,12 +21,13 @@ See implementation progress log [here](https://docs.google.com/presentation/d/1H
     - [x] LPIPS loss
     - [x] checkpointing
     - [ ] Minor improvements
-        - [ ] wandb logging
-        - [ ] cli args / config 
+        - [x] wandb logging
+        - [x] cli args / config 
         - [ ] RoPE
         - [x] SwiGLU
         - [x] GQA
         - [x] QK normalization
+        - [ ] Convolution patching  
 - [ ] Interactive Dynamics Model
     - [x] Add actions to Toy Video Dataset
     - [x] Add multi-modality support for efficient transformer block

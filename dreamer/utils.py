@@ -32,6 +32,23 @@ temporal_unpatchify = jax.jit(
     static_argnames=("H", "W", "C", "patch"),
 )
 
+def patch_normalize(patch_tokens, *, eps=1e-6):
+    """
+    Normalize patch tokens to have zero mean and unit variance.
+    """
+    mean = jnp.mean(patch_tokens, axis=-1, keepdims=True)
+    var = jnp.var(patch_tokens, axis=-1, keepdims=True)
+    std = jnp.sqrt(var + eps)
+
+    norm_patch_tokens = (patch_tokens - mean) / std
+    return norm_patch_tokens, mean, std
+
+def patch_unnormalize(norm_patch_tokens, *, mean, std):
+    """
+    Unnormalize patch tokens to have the original mean and variance.
+    """
+    return norm_patch_tokens * std + mean
+
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
