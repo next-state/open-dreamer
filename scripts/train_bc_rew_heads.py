@@ -1044,6 +1044,7 @@ def run(cfg: RealismConfig):
 
 @hydra.main(version_base=None, config_path="../configs", config_name="bc_rew")
 def main(cfg: DictConfig):
+    # Merge with structured schema to fill defaults and type check
     schema = OmegaConf.structured(RealismConfig)
     cfg = OmegaConf.merge(schema, cfg)
     realism_cfg = OmegaConf.to_object(cfg)
@@ -1052,24 +1053,4 @@ def main(cfg: DictConfig):
 
 
 if __name__ == "__main__":
-    cfg = RealismConfig(
-        run_name="train_bc_rew_flippedrew_test",
-        tokenizer_ckpt="./logs/test/checkpoints",
-        pretrained_dyn_ckpt="./logs/dynamics/train_dynamics_test/checkpoints",
-        use_wandb=False,
-        wandb_entity="edhu",
-        wandb_project="tiny_dreamer_4",
-        log_dir="./logs/behaviour/cloning",
-        max_steps=1_000_000_000,
-        log_every=5_000,
-        lr=1e-4,
-        write_video_every=100_000,
-        ckpt_save_every=100_000,
-        ckpt_max_to_keep=2,
-        loss_weight_shortcut=1.0,
-        loss_weight_policy=0.3,
-        loss_weight_reward=0.3,
-        action_dim=4,
-    )
-    print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
-    run(cfg)
+    main()
