@@ -256,8 +256,6 @@ class GroupedQueryAttention(nn.Module):
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
             scale = 1.0 
 
-        mask = mask.astype(jnp.bool_)  # FIXME: the mask is currently float32, we need to fix that bug rather than casting here
-
         attn = jax.nn.dot_product_attention(q, k, v, mask=mask, scale=scale)  # TODO: try setting implementation="cudnn"
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
@@ -310,7 +308,7 @@ class TimeSelfAttention(nn.Module):
         # x: (B, T, S, D) -> attend across T, causal
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
-        causal = nn.attention.make_causal_mask(jnp.ones((B*S, T), dtype=bool))
+        causal = nn.attention.make_causal_mask(jnp.ones((B*S, T), dtype=bool), dtype=jnp.bool_)
         out = GroupedQueryAttention(
             dim=self.dim,
             num_heads=self.num_heads,
