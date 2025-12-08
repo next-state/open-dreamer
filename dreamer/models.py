@@ -526,7 +526,7 @@ class Decoder(nn.Module):
         B, T, N_l, d_bottleneck = z.shape
 
         # 1) Up-project latent bottleneck to d_model (per latent token)
-        latents = nn.tanh(self.up_proj(z))  # (B, T, N_l, D)
+        latents = self.up_proj(z)  # (B, T, N_l, D)
 
         # 2) Learned per-patch query tokens (owned by the decoder)
         patches = jnp.broadcast_to(
