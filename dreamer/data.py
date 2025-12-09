@@ -36,7 +36,7 @@ class DatasetConfig:
     
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: float = 0.5
-    dataset_std: float = 0.25
+    dataset_std: float = 0.288675  # sqrt(1/12)
 
 
 # ============================================================

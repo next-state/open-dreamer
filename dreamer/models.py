@@ -8,7 +8,6 @@ from enum import IntEnum
 from typing import Optional, Tuple, Any
 from einops import rearrange
 import math
-from dreamer.utils import patch_normalize
 
 
 class Modality(IntEnum):
@@ -429,8 +428,7 @@ class Encoder(nn.Module):
 
     @nn.compact
     def __call__(self, patch_tokens, *, deterministic: bool = True) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
-        # 1) Normalize and project patches to D_model
-        patch_tokens, _, _ = patch_normalize(patch_tokens)
+        # 1) Project patches to D_model
         proj_patches = self.patch_proj(patch_tokens)  # (B, T, Np, D)
 
         # 2) MAE mask-and-replace on patch tokens (encoder input only)
