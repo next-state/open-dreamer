@@ -76,25 +76,33 @@ def apply_rotary_emb(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cis: jnp.ndarray) -
     xk: (B, S, K, H)
     freqs_cis: (L, H/2)
     """
-    D = xq.shape[-1]
-    d_half = D // 2
+
+    # Rearrange to (..., H/2, 2) to avoid the slow "stride=2" memory access pattern.
+    xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
+    xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
     
-    xq_r, xq_i = xq[..., :d_half], xq[..., d_half:]
-    xk_r, xk_i = xk[..., :d_half], xk[..., d_half:]
+    # Convert to complex: Index 0 is Real (even), Index 1 is Imag (odd)
+    xq_c = jax.lax.complex(xq_pairs[..., 0], xq_pairs[..., 1])
+    xk_c = jax.lax.complex(xk_pairs[..., 0], xk_pairs[..., 1])
     
-    xq_c = jax.lax.complex(xq_r, xq_i)
-    xk_c = jax.lax.complex(xk_r, xk_i)
-    
+    # Broadcast freqs_cis (L, H/2) -> (1, L, 1, H/2)
     T = xq.shape[1]
     S = xk.shape[1]
+    
     freqs_cis_q = freqs_cis[:T][None, :, None, :]
     freqs_cis_k = freqs_cis[:S][None, :, None, :]
     
+    # Rotate
     xq_out_c = xq_c * freqs_cis_q
     xk_out_c = xk_c * freqs_cis_k
-
-    xq_out = jnp.concatenate([jnp.real(xq_out_c), jnp.imag(xq_out_c)], axis=-1)
-    xk_out = jnp.concatenate([jnp.real(xk_out_c), jnp.imag(xk_out_c)], axis=-1)
+    
+    # Convert back to real
+    xq_out = jnp.stack([jnp.real(xq_out_c), jnp.imag(xq_out_c)], axis=-1)
+    xk_out = jnp.stack([jnp.real(xk_out_c), jnp.imag(xk_out_c)], axis=-1)
+    
+    # Flatten back to (..., H) -> [r0, i0, r1, i1...]
+    xq_out = rearrange(xq_out, '... d two -> ... (d two)')
+    xk_out = rearrange(xk_out, '... d two -> ... (d two)')
     
     return xq_out, xk_out
 
