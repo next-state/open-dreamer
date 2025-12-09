@@ -60,49 +60,57 @@ def sinusoid_table(n: int, d: int, base: float = 10000.0, dtype=jnp.float32) -> 
 
 
 @lru_cache(maxsize=8)
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype=jnp.float32) -> jnp.ndarray:
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype=jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+    Returns:
+        freqs_cos: (end, dim//2)
+        freqs_sin: (end, dim//2)
     """
     freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
     t = jnp.arange(end, dtype=dtype)
     freqs = jnp.outer(t, freqs)  # (end, dim//2)
-    freqs_cis = jnp.exp(1j * freqs)  # complex64
-    return freqs_cis
+    return jnp.cos(freqs), jnp.sin(freqs)
 
 
-def apply_rotary_emb(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cis: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+def apply_rotary_emb(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cos: jnp.ndarray, freqs_sin: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Apply Rotary Positional Embeddings (RoPE) to queries and keys.
+    Apply Rotary Positional Embeddings (RoPE) to queries and keys using real sin/cos.
     xq: (B, T, N, H)
     xk: (B, S, K, H)
-    freqs_cis: (L, H/2)
+    freqs_cos: (L, H/2)
+    freqs_sin: (L, H/2)
     """
+    # Rearrange to (..., H/2, 2)
+    xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
+    xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
 
-    # Rearrange to (..., H/2, 2) to avoid the slow "stride=2" memory access pattern.
-    xq_pairs = rearrange(xq, '... (d two) -> two ... d', two=2)
-    xk_pairs = rearrange(xk, '... (d two) -> two ... d', two=2)
-    
-    # Convert to complex: Index 0 is Real (even), Index 1 is Imag (odd)
-    xq_c = jax.lax.complex(*xq_pairs)
-    xk_c = jax.lax.complex(*xk_pairs)
-    
+    xq_r, xq_i = xq_pairs[..., 0], xq_pairs[..., 1]
+    xk_r, xk_i = xk_pairs[..., 0], xk_pairs[..., 1]
+
     T, S = xq.shape[1], xk.shape[1]
-    # Broadcast freqs_cis (L, H/2) -> (1, L, 1, H/2)
-    freqs_cis_q = freqs_cis[None, :T, None, :]
-    freqs_cis_k = freqs_cis[None, :S, None, :]
     
-    # Rotate
-    xq_out_c = xq_c * freqs_cis_q
-    xk_out_c = xk_c * freqs_cis_k
+    # Broadcast freqs (L, H/2) -> (1, L, 1, H/2)
+    cos_q = freqs_cos[None, :T, None, :]
+    sin_q = freqs_sin[None, :T, None, :]
+    cos_k = freqs_cos[None, :S, None, :]
+    sin_k = freqs_sin[None, :S, None, :]
+
+    # Rotation:
+    # x' = x cos - y sin
+    # y' = x sin + y cos
+    xq_out_r = xq_r * cos_q - xq_i * sin_q
+    xq_out_i = xq_r * sin_q + xq_i * cos_q
     
-    # Convert back to real
-    xq_out = jnp.stack([jnp.real(xq_out_c), jnp.imag(xq_out_c)], axis=0)
-    xk_out = jnp.stack([jnp.real(xk_out_c), jnp.imag(xk_out_c)], axis=0)
-    
-    # Flatten back to (..., H) -> [r0, i0, r1, i1...]
-    xq_out = rearrange(xq_out, 'two ... d -> ... (d two)')
-    xk_out = rearrange(xk_out, 'two ... d -> ... (d two)')
+    xk_out_r = xk_r * cos_k - xk_i * sin_k
+    xk_out_i = xk_r * sin_k + xk_i * cos_k
+
+    # Stack back and flatten
+    xq_out = jnp.stack([xq_out_r, xq_out_i], axis=-1)
+    xk_out = jnp.stack([xk_out_r, xk_out_i], axis=-1)
+
+    xq_out = rearrange(xq_out, '... d two -> ... (d two)')
+    xk_out = rearrange(xk_out, '... d two -> ... (d two)')
     
     return xq_out, xk_out
 
@@ -250,8 +258,8 @@ class GroupedQueryAttention(nn.Module):
         if self.use_rope:
             head_dim = q.shape[-1]
             max_len = max(q.shape[1], k.shape[1])
-            freqs_cis = precompute_freqs_cis(head_dim, max_len, self.rope_theta, dtype=q.dtype)
-            q, k = apply_rotary_emb(q, k, freqs_cis)
+            freqs_cos, freqs_sin = precompute_freqs_cis(head_dim, max_len, self.rope_theta, dtype=q.dtype)
+            q, k = apply_rotary_emb(q, k, freqs_cos, freqs_sin)
 
         scale = q.shape[-1] ** -0.5
         if self.qk_norm_type == 'qknorm':
