@@ -471,6 +471,8 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=cfg.enc_n_latents // cfg.packing_factor,
         packing_factor=cfg.packing_factor,
+        dataset_mean=cfg.dataset.dataset_mean,
+        dataset_std=cfg.dataset.dataset_std,
         start_mode="pure",
         rollout="autoregressive",
     )

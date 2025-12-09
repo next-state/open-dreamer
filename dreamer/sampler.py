@@ -12,6 +12,7 @@ from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadM
 from dreamer.utils import (
     temporal_patchify, temporal_unpatchify,
     pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck,
+    unnormalize_with_dataset_stats,
 )
 
 # ---------------------------
@@ -42,6 +43,9 @@ class SamplerConfig:
     # tokenizer shapes
     n_spatial: int = 8
     packing_factor: int = 2
+    # dataset normalization
+    dataset_mean: float = 0.5
+    dataset_std: float = 0.288675
     # debugging (host-side only)
     debug: bool = False
     # Called with a dict. We call it twice: once with a high-level run "plan" (kind="plan"),
@@ -312,7 +316,9 @@ def sample_video(
         unpack_spatial_to_bottleneck(z_ctx_for_floor, n_spatial=config.n_spatial, k=config.packing_factor),
         unpack_spatial_to_bottleneck(gt_future_latents, n_spatial=config.n_spatial, k=config.packing_factor)
     ], axis=1)
-    floor_patches = decoder.apply(dec_vars, floor_btLd, deterministic=True)
+    floor_patches_norm = decoder.apply(dec_vars, floor_btLd, deterministic=True)
+    floor_patches = unnormalize_with_dataset_stats(floor_patches_norm, mean=config.dataset_mean, std=config.dataset_std)
+    floor_patches = jnp.clip(floor_patches, 0.0, 1.0)
     floor_frames = temporal_unpatchify(floor_patches, H, W, C, config.patch)
 
     # 4) choose schedule/step size
@@ -363,7 +369,9 @@ def sample_video(
         unpack_spatial_to_bottleneck(z_all[:, :config.ctx_length, :, :], n_spatial=config.n_spatial, k=config.packing_factor),
         unpack_spatial_to_bottleneck(pred_latents, n_spatial=config.n_spatial, k=config.packing_factor),
     ], axis=1)
-    pred_patches = decoder.apply(dec_vars, pred_btLd, deterministic=True)
+    pred_patches_norm = decoder.apply(dec_vars, pred_btLd, deterministic=True)
+    pred_patches = unnormalize_with_dataset_stats(pred_patches_norm, mean=config.dataset_mean, std=config.dataset_std)
+    pred_patches = jnp.clip(pred_patches, 0.0, 1.0)
     pred_frames = temporal_unpatchify(pred_patches, H, W, C, config.patch)
 
     gt_frames = frames[:, :config.ctx_length + horizon]

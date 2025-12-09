@@ -186,7 +186,7 @@ def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, dro
 # --- train step ---
 @partial(jax.jit, static_argnames=("encoder","decoder","tx","patch","H","W","C", "lpips_weight", "lpips_frac", "should_log", "dataset_mean", "dataset_std"))
 def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch, *,
-               patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0, should_log=False, dataset_mean=0.5, dataset_std=0.25):
+               patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0, should_log=False, dataset_mean=0.5, dataset_std=0.288675):
     """
     (master_key, params, opt_state, model_state, batch)
         │

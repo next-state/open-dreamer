@@ -573,6 +573,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
         rng_key=jax.random.PRNGKey(4242), mae_eval_key=env["mae_eval_key"],
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=n_spatial, packing_factor=cfg.packing_factor,
+        dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
     )
     pred_frames, floor_frames, gt_frames = sample_video(
         encoder=enc, decoder=dec, dynamics=dyn,
@@ -668,6 +669,7 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
         rng_key=jax.random.PRNGKey(101010), mae_eval_key=env["mae_eval_key"],
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=n_spatial, packing_factor=cfg.packing_factor,
+        dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
     )
     pred_frames, floor_frames, gt_frames = sample_video(
         encoder=enc, decoder=dec, dynamics=dyn,
