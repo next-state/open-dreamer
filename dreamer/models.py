@@ -162,6 +162,7 @@ class GroupedQueryAttention(nn.Module):
     dropout_rate: float = 0.0
     deterministic: bool = True
     qk_norm_type: str | None = None  # "qknorm", or "quest"
+    is_causal: bool = False 
 
     def setup(self):
         assert self.dim % self.num_heads == 0
@@ -204,9 +205,7 @@ class GroupedQueryAttention(nn.Module):
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
             scale = 1.0 
 
-        mask = mask.astype(jnp.bool_)  # FIXME: the mask is currently float32, we need to fix that bug rather than casting here
-
-        attn = jax.nn.dot_product_attention(q, k, v, mask=mask, scale=scale)  # TODO: try setting implementation="cudnn"
+        attn = jax.nn.dot_product_attention(q, k, v, mask=mask, scale=scale, is_causal=self.is_causal)  # TODO: try setting implementation="cudnn"
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
@@ -233,6 +232,7 @@ class SpaceSelfAttentionModality(nn.Module):
             dropout_rate=self.dropout_rate,
             qk_norm_type=self.qk_norm_type,
             deterministic=deterministic,
+            is_causal=False,
         )(x, mask=mask)
 
         out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
@@ -252,7 +252,6 @@ class TimeSelfAttention(nn.Module):
         # x: (B, T, S, D) -> attend across T, causal
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
-        causal = nn.attention.make_causal_mask(jnp.ones((B*S, T), dtype=bool))
         out = GroupedQueryAttention(
             dim=self.dim,
             num_heads=self.num_heads,
@@ -260,7 +259,8 @@ class TimeSelfAttention(nn.Module):
             dropout_rate=self.dropout_rate,
             qk_norm_type=self.qk_norm_type,
             deterministic=deterministic,
-        )(x, mask=causal)
+            is_causal=True,
+        )(x, mask=None)
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         return out
 
