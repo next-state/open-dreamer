@@ -14,7 +14,7 @@ from jaxlpips import LPIPS
 from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
-from dreamer.utils import temporal_patchify, temporal_unpatchify, patch_normalize, patch_unnormalize, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
+from dreamer.utils import temporal_patchify, temporal_unpatchify, normalize_with_dataset_stats, unnormalize_with_dataset_stats, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
 from dreamer.logging import MetricLogger
 
 
@@ -152,18 +152,18 @@ def lpips_on_mae_recon(
     return jnp.mean(lp)
 
 # --- viz step ---
-@partial(jax.jit, static_argnames=("encoder","decoder","patch"))
-def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, drop_key):
+@partial(jax.jit, static_argnames=("encoder","decoder","patch","dataset_mean","dataset_std"))
+def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, drop_key, dataset_mean, dataset_std):
     # Same preprocessing as train
     target_btnd = temporal_patchify(batch, patch)  # (B, T, Np, D)
-    _, mean, std = patch_normalize(target_btnd)
+    target_norm = normalize_with_dataset_stats(target_btnd, mean=dataset_mean, std=dataset_std)
 
     # Run full model (no dropout during viz)
     pred_norm, (mae_mask_btNp1, keep_prob_bt1) = forward_apply(
-        encoder, decoder, enc_vars, dec_vars, target_btnd,
+        encoder, decoder, enc_vars, dec_vars, target_norm,
         mae_key=mae_key, drop_key=drop_key, train=False
     )
-    pred_btnd = patch_unnormalize(pred_norm, mean=mean, std=std)
+    pred_btnd = unnormalize_with_dataset_stats(pred_norm, mean=dataset_mean, std=dataset_std)
     pred_btnd = jnp.clip(pred_btnd, 0.0, 1.0)
 
     # Compose standard MAE visualization:
@@ -184,9 +184,9 @@ def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, dro
 
 
 # --- train step ---
-@partial(jax.jit, static_argnames=("encoder","decoder","tx","patch","H","W","C", "lpips_weight", "lpips_frac", "should_log"))
+@partial(jax.jit, static_argnames=("encoder","decoder","tx","patch","H","W","C", "lpips_weight", "lpips_frac", "should_log", "dataset_mean", "dataset_std"))
 def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch, *,
-               patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0, should_log=False):
+               patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0, should_log=False, dataset_mean=0.5, dataset_std=0.25):
     """
     (master_key, params, opt_state, model_state, batch)
         │
@@ -211,18 +211,18 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
     def loss_fn(packed_params):
         # Replace params in vars
         ev, dv = unpack_mae_params(packed_params, enc_vars, dec_vars)
-        pred_norm, mae_info = forward_apply(encoder, decoder, ev, dv, target_btnd,
+        target_norm = normalize_with_dataset_stats(target_btnd, mean=dataset_mean, std=dataset_std)
+        pred_norm, mae_info = forward_apply(encoder, decoder, ev, dv, target_norm,
                                             mae_key=mae_key, drop_key=drop_key, train=True)
         mae_mask, keep_prob = mae_info
 
-        target_norm, mean, std = patch_normalize(target_btnd)
         mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
 
         mse_pix = 0.0  # only for logging, to compute PSNR/RMSE
         pred_btnd = None
         
         if should_log or lpips_weight > 0.0:
-            pred_btnd = patch_unnormalize(pred_norm, mean=mean, std=std)
+            pred_btnd = unnormalize_with_dataset_stats(pred_norm, mean=dataset_mean, std=dataset_std)
             
         if should_log:
             mse_pix = recon_loss_from_mae(pred_btnd, target_btnd, mae_mask)
@@ -379,6 +379,7 @@ def run(cfg: TokenizerConfig):
                 master_key=master_key, step=step, 
                 lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
                 should_log=should_log,
+                dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
             )
             train_t = time.perf_counter() - train_start_t
             total_t = data_t + train_t
@@ -415,7 +416,8 @@ def run(cfg: TokenizerConfig):
                 _, viz_batch = next_batch(vis_batch_key)
                 viz_batch = viz_batch[:8, :1]
                 out = viz_step(encoder, decoder, enc_vars, dec_vars, viz_batch,
-                               patch=cfg.patch_size, mae_key=mae_key, drop_key=drop_key)
+                               patch=cfg.patch_size, mae_key=mae_key, drop_key=drop_key,
+                               dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std)
                 target = jnp.concatenate(temporal_unpatchify(out["target"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
                 masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
                 rec_masked  = jnp.concatenate(temporal_unpatchify(out["recon_masked"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)

@@ -18,22 +18,29 @@ temporal_unpatchify = jax.jit(
     static_argnames=("H", "W", "C", "patch"),
 )
 
-def patch_normalize(patch_tokens, *, eps=1e-6):
+def normalize_with_dataset_stats(videos, *, mean, std):
     """
-    Normalize patch tokens to have zero mean and unit variance.
+    Normalize videos using dataset-level statistics.
+    Args:
+        videos: input videos
+        mean: dataset mean (scalar or broadcastable)
+        std: dataset std (scalar or broadcastable)
+    Returns:
+        normalized videos
     """
-    mean = jnp.mean(patch_tokens, axis=-1, keepdims=True)
-    var = jnp.var(patch_tokens, axis=-1, keepdims=True)
-    std = jnp.sqrt(var + eps)
+    return (videos - mean) / std
 
-    norm_patch_tokens = (patch_tokens - mean) / std
-    return norm_patch_tokens, mean, std
-
-def patch_unnormalize(norm_patch_tokens, *, mean, std):
+def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
     """
-    Unnormalize patch tokens to have the original mean and variance.
+    Unnormalize videos using dataset-level statistics.
+    Args:
+        normalized_videos: normalized videos
+        mean: dataset mean (scalar or broadcastable)
+        std: dataset std (scalar or broadcastable)
+    Returns:
+        unnormalized videos
     """
-    return norm_patch_tokens * std + mean
+    return normalized_videos * std + mean
 
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     """

@@ -33,6 +33,10 @@ class DatasetConfig:
     hold_min: int = 4
     hold_max: int = 9
     diversify_data: bool = True
+    
+    # Dataset normalization statistics (for pixel values in [0, 1])
+    dataset_mean: float = 0.5
+    dataset_std: float = 0.25
 
 
 # ============================================================
