@@ -1,3 +1,4 @@
+from functools import lru_cache
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
@@ -58,6 +59,7 @@ def sinusoid_table(n: int, d: int, base: float = 10000.0, dtype=jnp.float32) -> 
     return table.astype(dtype)
 
 
+@lru_cache(maxsize=8)
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype=jnp.float32) -> jnp.ndarray:
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
@@ -78,31 +80,29 @@ def apply_rotary_emb(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cis: jnp.ndarray) -
     """
 
     # Rearrange to (..., H/2, 2) to avoid the slow "stride=2" memory access pattern.
-    xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
-    xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
+    xq_pairs = rearrange(xq, '... (d two) -> two ... d', two=2)
+    xk_pairs = rearrange(xk, '... (d two) -> two ... d', two=2)
     
     # Convert to complex: Index 0 is Real (even), Index 1 is Imag (odd)
-    xq_c = jax.lax.complex(xq_pairs[..., 0], xq_pairs[..., 1])
-    xk_c = jax.lax.complex(xk_pairs[..., 0], xk_pairs[..., 1])
+    xq_c = jax.lax.complex(*xq_pairs)
+    xk_c = jax.lax.complex(*xk_pairs)
     
+    T, S = xq.shape[1], xk.shape[1]
     # Broadcast freqs_cis (L, H/2) -> (1, L, 1, H/2)
-    T = xq.shape[1]
-    S = xk.shape[1]
-    
-    freqs_cis_q = freqs_cis[:T][None, :, None, :]
-    freqs_cis_k = freqs_cis[:S][None, :, None, :]
+    freqs_cis_q = freqs_cis[None, :T, None, :]
+    freqs_cis_k = freqs_cis[None, :S, None, :]
     
     # Rotate
     xq_out_c = xq_c * freqs_cis_q
     xk_out_c = xk_c * freqs_cis_k
     
     # Convert back to real
-    xq_out = jnp.stack([jnp.real(xq_out_c), jnp.imag(xq_out_c)], axis=-1)
-    xk_out = jnp.stack([jnp.real(xk_out_c), jnp.imag(xk_out_c)], axis=-1)
+    xq_out = jnp.stack([jnp.real(xq_out_c), jnp.imag(xq_out_c)], axis=0)
+    xk_out = jnp.stack([jnp.real(xk_out_c), jnp.imag(xk_out_c)], axis=0)
     
     # Flatten back to (..., H) -> [r0, i0, r1, i1...]
-    xq_out = rearrange(xq_out, '... d two -> ... (d two)')
-    xk_out = rearrange(xk_out, '... d two -> ... (d two)')
+    xq_out = rearrange(xq_out, 'two ... d -> ... (d two)')
+    xk_out = rearrange(xk_out, 'two ... d -> ... (d two)')
     
     return xq_out, xk_out
 
