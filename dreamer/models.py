@@ -1,3 +1,4 @@
+from functools import lru_cache
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
@@ -56,6 +57,62 @@ def sinusoid_table(n: int, d: int, base: float = 10000.0, dtype=jnp.float32) -> 
     angles = pos * div                                    # (n,d)
     table = jnp.where((i % 2) == 0, jnp.sin(angles), jnp.cos(angles))
     return table.astype(dtype)
+
+
+@lru_cache(maxsize=8)
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype=jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+    Returns:
+        freqs_cos: (end, dim//2)
+        freqs_sin: (end, dim//2)
+    """
+    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
+    t = jnp.arange(end, dtype=dtype)
+    freqs = jnp.outer(t, freqs)  # (end, dim//2)
+    return jnp.cos(freqs), jnp.sin(freqs)
+
+
+def apply_rotary_emb(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cos: jnp.ndarray, freqs_sin: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Apply Rotary Positional Embeddings (RoPE) to queries and keys using real sin/cos.
+    xq: (B, T, N, H)
+    xk: (B, S, K, H)
+    freqs_cos: (L, H/2)
+    freqs_sin: (L, H/2)
+    """
+    # Rearrange to (..., H/2, 2)
+    xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
+    xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
+
+    xq_r, xq_i = xq_pairs[..., 0], xq_pairs[..., 1]
+    xk_r, xk_i = xk_pairs[..., 0], xk_pairs[..., 1]
+
+    T, S = xq.shape[1], xk.shape[1]
+    
+    # Broadcast freqs (L, H/2) -> (1, L, 1, H/2)
+    cos_q = freqs_cos[None, :T, None, :]
+    sin_q = freqs_sin[None, :T, None, :]
+    cos_k = freqs_cos[None, :S, None, :]
+    sin_k = freqs_sin[None, :S, None, :]
+
+    # Rotation:
+    # x' = x cos - y sin
+    # y' = x sin + y cos
+    xq_out_r = xq_r * cos_q - xq_i * sin_q
+    xq_out_i = xq_r * sin_q + xq_i * cos_q
+    
+    xk_out_r = xk_r * cos_k - xk_i * sin_k
+    xk_out_i = xk_r * sin_k + xk_i * cos_k
+
+    # Stack back and flatten
+    xq_out = jnp.stack([xq_out_r, xq_out_i], axis=-1)
+    xk_out = jnp.stack([xk_out_r, xk_out_i], axis=-1)
+
+    xq_out = rearrange(xq_out, '... d two -> ... (d two)')
+    xk_out = rearrange(xk_out, '... d two -> ... (d two)')
+    
+    return xq_out, xk_out
 
 
 def add_sinusoidal_positions(tokens_btSd: jnp.ndarray) -> jnp.ndarray:
@@ -163,6 +220,8 @@ class GroupedQueryAttention(nn.Module):
     deterministic: bool = True
     qk_norm_type: str | None = None  # "qknorm", or "quest"
     is_causal: bool = False 
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     def setup(self):
         assert self.dim % self.num_heads == 0
@@ -196,6 +255,12 @@ class GroupedQueryAttention(nn.Module):
         q = rearrange(q, "B T (N H) -> B T N H", N=self.num_heads)
         k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
 
+        if self.use_rope:
+            head_dim = q.shape[-1]
+            max_len = max(q.shape[1], k.shape[1])
+            freqs_cos, freqs_sin = precompute_freqs_cis(head_dim, max_len, self.rope_theta, dtype=q.dtype)
+            q, k = apply_rotary_emb(q, k, freqs_cos, freqs_sin)
+
         scale = q.shape[-1] ** -0.5
         if self.qk_norm_type == 'qknorm':
             q = self.q_ln(q)
@@ -218,6 +283,8 @@ class SpaceSelfAttentionModality(nn.Module):
     num_kv_heads: int
     dropout_rate: float = 0.0
     qk_norm_type: str | None = None
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool):
@@ -231,6 +298,8 @@ class SpaceSelfAttentionModality(nn.Module):
             num_kv_heads=self.num_kv_heads,
             dropout_rate=self.dropout_rate,
             qk_norm_type=self.qk_norm_type,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
             deterministic=deterministic,
             is_causal=False,
         )(x, mask=mask)
@@ -245,6 +314,8 @@ class TimeSelfAttention(nn.Module):
     num_kv_heads: int
     dropout_rate: float = 0.0
     qk_norm_type: str | None = None
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool):
@@ -258,6 +329,8 @@ class TimeSelfAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             dropout_rate=self.dropout_rate,
             qk_norm_type=self.qk_norm_type,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
             deterministic=deterministic,
             is_causal=True,
         )(x, mask=None)
@@ -274,6 +347,8 @@ class BlockCausalLayer(nn.Module):
     mlp_ratio: float = 4.0
     layer_index: int = 0
     time_every: int = 4
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     def setup(self):
         self.norm = RMSNorm()
@@ -287,6 +362,8 @@ class BlockCausalLayer(nn.Module):
             num_kv_heads=self.num_kv_heads,
             dropout_rate=self.dropout_rate,
             qk_norm_type=self.qk_norm_type,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
         )
 
         # --- MLP ---
@@ -316,6 +393,8 @@ class BlockCausalTransformer(nn.Module):
     qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     time_every: int = 4
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool):
@@ -324,6 +403,8 @@ class BlockCausalTransformer(nn.Module):
                 self.d_model, self.n_heads, self.n_kv_heads,
                 dropout_rate=self.dropout_rate, qk_norm_type=self.qk_norm_type,
                 mlp_ratio=self.mlp_ratio, layer_index=i, time_every=self.time_every,
+                use_rope=self.use_rope,
+                rope_theta=self.rope_theta,
             )(x, mask=mask, deterministic=deterministic)
         return x
 
@@ -341,7 +422,9 @@ class Encoder(nn.Module):
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
-    
+    use_rope: bool = False
+    rope_theta: float = 10000.0
+
     def setup(self):
         self.patch_proj = nn.Dense(self.d_model, name="patch_proj")
         self.bottleneck_proj = nn.Dense(self.d_bottleneck, name="bottleneck_proj")
@@ -359,6 +442,8 @@ class Encoder(nn.Module):
             qk_norm_type=self.qk_norm_type,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
         )
         self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
 
@@ -381,7 +466,8 @@ class Encoder(nn.Module):
         # print(f"tokens_btSd.shape: {tokens_btSd.shape}")
 
         # 4) Add sinusoidal positions (param-free)
-        tokens = add_sinusoidal_positions(tokens)
+        if not self.use_rope:
+            tokens = add_sinusoidal_positions(tokens)
 
         # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
         mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
@@ -420,6 +506,8 @@ class Decoder(nn.Module):
     qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     time_every: int = 4
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     def setup(self):
         self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
@@ -440,6 +528,8 @@ class Decoder(nn.Module):
             qk_norm_type=self.qk_norm_type,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
         )
         mask = make_mask(self.modality_ids, "decoder")
         self.mask = self.variable("constants", "mask", lambda: mask)
@@ -449,7 +539,7 @@ class Decoder(nn.Module):
         B, T, N_l, d_bottleneck = z.shape
 
         # 1) Up-project latent bottleneck to d_model (per latent token)
-        latents = nn.tanh(self.up_proj(z))  # (B, T, N_l, D)
+        latents = self.up_proj(z)  # (B, T, N_l, D)
 
         # 2) Learned per-patch query tokens (owned by the decoder)
         patches = jnp.broadcast_to(
@@ -461,7 +551,8 @@ class Decoder(nn.Module):
         tokens = jnp.concatenate([latents, patches], axis=2)
 
         # 4) Add sinusoidal positions
-        tokens = add_sinusoidal_positions(tokens)
+        if not self.use_rope:
+            tokens = add_sinusoidal_positions(tokens)
 
         # 5) Axial block-causal transformer
         #    - SpaceSelfAttention over all S tokens (latents + queries)
@@ -520,6 +611,8 @@ class Dynamics(nn.Module):
     qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     time_every: int = 4
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     def setup(self):
         # Want to transform bottleneck inputs (B, T, N_b, D_b) to (B, T, N_b/packing_factor, D_b*packing_factor)
@@ -558,6 +651,8 @@ class Dynamics(nn.Module):
             qk_norm_type=self.qk_norm_type,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
         )
 
         # -------- Discrete embeddings for shortcut conditioning --------
@@ -622,7 +717,9 @@ class Dynamics(nn.Module):
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
-        tokens = add_sinusoidal_positions(tokens)      # (B, T, N_total, d_model)
+        if not self.use_rope:
+            tokens = add_sinusoidal_positions(tokens)      # (B, T, N_total, d_model)
+        
         mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
         x = self.transformer(tokens, mask, deterministic=deterministic)
         spatial_tokens = x[:, :, self.spatial_slice, :]
