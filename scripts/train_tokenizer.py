@@ -28,9 +28,13 @@ class EncoderConfig:
     d_bottleneck: int = 32
     d_model: int = 64
     n_heads: int = 4
+    n_kv_heads: int = 2
     n_patches: int = 64  # Will be computed from H, W, patch_size
     depth: int = 8
-    dropout: float = 0.05
+    dropout_rate: float = 0.05
+    qk_norm_type: str | None = None
+    use_rope: bool = False
+    rope_theta: float = 10000.0
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
@@ -39,11 +43,15 @@ class EncoderConfig:
 class DecoderConfig:
     d_model: int = 64
     n_heads: int = 4
+    n_kv_heads: int = 2
     n_latents: int = 16
     n_patches: int = 64  # Will be computed from H, W, patch_size
     d_patch: int = 48    # Will be computed from patch_size, C
     depth: int = 8
-    dropout: float = 0.05
+    dropout_rate: float = 0.05
+    qk_norm_type: str | None = None
+    use_rope: bool = False
+    rope_theta: float = 10000.0
     time_every: int = 4
 
 @dataclass(frozen=True)

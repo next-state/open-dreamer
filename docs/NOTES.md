@@ -25,7 +25,8 @@ See implementation progress log [here](https://docs.google.com/presentation/d/1H
         - [ ] cli args / config 
         - [ ] RoPE
         - [x] SwiGLU
-        - [ ] GQA
+        - [x] GQA
+        - [x] QK normalization
 - [ ] Interactive Dynamics Model
     - [x] Add actions to Toy Video Dataset
     - [x] Add multi-modality support for efficient transformer block
@@ -62,8 +63,8 @@ See implementation progress log [here](https://docs.google.com/presentation/d/1H
         - [ ] Dynamics finetuning
     - [ ] Architecture improvements
         - [ ] Imagination KV caching
+        - [ ] Attention logit soft capping
         - [ ] Continue predictor
-        - [ ] GQA
         - [ ] RoPE embeddings
 </details>
 
