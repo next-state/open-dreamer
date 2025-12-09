@@ -76,28 +76,25 @@ def apply_rotary_emb(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cis: jnp.ndarray) -
     xk: (B, S, K, H)
     freqs_cis: (L, H/2)
     """
-    # Reshape for complex representation: (..., H/2, 2) -> (..., H/2) complex
-    xq_shape = xq.shape
-    xk_shape = xk.shape
+    D = xq.shape[-1]
+    d_half = D // 2
     
-    xq_c = jax.lax.complex(xq[..., 0::2], xq[..., 1::2]) # (B, T, N, H/2)
-    xk_c = jax.lax.complex(xk[..., 0::2], xk[..., 1::2]) # (B, S, K, H/2)
+    xq_r, xq_i = xq[..., :d_half], xq[..., d_half:]
+    xk_r, xk_i = xk[..., :d_half], xk[..., d_half:]
     
-    # Broadcast freqs_cis: (L, H/2) -> (1, L, 1, H/2)
-    # Match T/S dimension. 
-    # Assumes T and S start at 0 (no cache offset handling yet).
+    xq_c = jax.lax.complex(xq_r, xq_i)
+    xk_c = jax.lax.complex(xk_r, xk_i)
+    
     T = xq.shape[1]
     S = xk.shape[1]
-    
     freqs_cis_q = freqs_cis[:T][None, :, None, :]
     freqs_cis_k = freqs_cis[:S][None, :, None, :]
     
     xq_out_c = xq_c * freqs_cis_q
     xk_out_c = xk_c * freqs_cis_k
-    
-    # Convert back to real
-    xq_out = jnp.stack([jnp.real(xq_out_c), jnp.imag(xq_out_c)], axis=-1).reshape(xq_shape)
-    xk_out = jnp.stack([jnp.real(xk_out_c), jnp.imag(xk_out_c)], axis=-1).reshape(xk_shape)
+
+    xq_out = jnp.concatenate([jnp.real(xq_out_c), jnp.imag(xq_out_c)], axis=-1)
+    xk_out = jnp.concatenate([jnp.real(xk_out_c), jnp.imag(xk_out_c)], axis=-1)
     
     return xq_out, xk_out
 
