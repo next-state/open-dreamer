@@ -68,10 +68,13 @@ class RealismConfig:
     dec_depth: int = 8
     dyn_depth: int = 8
     n_heads: int = 4
+    n_kv_heads: int = 2
+    qk_norm_type: str | None = None
+    use_rope: bool = True
+    rope_theta: float = 10000.0
     packing_factor: int = 2
     n_register: int = 4 # number of register tokens for dynamics
     n_agent: int = 1 # number of agent tokens for dynamics
-    agent_space_mode: str = "wm_agent_isolated"
 
     # schedule
     k_max: int = 8
@@ -436,10 +439,12 @@ def save_evaluation_video(
     Returns:
         True if successful, False otherwise
     """
+    print(f"[eval:{tag}] MP4 write started...")
     try:
         with imageio.get_writer(output_path, fps=25, codec="libx264", quality=8) as w:
             for fr in grid_frames:
                 w.append_data(fr)
+        print(f"[eval:{tag}] MP4 write completed successfully.")
         return True
     except Exception as e:
         print(f"[eval:{tag}] MP4 write skipped ({e})")
@@ -545,21 +550,30 @@ def initialize_models_and_tokenizer(
         n_latents=cfg.enc_n_latents,
         n_patches=num_patches,
         n_heads=cfg.n_heads,
+        n_kv_heads=cfg.n_kv_heads,
         depth=cfg.enc_depth,
-        dropout=0.0,
+        dropout_rate=0.0,
+        qk_norm_type=cfg.qk_norm_type,
+        use_rope=cfg.use_rope,
+        rope_theta=cfg.rope_theta,
         d_bottleneck=cfg.enc_d_bottleneck,
         mae_p_min=0.0, mae_p_max=0.0,
-        time_every=4, latents_only_time=True,
+        mlp_ratio=4.0,
+        time_every=4,
     )
     dec_kwargs = dict(
         d_model=cfg.d_model_enc,
         n_heads=cfg.n_heads,
+        n_kv_heads=cfg.n_kv_heads,
         depth=cfg.dec_depth,
         n_latents=cfg.enc_n_latents,
         n_patches=num_patches,
         d_patch=D_patch,
-        dropout=0.0,
-        mlp_ratio=4.0, time_every=4, latents_only_time=True,
+        dropout_rate=0.0,
+        qk_norm_type=cfg.qk_norm_type,
+        use_rope=cfg.use_rope,
+        rope_theta=cfg.rope_theta,
+        mlp_ratio=4.0, time_every=4,
     )
     n_spatial = cfg.enc_n_latents // cfg.packing_factor # number of spatial tokens for dynamics
     dyn_kwargs = dict(
@@ -567,9 +581,14 @@ def initialize_models_and_tokenizer(
         d_bottleneck=cfg.enc_d_bottleneck,
         d_spatial=cfg.enc_d_bottleneck * cfg.packing_factor,
         n_spatial=n_spatial, n_register=cfg.n_register,
-        n_heads=cfg.n_heads, depth=cfg.dyn_depth,
-        space_mode=cfg.agent_space_mode, n_agent=cfg.n_agent,
-        dropout=0.0, k_max=k_max, 
+        n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.dyn_depth,
+        n_agent=cfg.n_agent,
+        dropout_rate=0.0,
+        qk_norm_type=cfg.qk_norm_type,
+        use_rope=cfg.use_rope,
+        rope_theta=cfg.rope_theta,
+        k_max=k_max, 
+        mlp_ratio=4.0,
         time_every=4,
     )
 

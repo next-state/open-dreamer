@@ -6,8 +6,8 @@ defaults:
 ckpt_max_to_keep: 2
 
 # WandB
-use_wandb: true
-wandb_entity: null # add your wandb entity by adding `wandb_entity=<your_entity>` to the launch command
+use_wandb: True
+wandb_entity: Null
 wandb_project: tiny_dreamer_4
 
 # Hydra

@@ -22,8 +22,9 @@ dev = [
     "ipdb>=0.13.13",
 ]
 
-[tool.setuptools]
-package-dir = {"" = "."}
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.setuptools]
+package-dir = {"" = "."}
