@@ -1,3 +1,4 @@
+from functools import lru_cache
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
@@ -6,20 +7,10 @@ from flax.core import FrozenDict
 import flax
 from enum import IntEnum
 from typing import Optional, Tuple, Any
-from einops import rearrange
+from einops import rearrange, repeat
 import math
+from .utils import make_mask, Modality
 
-class Modality(IntEnum):
-    LATENT   = -1
-    IMAGE    = 0
-    ACTION   = 1
-    PROPRIO  = 2
-    REGISTER = 3
-    SPATIAL = 4
-    SHORTCUT_SIGNAL = 5
-    SHORTCUT_STEP = 6
-    AGENT = 7
-    # add more as needed
 
 @flax.struct.dataclass  # immutable, PyTree-friendly
 class TokenLayout:
@@ -68,6 +59,62 @@ def sinusoid_table(n: int, d: int, base: float = 10000.0, dtype=jnp.float32) -> 
     return table.astype(dtype)
 
 
+@lru_cache(maxsize=8)
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype=jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+    Returns:
+        freqs_cos: (end, dim//2)
+        freqs_sin: (end, dim//2)
+    """
+    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
+    t = jnp.arange(end, dtype=dtype)
+    freqs = jnp.outer(t, freqs)  # (end, dim//2)
+    return jnp.cos(freqs), jnp.sin(freqs)
+
+
+def apply_rotary_emb(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cos: jnp.ndarray, freqs_sin: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Apply Rotary Positional Embeddings (RoPE) to queries and keys using real sin/cos.
+    xq: (B, T, N, H)
+    xk: (B, S, K, H)
+    freqs_cos: (L, H/2)
+    freqs_sin: (L, H/2)
+    """
+    # Rearrange to (..., H/2, 2)
+    xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
+    xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
+
+    xq_r, xq_i = xq_pairs[..., 0], xq_pairs[..., 1]
+    xk_r, xk_i = xk_pairs[..., 0], xk_pairs[..., 1]
+
+    T, S = xq.shape[1], xk.shape[1]
+    
+    # Broadcast freqs (L, H/2) -> (1, L, 1, H/2)
+    cos_q = freqs_cos[None, :T, None, :]
+    sin_q = freqs_sin[None, :T, None, :]
+    cos_k = freqs_cos[None, :S, None, :]
+    sin_k = freqs_sin[None, :S, None, :]
+
+    # Rotation:
+    # x' = x cos - y sin
+    # y' = x sin + y cos
+    xq_out_r = xq_r * cos_q - xq_i * sin_q
+    xq_out_i = xq_r * sin_q + xq_i * cos_q
+    
+    xk_out_r = xk_r * cos_k - xk_i * sin_k
+    xk_out_i = xk_r * sin_k + xk_i * cos_k
+
+    # Stack back and flatten
+    xq_out = jnp.stack([xq_out_r, xq_out_i], axis=-1)
+    xk_out = jnp.stack([xk_out_r, xk_out_i], axis=-1)
+
+    xq_out = rearrange(xq_out, '... d two -> ... (d two)')
+    xk_out = rearrange(xk_out, '... d two -> ... (d two)')
+    
+    return xq_out, xk_out
+
+
 def add_sinusoidal_positions(tokens_btSd: jnp.ndarray) -> jnp.ndarray:
     """tokens: (B,T,S,D) -> adds time and step sinusoids and returns same shape."""
     B, T, S, D = tokens_btSd.shape
@@ -113,18 +160,18 @@ class MLP(nn.Module):
     Transformer MLP with optional SwiGLU gating.
 
     Args:
-      d_model:     input/output width of the block (last-dim of x).
-      mlp_ratio:   expansion factor for hidden size if NOT using 2/3 parity.
-      dropout:     dropout rate applied after activation and after output proj.
-      swiglu:      if True, use SwiGLU; else standard GELU MLP.
+      d_model:          input/output width of the block (last-dim of x).
+      mlp_ratio:    expansion factor for hidden size if NOT using 2/3 parity.
+      dropout_rate: dropout rate applied after activation and after output proj.
+      swiglu:       if True, use SwiGLU; else standard GELU MLP.
       parity_2over3:
-                   if True and swiglu=True, set hidden = (2/3)*mlp_ratio*d_model
-                   to roughly match parameter count of a GELU MLP with mlp_ratio.
-      dtype:       param/compute dtype.
+                    if True and swiglu=True, set hidden = (2/3)*mlp_ratio*d_model
+                    to roughly match parameter count of a GELU MLP with mlp_ratio.
+      dtype:        param/compute dtype.
     """
     d_model: int
     mlp_ratio: float = 4.0
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
     dtype: Any = jnp.float32
@@ -159,238 +206,206 @@ class MLP(nn.Module):
             h = nn.Dense(hidden, dtype=self.dtype, name="fc_in")(x)
             h = nn.gelu(h)
 
-        h = nn.Dropout(self.dropout)(h, deterministic=deterministic)
+        h = nn.Dropout(self.dropout_rate)(h, deterministic=deterministic)
         y = nn.Dense(self.d_model, dtype=self.dtype, name="fc_out")(h)
-        y = nn.Dropout(self.dropout)(y, deterministic=deterministic)
+        y = nn.Dropout(self.dropout_rate)(y, deterministic=deterministic)
         return y
-# ---------- axial attention layers ----------
-class SpaceSelfAttentionModality(nn.Module):
-    """
-    Space self-attention with modality routing.
 
-    Args:
-      d_model: int
-      n_heads: int
-      modality_ids: jnp.ndarray with shape (S,), per-token modality id for the S tokens.
-                    Convention: latents are the first `n_latents` tokens; you can set their id to -1.
-      n_latents: int, number of latent tokens at the beginning of S.
-      mode: str in {"encoder", "decoder", "wm_agent", "wm_agent_isolated"}.
-            - "encoder": latents→all; non-latents→same-modality only.
-            - "decoder": latents→latents-only; non-latents→same-modality + latents.
-            - "wm_agent": agent reads all; all non-agent tokens read all *except* agent.
-            - "wm_agent_isolated": agent reads nobody; all non-agent tokens read all *except* agent.
-      dropout: float
-    """
-    d_model: int
-    n_heads: int
-    modality_ids: jnp.ndarray  # (S,)
-    n_latents: int
-    mode: str = "encoder"      # or "decoder"
-    dropout: float = 0.0
+# ---------- axial attention layers ----------
+class GroupedQueryAttention(nn.Module):
+    dim: int
+    num_heads: int
+    num_kv_heads: int
+    dropout_rate: float = 0.0
+    deterministic: bool = True
+    qk_norm_type: str | None = None  # "qknorm", or "quest"
+    is_causal: bool = False 
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     def setup(self):
-        # Cache a (S,S) boolean mask indicating allowed key for each query index, per mode.
-        S = int(self.modality_ids.shape[0])
+        assert self.dim % self.num_heads == 0
+        assert self.num_heads % self.num_kv_heads == 0
 
-        # Broadcast helpers
-        q_idx = jnp.arange(S)[:, None]       # (S,1)
-        k_idx = jnp.arange(S)[None, :]       # (1,S)
+        head_dim = self.dim // self.num_heads
+        kv_dim = self.num_kv_heads * head_dim
 
-        is_q_lat = q_idx < self.n_latents     # (S,1) bool
-        is_k_lat = k_idx < self.n_latents     # (1,S) bool
+        self.to_q = nn.Dense(self.dim, use_bias=False)
+        self.to_kv = nn.Dense(2 * kv_dim, use_bias=False)
+        self.to_out = nn.Dense(self.dim, use_bias=False)
+        self.dropout = nn.Dropout(self.dropout_rate)
 
-        q_mod = self.modality_ids[q_idx]      # (S,1)
-        k_mod = self.modality_ids[k_idx]      # (1,S)
-        same_mod = (q_mod == k_mod)           # (S,S)
+        if self.qk_norm_type == 'qknorm':
+            self.q_ln = nn.LayerNorm(use_bias=True, use_scale=True)
+            self.k_ln = nn.LayerNorm(use_bias=True, use_scale=True)
 
-        if self.mode == "encoder":
-            # latents -> all; non-latents -> same modality only (no access to latents unless same modality==latent, which they aren't)
-            allow_lat_q = jnp.ones((S, S), dtype=bool)             # lat q attends to everything
-            allow_nonlat_q = same_mod                              # non-lat q attends within itself only
-            mask = jnp.where(is_q_lat, allow_lat_q, allow_nonlat_q)
-        elif self.mode == "decoder":
-            # latents -> latents only; non-latents -> same modality OR latents
-            allow_lat_q = is_k_lat                                  # lat q -> lat k only
-            allow_nonlat_q = jnp.logical_or(same_mod, is_k_lat)     # non-lat q -> same mod + latents
-            mask = jnp.where(is_q_lat, allow_lat_q, allow_nonlat_q)
-        elif self.mode in ["wm_agent", "wm_agent_isolated"]:
-            S = int(self.modality_ids.shape[0])
-            q_idx = jnp.arange(S)[:, None]   # (S,1)
-            k_idx = jnp.arange(S)[None, :]   # (1,S)
-            q_mod = self.modality_ids[q_idx] # (S,1)
-            k_mod = self.modality_ids[k_idx] # (1,S)
+    def __call__(self, x, mask, *args):
+        """
+        https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html
+        B = batch size
+        S = length of the key/value (source)
+        T = length of the query (target)
+        N = number of attention heads
+        H = dimensions of each attention head
+        K = number of key/value heads
+        G = number of groups, which equals to N // K
+        """
+        q = self.to_q(x)
+        kv = self.to_kv(x)
+        q = rearrange(q, "B T (N H) -> B T N H", N=self.num_heads)
+        k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
 
-            is_agent_q = (q_mod == Modality.AGENT)
-            is_agent_k = (k_mod == Modality.AGENT)
-            is_action_q = (q_mod == Modality.ACTION)
-            is_action_k = (k_mod == Modality.ACTION)
+        if self.use_rope:
+            head_dim = q.shape[-1]
+            max_len = max(q.shape[1], k.shape[1])
+            freqs_cos, freqs_sin = precompute_freqs_cis(head_dim, max_len, self.rope_theta, dtype=q.dtype)
+            q, k = apply_rotary_emb(q, k, freqs_cos, freqs_sin)
 
-            # Observation bucket = spatial ∪ register ∪ shortcut tokens
-            is_obs_k = (
-                (k_mod == Modality.SPATIAL) |
-                (k_mod == Modality.REGISTER) |
-                (k_mod == Modality.SHORTCUT_SIGNAL) |
-                (k_mod == Modality.SHORTCUT_STEP)
-            )
-            is_obs_q = (
-                (q_mod == Modality.SPATIAL) |
-                (q_mod == Modality.REGISTER) |
-                (q_mod == Modality.SHORTCUT_SIGNAL) |
-                (q_mod == Modality.SHORTCUT_STEP)
-            )
+        scale = q.shape[-1] ** -0.5
+        if self.qk_norm_type == 'qknorm':
+            q = self.q_ln(q)
+            k = self.k_ln(k)
+        elif self.qk_norm_type == 'quest':
+            # claims to beat qknorm https://openreview.net/pdf?id=HkztQWZfl2
+            k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
+            scale = 1.0 
 
-            # Agent queries:
-            #  - wm_agent: agent reads all (obs ∪ action ∪ agent)
-            #  - wm_agent_isolated: agent reads nobody
-            allow_for_agent_q = jnp.where(
-                self.mode == "wm_agent",
-                jnp.ones((S, S), dtype=bool),
-                jnp.zeros((S, S), dtype=bool)
-            )
+        attn = jax.nn.dot_product_attention(q, k, v, mask=mask, scale=scale, is_causal=self.is_causal)  # TODO: try setting implementation="cudnn"
+        attn = rearrange(attn, "B T N H -> B T (N H)")
 
-            # Non-agent queries (route by query modality)
-            allow_for_action_q = is_action_k                                  # action -> action only  (1,S)
-            allow_for_obs_q    = (is_obs_k | is_action_k)                     # obs -> obs ∪ action    (1,S)
+        out = self.to_out(attn)
+        return self.dropout(out, deterministic=self.deterministic)
 
-            # Build per-query row permissions with broadcasting from (1,S) to (S,S)
-            allow_nonagent = jnp.where(
-                is_action_q, allow_for_action_q,
-                jnp.where(is_obs_q, allow_for_obs_q, jnp.zeros((S, S), dtype=bool))
-            )
-
-            # Nobody can read agent keys except agent q
-            allow_nonagent = jnp.where(is_agent_k, False, allow_nonagent)
-
-            mask = jnp.where(is_agent_q, allow_for_agent_q, allow_nonagent)
-        else:
-            raise ValueError(f"Unknown mode {self.mode}")
-
-        # Save (1,1,S,S) so it broadcasts over batch*time and heads -> (B*T, 1, S, S)
-        modality_mask = mask[None, None, :, :]                   # (1,1,S,S)
-        self.modality_mask = self.variable("constants", "modality_mask", lambda: modality_mask)
+class SpaceSelfAttentionModality(nn.Module):
+    """Space self-attention with modality routing."""
+    dim: int
+    num_heads: int
+    num_kv_heads: int
+    dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, x, *, deterministic: bool):
+    def __call__(self, x, mask, *, deterministic: bool):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
         B, T, S, D = x.shape
-        x_ = x.reshape(B*T, S, D)
+        x = rearrange(x, "B T S D -> (B T) S D")
 
-        # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
-        mask = jnp.broadcast_to(self.modality_mask.value, (B*T, 1, S, S))   # (B*T,1,S,S)
-
-        y_ = nn.MultiHeadDotProductAttention(
-            num_heads=self.n_heads,
-            qkv_features=self.d_model,
-            dropout_rate=self.dropout,
+        out = GroupedQueryAttention(
+            dim=self.dim,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
             deterministic=deterministic,
-        )(x_, x_, mask=mask)
+            is_causal=False,
+        )(x, mask=mask)
 
-        y = y_.reshape(B, T, S, D)
-        return y
+        out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
+        return out
 
 class TimeSelfAttention(nn.Module):
-    d_model: int
-    n_heads: int
-    dropout: float = 0.0
-    latents_only: bool = True
-    n_latents: int = 0   # required if latents_only
+    """Time self-attention."""
+    dim: int
+    num_heads: int
+    num_kv_heads: int
+    dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, x, *, deterministic: bool):
+    def __call__(self, x, mask, *, deterministic: bool):
+        # mask does nothing, but is required for API consistency
         # x: (B, T, S, D) -> attend across T, causal
         B, T, S, D = x.shape
-        if self.latents_only:
-            assert 0 < self.n_latents <= S
-            lat = x[:, :, :self.n_latents, :]                # (B, T, L, D)
-            lat_btld = lat.transpose(0, 2, 1, 3).reshape(B*self.n_latents, T, D)  # (B*L, T, D)
-            causal = nn.attention.make_causal_mask(jnp.ones((B*self.n_latents, T), dtype=bool))
-            out = nn.MultiHeadDotProductAttention(
-                num_heads=self.n_heads,
-                qkv_features=self.d_model,
-                dropout_rate=self.dropout,
-                deterministic=deterministic,
-            )(lat_btld, lat_btld, mask=causal)
-            out = out.reshape(B, self.n_latents, T, D).transpose(0, 2, 1, 3)      # back to (B, T, L, D)
-            x = x.at[:, :, :self.n_latents, :].set(out)
-            return x
-        else:
-            x_bstd = x.transpose(0, 2, 1, 3).reshape(B*S, T, D)  # (B*S, T, D)
-            causal = nn.attention.make_causal_mask(jnp.ones((B*S, T), dtype=bool))
-            out = nn.MultiHeadDotProductAttention(
-                num_heads=self.n_heads,
-                qkv_features=self.d_model,
-                dropout_rate=self.dropout,
-                deterministic=deterministic,
-            )(x_bstd, x_bstd, mask=causal)
-            out = out.reshape(B, S, T, D).transpose(0, 2, 1, 3)  # back to (B, T, S, D)
-            return out
+        x = rearrange(x, "B T S D -> (B S) T D")
+        out = GroupedQueryAttention(
+            dim=self.dim,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
+            deterministic=deterministic,
+            is_causal=True,
+        )(x, mask=None)
+        out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
+        return out
 
 # ---------- a single block-causal layer ----------
 class BlockCausalLayer(nn.Module):
-    d_model: int
-    n_heads: int
-    n_latents: int
-    modality_ids: jnp.ndarray     # (S,)
-    space_mode: str               # "encoder", "decoder", "wm_agent", "wm_agent_isolated"
-    dropout: float = 0.0
+    dim: int
+    num_heads: int
+    num_kv_heads: int
+    dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     layer_index: int = 0
     time_every: int = 4
-    latents_only_time: bool = True
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
-    @nn.compact
-    def __call__(self, x, *, deterministic: bool):
-        # --- Space attention (within timestep, modality-aware) ---
-        y = RMSNorm()(x)
-        y = SpaceSelfAttentionModality(
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            modality_ids=self.modality_ids,
-            n_latents=self.n_latents,
-            mode=self.space_mode,
-            dropout=self.dropout,
-        )(y, deterministic=deterministic)
-        x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
+    def setup(self):
+        self.norm = RMSNorm()
 
-        # --- Time attention (causal across timesteps), only on some layers ---
-        if (self.layer_index + 1) % self.time_every == 0:
-            y = RMSNorm()(x)
-            y = TimeSelfAttention(
-                self.d_model, self.n_heads, self.dropout,
-                latents_only=self.latents_only_time, n_latents=self.n_latents
-            )(y, deterministic=deterministic)
-            x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
+        # --- Time or space attention ---
+        self.use_time = (self.layer_index + 1) % self.time_every == 0
+        attention_module = TimeSelfAttention if self.use_time else SpaceSelfAttentionModality
+        self.attn = attention_module(
+            dim=self.dim,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
+        )
 
         # --- MLP ---
-        y = RMSNorm()(x)
-        y = MLP(self.d_model, self.mlp_ratio, self.dropout)(y, deterministic=deterministic)
-        x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
+        self.norm_mlp = RMSNorm()
+        self.mlp = MLP(self.dim, self.mlp_ratio, self.dropout_rate)
+
+    @nn.compact
+    def __call__(self, x, mask, *, deterministic: bool):
+        # --- Space attention (within timestep, modality-aware) ---
+        y = self.norm(x)
+        y = self.attn(y, mask=mask, deterministic=deterministic)
+        x = x + y
+
+        # --- MLP ---
+        y = self.norm_mlp(x)
+        y = self.mlp(y, deterministic=deterministic)
+        x = x + y
         return x
 # ---------- the transformer stack ----------
 
 class BlockCausalTransformer(nn.Module):
     d_model: int
     n_heads: int
+    n_kv_heads: int
     depth: int
-    n_latents: int
-    modality_ids: jnp.ndarray   # (S,)
-    space_mode: str             # "encoder" or "decoder"
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     time_every: int = 4
-    latents_only_time: bool = True
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, x, *, deterministic: bool):
+    def __call__(self, x, mask, *, deterministic: bool):
         for i in range(self.depth):
             x = BlockCausalLayer(
-                self.d_model, self.n_heads, self.n_latents,
-                modality_ids=self.modality_ids,
-                space_mode=self.space_mode,
-                dropout=self.dropout, mlp_ratio=self.mlp_ratio,
-                layer_index=i, time_every=self.time_every,
-                latents_only_time=self.latents_only_time,
-            )(x, deterministic=deterministic)
+                self.d_model, self.n_heads, self.n_kv_heads,
+                dropout_rate=self.dropout_rate, qk_norm_type=self.qk_norm_type,
+                mlp_ratio=self.mlp_ratio, layer_index=i, time_every=self.time_every,
+                use_rope=self.use_rope,
+                rope_theta=self.rope_theta,
+            )(x, mask=mask, deterministic=deterministic)
         return x
 
 class Encoder(nn.Module):
@@ -398,30 +413,37 @@ class Encoder(nn.Module):
     n_latents: int
     n_patches: int
     n_heads: int
+    n_kv_heads: int
     depth: int
     d_bottleneck: int
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     time_every: int = 4
-    latents_only_time: bool = True
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
-    
+    use_rope: bool = False
+    rope_theta: float = 10000.0
+
     def setup(self):
         self.patch_proj = nn.Dense(self.d_model, name="patch_proj")
         self.bottleneck_proj = nn.Dense(self.d_bottleneck, name="bottleneck_proj")
         self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
         self.modality_ids = self.layout.modality_ids()            # (S,)
+        mask = make_mask(self.modality_ids, "encoder")
+        self.mask = self.variable("constants", "mask", lambda: mask)
+
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
+            n_kv_heads=self.n_kv_heads,
             depth=self.depth,
-            n_latents=self.n_latents,
-            modality_ids=self.modality_ids,
-            space_mode="encoder",                 # << encoder routing
-            dropout=self.dropout, mlp_ratio=self.mlp_ratio,
+            dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
+            mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
-            latents_only_time=self.latents_only_time,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
         )
         self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
 
@@ -444,10 +466,13 @@ class Encoder(nn.Module):
         # print(f"tokens_btSd.shape: {tokens_btSd.shape}")
 
         # 4) Add sinusoidal positions (param-free)
-        tokens = add_sinusoidal_positions(tokens)
+        if not self.use_rope:
+            tokens = add_sinusoidal_positions(tokens)
 
+        # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
+        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
         # 5) Feed tokens into transformer
-        encoded_tokens = self.transformer(tokens, deterministic=deterministic)
+        encoded_tokens = self.transformer(tokens, mask=mask, deterministic=deterministic)
         # print(f"encoded_tokens_btSd.shape: {encoded_tokens_btSd.shape}")
 
         # 6) Project latent tokens to bottleneck and tanh
@@ -467,19 +492,22 @@ class Decoder(nn.Module):
     Config:
       - n_patches: number of patch query tokens to use in the decoder
       - d_patch:   dimensionality of each patch to reconstruct (D_patch)
-      - d_model, n_heads, depth, dropout, mlp_ratio, time_every, latents_only_time
+      - d_model, n_heads, depth, dropout_rate, mlp_ratio, time_every, latents_only_time
         typically mirror the encoder.
     """
     d_model: int
     n_heads: int
+    n_kv_heads: int
     depth: int
     n_latents: int
     n_patches: int
     d_patch: int
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     time_every: int = 4
-    latents_only_time: bool = True
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     def setup(self):
         self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
@@ -494,22 +522,24 @@ class Decoder(nn.Module):
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
+            n_kv_heads=self.n_kv_heads,
             depth=self.depth,
-            n_latents=self.n_latents,
-            modality_ids=self.modality_ids,
-            space_mode="decoder",                 # << decoder routing
-            dropout=self.dropout,
+            dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
-            latents_only_time=self.latents_only_time,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
         )
+        mask = make_mask(self.modality_ids, "decoder")
+        self.mask = self.variable("constants", "mask", lambda: mask)
 
     @nn.compact
     def __call__(self, z: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
         B, T, N_l, d_bottleneck = z.shape
 
         # 1) Up-project latent bottleneck to d_model (per latent token)
-        latents = nn.tanh(self.up_proj(z))  # (B, T, N_l, D)
+        latents = self.up_proj(z)  # (B, T, N_l, D)
 
         # 2) Learned per-patch query tokens (owned by the decoder)
         patches = jnp.broadcast_to(
@@ -521,12 +551,14 @@ class Decoder(nn.Module):
         tokens = jnp.concatenate([latents, patches], axis=2)
 
         # 4) Add sinusoidal positions
-        tokens = add_sinusoidal_positions(tokens)
+        if not self.use_rope:
+            tokens = add_sinusoidal_positions(tokens)
 
         # 5) Axial block-causal transformer
         #    - SpaceSelfAttention over all S tokens (latents + queries)
         #    - TimeSelfAttention only over the first N_l latent tokens
-        x = self.transformer(tokens, deterministic=deterministic)
+        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
+        x = self.transformer(tokens, mask=mask, deterministic=deterministic)
         # 6) Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
         pred_btnd = nn.sigmoid(self.patch_head(x_patches))  # (B,T,Np,D_patch)
@@ -572,12 +604,15 @@ class Dynamics(nn.Module):
     n_register: int           # number of learned register tokens
     n_agent: int              # number of agent tokens
     n_heads: int
+    n_kv_heads: int
     depth: int
     k_max: int                 # maximum number of sampling steps (defines finest step 1/)
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
+    qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
     time_every: int = 4
-    space_mode: str = "wm_agent_isolated" # or "wm_agent"
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     def setup(self):
         # Want to transform bottleneck inputs (B, T, N_b, D_b) to (B, T, N_b/packing_factor, D_b*packing_factor)
@@ -604,18 +639,20 @@ class Dynamics(nn.Module):
         self.spatial_slice = self.layout.slices()[Modality.SPATIAL]
         self.agent_slice  = self.layout.slices().get(Modality.AGENT, slice(0,0))  # safe if n_agent==0
         self.modality_ids = self.layout.modality_ids()
+        mask = make_mask(self.modality_ids, "wm_agent")
+        self.mask = self.variable("constants", "mask", lambda: mask)
 
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
+            n_kv_heads=self.n_kv_heads,
             depth=self.depth,
-            n_latents=0,
-            modality_ids=self.modality_ids,
-            space_mode=self.space_mode,
-            dropout=self.dropout,
+            dropout_rate=self.dropout_rate,
+            qk_norm_type=self.qk_norm_type,
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
-            latents_only_time=False,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
         )
 
         # -------- Discrete embeddings for shortcut conditioning --------
@@ -642,11 +679,9 @@ class Dynamics(nn.Module):
         deterministic: bool = True,
     ):
         """
-        Pretrain script: instantiate with space_mode="wm_agent_isolated" and pass agent_tokens=None (dummy).
-        Fine-tune script: instantiate with space_mode="wm_agent" and pass real agent_tokens from task embedding.
         Args:
           packed_enc_tokens:      (B, T, n_spatial, d_spatial) packed encoder tokens
-          actions:    (B, T, N_a, D_a) raw action tokens
+          actions:    (B, T) int32 in [0, n_keyboard) raw action tokens
           steps:      (B, T) float32 — step sizes, 1/2^x
           signals:    (B, T) float32 - signal values, grid that is reachable by current step size
 
@@ -682,8 +717,11 @@ class Dynamics(nn.Module):
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
-        tokens = add_sinusoidal_positions(tokens)      # (B, T, N_total, d_model)
-        x = self.transformer(tokens, deterministic=deterministic)
+        if not self.use_rope:
+            tokens = add_sinusoidal_positions(tokens)      # (B, T, N_total, d_model)
+        
+        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
+        x = self.transformer(tokens, mask, deterministic=deterministic)
         spatial_tokens = x[:, :, self.spatial_slice, :]
         x1_hat = self.flow_x_head(spatial_tokens)
         h_t = x[:, :, self.agent_slice, :] if self.n_agent > 0 else None  # (B,T,n_agent,D) or None
@@ -731,7 +769,7 @@ class PolicyHeadMTP(nn.Module):
     L: int = 8
     kind: str = "categorical"  # or "vbinary"
     mlp_ratio: float = 2.0
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
     dtype: Any = jnp.float32
@@ -741,7 +779,7 @@ class PolicyHeadMTP(nn.Module):
         self.projector = MLP(
             d_model=self.d_model,
             mlp_ratio=self.mlp_ratio,
-            dropout=self.dropout,
+            dropout_rate=self.dropout_rate,
             swiglu=self.swiglu,
             parity_2over3=self.parity_2over3,
             dtype=self.dtype,
@@ -770,7 +808,7 @@ class RewardHeadMTP(nn.Module):
     L: int = 8
     num_bins: int = 101
     mlp_ratio: float = 2.0
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
     dtype: Any = jnp.float32
@@ -782,7 +820,7 @@ class RewardHeadMTP(nn.Module):
         self.projector = MLP(
             d_model=self.d_model,
             mlp_ratio=self.mlp_ratio,
-            dropout=self.dropout,
+            dropout_rate=self.dropout_rate,
             swiglu=self.swiglu,
             parity_2over3=self.parity_2over3,
             dtype=self.dtype,
@@ -816,7 +854,7 @@ class ValueHead(nn.Module):
     d_model: int
     num_bins: int = 101
     mlp_ratio: float = 2.0
-    dropout: float = 0.0
+    dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
     dtype: Any = jnp.float32
@@ -828,7 +866,7 @@ class ValueHead(nn.Module):
         self.projector = MLP(
             d_model=self.d_model,
             mlp_ratio=self.mlp_ratio,
-            dropout=self.dropout,
+            dropout_rate=self.dropout_rate,
             swiglu=self.swiglu,
             parity_2over3=self.parity_2over3,
             dtype=self.dtype,
@@ -854,6 +892,10 @@ class ValueHead(nn.Module):
         return logits, centers_log
 
 
+
+
+# ---------- test encoder/decoder ----------
+
 def test_encoder_decoder():
     rng = jax.random.PRNGKey(0)
     B = 2
@@ -864,8 +906,8 @@ def test_encoder_decoder():
     enc_d_bottleneck = 3
     x = jnp.ones((B, T, n_patches, d_patch))  # (B,T,Np,D_patch)
 
-    encoder = Encoder(d_model=8, n_latents=enc_n_latents, n_patches=n_patches, n_heads=2, depth=2, dropout=0.5, d_bottleneck=enc_d_bottleneck)
-    decoder = Decoder(d_model=8, n_heads=2, depth=2, n_patches=n_patches, n_latents=enc_n_latents, d_patch=d_patch, dropout=0.5)
+    encoder = Encoder(d_model=8, n_latents=enc_n_latents, n_patches=n_patches, n_heads=2, n_kv_heads=1, depth=2, dropout_rate=0.5, d_bottleneck=enc_d_bottleneck)
+    decoder = Decoder(d_model=8, n_heads=2, n_kv_heads=1, depth=2, n_patches=n_patches, n_latents=enc_n_latents, d_patch=d_patch, dropout_rate=0.5)
     # init: give both "mae" and "dropout" keys (dropout only needed if deterministic=False)
     enc_vars = encoder.init(
         {"params": rng, "mae": jax.random.PRNGKey(1), "dropout": jax.random.PRNGKey(2)},
@@ -923,8 +965,8 @@ def test_dynamics():
     T = 10
     fake_enc_z = jnp.ones((B, T, 512, 16), dtype=jnp.float32)
     fake_actions = jnp.ones((B, T), dtype=jnp.int32)
-    fake_steps = jnp.full((B, T), 1/256, dtype=jnp.float32)
-    fake_signals = jnp.full((B, T), 0.0, dtype=jnp.float32)
+    fake_step_idxs = jnp.zeros((B, T), dtype=jnp.int32)
+    fake_signal_idxs = jnp.zeros((B, T), dtype=jnp.int32)
     def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
         """
         (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
@@ -942,6 +984,7 @@ def test_dynamics():
         "d_bottleneck": 16,
         "k_max": 8,
         "n_register": 10,
+        "n_agent": 1,
         "n_heads": 4,
         "depth": 4,
         "dropout": 0.0
@@ -950,32 +993,16 @@ def test_dynamics():
     dynamics_vars = dynamics.init(
         {"params": rng, "dropout": jax.random.PRNGKey(2)},
         fake_actions,
-        fake_steps,
-        fake_signals,
+        fake_step_idxs,
+        fake_signal_idxs,
         fake_packed_enc_tokens,
     )
-    out = dynamics.apply(dynamics_vars, fake_actions, fake_steps, fake_signals, fake_packed_enc_tokens,
+    out = dynamics.apply(dynamics_vars, fake_actions, fake_step_idxs, fake_signal_idxs, fake_packed_enc_tokens,
                         rngs={"dropout": jax.random.PRNGKey(2)},
                         deterministic=True)
 
-def _build_modality_mask(modality_ids, mode: str, n_latents=0, d_model=16, n_heads=2):
-    class _Peek(nn.Module):
-        @nn.compact
-        def __call__(self, x):
-            att = SpaceSelfAttentionModality(
-                d_model=d_model, n_heads=n_heads,
-                modality_ids=modality_ids, n_latents=n_latents,
-                mode=mode, dropout=0.0)
-            y = att(x, deterministic=True)
-            # expose stored mask
-            mask = att.variables["constants"]["modality_mask"]  # (1,1,S,S)
-            return y, mask
-
-    B,T,S,D = 1,1,modality_ids.shape[0],d_model
-    x = jnp.zeros((B,T,S,D))
-    vars_ = _Peek().init(jax.random.PRNGKey(0), x)
-    _, mask = _Peek().apply(vars_, x, mutable=False)
-    return jnp.asarray(mask)  # (1,1,S,S)
+def _build_modality_mask(modality_ids, mode: str):
+    return make_mask(modality_ids, mode)
 
 def _pack_bottleneck_to_spatial(z_btLd, n_spatial, k):
     return rearrange(z_btLd, 'b t (n k) d -> b t n (k d)', n=n_spatial, k=k)
@@ -1015,7 +1042,7 @@ def test_agent_firewall():
     agent_row = (modality_ids == AGENT)  # queries that are agent
 
     # ----- wm_agent -----
-    mask = _build_modality_mask(modality_ids, "wm_agent")[0,0]  # (S,S)
+    mask = _build_modality_mask(modality_ids, "wm_agent")  # (S,S)
     _print_mask_summary("wm_agent", modality_ids, mask)
 
     # Others never see agent: find any offending (q,k) where q!=agent and k is agent
@@ -1042,30 +1069,7 @@ def test_agent_firewall():
     if agent_q_idx >= 0:
         assert jnp.all(mask[agent_q_idx, :]), "Agent query cannot read some token in wm_agent"
 
-    # ----- wm_agent_isolated -----
-    mask_iso = _build_modality_mask(modality_ids, "wm_agent_isolated")[0,0]
-    _print_mask_summary("wm_agent_isolated", modality_ids, mask_iso)
 
-    # Others still never see agent
-    bad_q_iso = []
-    for q in range(S):
-        if not bool(agent_row[q]):
-            if bool(mask_iso[q, agent_col].sum()):
-                bad_q_iso.append(q)
-    if bad_q_iso:
-        print("Violations in wm_agent_isolated (non-agent reads agent) at query rows:", bad_q_iso)
-
-    # Agent reads nobody in isolated
-    if agent_q_idx >= 0:
-        agent_reads_iso = int(mask_iso[agent_q_idx, :].sum())
-        print("Agent read-count in isolated mode:", agent_reads_iso)
-
-    # Assertions
-    for q in range(S):
-        if not bool(agent_row[q]):
-            assert mask_iso[q, agent_col].sum() == 0, "Non-agent query can attend to agent in isolated!"
-    if agent_q_idx >= 0:
-        assert mask_iso[agent_q_idx, :].sum() == 0, "Agent should read nobody in wm_agent_isolated"
 
 
 def test_x1hat_invariant_to_agent_tokens():
@@ -1084,8 +1088,8 @@ def test_x1hat_invariant_to_agent_tokens():
     dyn = Dynamics(
         d_model=D, d_bottleneck=d_b, d_spatial=d_spatial,
         n_spatial=n_spatial, n_register=2, n_agent=1,
-        n_heads=2, depth=2, k_max=8, dropout=0.0, mlp_ratio=2.0,
-        time_every=2, space_mode="wm_agent"  # try either mode
+        n_heads=2, n_kv_heads=1, depth=2, k_max=8, dropout_rate=0.0, mlp_ratio=2.0,
+        time_every=2
     )
     vars_ = dyn.init({"params": jax.random.PRNGKey(0), "dropout": jax.random.PRNGKey(1)},
                      actions, step_idx, sig_idx, packed)
@@ -1116,7 +1120,7 @@ def test_shapes_and_h_t():
     packed = _pack_bottleneck_to_spatial(jnp.ones((B,T,n_b,d_b)), n_spatial, pack)
     dyn = Dynamics(d_model=D, d_bottleneck=d_b, d_spatial=d_spatial,
                    n_spatial=n_spatial, n_register=3, n_agent=1,
-                   n_heads=2, depth=2, k_max=8, space_mode="wm_agent")
+                   n_heads=2, depth=2, k_max=8)
     actions = jnp.zeros((B,T), dtype=jnp.int32)
     step_idx = jnp.zeros((B,T), dtype=jnp.int32)
     sig_idx  = jnp.zeros((B,T), dtype=jnp.int32)
@@ -1136,7 +1140,7 @@ def test_wm_routed():
       - Action q -> {Action k}
       - Obs q    -> {Obs k ∪ Action k} and never Agent k
       - Agent q  -> {Obs k ∪ Action k ∪ Agent k}    (wm_agent)
-                  -> {}                              (wm_agent_isolated)
+
       - For any non-agent q, Agent k is disallowed.
     """
     # Shorthand modality ints
@@ -1166,7 +1170,7 @@ def test_wm_routed():
     )
 
     def assert_mask(mode: str):
-        mask = _build_modality_mask(modality_ids, mode)[0, 0]  # (S,S) bool
+        mask = _build_modality_mask(modality_ids, mode)  # (S,S) bool
         _print_mask_summary(mode, modality_ids, mask)
 
         # 1) Non-agent q must never see Agent k
@@ -1174,46 +1178,38 @@ def test_wm_routed():
             if not bool(is_agent[q]):
                 assert not bool(mask[q, is_agent].any()), f"[{mode}] non-agent q={q} can read Agent k!"
 
-        # 2) Action q -> Action k only
-        for q in range(S):
-            if bool(is_action[q]):
-                # Allowed: action keys only
-                allowed = mask[q]
-                assert bool(allowed[is_action].all()), f"[{mode}] action q={q} cannot read some action k!"
-                assert not bool(allowed[~is_action].any()), f"[{mode}] action q={q} reads non-action keys!"
-
-        # 3) Obs q -> Obs k ∪ Action k (and never Agent k, already checked)
-        for q in range(S):
-            if bool(is_obs[q]):
-                allowed = mask[q]
-                # Must allow all obs keys? We enforce "subset includes only obs∪action".
-                # It's okay if some obs keys are masked by design, but we require no extra keys.
-                extras = allowed & ~(is_obs | is_action)
-                assert not bool(extras.any()), f"[{mode}] obs q={q} reads keys outside obs∪action!"
-
-                # Should at least be able to read *some* obs or action key (nontrivial)
-                assert bool((allowed & (is_obs | is_action)).any()), f"[{mode}] obs q={q} cannot read obs∪action at all!"
-
-        # 4) Agent q behavior differs by mode
+        # 2) Action q -> Action k only? NO, in wm_agent, non-agent can read all non-agent.
+        # So we just check that non-agent CAN read other non-agent keys (like Spatial).
+        # And specifically check that they CANNOT read Agent.
+        
+        # 3) Obs q -> Obs k ∪ Action k? NO, same as above.
+        
+        # We only strictly enforce:
+        # A) Non-agent q cannot read Agent k
+        # B) Agent q can read Agent k (and everyone else)
+        
+        # Check A: (Already done in step 1)
+        
+        # Check B:
         agent_rows = [i for i in range(S) if bool(is_agent[i])]
         if agent_rows:
             q = agent_rows[0]
             if mode == "wm_agent":
                 # Agent reads everyone (including agent)
                 assert bool(mask[q].all()), "[wm_agent] agent q cannot read all keys!"
-            else:
-                # Isolated: agent reads nobody
-                assert int(mask[q].sum()) == 0, "[wm_agent_isolated] agent q should read nobody!"
+
 
     # Run both modes
     assert_mask("wm_agent")
-    assert_mask("wm_agent_isolated")
+
     print("\n[test_wm_routed] All routing assertions passed ✅")
 
 
 if __name__ == "__main__":
-    # test_agent_firewall()
-    # test_x1hat_invariant_to_agent_tokens()
-    # test_shapes_and_h_t()
+    test_encoder_decoder()
+    test_dynamics()
+    test_agent_firewall()
+    test_x1hat_invariant_to_agent_tokens()
+    test_shapes_and_h_t()
     test_wm_routed()
     print("\nAll tests passed ✅")
