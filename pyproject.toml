@@ -3,18 +3,21 @@ name = "tiny-dreamer-4"
 version = "0.1.0"
 description = "Dreamer 4 implementation in pure Jax"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = "==3.11.*"
 dependencies = [
-    "einops>=0.8.1",
-    "flax>=0.12.0",
-    "hydra-core>=1.3.2",
-    "imageio[ffmpeg]>=2.37.0",
-    "jax[cuda12]>=0.7.2",
-    "jaxlpips>=1.2.0",
-    "matplotlib>=3.10.7",
-    "optax>=0.2.6",
-    "tqdm>=4.67.1",
-    "wandb>=0.23.0",
+    "einops",
+    "flax",
+    "hydra-core",
+    "imageio[ffmpeg]",
+    "jax[cuda12]",
+    "jaxlpips",
+    "matplotlib",
+    "optax",
+    "tqdm",
+    "wandb",
+    "procgen-mirror",
+    "tyro>=1.0.0",
+    "array-record>=0.8.3",
 ]
 
 [dependency-groups]

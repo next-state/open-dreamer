@@ -11,6 +11,7 @@ import tyro
 import json
 import os
 import pickle
+from gym3 import types_np
 from array_record.python.array_record_module import ArrayRecordWriter
 
 
@@ -60,7 +61,7 @@ class Args:
     num_episodes_train: int = 10000
     num_episodes_val: int = 500
     num_episodes_test: int = 500
-    output_dir: str = "data/coinrun_episodes"
+    output_dir: str = "datasets/coinrun_episodes"
     min_episode_length: int = 1000
     max_episode_length: int = 1000
     chunk_size: int = 160
@@ -101,7 +102,7 @@ def generate_episodes(num_episodes, split):
         first_obs = True
         for step_t in range(args.max_episode_length):
             _, obs, first = env.observe()
-            action = np.random.randint(0, env.ac_space.n)
+            action = types_np.sample(env.ac_space, bshape=(env.num,))
             env.act(action)
             observations_seq.append(obs["rgb"])
             actions_seq.append(action)
