@@ -1,6 +1,6 @@
 # sampling logic for debugging / visualization. Not JIT friendly.
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Tuple, Optional, Dict, Any, Callable
 from einops import reduce
 
@@ -12,7 +12,7 @@ from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadM
 from dreamer.utils import (
     temporal_patchify, temporal_unpatchify,
     pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck,
-    unnormalize_with_dataset_stats,
+    normalize_with_dataset_stats, unnormalize_with_dataset_stats,
 )
 
 # ---------------------------
@@ -44,8 +44,8 @@ class SamplerConfig:
     n_spatial: int = 8
     packing_factor: int = 2
     # dataset normalization
-    dataset_mean: float = 0.5
-    dataset_std: float = 0.288675
+    dataset_mean: list[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
+    dataset_std: list[float] = field(default_factory=lambda: [0.288675, 0.288675, 0.288675])
     # debugging (host-side only)
     debug: bool = False
     # Called with a dict. We call it twice: once with a high-level run "plan" (kind="plan"),
@@ -294,7 +294,8 @@ def sample_video(
 
     # 1) encode once (deterministic key)
     patches = temporal_patchify(frames, config.patch)
-    z_btLd, _ = encoder.apply(enc_vars, patches, rngs={"mae": mae_key}, deterministic=True)
+    patches_norm = normalize_with_dataset_stats(patches, mean=config.dataset_mean, std=config.dataset_std)
+    z_btLd, _ = encoder.apply(enc_vars, patches_norm, rngs={"mae": mae_key}, deterministic=True)
     z_all = pack_bottleneck_to_spatial(z_btLd, n_spatial=config.n_spatial, k=config.packing_factor)  # (B,T,n_spatial,D_s)
 
     # 2) split context vs future

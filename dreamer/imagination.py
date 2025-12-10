@@ -20,6 +20,7 @@ from dreamer.utils import (
     temporal_unpatchify,
     pack_bottleneck_to_spatial,
     unpack_spatial_to_bottleneck,
+    normalize_with_dataset_stats,
 )
 def _assert_power_of_two(k: int):
     if k < 1 or (k & (k - 1)) != 0:
@@ -681,9 +682,10 @@ def test_single_step_denoise_real_ckpt(use_jit: bool = False):
 
     # Encode full video once.
     patches = temporal_patchify(frames, patch)
+    patches_norm = normalize_with_dataset_stats(patches, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
     z_btLd, _ = train_state.encoder.apply(
         train_state.enc_vars,
-        patches,
+        patches_norm,
         rngs={"mae": train_state.mae_eval_key},
         deterministic=True,
     )
@@ -828,9 +830,10 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
 
     # Encode full video once.
     patches = temporal_patchify(frames, patch)
+    patches_norm = normalize_with_dataset_stats(patches, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
     z_btLd, _ = train_state.encoder.apply(
         train_state.enc_vars,
-        patches,
+        patches_norm,
         rngs={"mae": train_state.mae_eval_key},
         deterministic=True,
     )

@@ -53,6 +53,7 @@ from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn, Dat
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
+    normalize_with_dataset_stats,
     with_params,
     make_state,
     make_manager,
@@ -649,9 +650,10 @@ def initialize_models(
     )
 
     mae_eval_key = jax.random.PRNGKey(777)
+    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
     z_btLd, _ = encoder.apply(
         enc_vars,
-        patches_btnd,
+        patches_norm,
         rngs={"mae": mae_eval_key},
         deterministic=True,
     )
@@ -807,6 +809,8 @@ def encode_frames_to_spatial(
     patch: int,
     n_spatial: int,
     packing_factor: int,
+    dataset_mean,
+    dataset_std,
 ) -> jnp.ndarray:
     """
     Encode input frames into packed spatial tokens suitable for the dynamics model.
@@ -818,9 +822,10 @@ def encode_frames_to_spatial(
         z_ctx: (B, T_ctx, n_spatial, d_spatial)
     """
     patches_btnd = temporal_patchify(frames, patch)
+    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=dataset_mean, std=dataset_std)
     z_btLd, _ = encoder.apply(
         enc_vars,
-        patches_btnd,
+        patches_norm,
         rngs={"mae": mae_eval_key},
         deterministic=True,
     )
@@ -969,6 +974,8 @@ def eval_rollout_real_env(
     max_context: int,
     schedule_step_idx: int,
     k_max: int,
+    dataset_mean,
+    dataset_std,
     rng_key: jax.Array,
 ) -> EpisodeResult:
     """
@@ -996,6 +1003,8 @@ def eval_rollout_real_env(
         patch=patch,
         n_spatial=n_spatial,
         packing_factor=packing_factor,
+        dataset_mean=dataset_mean,
+        dataset_std=dataset_std,
     )  # (B, 1, n_spatial, d_spatial)
 
     # Initialize sliding context by tiling the initial frame and action.
@@ -1044,6 +1053,8 @@ def eval_rollout_real_env(
             patch=patch,
             n_spatial=n_spatial,
             packing_factor=packing_factor,
+            dataset_mean=dataset_mean,
+            dataset_std=dataset_std,
         )  # (B, 1, n_spatial, d_spatial)
 
         z_ctx_next = jnp.concatenate([z_ctx_t, z_next], axis=1)[
@@ -1181,6 +1192,8 @@ def evaluate_policy_real_env(
             max_context=cfg.context_length,
             schedule_step_idx=schedule_step_idx,
             k_max=k_max,
+            dataset_mean=cfg.dataset.dataset_mean,
+            dataset_std=cfg.dataset.dataset_std,
             rng_key=subkey,
         )
 
@@ -1270,6 +1283,8 @@ def train_step(
     patch: int,
     n_spatial: int,
     packing_factor: int,
+    dataset_mean,
+    dataset_std,
     rng_key: jax.Array,
 ):
     """
@@ -1298,9 +1313,10 @@ def train_step(
 
     # ----- Encode context frames to latents -----
     context_patches = temporal_patchify(context_frames, patch)
+    context_patches_norm = normalize_with_dataset_stats(context_patches, mean=dataset_mean, std=dataset_std)
     z_btLd, _ = encoder.apply(
         enc_vars,
-        context_patches,
+        context_patches_norm,
         rngs={"mae": mae_eval_key},
         deterministic=True,
     )
@@ -1711,6 +1727,8 @@ def run(cfg: RLConfig):
             patch=patch,
             n_spatial=n_spatial,
             packing_factor=cfg.packing_factor,
+            dataset_mean=cfg.dataset.dataset_mean,
+            dataset_std=cfg.dataset.dataset_std,
             rng_key=step_key,
         )
         train_t = time.perf_counter() - train_start_t
