@@ -913,16 +913,7 @@ def run(cfg: RealismConfig):
         print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
 
     # Data iterator (streaming)
-    next_batch = make_iterator(
-        cfg.dataset.B, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C,
-        pixels_per_step=cfg.dataset.pixels_per_step,
-        size_min=cfg.dataset.size_min, size_max=cfg.dataset.size_max,
-        hold_min=cfg.dataset.hold_min, hold_max=cfg.dataset.hold_max,
-        fg_min_color=0 if cfg.dataset.diversify_data else 128,
-        fg_max_color=255 if cfg.dataset.diversify_data else 128,
-        bg_min_color=0 if cfg.dataset.diversify_data else 255,
-        bg_max_color=255 if cfg.dataset.diversify_data else 255,
-    )
+    next_batch = make_iterator(cfg.dataset)
 
     # Initialize models and restore tokenizer
     init_rng = jax.random.PRNGKey(0)

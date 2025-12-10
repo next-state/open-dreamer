@@ -277,11 +277,8 @@ def run(cfg: TokenizerConfig):
         lpips_loss_fn = LPIPS(pretrained_network="alexnet")
 
     # data
-    _next_batch = make_iterator(
-        cfg.dataset.B, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, 
-        cfg.dataset.pixels_per_step, cfg.dataset.size_min, cfg.dataset.size_max, 
-        cfg.dataset.hold_min, cfg.dataset.hold_max
-    )
+    # data
+    _next_batch = make_iterator(cfg.dataset)
     def next_batch(rng):
         rng, (videos, actions, rewards) = _next_batch(rng)
         return rng, videos

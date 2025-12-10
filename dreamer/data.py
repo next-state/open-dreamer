@@ -33,6 +33,11 @@ class DatasetConfig:
     hold_min: int = 4
     hold_max: int = 9
     diversify_data: bool = True
+    
+    # Dataset selection
+    source: str = "bouncing_square"  # "bouncing_square" or "custom"
+    action_dim: int = 1  # For bouncing square it's discrete (1 dim), for others might be >1 or continuous
+
 
 
 # ============================================================
@@ -257,7 +262,7 @@ def generate_batch(
 # JIT-friendly iterator with stochastic policy
 # ============================================================
 
-def make_iterator(
+def make_bouncing_square_iterator(
     batch_size: int,
     time_steps: int,
     height: int,
@@ -408,6 +413,79 @@ def make_iterator(
         return key, (video, actions, rewards)
 
     return next
+
+
+def make_custom_iterator(cfg: DatasetConfig):
+    """
+    Template for a custom dataloader.
+    
+    Modify this function to load your data (e.g. from disk or another generator).
+    Be sure to respect cfg.H, cfg.W, cfg.T, cfg.B.
+    """
+    B, T, H, W, C = cfg.B, cfg.T, cfg.H, cfg.W, cfg.C
+    
+    @jax.jit
+    def next_batch(key):
+        """
+        Returns:
+            key: updated PRNGKey
+            (video, actions, rewards):
+                video   (B,T,H,W,C) float32 in [0,1]
+                actions (B,T,...)   int32 or float32 depending on action space
+                rewards (B,T)       float32
+        """
+        key, sub = jax.random.split(key)
+        
+        # Placeholder: Generate random noise video and zeros actions
+        video = jax.random.uniform(sub, (B, T, H, W, C), minval=0.0, maxval=1.0)
+        
+        # Example: if action_dim > 1, return (B, T, action_dim)
+        if cfg.action_dim > 1:
+            actions = jnp.zeros((B, T, cfg.action_dim), dtype=jnp.float32)
+        else:
+            # Discrete actions
+            actions = jnp.zeros((B, T), dtype=jnp.int32)
+            
+        rewards = jnp.zeros((B, T), dtype=jnp.float32)
+        
+        return key, (video, actions, rewards)
+
+    return next_batch
+
+
+def make_iterator(cfg: DatasetConfig):
+    """
+    Factory function to create a data iterator based on config.
+    """
+    if cfg.source == "bouncing_square":
+        if cfg.diversify_data:
+            fg_min, fg_max = 0, 255
+            bg_min, bg_max = 0, 255
+        else:
+            fg_min, fg_max = 128, 128
+            bg_min, bg_max = 255, 255
+            
+        return make_bouncing_square_iterator(
+            batch_size=cfg.B,
+            time_steps=cfg.T,
+            height=cfg.H,
+            width=cfg.W,
+            channels=cfg.C,
+            pixels_per_step=cfg.pixels_per_step,
+            size_min=cfg.size_min,
+            size_max=cfg.size_max,
+            hold_min=cfg.hold_min,
+            hold_max=cfg.hold_max,
+            fg_min_color=fg_min,
+            fg_max_color=fg_max,
+            bg_min_color=bg_min,
+            bg_max_color=bg_max,
+        )
+    elif cfg.source == "custom":
+        return make_custom_iterator(cfg)
+    else:
+        raise ValueError(f"Unknown dataset source: {cfg.source}")
+
 
 
 # ============================================================
@@ -701,7 +779,7 @@ def test_iterator():
     B, T = 6, 48
     H, W, C = 64, 64, 3
 
-    next_step = make_iterator(
+    next_step = make_bouncing_square_iterator(
         batch_size=B,
         time_steps=T,
         height=H,
