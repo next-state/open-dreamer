@@ -14,7 +14,7 @@ from jaxlpips import LPIPS
 from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
-from dreamer.utils import temporal_patchify, temporal_unpatchify, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
+from dreamer.utils import patchify, unpatchify, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
 from dreamer.logging import MetricLogger
 
 
@@ -134,8 +134,8 @@ def lpips_on_mae_recon(
     recon_masked_btnd = jnp.where(mae_mask, pred, target)
 
     # 2) Unpatchify to (B,T,H,W,C) in [0,1]
-    recon_imgs = temporal_unpatchify(recon_masked_btnd, H, W, C, patch)
-    target_imgs = temporal_unpatchify(target,        H, W, C, patch)
+    recon_imgs = unpatchify(recon_masked_btnd, H, W, C, patch)
+    target_imgs = unpatchify(target,        H, W, C, patch)
 
     # 3) Optional subsample frames over T to save compute
     if subsample_frac < 1.0:
@@ -163,7 +163,7 @@ def lpips_on_mae_recon(
 @partial(jax.jit, static_argnames=("encoder","decoder","patch"))
 def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, drop_key):
     # Same preprocessing as train
-    patches_btnd = temporal_patchify(batch, patch)  # (B,T,Np,D)
+    patches_btnd = patchify(batch, patch)  # (B,T,Np,D)
 
     # Run full model (no dropout during viz)
     pred_btnd, (mae_mask_btNp1, keep_prob_bt1) = forward_apply(
@@ -206,7 +206,7 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
     return (new_params, new_opt_state, new_model_state, metrics)
     """
     # 1) Prepare data
-    patches_btnd = temporal_patchify(batch, patch)  # (B,T,Np,Dp)
+    patches_btnd = patchify(batch['videos'], patch)  # (B,T,Np,Dp)
 
     # 2) Make per-step RNGs (fold_in ensures different masks per step even if base key repeats)
     step_key  = jax.random.fold_in(master_key, step)
@@ -268,7 +268,6 @@ def run(cfg: TokenizerConfig):
 
     rng = jax.random.PRNGKey(0)
     
-    num_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
     D_patch = cfg.patch_size * cfg.patch_size * cfg.dataset.C
 
     # instantiate once
@@ -277,15 +276,12 @@ def run(cfg: TokenizerConfig):
         lpips_loss_fn = LPIPS(pretrained_network="alexnet")
 
     # data
-    # data
     _next_batch = make_iterator(cfg.dataset)
-    def next_batch(rng):
-        rng, (videos, actions, rewards) = _next_batch(rng)
-        return rng, videos
 
-    rng, batch_rng = jax.random.split(rng)
-    rng, first_batch = next_batch(rng)  # warmup
+    first_batch = next(iter(_next_batch))
 
+    first_patches = patchify(first_batch['videos'], cfg.patch_size)
+    num_patches = first_patches.shape[-2]
     # models
     enc_kwargs = asdict(cfg.encoder)
     enc_kwargs.update({
@@ -301,7 +297,6 @@ def run(cfg: TokenizerConfig):
     encoder = Encoder(**enc_kwargs)
     decoder = Decoder(**dec_kwargs)
 
-    first_patches = temporal_patchify(first_batch, cfg.patch_size)
     rng, enc_vars, dec_vars = init_models(
         rng, encoder, decoder, first_patches, 
         cfg.dataset.B, cfg.dataset.T, cfg.encoder.n_latents, cfg.encoder.d_bottleneck
@@ -347,17 +342,10 @@ def run(cfg: TokenizerConfig):
             max_steps=cfg.max_steps,
             wandb_obj=wandb
         )
-        pbar = tqdm(range(start_step, cfg.max_steps + 1), 
-                    initial=start_step, 
-                    total=cfg.max_steps, 
-                    desc="Training Tokenizer", 
-                    dynamic_ncols=True)
+        pbar = tqdm(enumerate(_next_batch))
         
-        for step in pbar:
-            # use a fixed batch for debugging
-            # _, batch = next_batch(jax.random.PRNGKey(0))
+        for step, batch in pbar:
             data_start_t = time.perf_counter()
-            rng, batch = next_batch(rng)
             data_t = time.perf_counter() - data_start_t
 
             rng, master_key = jax.random.split(rng)
@@ -400,16 +388,16 @@ def run(cfg: TokenizerConfig):
             if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                 rng, viz_key = jax.random.split(rng)
                 mae_key, drop_key, vis_batch_key = jax.random.split(viz_key, 3)
-                _, viz_batch = next_batch(vis_batch_key)
+                viz_batch = batch['videos']
                 viz_batch = viz_batch[:8, :1]
                 out = viz_step(encoder, decoder, enc_vars, dec_vars, viz_batch,
                                patch=cfg.patch_size, mae_key=mae_key, drop_key=drop_key)
-                target = jnp.concatenate(temporal_unpatchify(out["target"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
-                masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
-                rec_masked  = jnp.concatenate(temporal_unpatchify(out["recon_masked"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
-                rec_unmasked  = jnp.concatenate(temporal_unpatchify(out["recon_full"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
+                target = jnp.concatenate(unpatchify(out["target"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
+                masked_in = jnp.concatenate(unpatchify(out["masked_input"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
+                rec_masked  = jnp.concatenate(unpatchify(out["recon_masked"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
+                rec_unmasked  = jnp.concatenate(unpatchify(out["recon_full"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
                 grid = jnp.concatenate([target, masked_in, rec_masked, rec_unmasked])
-                grid = jnp.asarray(grid * 255.0, dtype=jnp.uint8)
+                grid = jnp.asarray(grid, dtype=jnp.uint8)
                 vis_path = run_dir / "viz"
                 _ensure_dir(vis_path)
                 imageio.imwrite(vis_path / f"step_{step:03d}.png", grid)

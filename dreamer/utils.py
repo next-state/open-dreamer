@@ -20,18 +20,6 @@ class Modality(IntEnum):
     # add more as needed
 
 
-
-# --- helpers ---
-temporal_patchify = jax.jit(
-    jax.vmap(patchify, in_axes=(1, None), out_axes=1),  # (B,T,H,W,C) -> (B,T,Np,Dp)
-    static_argnames=("patch",),
-)
-
-temporal_unpatchify = jax.jit(
-    jax.vmap(unpatchify, in_axes=(1, None, None, None, None), out_axes=1),
-    static_argnames=("H", "W", "C", "patch"),
-)
-
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.

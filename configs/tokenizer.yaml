@@ -8,6 +8,15 @@ ckpt_save_every: 10_000
 
 patch_size: 4
 
+dataset:
+  source: "custom"
+  array_record_path: "datasets/coinrun_episodes/train"
+  B: 4
+  T: 16
+  H: 64
+  W: 64
+  C: 3
+
 encoder:
   n_latents: 16
   d_bottleneck: 32
@@ -35,7 +44,7 @@ decoder:
   rope_theta: ${encoder.rope_theta}
   time_every: ${encoder.time_every}
 
-lr: 1e-4
+lr: 3e-4
 max_steps: 1_000_000_000
 log_every: 100
 lpips_weight: 0.2

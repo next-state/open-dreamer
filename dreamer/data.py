@@ -21,10 +21,10 @@ class DatasetConfig:
     name: str = "bouncing_square"
     
     # Batch and sequence dimensions
-    B: int = 32  # batch size
-    T: int = 64  # sequence length
-    H: int = 32  # height
-    W: int = 32  # width
+    B: int = 4  # batch size
+    T: int = 16  # sequence length
+    H: int = 64  # height
+    W: int = 64  # width
     C: int = 3   # channels
     
     # Bouncing square specific parameters
@@ -36,9 +36,9 @@ class DatasetConfig:
     diversify_data: bool = True
     
     # Dataset selection
-    source: str = "bouncing_square"  # "bouncing_square" or "custom"
+    source: str = "custom"  # "bouncing_square" or "custom"
     action_dim: int = 1  # For bouncing square it's discrete (1 dim), for others might be >1 or continuous
-    array_record_path: str = "" 
+    array_record_path: str = "datasets/coinrun_episodes/train" 
 
 
 
@@ -724,7 +724,8 @@ def patchify(x: jnp.ndarray, patch: int) -> jnp.ndarray:
     x: (B, H, W, C)  ->  patches: (B, N, D)
       where N = (H/patch)*(W/patch), D = patch*patch*C
     """
-    patches = rearrange(x, "b (hp p1) (wp p2) c -> b (hp wp) (p1 p2 c)", p1=patch, p2=patch)
+    patches = rearrange(x, "... (hp p1) (wp p2) c -> ... (hp wp) (p1 p2 c)", p1=patch, p2=patch)
+    patches = (patches/127.5)-1
     return patches
 
 def unpatchify(patches: jnp.ndarray, H: int, W: int, C: int, patch: int) -> jnp.ndarray:
@@ -732,7 +733,8 @@ def unpatchify(patches: jnp.ndarray, H: int, W: int, C: int, patch: int) -> jnp.
     patches: (B, N, D)  ->  x: (B, H, W, C)
       where N = (H/patch)*(W/patch), D = patch*patch*C
     """
-    image = rearrange(patches, "b (hp wp) (p1 p2 c) -> b (hp p1) (wp p2) c", hp=H//patch, wp=W//patch, p1=patch, p2=patch, c=C)
+    image = rearrange(patches, "... (hp wp) (p1 p2 c) -> ... (hp p1) (wp p2) c", hp=H//patch, wp=W//patch, p1=patch, p2=patch, c=C)
+    image = (image+1)*127.5
     return image
 
 
