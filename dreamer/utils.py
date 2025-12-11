@@ -32,6 +32,62 @@ temporal_unpatchify = jax.jit(
     static_argnames=("H", "W", "C", "patch"),
 )
 
+def normalize_with_dataset_stats(videos, *, mean, std):
+    """
+    Normalize videos using dataset-level statistics.
+    
+    Handles both flattened patches (B, T, N, patch*patch*C) and spatial images (B, T, H, W, C).
+    For flattened patches, tiles the per-channel stats to match the interleaved layout.
+    
+    Args:
+        videos: input videos/patches
+        mean: dataset mean (list of C floats for per-channel)
+        std: dataset std (list of C floats for per-channel)
+    Returns:
+        normalized videos
+    """
+    mean_arr = jnp.asarray(mean, dtype=videos.dtype)
+    std_arr = jnp.asarray(std, dtype=videos.dtype)
+    
+    last_dim = videos.shape[-1]
+    num_channels = len(mean)
+    
+    if last_dim > num_channels and last_dim % num_channels == 0:
+        # flattened patches: tile stats to match interleaved layout
+        num_pixels = last_dim // num_channels
+        mean_arr = jnp.tile(mean_arr, num_pixels)
+        std_arr = jnp.tile(std_arr, num_pixels)
+    
+    return (videos - mean_arr) / std_arr
+
+def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
+    """
+    Unnormalize videos using dataset-level statistics.
+    
+    Handles both flattened patches (B, T, N, patch*patch*C) and spatial images (B, T, H, W, C).
+    For flattened patches, tiles the per-channel stats to match the interleaved layout.
+    
+    Args:
+        normalized_videos: normalized videos/patches
+        mean: dataset mean (list of C floats for per-channel)
+        std: dataset std (list of C floats for per-channel)
+    Returns:
+        unnormalized videos
+    """
+    mean_arr = jnp.asarray(mean, dtype=normalized_videos.dtype)
+    std_arr = jnp.asarray(std, dtype=normalized_videos.dtype)
+    
+    last_dim = normalized_videos.shape[-1]
+    num_channels = len(mean)
+    
+    if last_dim > num_channels and last_dim % num_channels == 0:
+        # flattened patches: tile stats to match interleaved layout
+        num_pixels = last_dim // num_channels
+        mean_arr = jnp.tile(mean_arr, num_pixels)
+        std_arr = jnp.tile(std_arr, num_pixels)
+    
+    return normalized_videos * std_arr + mean_arr
+
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.

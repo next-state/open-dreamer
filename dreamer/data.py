@@ -1,5 +1,5 @@
 from functools import partial
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import jax
 import jax.numpy as jnp
 import imageio.v2 as imageio
@@ -33,6 +33,10 @@ class DatasetConfig:
     hold_min: int = 4
     hold_max: int = 9
     diversify_data: bool = True
+    
+    # Dataset normalization statistics (for pixel values in [0, 1])
+    dataset_mean: list[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
+    dataset_std: list[float] = field(default_factory=lambda: [0.288675, 0.288675, 0.288675])  # sqrt(1/12)
 
 
 # ============================================================

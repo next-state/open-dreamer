@@ -21,7 +21,8 @@ import orbax.checkpoint as ocp
 from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
 from dreamer.data import make_iterator, DatasetConfig
 from dreamer.utils import (
-    temporal_patchify, pack_bottleneck_to_spatial, 
+    temporal_patchify, pack_bottleneck_to_spatial,
+    normalize_with_dataset_stats,
     with_params, make_state, make_manager, pack_mae_params,
 )
 
@@ -419,7 +420,8 @@ def init_models_and_restore(cfg: EvalConfig):
 
     # init dynamics vars from shapes
     mae_eval_key = jax.random.PRNGKey(777)
-    z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True)
+    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
+    z_btLd, _ = encoder.apply(enc_vars, patches_norm, rngs={"mae": mae_eval_key}, deterministic=True)
     z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
     emax = jnp.log2(cfg.k_max).astype(jnp.int32)
     step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
@@ -480,7 +482,8 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
 
     # encode to clean latents
     patches = temporal_patchify(frames, cfg.patch)
-    z_btLd, _ = enc.apply(enc_vars, patches, rngs={"mae": env["mae_eval_key"]}, deterministic=True)
+    patches_norm = normalize_with_dataset_stats(patches, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
+    z_btLd, _ = enc.apply(enc_vars, patches_norm, rngs={"mae": env["mae_eval_key"]}, deterministic=True)
     z_all = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
 
     # run dynamics once per timestep with "pure/clean" inputs: sigma=1 → z_tilde=z1, sigma_idx=k_max-1
@@ -589,6 +592,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
         rng_key=jax.random.PRNGKey(4242), mae_eval_key=env["mae_eval_key"],
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=n_spatial, packing_factor=cfg.packing_factor,
+        dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
     )
     pred_frames, floor_frames, gt_frames = sample_video(
         encoder=enc, decoder=dec, dynamics=dyn,
@@ -684,6 +688,7 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
         rng_key=jax.random.PRNGKey(101010), mae_eval_key=env["mae_eval_key"],
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=n_spatial, packing_factor=cfg.packing_factor,
+        dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
     )
     pred_frames, floor_frames, gt_frames = sample_video(
         encoder=enc, decoder=dec, dynamics=dyn,
@@ -694,7 +699,8 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
     # We want heads' predictions per generated step. We'll compute h on the final τ for each future step.
     # Re-encode context, and for each step t, run a single-step clean call with z_clean_pred (from sampler)
     patches = temporal_patchify(frames, cfg.patch)
-    z_btLd, _ = enc.apply(enc_vars, patches, rngs={"mae": env["mae_eval_key"]}, deterministic=True)
+    patches_norm = normalize_with_dataset_stats(patches, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
+    z_btLd, _ = enc.apply(enc_vars, patches_norm, rngs={"mae": env["mae_eval_key"]}, deterministic=True)
     z_all = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
     z_ctx_clean = z_all[:, :cfg.ctx_length, :, :]
 
@@ -727,7 +733,8 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
     # We'll also need the predicted latent at each step; we can re-encode pred_frames to get z for viz-aligned heads.
     # (This is slightly heavier but simple and faithful to what was decoded.)
     pred_patches = temporal_patchify(pred_frames, cfg.patch)
-    pred_btLd, _ = enc.apply(enc_vars, pred_patches, rngs={"mae": env["mae_eval_key"]}, deterministic=True)
+    pred_patches_norm = normalize_with_dataset_stats(pred_patches, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
+    pred_btLd, _ = enc.apply(enc_vars, pred_patches_norm, rngs={"mae": env["mae_eval_key"]}, deterministic=True)
     pred_latents_full = pack_bottleneck_to_spatial(pred_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
     pred_future_latents = pred_latents_full[:, cfg.ctx_length:, :, :]  # (B, horizon, S, D)
 
