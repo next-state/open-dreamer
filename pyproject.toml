@@ -18,6 +18,8 @@ dependencies = [
     "procgen-mirror",
     "tyro>=1.0.0",
     "array-record>=0.8.3",
+    "grain>=0.2.15",
+    "ipykernel>=7.1.0",
 ]
 
 [dependency-groups]

@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import imageio.v2 as imageio
 from einops import rearrange
+import coinrun_data.dataloader as coinrun_loader
 
 
 # ============================================================
@@ -37,6 +38,7 @@ class DatasetConfig:
     # Dataset selection
     source: str = "bouncing_square"  # "bouncing_square" or "custom"
     action_dim: int = 1  # For bouncing square it's discrete (1 dim), for others might be >1 or continuous
+    array_record_path: str = "" 
 
 
 
@@ -415,43 +417,6 @@ def make_bouncing_square_iterator(
     return next
 
 
-def make_custom_iterator(cfg: DatasetConfig):
-    """
-    Template for a custom dataloader.
-    
-    Modify this function to load your data (e.g. from disk or another generator).
-    Be sure to respect cfg.H, cfg.W, cfg.T, cfg.B.
-    """
-    B, T, H, W, C = cfg.B, cfg.T, cfg.H, cfg.W, cfg.C
-    
-    @jax.jit
-    def next_batch(key):
-        """
-        Returns:
-            key: updated PRNGKey
-            (video, actions, rewards):
-                video   (B,T,H,W,C) float32 in [0,1]
-                actions (B,T,...)   int32 or float32 depending on action space
-                rewards (B,T)       float32
-        """
-        key, sub = jax.random.split(key)
-        
-        # Placeholder: Generate random noise video and zeros actions
-        video = jax.random.uniform(sub, (B, T, H, W, C), minval=0.0, maxval=1.0)
-        
-        # Example: if action_dim > 1, return (B, T, action_dim)
-        if cfg.action_dim > 1:
-            actions = jnp.zeros((B, T, cfg.action_dim), dtype=jnp.float32)
-        else:
-            # Discrete actions
-            actions = jnp.zeros((B, T), dtype=jnp.int32)
-            
-        rewards = jnp.zeros((B, T), dtype=jnp.float32)
-        
-        return key, (video, actions, rewards)
-
-    return next_batch
-
 
 def make_iterator(cfg: DatasetConfig):
     """
@@ -482,7 +447,15 @@ def make_iterator(cfg: DatasetConfig):
             bg_max_color=bg_max,
         )
     elif cfg.source == "custom":
-        return make_custom_iterator(cfg)
+        return coinrun_loader.get_dataloader(
+            array_record_paths=cfg.array_record_path,
+            seq_len=cfg.T,
+            global_batch_size=cfg.B,
+            image_h=cfg.H,
+            image_w=cfg.W,
+            image_c=cfg.C, 
+            num_workers=1 # Use 1 worker to avoid multiprocessing complexity issues if any
+        )
     else:
         raise ValueError(f"Unknown dataset source: {cfg.source}")
 

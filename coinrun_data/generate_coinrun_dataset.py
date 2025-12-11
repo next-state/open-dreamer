@@ -15,7 +15,7 @@ from gym3 import types_np
 from array_record.python.array_record_module import ArrayRecordWriter
 
 
-def save_chunks(file_idx, chunks_per_file, output_dir, obs_chunks, act_chunks=None):
+def save_chunks(file_idx, chunks_per_file, output_dir, obs_chunks, act_chunks=None, rew_chunks=None):
     os.makedirs(output_dir, exist_ok=True)
 
     metadata = []
@@ -26,6 +26,10 @@ def save_chunks(file_idx, chunks_per_file, output_dir, obs_chunks, act_chunks=No
         if act_chunks:
             act_chunk_batch = act_chunks[:chunks_per_file]
             act_chunks = act_chunks[chunks_per_file:]
+        rew_chunk_batch = None
+        if rew_chunks:
+            rew_chunk_batch = rew_chunks[:chunks_per_file]
+            rew_chunks = rew_chunks[chunks_per_file:]
         episode_path = os.path.join(output_dir, f"data_{file_idx:04d}.array_record")
         writer = ArrayRecordWriter(str(episode_path), "group_size:1")
         seq_lens = []
@@ -41,6 +45,11 @@ def save_chunks(file_idx, chunks_per_file, output_dir, obs_chunks, act_chunks=No
                     act_chunk_batch[idx]
                 ), f"Observation data length and action sequence length do not match: {len(chunk)} != {len(act_chunk_batch[idx])}"
                 chunk_record["actions"] = act_chunk_batch[idx]
+            if rew_chunk_batch:
+                assert len(chunk) == len(
+                    rew_chunk_batch[idx]
+                ), f"Observation data length and reward sequence length do not match: {len(chunk)} != {len(rew_chunk_batch[idx])}"
+                chunk_record["rewards"] = rew_chunk_batch[idx]
             writer.write(pickle.dumps(chunk_record))
         writer.close()
         file_idx += 1
@@ -53,7 +62,7 @@ def save_chunks(file_idx, chunks_per_file, output_dir, obs_chunks, act_chunks=No
         )
         print(f"Created {episode_path} with {len(chunk_batch)} video chunks")
 
-    return metadata, file_idx, obs_chunks, act_chunks
+    return metadata, file_idx, obs_chunks, act_chunks, rew_chunks
 
 
 @dataclass
@@ -86,6 +95,7 @@ def generate_episodes(num_episodes, split):
     episode_metadata = []
     obs_chunks = []
     act_chunks = []
+    rew_chunks = []
     file_idx = 0
     output_dir_split = os.path.join(args.output_dir, split)
     while episode_idx < num_episodes:
@@ -94,23 +104,28 @@ def generate_episodes(num_episodes, split):
 
         observations_seq = []
         actions_seq = []
+        rewards_seq = []
         episode_obs_chunks = []
         episode_act_chunks = []
+        episode_rew_chunks = []
 
         # --- Run episode ---
         step_t = 0
         first_obs = True
         for step_t in range(args.max_episode_length):
-            _, obs, first = env.observe()
+            rew, obs, first = env.observe()
             action = types_np.sample(env.ac_space, bshape=(env.num,))
             env.act(action)
             observations_seq.append(obs["rgb"])
             actions_seq.append(action)
+            rewards_seq.append(rew)
             if len(observations_seq) == args.chunk_size:
                 episode_obs_chunks.append(observations_seq)
                 episode_act_chunks.append(actions_seq)
+                episode_rew_chunks.append(rewards_seq)
                 observations_seq = []
                 actions_seq = []
+                rewards_seq = []
             if first and not first_obs:
                 break
             first_obs = False
@@ -126,6 +141,7 @@ def generate_episodes(num_episodes, split):
                     )
                 episode_obs_chunks.append(observations_seq)
                 episode_act_chunks.append(actions_seq)
+                episode_rew_chunks.append(rewards_seq)
 
             obs_chunks_data = [
                 np.concatenate(seq, axis=0).astype(np.uint8)
@@ -134,11 +150,15 @@ def generate_episodes(num_episodes, split):
             act_chunks_data = [
                 np.concatenate(act, axis=0) for act in episode_act_chunks
             ]
+            rew_chunks_data = [
+                np.concatenate(rew, axis=0) for rew in episode_rew_chunks
+            ]
             obs_chunks.extend(obs_chunks_data)
             act_chunks.extend(act_chunks_data)
+            rew_chunks.extend(rew_chunks_data)
 
-            ep_metadata, file_idx, obs_chunks, act_chunks = save_chunks(
-                file_idx, args.chunks_per_file, output_dir_split, obs_chunks, act_chunks
+            ep_metadata, file_idx, obs_chunks, act_chunks, rew_chunks = save_chunks(
+                file_idx, args.chunks_per_file, output_dir_split, obs_chunks, act_chunks, rew_chunks
             )
             episode_metadata.extend(ep_metadata)
 
