@@ -5,7 +5,7 @@ import orbax.checkpoint as ocp
 from pathlib import Path
 import flax
 from flax.core import freeze, unfreeze, FrozenDict
-from einops import rearrange
+from einops import rearrange, repeat
 from enum import IntEnum
 from typing import Tuple
 
@@ -43,6 +43,65 @@ class TokenLayout:
             out[m] = slice(idx, idx + n)
             idx += n
         return out
+
+    def make_mask(self, mode: str, B: int, T: int):
+        """
+        Returns a (B*T, 1, S, S) boolean mask indicating allowed key for each query index, per mode.
+        S = number of tokens in a single frame.
+
+        Modes:
+        - "encoder":
+            - Latent tokens (query) can attend to ALL tokens (key).
+            - Non-latent tokens (query) can ONLY attend to tokens of the SAME modality (key).
+        - "decoder":
+            - Latent tokens (query) can ONLY attend to Latent tokens (key).
+            - Non-latent tokens (query) can attend to tokens of the SAME modality AND Latent tokens (key).
+        - "wm_agent":
+            - Action tokens (query) can ONLY attend to Action tokens (key).
+            - Observation tokens (query) can attend to Observation AND Action tokens (key).
+            - Agent tokens (query) can attend to ALL tokens (key).
+        """
+        modality_ids = self.modality_ids()
+        S = int(modality_ids.shape[0])
+
+        # Broadcast helpers
+        q_idx = jnp.arange(S)[:, None]       # (S,1)
+        k_idx = jnp.arange(S)[None, :]       # (1,S)
+
+        q_mod = modality_ids[q_idx]      # (S,1)
+        k_mod = modality_ids[k_idx]      # (1,S)
+
+        if mode == "encoder":
+            # latents -> all; non-latents -> same modality only
+            mask = (q_mod == k_mod) | (q_mod == Modality.LATENT)
+        elif mode == "decoder":
+            # latents -> latents only; non-latents -> same modality + latents
+            mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
+        elif mode == "wm_agent":
+            # wm_agent:
+
+            # Hierarchy levels: Action=0, Obs=1, Agent=2
+            # mask = level(q) >= level(k)
+            
+            def get_level(mod):
+                # Default to 1 (Obs)
+                lvl = jnp.ones_like(mod, dtype=jnp.int32) # Default to 1 (Obs)
+                lvl = jnp.where(mod == Modality.ACTION, 0, lvl) # Set to 0 if Action
+                lvl = jnp.where(mod == Modality.AGENT, 2, lvl) # Set to 2 if Agent
+                
+                return lvl
+
+            q_level = get_level(q_mod)
+            k_level = get_level(k_mod)
+            
+            mask = q_level >= k_level
+        else:
+            raise ValueError(f"Unknown mode {mode}")
+
+        # Save (S,S)
+        mask = repeat(modality_mask, "q k -> (b t) h q k", b=B, t=T, h=1)
+        mask = jax.lax.stop_gradient(mask)
+        return mask
 
 
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
@@ -124,60 +183,4 @@ def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict |
 
 
 
-def make_mask(token_layout: TokenLayout, mode: str):
-    """
-    Returns a (S,S) boolean mask indicating allowed key for each query index, per mode.
-    S = number of tokens in a single frame.
 
-    Modes:
-    - "encoder":
-        - Latent tokens (query) can attend to ALL tokens (key).
-        - Non-latent tokens (query) can ONLY attend to tokens of the SAME modality (key).
-    - "decoder":
-        - Latent tokens (query) can ONLY attend to Latent tokens (key).
-        - Non-latent tokens (query) can attend to tokens of the SAME modality AND Latent tokens (key).
-    - "wm_agent":
-        - Action tokens (query) can ONLY attend to Action tokens (key).
-        - Observation tokens (query) can attend to Observation AND Action tokens (key).
-        - Agent tokens (query) can attend to ALL tokens (key).
-    """
-    modality_ids = token_layout.modality_ids()
-    S = int(modality_ids.shape[0])
-
-    # Broadcast helpers
-    q_idx = jnp.arange(S)[:, None]       # (S,1)
-    k_idx = jnp.arange(S)[None, :]       # (1,S)
-
-    q_mod = modality_ids[q_idx]      # (S,1)
-    k_mod = modality_ids[k_idx]      # (1,S)
-
-    if mode == "encoder":
-        # latents -> all; non-latents -> same modality only
-        mask = (q_mod == k_mod) | (q_mod == Modality.LATENT)
-    elif mode == "decoder":
-        # latents -> latents only; non-latents -> same modality + latents
-        mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
-    elif mode == "wm_agent":
-        # wm_agent:
-
-        # Hierarchy levels: Action=0, Obs=1, Agent=2
-        # mask = level(q) >= level(k)
-        
-        def get_level(mod):
-            # Default to 1 (Obs)
-            lvl = jnp.ones_like(mod, dtype=jnp.int32) # Default to 1 (Obs)
-            lvl = jnp.where(mod == Modality.ACTION, 0, lvl) # Set to 0 if Action
-            lvl = jnp.where(mod == Modality.AGENT, 2, lvl) # Set to 2 if Agent
-            
-            return lvl
-
-        q_level = get_level(q_mod)
-        k_level = get_level(k_mod)
-        
-        mask = q_level >= k_level
-    else:
-        raise ValueError(f"Unknown mode {mode}")
-
-    # Save (S,S)
-    modality_mask = jax.lax.stop_gradient(mask)
-    return modality_mask

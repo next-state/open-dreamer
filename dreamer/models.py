@@ -9,7 +9,7 @@ from enum import IntEnum
 from typing import Optional, Tuple, Any
 from einops import rearrange, repeat
 import math
-from .utils import make_mask, Modality, TokenLayout
+from .utils import Modality, TokenLayout
 
 
 
@@ -392,18 +392,15 @@ class Encoder(nn.Module):
 
         # 3) Prepend learned latents (owned here)
         B, T = proj_patches_masked.shape[:2]
-        latents = jnp.broadcast_to(self.latents[None, None, ...], (B, T, *self.latents.shape))
+        latents = repeat(self.latents, "... -> b t ...", b=B, t=T)
         tokens = jnp.concatenate([latents, proj_patches_masked], axis=2)  # (B,T,S=(Np+Nl),D)
-
-
 
         # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
         layout = TokenLayout((
             (Modality.LATENT, self.n_latents),
             (Modality.IMAGE, patch_tokens.shape[-2]),
             ))
-        mask = make_mask(layout, "encoder")
-        mask = repeat(mask, " ... -> bt h ...", bt=B*T, h=1)
+        mask = layout.make_mask("encoder", B, T)
 
         # 5) Feed tokens into transformer
         encoded_tokens = self.transformer(tokens, mask=mask, deterministic=deterministic)
@@ -481,8 +478,7 @@ class Decoder(nn.Module):
             (Modality.LATENT, N_l),
             (Modality.IMAGE, self.n_patches)
             ))
-        mask = make_mask(layout, "decoder")
-        mask = repeat(mask, " ... -> bt h ...", bt=B*T, h=1)
+        mask = layout.make_mask("decoder", B, T)
 
         # 6) Axial block-causal transformer
         x = self.transformer(tokens, mask=mask, deterministic=deterministic)
@@ -565,8 +561,6 @@ class Dynamics(nn.Module):
         self.spatial_slice = self.layout.slices()[Modality.SPATIAL]
         self.agent_slice  = self.layout.slices().get(Modality.AGENT, slice(0,0))  # safe if n_agent==0
         self.modality_ids = self.layout.modality_ids()
-        mask = make_mask(self.layout, "wm_agent")
-        self.mask = self.variable("constants", "mask", lambda: mask)
 
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
@@ -644,7 +638,7 @@ class Dynamics(nn.Module):
 
 
         
-        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
+        mask = self.layout.make_mask("wm_agent", B, T)
         x = self.transformer(tokens, mask, deterministic=deterministic)
         spatial_tokens = x[:, :, self.spatial_slice, :]
         x1_hat = self.flow_x_head(spatial_tokens)
