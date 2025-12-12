@@ -72,7 +72,7 @@ def lpips_on_mae_recon(
 
 # --- viz step ---
 @partial(jax.jit, static_argnames=("tokenizer"))
-def viz_step(tokenizer, params, videos, *, mae_key, drop_key):
+def _viz_step_jit(tokenizer, params, videos, *, mae_key, drop_key):
     # Model expects -1..1
     
     # Run full model (no dropout during viz)
@@ -90,7 +90,30 @@ def viz_step(tokenizer, params, videos, *, mae_key, drop_key):
     recon_masked = videos_255 * (1.0 - frame_mask) + recon_255 * frame_mask
     recon_full = recon_255
 
-    return videos_255, masked_input, recon_masked, recon_full, frame_mask
+    grid = jnp.concatenate([videos_255, masked_input, recon_masked, recon_full], axis=2)
+    grid = einops.rearrange(grid[:,0], "b h w c -> h (b w) c")
+    grid = grid.clip(0, 255).astype(jnp.uint8)
+
+    return grid 
+
+def viz_step(tokenizer, params, videos, rng, step, run_dir):
+    # Split RNG for visualization
+    # We use fold_in to allow deterministic visualization regardless of training path
+    rng_viz = jax.random.fold_in(rng, step)
+    mae_key, drop_key = jax.random.split(rng_viz, 2)
+    
+    # Take first 8 examples, first frame: (8, 1, H, W, C)
+    viz_batch = videos[:8, :1]
+    viz_batch = viz_batch.astype(jnp.float32) 
+    
+    grid = _viz_step_jit(
+        tokenizer, params, viz_batch, mae_key=mae_key, drop_key=drop_key
+    )
+    
+    vis_path = run_dir / "viz"
+    if not vis_path.exists():
+        vis_path.mkdir(parents=True)
+    imageio.imwrite(vis_path / f"step_{step:03d}.png", grid)
 
 
 # --- train step ---
@@ -161,7 +184,7 @@ def run(cfg: TokenizerConfig):
     # Mock dataset for debugging
     rng, key = jax.random.split(rng)
     B, T, H, W, C = cfg.dataset.B, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C
-    dummy_videos = jax.random.randint(key, (B, T, H, W, C), 0, 255, dtype=jnp.uint8)
+    dummy_videos = jax.random.uniform(key, (B, T, H, W, C))
 
     tokenizer = Tokenizer(cfg)
     rng, tokenizer_vars = init_models(rng, tokenizer, dummy_videos)
@@ -229,15 +252,7 @@ def run(cfg: TokenizerConfig):
                 
                 logger.log(
                     step,
-                    metrics={
-                        "total": aux['loss_total'],
-                        "rmse": rmse,
-                        "lpips": aux['loss_lpips'],
-                        "psnr": psnr,
-                        "time/data": data_t,
-                        "time/train": train_t,
-                        "time/total": total_t,
-                    },
+                    metrics={"total": aux['loss_total'], "rmse": rmse, "lpips": aux['loss_lpips'], "psnr": psnr, "time/data": data_t, "time/train": train_t, "time/total": total_t},
                     pbar=pbar,
                     float_fmt=".6f"
                 )
@@ -248,24 +263,7 @@ def run(cfg: TokenizerConfig):
 
             # Viz
             if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
-                rng, viz_key = jax.random.split(rng)
-                mae_key, drop_key, vis_batch_key = jax.random.split(viz_key, 3)
-                
-                # Take first 8 examples, first frame: (8, 1, H, W, C)
-                viz_batch = videos[:8, :1]
-                # Normalize to 0..1 for viz_step
-                viz_batch = viz_batch.astype(jnp.float32) 
-                
-                target, masked_in, rec_masked, rec_full, frame_mask = viz_step(tokenizer, params, viz_batch, mae_key=mae_key, drop_key=drop_key)
-                
-                grid = jnp.concatenate([target, masked_in, rec_masked, rec_full], axis=2)
-                grid = einops.rearrange(grid[:,0], "b h w c -> h (b w) c")
-                grid = grid.clip(0, 255).astype(jnp.uint8)
-                
-                vis_path = run_dir / "viz"
-                if not vis_path.exists():
-                    vis_path.mkdir(parents=True)
-                imageio.imwrite(vis_path / f"step_{step:03d}.png", grid)
+                viz_step(tokenizer, params, videos, rng, step, run_dir)
     finally:
         # Make sure any background saves finish before exit.
         # mngr.wait_until_finished()
