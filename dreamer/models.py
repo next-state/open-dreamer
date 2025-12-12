@@ -246,8 +246,8 @@ class GroupedQueryAttention(nn.Module):
         self.dropout = nn.Dropout(self.dropout_rate)
 
         if self.qk_norm_type == 'qknorm':
-            self.q_ln = nn.LayerNorm(use_bias=True, use_scale=True)
-            self.k_ln = nn.LayerNorm(use_bias=True, use_scale=True)
+            self.q_ln = nn.RMSNorm(use_scale=True)
+            self.k_ln = nn.RMSNorm(use_scale=True)
 
     def __call__(self, x, mask, *args, cache: Optional[KVCache] = None):
         """
