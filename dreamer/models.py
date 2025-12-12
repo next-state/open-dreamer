@@ -9,39 +9,9 @@ from enum import IntEnum
 from typing import Optional, Tuple, Any
 from einops import rearrange, repeat
 import math
-from .utils import make_mask, Modality
+from .utils import make_mask, Modality, TokenLayout
 
 
-@flax.struct.dataclass  # immutable, PyTree-friendly
-class TokenLayout:
-    """
-    Ordered token layout for a single timestep: latents first (if any),
-    then a sequence of (modality, count) segments.
-    """
-    n_latents: int
-    segments: Tuple[Tuple[Modality, int], ...]  # e.g., ((Modality.IMAGE, n_patches), (Modality.ACTION, n_act), ...)
-
-    def S(self) -> int:
-        return self.n_latents + sum(n for _, n in self.segments)
-
-    def modality_ids(self) -> jnp.ndarray:
-        parts = [jnp.full((self.n_latents,), Modality.LATENT, dtype=jnp.int32)] if self.n_latents > 0 else []
-        for m, n in self.segments:
-            if n > 0:
-                parts.append(jnp.full((n,), int(m), dtype=jnp.int32))
-        return jnp.concatenate(parts) if parts else jnp.zeros((0,), dtype=jnp.int32)  # (S,)
-
-    def slices(self) -> dict:
-        """Convenience: start/stop indices per modality (first occurrence if repeated)."""
-        idx = 0
-        out = {}
-        if self.n_latents > 0:
-            out[Modality.LATENT] = slice(idx, idx + self.n_latents); idx += self.n_latents
-        for m, n in self.segments:
-            if n > 0 and m not in out:
-                out[m] = slice(idx, idx + n)
-            idx += n
-        return out
 
     
 def sinusoid_table(n: int, d: int, base: float = 10000.0, dtype=jnp.float32) -> jnp.ndarray:
@@ -428,10 +398,6 @@ class Encoder(nn.Module):
     def setup(self):
         self.patch_proj = nn.Dense(self.d_model, name="patch_proj")
         self.bottleneck_proj = nn.Dense(self.d_bottleneck, name="bottleneck_proj")
-        self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
-        self.modality_ids = self.layout.modality_ids()            # (S,)
-        mask = make_mask(self.modality_ids, "encoder")
-        self.mask = self.variable("constants", "mask", lambda: mask)
 
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
@@ -454,29 +420,30 @@ class Encoder(nn.Module):
 
         # 2) MAE mask-and-replace on patch tokens (encoder input only)
         proj_patches_masked, patch_mask, keep_prob = MAEReplacer(name="mae", p_min=self.mae_p_min, p_max=self.mae_p_max)(proj_patches)
-        # print(f"proj_patches_masked.shape: {proj_patches_masked.shape}")
-        # print(f"patch_mask.shape: {patch_mask.shape}")
 
         # 3) Prepend learned latents (owned here)
-        # print(f"latents.shape: {latents.shape}")
         B, T = proj_patches_masked.shape[:2]
         latents = jnp.broadcast_to(self.latents[None, None, ...], (B, T, *self.latents.shape))
-        # print(f"lat_btld.shape: {lat_btld.shape}")
         tokens = jnp.concatenate([latents, proj_patches_masked], axis=2)  # (B,T,S=(Np+Nl),D)
-        # print(f"tokens_btSd.shape: {tokens_btSd.shape}")
 
         # 4) Add sinusoidal positions (param-free)
         if not self.use_rope:
             tokens = add_sinusoidal_positions(tokens)
 
         # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
-        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
+        layout = TokenLayout((
+            (Modality.LATENT, self.n_latents),
+            (Modality.IMAGE, patch_tokens.shape[-2]),
+            ))
+
+        mask = make_mask(layout, "encoder")
+        mask = repeat(mask, " ... -> bt h ...", bt=B*T, h=1)
+
         # 5) Feed tokens into transformer
         encoded_tokens = self.transformer(tokens, mask=mask, deterministic=deterministic)
-        # print(f"encoded_tokens_btSd.shape: {encoded_tokens_btSd.shape}")
 
         # 6) Project latent tokens to bottleneck and tanh
-        latent_tokens = encoded_tokens[:, :, :self.n_latents, :]
+        latent_tokens = encoded_tokens[:, :, :self.n_latents]
         proj_tokens = nn.tanh(self.bottleneck_proj(latent_tokens))
 
         return proj_tokens, (patch_mask, keep_prob)  # keep mask if you want diagnostics
@@ -510,8 +477,6 @@ class Decoder(nn.Module):
     rope_theta: float = 10000.0
 
     def setup(self):
-        self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
-        self.modality_ids = self.layout.modality_ids()
         self.up_proj = nn.Dense(self.d_model, name="up_proj")
         self.patch_queries = self.param(
             "patch_queries",
@@ -531,8 +496,6 @@ class Decoder(nn.Module):
             use_rope=self.use_rope,
             rope_theta=self.rope_theta,
         )
-        mask = make_mask(self.modality_ids, "decoder")
-        self.mask = self.variable("constants", "mask", lambda: mask)
 
     @nn.compact
     def __call__(self, z: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
@@ -542,24 +505,26 @@ class Decoder(nn.Module):
         latents = self.up_proj(z)  # (B, T, N_l, D)
 
         # 2) Learned per-patch query tokens (owned by the decoder)
-        patches = jnp.broadcast_to(
-            self.patch_queries[None, None, ...],
-            (B, T, self.n_patches, self.d_model),
-        )  # (B, T, Np, D)
+        patches = repeat(self.patch_queries, " ... -> b t ...", b=B, t=T)  # (B, T, Np, D)
 
         # 3) Concat: [latents, patch queries]  ->  (B, T, S=N_l+N_p, D)
-        tokens = jnp.concatenate([latents, patches], axis=2)
+        tokens = jnp.concatenate([latents, patches], axis=-2)
 
         # 4) Add sinusoidal positions
         if not self.use_rope:
             tokens = add_sinusoidal_positions(tokens)
 
-        # 5) Axial block-causal transformer
-        #    - SpaceSelfAttention over all S tokens (latents + queries)
-        #    - TimeSelfAttention only over the first N_l latent tokens
-        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
+        # 5) Make mask
+        layout = TokenLayout((
+            (Modality.LATENT, N_l),
+            (Modality.IMAGE, self.n_patches)
+            ))
+        mask = make_mask(layout, "decoder")
+        mask = repeat(mask, " ... -> bt h ...", bt=B*T, h=1)
+
+        # 6) Axial block-causal transformer
         x = self.transformer(tokens, mask=mask, deterministic=deterministic)
-        # 6) Prediction head over the patch-query slice
+        # 7) Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
         pred_btnd = nn.sigmoid(self.patch_head(x_patches))  # (B,T,Np,D_patch)
         return pred_btnd
@@ -635,7 +600,7 @@ class Dynamics(nn.Module):
         ]
         if self.n_agent > 0:
             segments.append((Modality.AGENT, self.n_agent))
-        self.layout = TokenLayout(n_latents=0, segments=tuple(segments))
+        self.layout = TokenLayout(segments=tuple(segments))
         self.spatial_slice = self.layout.slices()[Modality.SPATIAL]
         self.agent_slice  = self.layout.slices().get(Modality.AGENT, slice(0,0))  # safe if n_agent==0
         self.modality_ids = self.layout.modality_ids()

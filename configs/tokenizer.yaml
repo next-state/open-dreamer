@@ -11,7 +11,7 @@ patch_size: 4
 dataset:
   source: "custom"
   array_record_path: "datasets/coinrun_episodes/train"
-  B: 4
+  B: 64
   T: 16
   H: 64
   W: 64

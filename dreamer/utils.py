@@ -3,9 +3,11 @@ import jax.numpy as jnp
 from dreamer.data import patchify, unpatchify
 import orbax.checkpoint as ocp
 from pathlib import Path
+import flax
 from flax.core import freeze, unfreeze, FrozenDict
 from einops import rearrange
 from enum import IntEnum
+from typing import Tuple
 
 class Modality(IntEnum):
     LATENT   = -1
@@ -18,6 +20,29 @@ class Modality(IntEnum):
     SHORTCUT_STEP = 6
     AGENT = 7
     # add more as needed
+
+@flax.struct.dataclass  # immutable, PyTree-friendly
+class TokenLayout:
+    """
+    Ordered token layout for a single timestep: segments define the order.
+    """
+    segments: Tuple[Tuple[Modality, int], ...]  # e.g., ((Modality.LATENT, n_latents), (Modality.IMAGE, n_patches), ...)
+
+    def S(self) -> int:
+        return sum(n for _, n in self.segments)
+
+    def modality_ids(self) -> jnp.ndarray:
+        parts = [jnp.full((n,), int(m), dtype=jnp.int32) for m, n in self.segments]
+        return jnp.concatenate(parts)
+
+    def slices(self) -> dict:
+        """Convenience: start/stop indices per modality (first occurrence if repeated)."""
+        idx = 0
+        out = {}
+        for m, n in self.segments:
+            out[m] = slice(idx, idx + n)
+            idx += n
+        return out
 
 
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
@@ -99,7 +124,7 @@ def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict |
 
 
 
-def make_mask(modality_ids: jnp.ndarray, mode: str):
+def make_mask(token_layout: TokenLayout, mode: str):
     """
     Returns a (S,S) boolean mask indicating allowed key for each query index, per mode.
     S = number of tokens in a single frame.
@@ -116,6 +141,7 @@ def make_mask(modality_ids: jnp.ndarray, mode: str):
         - Observation tokens (query) can attend to Observation AND Action tokens (key).
         - Agent tokens (query) can attend to ALL tokens (key).
     """
+    modality_ids = token_layout.modality_ids()
     S = int(modality_ids.shape[0])
 
     # Broadcast helpers
