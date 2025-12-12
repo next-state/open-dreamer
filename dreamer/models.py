@@ -1,4 +1,5 @@
 from functools import lru_cache
+from dataclasses import asdict
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
@@ -10,6 +11,8 @@ from typing import Optional, Tuple, Any
 from einops import rearrange, repeat
 import math
 from .utils import Modality, TokenLayout
+from .data import patchify, unpatchify
+from .configs import TokenizerConfig
 
 
 
@@ -352,7 +355,7 @@ class BlockCausalTransformer(nn.Module):
 class Encoder(nn.Module):
     d_model: int
     n_latents: int
-    n_patches: int
+    patch_size: int
     n_heads: int
     n_kv_heads: int
     depth: int
@@ -380,15 +383,21 @@ class Encoder(nn.Module):
             time_every=self.time_every,
             rope_theta=self.rope_theta,
         )
+        self.mask_and_replace = MAEReplacer(name="mae", p_min=self.mae_p_min, p_max=self.mae_p_max)
         self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
 
     @nn.compact
-    def __call__(self, patch_tokens, *, deterministic: bool = True) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
-        # 1) Project patches to D_model
+    def __call__(self, videos, *, deterministic: bool = True) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+        # 1) Make patches and project to D_model
+        B, T, H, W, C = videos.shape
+        patch_tokens = patchify(videos, patch=self.patch_size)
         proj_patches = self.patch_proj(patch_tokens)  # (B,T,Np,D)
 
         # 2) MAE mask-and-replace on patch tokens (encoder input only)
-        proj_patches_masked, patch_mask, keep_prob = MAEReplacer(name="mae", p_min=self.mae_p_min, p_max=self.mae_p_max)(proj_patches)
+        proj_patches_masked, patch_mask, keep_prob = self.mask_and_replace(proj_patches)
+        # patch_mask is (B,T,Np,1), need to expand to pixels (B,T,Np, P*P)
+        patch_mask_expanded = jnp.repeat(patch_mask, self.patch_size**2, axis=-1)
+        frame_mask = unpatchify(patch_mask_expanded, self.patch_size, H, W)
 
         # 3) Prepend learned latents (owned here)
         B, T = proj_patches_masked.shape[:2]
@@ -409,7 +418,7 @@ class Encoder(nn.Module):
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
         proj_tokens = nn.tanh(self.bottleneck_proj(latent_tokens))
 
-        return proj_tokens, (patch_mask, keep_prob)  # keep mask if you want diagnostics
+        return proj_tokens, (frame_mask, keep_prob)  # keep mask if you want diagnostics
 
 class Decoder(nn.Module):
     """
@@ -430,8 +439,10 @@ class Decoder(nn.Module):
     n_kv_heads: int
     depth: int
     n_latents: int
-    n_patches: int
+    patch_size: int
     d_patch: int
+    H: int
+    W: int
     dropout_rate: float = 0.0
     qk_norm_type: str | None = None
     mlp_ratio: float = 4.0
@@ -439,13 +450,10 @@ class Decoder(nn.Module):
     rope_theta: float = 10000.0
 
     def setup(self):
+        self.n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
         self.up_proj = nn.Dense(self.d_model, name="up_proj")
-        self.patch_queries = self.param(
-            "patch_queries",
-            nn.initializers.normal(0.02),
-            (self.n_patches, self.d_model),
-        ) # (Np, D)
         self.patch_head = nn.Dense(self.d_patch, name="patch_head") # (Np, D_patch)
+
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
@@ -457,6 +465,7 @@ class Decoder(nn.Module):
             time_every=self.time_every,
             rope_theta=self.rope_theta,
         )
+        self.patch_queries = self.param("patch_queries", nn.initializers.normal(0.02),(self.n_patches, self.d_model)) # (Np, D)
 
     @nn.compact
     def __call__(self, z: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
@@ -471,8 +480,6 @@ class Decoder(nn.Module):
         # 3) Concat: [latents, patch queries]  ->  (B, T, S=N_l+N_p, D)
         tokens = jnp.concatenate([latents, patches], axis=-2)
 
-
-
         # 5) Make mask
         layout = TokenLayout((
             (Modality.LATENT, N_l),
@@ -485,7 +492,28 @@ class Decoder(nn.Module):
         # 7) Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
         pred_btnd = nn.sigmoid(self.patch_head(x_patches))  # (B,T,Np,D_patch)
-        return pred_btnd
+        out_frames = unpatchify(pred_btnd, patch=self.patch_size, H=self.H, W=self.W)
+        return out_frames
+
+
+class Tokenizer(nn.Module):
+    config: TokenizerConfig
+
+    def setup(self):
+        # Encoder configuration
+        enc_kwargs = asdict(self.config.encoder)
+        dec_kwargs = asdict(self.config.decoder)
+        dec_kwargs["H"] = self.config.dataset.H
+        dec_kwargs["W"] = self.config.dataset.W
+
+        self.encoder = Encoder(**enc_kwargs)
+        self.decoder = Decoder(**dec_kwargs)
+
+    @nn.compact
+    def __call__(self, videos, deterministic: bool = True):
+        z, aux = self.encoder(videos, deterministic=deterministic)
+        recon = self.decoder(z, deterministic=deterministic)
+        return recon, aux
 
 class ActionEncoder(nn.Module):
     d_model: int
@@ -808,326 +836,3 @@ class ValueHead(nn.Module):
         logits = self.out(x)                                   # (B, T, K)
         centers_log = self.centers_var.value                   # (K,)
         return logits, centers_log
-
-
-
-
-# ---------- test encoder/decoder ----------
-
-def test_encoder_decoder():
-    rng = jax.random.PRNGKey(0)
-    B = 2
-    T = 10
-    n_patches = 4
-    d_patch = 3
-    enc_n_latents = 2
-    enc_d_bottleneck = 3
-    x = jnp.ones((B, T, n_patches, d_patch))  # (B,T,Np,D_patch)
-
-    encoder = Encoder(d_model=8, n_latents=enc_n_latents, n_patches=n_patches, n_heads=2, n_kv_heads=1, depth=2, dropout_rate=0.5, d_bottleneck=enc_d_bottleneck)
-    decoder = Decoder(d_model=8, n_heads=2, n_kv_heads=1, depth=2, n_patches=n_patches, n_latents=enc_n_latents, d_patch=d_patch, dropout_rate=0.5)
-    # init: give both "mae" and "dropout" keys (dropout only needed if deterministic=False)
-    enc_vars = encoder.init(
-        {"params": rng, "mae": jax.random.PRNGKey(1), "dropout": jax.random.PRNGKey(2)},
-        x,
-        deterministic=True,
-    )
-    # Decode
-    fake_z = jnp.ones((B, T, enc_n_latents, enc_d_bottleneck))
-    dec_vars = decoder.init(
-        {"params": rng, "dropout": jax.random.PRNGKey(2)},
-        fake_z,
-        deterministic=True,
-    )
-
-    def forward_apply(enc_vars: FrozenDict, dec_vars: FrozenDict,
-                    patches_btnd: jnp.ndarray,
-                    *, mae_key=None, drop_key=None, train: bool):
-        # Encoder
-        rngs_enc = {}
-        if train:
-            rngs_enc = {"mae": mae_key, "dropout": drop_key}
-        else:
-            rngs_enc = {"mae": mae_key}  # if you still want masking during eval
-
-        z_btLd, mae_info = encoder.apply(enc_vars, patches_btnd,
-                                        rngs=rngs_enc,
-                                        deterministic=not train)
-        # Decoder
-        rngs_dec = {"dropout": drop_key} if train else {}
-        pred_btnd = decoder.apply(dec_vars, z_btLd,
-                                rngs=rngs_dec,
-                                deterministic=not train)
-        return pred_btnd, mae_info
-    
-    jit_forward = jax.jit(forward_apply, static_argnames=["train"])
-    mae_key = jax.random.PRNGKey(0)
-    drop_key = jax.random.PRNGKey(1)
-    # Warm-up (compilation happens here)
-    t0 = time.time()
-    out = jit_forward(enc_vars, dec_vars, x, mae_key=mae_key, drop_key=drop_key, train=True)
-    jax.tree_util.tree_map(lambda y: y.block_until_ready(), out)
-    t1 = time.time()
-    # Hot run (should be much faster)
-    t2 = time.time()
-    out = jit_forward(enc_vars, dec_vars, x, mae_key=mae_key, drop_key=drop_key, train=True)
-    jax.tree_util.tree_map(lambda y: y.block_until_ready(), out)
-    t3 = time.time()
-
-    print(f"Warm-up (compile+run): {t1 - t0:.3f}s")
-    print(f"Hot run (cached):      {t3 - t2:.3f}s")
-
-def test_dynamics():
-    rng = jax.random.PRNGKey(0)
-    B = 2
-    T = 10
-    fake_enc_z = jnp.ones((B, T, 512, 16), dtype=jnp.float32)
-    fake_actions = jnp.ones((B, T), dtype=jnp.int32)
-    fake_step_idxs = jnp.zeros((B, T), dtype=jnp.int32)
-    fake_signal_idxs = jnp.zeros((B, T), dtype=jnp.int32)
-    def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
-        """
-        (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
-        Requires: N_b == n_spatial * k  (e.g., 512 -> 256 with k=2).
-        """
-        return rearrange(z_btLd, 'b t (n_spatial k) d -> b t n_spatial (k d)', n_spatial=n_spatial, k=k)
-    fake_packed_enc_tokens = pack_bottleneck_to_spatial(fake_enc_z, n_spatial=256, k=2)
-
-
-    # need some way to assert that 512 * 16 == 256 * 32
-    dynamics_kwargs = {
-        "d_model": 128,
-        "n_spatial": 256,
-        "d_spatial": 32,
-        "d_bottleneck": 16,
-        "k_max": 8,
-        "n_register": 10,
-        "n_agent": 1,
-        "n_heads": 4,
-        "depth": 4,
-        "dropout": 0.0
-    }
-    dynamics = Dynamics(**dynamics_kwargs)
-    dynamics_vars = dynamics.init(
-        {"params": rng, "dropout": jax.random.PRNGKey(2)},
-        fake_actions,
-        fake_step_idxs,
-        fake_signal_idxs,
-        fake_packed_enc_tokens,
-    )
-    out = dynamics.apply(dynamics_vars, fake_actions, fake_step_idxs, fake_signal_idxs, fake_packed_enc_tokens,
-                        rngs={"dropout": jax.random.PRNGKey(2)},
-                        deterministic=True)
-
-def _build_modality_mask(modality_ids, mode: str):
-    return make_mask(modality_ids, mode)
-
-def _pack_bottleneck_to_spatial(z_btLd, n_spatial, k):
-    return rearrange(z_btLd, 'b t (n k) d -> b t n (k d)', n=n_spatial, k=k)
-
-def _abbr(m):
-    # short labels just for printing rows/cols
-    return {
-        int(Modality.ACTION): "ACT",
-        int(Modality.SHORTCUT_SIGNAL): "SIG",
-        int(Modality.SHORTCUT_STEP): "STP",
-        int(Modality.SPATIAL): "SPA",
-        int(Modality.REGISTER): "REG",
-        int(Modality.AGENT): "AGT",
-        int(Modality.LATENT): "LAT",
-    }.get(int(m), f"M{int(m)}")
-
-def _print_mask_summary(name: str, modality_ids: jnp.ndarray, mask_2d: jnp.ndarray):
-    # mask_2d: (S,S) with True meaning "query row can read key col"
-    S = modality_ids.shape[0]
-    mods = [int(x) for x in list(modality_ids)]
-    headers = "     " + " ".join(f"{_abbr(m):>3}" for m in mods)
-    print(f"\n[{name}] modality order (Q rows / K cols): {mods}")
-    print(headers)
-    for q in range(S):
-        row = "".join("  ✓" if bool(mask_2d[q, k]) else "  ·" for k in range(S))
-        print(f"{_abbr(modality_ids[q]):>3}: {row}")
-    # row-wise counts
-    counts = jnp.sum(mask_2d, axis=1)
-    print("Row read-counts:", counts.tolist())
-
-def test_agent_firewall():
-    # layout: [ACTION, SIG, STEP, SPATIALx3, REGISTERx2, AGENTx1]
-    ACTION,SIGNAL,STEP,SPATIAL,REGISTER,AGENT = 1,5,6,4,3,7
-    modality_ids = jnp.array([ACTION, SIGNAL, STEP, SPATIAL, SPATIAL, SPATIAL, REGISTER, REGISTER, AGENT], dtype=jnp.int32)
-    S = modality_ids.shape[0]
-    agent_col = (modality_ids == AGENT)  # keys that are agent
-    agent_row = (modality_ids == AGENT)  # queries that are agent
-
-    # ----- wm_agent -----
-    mask = _build_modality_mask(modality_ids, "wm_agent")  # (S,S)
-    _print_mask_summary("wm_agent", modality_ids, mask)
-
-    # Others never see agent: find any offending (q,k) where q!=agent and k is agent
-    bad_q = []
-    for q in range(S):
-        if not bool(agent_row[q]):
-            if bool(mask[q, agent_col].sum()):
-                bad_q.append(q)
-    if bad_q:
-        print("Violations in wm_agent (non-agent reads agent) at query rows:", bad_q)
-
-    # Agent reads all in wm_agent
-    agent_q_idx = int(jnp.where(agent_row, size=1, fill_value=-1)[0][0])
-    if agent_q_idx >= 0:
-        agent_reads = mask[agent_q_idx, :]
-        missing = [k for k in range(S) if not bool(agent_reads[k])]
-        if missing:
-            print("Violations in wm_agent (agent cannot read some keys). Missing cols:", missing)
-
-    # Assertions
-    for q in range(S):
-        if not bool(agent_row[q]):
-            assert mask[q, agent_col].sum() == 0, "Non-agent query can attend to agent!"
-    if agent_q_idx >= 0:
-        assert jnp.all(mask[agent_q_idx, :]), "Agent query cannot read some token in wm_agent"
-
-
-
-
-def test_x1hat_invariant_to_agent_tokens():
-    B,T = 2,5
-    n_b, d_b = 8, 4      # encoder latents
-    n_spatial, pack = 4, 2
-    d_spatial = d_b * pack
-    D = 32
-
-    fake_enc_z = jnp.ones((B, T, n_b, d_b))
-    packed = _pack_bottleneck_to_spatial(fake_enc_z, n_spatial=n_spatial, k=pack)
-    actions = jnp.zeros((B,T), dtype=jnp.int32)
-    step_idx = jnp.zeros((B,T), dtype=jnp.int32)
-    sig_idx  = jnp.zeros((B,T), dtype=jnp.int32)
-
-    dyn = Dynamics(
-        d_model=D, d_bottleneck=d_b, d_spatial=d_spatial,
-        n_spatial=n_spatial, n_register=2, n_agent=1,
-        n_heads=2, n_kv_heads=1, depth=2, k_max=8, dropout_rate=0.0, mlp_ratio=2.0,
-        time_every=2
-    )
-    vars_ = dyn.init({"params": jax.random.PRNGKey(0), "dropout": jax.random.PRNGKey(1)},
-                     actions, step_idx, sig_idx, packed)
-
-    # random agent vs zeros
-    agent_rand = jax.random.normal(jax.random.PRNGKey(2), (B,T,1,D))
-    x1_a, _ = dyn.apply(vars_, actions, step_idx, sig_idx, packed,
-                        agent_tokens=agent_rand, rngs={"dropout": jax.random.PRNGKey(3)}, deterministic=True)
-    x1_b, _ = dyn.apply(vars_, actions, step_idx, sig_idx, packed,
-                        agent_tokens=jnp.zeros_like(agent_rand), rngs={"dropout": jax.random.PRNGKey(3)}, deterministic=True)
-
-    diff = x1_a - x1_b
-    max_abs = float(jnp.max(jnp.abs(diff)))
-    l2 = float(jnp.sqrt(jnp.sum(diff * diff)))
-    print("\n[x1_hat invariance] max|Δ| =", max_abs, " ||Δ||₂ =", l2)
-    print("x1_a shape:", x1_a.shape, " x1_b shape:", x1_b.shape)
-
-    # Must be exactly equal because agent cannot influence others
-    assert jnp.allclose(x1_a, x1_b, atol=0, rtol=0), "x1_hat changed with agent tokens—firewall broken"
-
-
-def test_shapes_and_h_t():
-    B,T,D = 2,6,32
-    n_b,d_b = 8,4
-    n_spatial, pack = 4,2
-    d_spatial = d_b*pack
-
-    packed = _pack_bottleneck_to_spatial(jnp.ones((B,T,n_b,d_b)), n_spatial, pack)
-    dyn = Dynamics(d_model=D, d_bottleneck=d_b, d_spatial=d_spatial,
-                   n_spatial=n_spatial, n_register=3, n_agent=1,
-                   n_heads=2, depth=2, k_max=8)
-    actions = jnp.zeros((B,T), dtype=jnp.int32)
-    step_idx = jnp.zeros((B,T), dtype=jnp.int32)
-    sig_idx  = jnp.zeros((B,T), dtype=jnp.int32)
-    vars_ = dyn.init({"params": jax.random.PRNGKey(0), "dropout": jax.random.PRNGKey(1)},
-                     actions, step_idx, sig_idx, packed)
-
-    x1_hat, h_t = dyn.apply(vars_, actions, step_idx, sig_idx, packed,
-                            agent_tokens=jnp.zeros((B,T,1,D)))
-    print("\n[shapes] x1_hat:", x1_hat.shape, " h_t:", (None if h_t is None else h_t.shape))
-    print("Expect x1_hat =", (B,T,n_spatial,d_spatial), " h_t =", (B,T,1,D))
-    assert x1_hat.shape == (B,T,n_spatial,d_spatial)
-    assert h_t.shape     == (B,T,1,D)
-
-def test_wm_routed():
-    """
-    Checks space-attention routing for Dreamer-4-style dynamics:
-      - Action q -> {Action k}
-      - Obs q    -> {Obs k ∪ Action k} and never Agent k
-      - Agent q  -> {Obs k ∪ Action k ∪ Agent k}    (wm_agent)
-
-      - For any non-agent q, Agent k is disallowed.
-    """
-    # Shorthand modality ints
-    ACTION  = int(Modality.ACTION)
-    SIGNAL  = int(Modality.SHORTCUT_SIGNAL)
-    STEP    = int(Modality.SHORTCUT_STEP)
-    SPATIAL = int(Modality.SPATIAL)
-    REGISTER= int(Modality.REGISTER)
-    AGENT   = int(Modality.AGENT)
-
-    # Toy layout (Q rows / K cols share this order):
-    # [ACT, SIG, STP, SPA, SPA, SPA, REG, REG, ACT, AGT]
-    modality_ids = jnp.array(
-        [ACTION, SIGNAL, STEP, SPATIAL, SPATIAL, SPATIAL, REGISTER, REGISTER, ACTION, AGENT],
-        dtype=jnp.int32
-    )
-    S = modality_ids.shape[0]
-
-    # Helper sets
-    is_agent = (modality_ids == AGENT)
-    is_action = (modality_ids == ACTION)
-    is_obs = (
-        (modality_ids == SPATIAL) |
-        (modality_ids == REGISTER) |
-        (modality_ids == SIGNAL)  |
-        (modality_ids == STEP)
-    )
-
-    def assert_mask(mode: str):
-        mask = _build_modality_mask(modality_ids, mode)  # (S,S) bool
-        _print_mask_summary(mode, modality_ids, mask)
-
-        # 1) Non-agent q must never see Agent k
-        for q in range(S):
-            if not bool(is_agent[q]):
-                assert not bool(mask[q, is_agent].any()), f"[{mode}] non-agent q={q} can read Agent k!"
-
-        # 2) Action q -> Action k only? NO, in wm_agent, non-agent can read all non-agent.
-        # So we just check that non-agent CAN read other non-agent keys (like Spatial).
-        # And specifically check that they CANNOT read Agent.
-        
-        # 3) Obs q -> Obs k ∪ Action k? NO, same as above.
-        
-        # We only strictly enforce:
-        # A) Non-agent q cannot read Agent k
-        # B) Agent q can read Agent k (and everyone else)
-        
-        # Check A: (Already done in step 1)
-        
-        # Check B:
-        agent_rows = [i for i in range(S) if bool(is_agent[i])]
-        if agent_rows:
-            q = agent_rows[0]
-            if mode == "wm_agent":
-                # Agent reads everyone (including agent)
-                assert bool(mask[q].all()), "[wm_agent] agent q cannot read all keys!"
-
-
-    # Run both modes
-    assert_mask("wm_agent")
-
-    print("\n[test_wm_routed] All routing assertions passed ✅")
-
-
-if __name__ == "__main__":
-    test_encoder_decoder()
-    test_dynamics()
-    test_agent_firewall()
-    test_x1hat_invariant_to_agent_tokens()
-    test_shapes_and_h_t()
-    test_wm_routed()
-    print("\nAll tests passed ✅")

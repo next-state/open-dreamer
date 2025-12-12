@@ -691,16 +691,19 @@ def patchify(x: jnp.ndarray, patch: int) -> jnp.ndarray:
       where N = (H/patch)*(W/patch), D = patch*patch*C
     """
     patches = rearrange(x, "... (hp p1) (wp p2) c -> ... (hp wp) (p1 p2 c)", p1=patch, p2=patch)
-    patches = (patches/127.5)-1
     return patches
 
-def unpatchify(patches: jnp.ndarray, H: int, W: int, C: int, patch: int) -> jnp.ndarray:
+def unpatchify(patches: jnp.ndarray, patch: int, H: int, W: int) -> jnp.ndarray:
     """
     patches: (B, N, D)  ->  x: (B, H, W, C)
       where N = (H/patch)*(W/patch), D = patch*patch*C
     """
-    image = rearrange(patches, "... (hp wp) (p1 p2 c) -> ... (hp p1) (wp p2) c", hp=H//patch, wp=W//patch, p1=patch, p2=patch, c=C)
-    image = (image+1)*127.5
+    image = rearrange(patches, "... (hp wp) (p1 p2 c) -> ... (hp p1) (wp p2) c", hp=H//patch, wp=W//patch, p1=patch, p2=patch)
+    if image.dtype == jnp.bool_:
+        return image
+
+    # image = image.clip(-1, 1)
+    # image = (image+1)*127.5
     return image
 
 

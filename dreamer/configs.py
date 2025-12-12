@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class DatasetConfig:
     """Configuration for dataset parameters.
     
@@ -30,14 +30,14 @@ class DatasetConfig:
     action_dim: int = 1  # For bouncing square it's discrete (1 dim), for others might be >1 or continuous
     array_record_path: str = "datasets/coinrun_episodes/train" 
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class EncoderConfig:
     n_latents: int = 16
     d_bottleneck: int = 32
     d_model: int = 64
     n_heads: int = 4
     n_kv_heads: int = 2
-    n_patches: int = 64  # Will be computed from H, W, patch_size
+    patch_size: int = 4
     depth: int = 8
     dropout_rate: float = 0.05
     qk_norm_type: str | None = None
@@ -46,13 +46,13 @@ class EncoderConfig:
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class DecoderConfig:
     d_model: int = 64
     n_heads: int = 4
     n_kv_heads: int = 2
     n_latents: int = 16
-    n_patches: int = 64  # Will be computed from H, W, patch_size
+    patch_size: int = 4
     d_patch: int = 48    # Will be computed from patch_size, C
     depth: int = 8
     dropout_rate: float = 0.05
@@ -67,6 +67,8 @@ class TokenizerConfig:
     ckpt_max_to_keep: int = 5
     ckpt_save_every: int = 10_000
 
+    patch_size: int = 4
+
     # wandb config
     use_wandb: bool = False
     wandb_entity: str | None = None
@@ -76,7 +78,6 @@ class TokenizerConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
 
     # model parameters
-    patch_size: int = 4
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
 

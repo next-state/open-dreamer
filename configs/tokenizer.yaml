@@ -12,7 +12,7 @@ dataset:
   source: "custom"
   array_record_path: "datasets/coinrun_episodes/train"
   B: 64
-  T: 16
+  T: 32
   H: 64
   W: 64
   C: 3
