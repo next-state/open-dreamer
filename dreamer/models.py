@@ -448,7 +448,9 @@ class BlockCausalTransformer(nn.Module):
         new_caches = {} if caches is not None else None
         
         for i in range(self.depth):
-            cache_i = caches.get(i) if caches is not None else None
+            time_index, time_offset = divmod(i, self.time_every)
+            is_time_layer = time_offset == 0
+            cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
             x, new_cache_i = BlockCausalLayer(
                 self.d_model, self.n_heads, self.n_kv_heads,
                 dropout_rate=self.dropout_rate, qk_norm_type=self.qk_norm_type,
@@ -458,7 +460,7 @@ class BlockCausalTransformer(nn.Module):
             )(x, mask=mask, deterministic=deterministic, cache=cache_i)
             
             if new_caches is not None and new_cache_i is not None:
-                new_caches[i] = new_cache_i
+                new_caches[time_index] = new_cache_i
         
         return x, new_caches
 
@@ -788,7 +790,7 @@ class Dynamics(nn.Module):
         spatial_tokens = x[:, :, self.spatial_slice, :]
         x1_hat = self.flow_x_head(spatial_tokens)
         h_t = x[:, :, self.agent_slice, :] if self.n_agent > 0 else None  # (B,T,n_agent,D) or None
-        return (x1_hat, h_t), new_caches
+        return x1_hat, h_t, new_caches
 
 class TaskEmbedder(nn.Module):
     d_model: int

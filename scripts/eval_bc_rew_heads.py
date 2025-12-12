@@ -76,7 +76,6 @@ class EvalConfig:
     schedule: str = "finest"  # "finest" or "shortcut"
     d: float | None = None    # e.g., 0.25 for shortcut
     ctx_signal_tau: float = 1.0
-    match_ctx_tau: bool = False
 
     # Visualization
     max_examples_to_plot: int = 4  # number of sequences to render as strips
@@ -585,7 +584,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
         d=(cfg.d if cfg.schedule=="shortcut" else None),
         start_mode="pure", rollout="teacher_forced",
         horizon=cfg.horizon, ctx_length=cfg.ctx_length,
-        ctx_signal_tau=cfg.ctx_signal_tau, match_ctx_tau=cfg.match_ctx_tau,
+        ctx_signal_tau=cfg.ctx_signal_tau,
         rng_key=jax.random.PRNGKey(4242), mae_eval_key=env["mae_eval_key"],
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=n_spatial, packing_factor=cfg.packing_factor,
@@ -680,7 +679,7 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
         d=(cfg.d if cfg.schedule=="shortcut" else None),
         start_mode="pure", rollout="autoregressive",
         horizon=cfg.horizon, ctx_length=cfg.ctx_length,
-        ctx_signal_tau=cfg.ctx_signal_tau, match_ctx_tau=cfg.match_ctx_tau,
+        ctx_signal_tau=cfg.ctx_signal_tau,
         rng_key=jax.random.PRNGKey(101010), mae_eval_key=env["mae_eval_key"],
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=n_spatial, packing_factor=cfg.packing_factor,

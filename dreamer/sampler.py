@@ -32,8 +32,7 @@ class SamplerConfig:
     rollout: RolloutMode = "teacher_forced" # "teacher_forced" or "autoregressive"
     horizon: int = 1
     ctx_length: int = 32
-    ctx_signal_tau: Optional[float] = None  # e.g., 0.9 for slightly corrupt viz; None/1.0 = clean
-    match_ctx_tau: bool = False             # NEW: corrupt context to current τ each step (uses fixed z0_ctx)
+    ctx_signal_tau: float = 0.9             # e.g., 0.9 for slightly corrupt viz; None/1.0 = clean
 
     rng_key: Optional[jax.Array] = None
     mae_eval_key: Optional[jax.Array] = None
@@ -125,7 +124,6 @@ def _build_run_plan(cfg: SamplerConfig) -> dict:
         "start_mode": cfg.start_mode,
         "ctx_length": cfg.ctx_length,
         "horizon": cfg.horizon,
-        "match_ctx_tau": bool(cfg.match_ctx_tau),
     }
     if cfg.rollout == "autoregressive":
         plan["tau0_policy"] = "pure (0.0)"
@@ -156,7 +154,7 @@ def _emit_plan(plan: dict, hook: Optional[Callable[[dict], None]], enable_print:
         hook(plan)
     if enable_print:
         keys = ["kind","k_max","schedule","d","K","e","rollout","start_mode",
-                "ctx_length","horizon","match_ctx_tau","tau0_policy","S","S_range","tau0_grid"]
+                "ctx_length","horizon","tau0_policy","S","S_range","tau0_grid"]
         msg = {k: plan[k] for k in keys if k in plan}
         print(f"[sampler] {msg}")
 
@@ -179,12 +177,10 @@ def denoise_single_latent(
     rng_key: jax.Array,
     clean_target_next: Optional[jnp.ndarray] = None,  # (B,1,n_spatial,D_s) if TF else None
     agent_tokens: jnp.ndarray = None, # (B, T_ctx + 1, n_agent, d_model)
-    match_ctx_tau: bool = False,
 ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
     """
     Denoise a single future latent using a τ-ladder.
       - Uses adaptive mixing α = (τ_{s+1} − τ_s) / (1 − τ_s)
-      - If match_ctx_tau=True, corrupt context to current τ at each step using a fixed z0_ctx
       - Returns both the denoised latent and the hidden state h_t from the final step
     
     Returns:
@@ -197,7 +193,7 @@ def denoise_single_latent(
     assert action_curr.shape == (B, 1)
 
     # 1) choose tau0
-    rng_key, r_tau, r_noise, r_ctx = jax.random.split(rng_key, 4)
+    rng_key, r_tau, r_noise = jax.random.split(rng_key, 3)
     if start_mode == "pure":
         tau0 = 0.0
     elif start_mode == "fixed":
@@ -205,9 +201,6 @@ def denoise_single_latent(
     else:
         tau0 = float(jax.random.uniform(r_tau, (), minval=0.0, maxval=1.0))
     tau0_aligned = _align_to_grid(tau0, d) if tau0 > 0.0 else 0.0
-
-    # Base noise for context if we match τ per step
-    z0_ctx = jax.random.normal(r_ctx, z_ctx_clean.shape, dtype=z_ctx_clean.dtype) if match_ctx_tau else None
 
     # 2) init current latent at tau0 (caller already provided it)
     z_t = z_t_init
@@ -227,20 +220,14 @@ def denoise_single_latent(
         # Correct per-step mixing toward clean:
         alpha = (tau_curr - tau_prev) / max(1.0 - tau_prev, 1e-8)
 
-        # Context at current τ (if requested)
-        if match_ctx_tau:
-            z_ctx_tau = tau_curr * z_ctx_clean + (1.0 - tau_curr) * z0_ctx
-        else:
-            z_ctx_tau = z_ctx_clean
-
         # Build sequence and indices
-        z_seq = jnp.concatenate([z_ctx_tau, z_t], axis=1)                   # (B, T_ctx+1, n_spatial, D_s)
+        z_seq = jnp.concatenate([z_ctx_clean, z_t], axis=1)                   # (B, T_ctx+1, n_spatial, D_s)
         actions_full = jnp.concatenate([actions_ctx, action_curr], axis=1)  # (B, T_ctx+1)
         step_idx = jnp.full((B, T_ctx + 1), e, dtype=jnp.int32)
         signal_idx = jnp.full((B, T_ctx + 1), _signal_idx_from_tau(jnp.asarray(tau_curr), k_max), dtype=jnp.int32)
 
         # Predict clean for the current frame
-        z_clean_pred_seq, h_seq = dynamics.apply(
+        z_clean_pred_seq, h_seq, _ = dynamics.apply(
             dyn_vars,
             actions_full,
             step_idx,
@@ -299,9 +286,9 @@ def sample_video(
     future_actions = actions[:, config.ctx_length: config.ctx_length + horizon]
     gt_future_latents = z_all[:, config.ctx_length: config.ctx_length + horizon, :, :]
 
-    # (Optional) single-shot context corruption for visualization "floor" only
+    # Single-shot context corruption for visualization "floor" only
     z_ctx_for_floor = z_ctx_clean
-    if config.ctx_signal_tau is not None and config.ctx_signal_tau < 1.0:
+    if config.ctx_signal_tau < 1.0:
         rng, nkey = jax.random.split(rng)
         noise = jax.random.normal(nkey, z_ctx_clean.shape, z_ctx_clean.dtype)
         tau = jnp.asarray(config.ctx_signal_tau, z_ctx_clean.dtype)
@@ -345,7 +332,6 @@ def sample_video(
             tau0_fixed=config.tau0_fixed,
             rng_key=step_key,
             clean_target_next=z1_ref,
-            match_ctx_tau=config.match_ctx_tau,
         )
         preds.append(z_clean_pred)
 

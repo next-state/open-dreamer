@@ -62,7 +62,8 @@ class ImaginationConfig:
     d: float  # denoising step size (e.g., 1/k_max or 1/4, etc.)
     start_mode: str = "pure"  # "pure" or "fixed" (no per-call randomness)
     tau0_fixed: float = 0.0   # used iff start_mode == "fixed"
-    match_ctx_tau: bool = False
+    tau_ctx: float = 0.9      # noise level on the context for autoregressive rollout stabilization
+                              # 0.1 in the paper, but it's a typo, they mean 1 - 0.1 = 0.9
 
 
 class DenoiseSchedule(NamedTuple):
@@ -74,7 +75,6 @@ class DenoiseSchedule(NamedTuple):
     signal_idx_seq: (S+1,) integer signal indices for each τ_s
     step_idx:       scalar integer step index e (same for all steps here)
     k_max:          scalar integer, copied from config for convenience
-    match_ctx_tau_w: scalar float32 in {0.0, 1.0} for context corruption flag
     """
 
     tau_seq: jnp.ndarray
@@ -82,7 +82,6 @@ class DenoiseSchedule(NamedTuple):
     signal_idx_seq: jnp.ndarray
     step_idx: int
     k_max: int
-    match_ctx_tau_w: float
 
 
 def _build_static_schedule(cfg: ImaginationConfig) -> DenoiseSchedule:
@@ -137,7 +136,6 @@ def _build_static_schedule(cfg: ImaginationConfig) -> DenoiseSchedule:
         signal_idx_seq=jnp.asarray(signal_idx_np, dtype=jnp.int32),
         step_idx=int(e),
         k_max=int(cfg.k_max),
-        match_ctx_tau_w=1.0 if cfg.match_ctx_tau else 0.0,
     )
     return schedule
 
@@ -151,19 +149,19 @@ def denoise_single_latent_static(
     dynamics: Dynamics,
     dyn_vars: Dict[str, Any],
     schedule: DenoiseSchedule,
-    actions_ctx: jnp.ndarray,  # (B, T_ctx)
-    action_curr: jnp.ndarray,  # (B, 1)
-    z_ctx_clean: jnp.ndarray,  # (B, T_ctx, n_spatial, D_s)
-    z_t_init: jnp.ndarray,     # (B, 1, n_spatial, D_s)
+    actions_ctx: jnp.ndarray,                 # (B, T_ctx)
+    action_curr: jnp.ndarray,                 # (B, 1)
+    z_ctx_t: jnp.ndarray,                     # (B, T_ctx, n_spatial, D_s)
+    z_noise_t: jnp.ndarray,                   # (B, 1, n_spatial, D_s)
     agent_tokens: jnp.ndarray | None = None,  # (B, T_ctx+1, n_agent, d_model)
-    z0_ctx: jnp.ndarray | None = None,        # (B, T_ctx, n_spatial, D_s) base noise for context
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    kv_cache: Dict[int, Any] | None = None,
+) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[int, Any] | None]:
     """
-    JAX-friendly τ-ladder denoiser for a single future latent.
+    JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
 
     - Uses a precomputed schedule (τ_seq, α_seq, signal_idx_seq, step_idx).
     - Contains only JAX ops in the inner loop (no Python branching on traced values).
-    - Returns both the denoised latent and the final hidden state h_t from dynamics.
+    - Returns the denoised latent, the final hidden state h_t from dynamics, and the updated KV cache.
 
     Args:
         dynamics: Dynamics model (Flax Module)
@@ -171,39 +169,30 @@ def denoise_single_latent_static(
         schedule: Precomputed DenoiseSchedule
         actions_ctx: (B, T_ctx) context actions
         action_curr: (B, 1) action for current step
-        z_ctx_clean: (B, T_ctx, n_spatial, D_s) clean context latents
-        z_t_init: (B, 1, n_spatial, D_s) initial noisy latent at τ_0
+        z_ctx_t: (B, T_ctx, n_spatial, D_s) context latents
+        z_ctx_noise_t: (B, T_ctx, n_spatial, D_s) stabilization noise for context
+        z_noise_t: (B, 1, n_spatial, D_s) initial noisy latent at τ_0
         agent_tokens: optional agent tokens (B, T_ctx+1, n_agent, d_model)
-        z0_ctx: base noise for context (same shape as z_ctx_clean); if None, zeros are used
+        kv_cache: KV cache for context frames (from previous finalized frames)
     """
-    B, T_ctx, n_spatial, D_s = z_ctx_clean.shape
-
-    if z0_ctx is None:
-        z0_ctx = jnp.zeros_like(z_ctx_clean)
+    B, T_ctx, n_spatial, D_s = z_ctx_t.shape
 
     S = schedule.alpha_seq.shape[0]
 
-    def body_fun(z_t, s):
-        tau_curr = schedule.tau_seq[s + 1]
+    def refinement_step(z_t, s):
         alpha = schedule.alpha_seq[s]
         signal_idx_scalar = schedule.signal_idx_seq[s + 1]
 
-        # Context at current τ. We encode the match_ctx_tau flag as a weight in the schedule
-        # so that we avoid data-dependent branching:
-        #   z_ctx_tau = τ * z_ctx_clean + (1-τ) * base
-        #   base = w * z0_ctx + (1-w) * z_ctx_clean
-        # where w ∈ {0,1}.
-        base_ctx = schedule.match_ctx_tau_w * z0_ctx + (1.0 - schedule.match_ctx_tau_w) * z_ctx_clean
-        z_ctx_tau = tau_curr * z_ctx_clean + (1.0 - tau_curr) * base_ctx
-
         # Build sequence and indices
-        z_seq = jnp.concatenate([z_ctx_tau, z_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
+        z_seq = jnp.concatenate([z_ctx_t, z_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
         actions_full = jnp.concatenate([actions_ctx, action_curr], axis=1)  # (B, T_ctx+1)
 
         step_idx = jnp.full((B, T_ctx + 1), schedule.step_idx, dtype=jnp.int32)
-        signal_idx = jnp.full((B, T_ctx + 1), signal_idx_scalar, dtype=jnp.int32)
+        signal_idx_ctx = jnp.full((B, T_ctx), (0.9 * schedule.k_max).astype(jnp.int32), dtype=jnp.int32)
+        signal_idx_curr = jnp.full((B, 1), signal_idx_scalar, dtype=jnp.int32)
+        signal_idx = jnp.concatenate([signal_idx_ctx, signal_idx_curr], axis=1)
 
-        z_clean_pred_seq, h_seq = dynamics.apply(
+        z_clean_pred_seq, h_seq, kv_cache_updated = dynamics.apply(
             dyn_vars,
             actions_full,
             step_idx,
@@ -211,6 +200,7 @@ def denoise_single_latent_static(
             z_seq,
             agent_tokens=agent_tokens,
             deterministic=True,
+            caches=kv_cache,
         )
 
         z_clean_pred = z_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
@@ -221,18 +211,18 @@ def denoise_single_latent_static(
         # Per-step mixing toward clean latent
         z_t_new = (1.0 - alpha) * z_t + alpha * z_clean_pred
 
-        return z_t_new, h_last
+        return z_t_new, (h_last, kv_cache_updated)
 
     # Run τ-ladder with JAX control flow using scan to keep carry/output structure consistent.
-    z_t_final, h_history = jax.lax.scan(
-        body_fun,
-        z_t_init,
+    z_t_final, (h_history, kv_cache_final) = jax.lax.scan(
+        refinement_step,
+        z_noise_t,
         jnp.arange(S),
     )
 
     h_last = h_history[-1]  # (B, n_agent, d_model)
 
-    return z_t_final, h_last  # (B, 1, n_spatial, D_s), (B, n_agent, d_model)
+    return z_t_final, h_last, kv_cache_final  # (B, 1, n_spatial, D_s), (B, n_agent, d_model), Dict[int, KVCache] | None
 
 
 # JIT-compiled variant (optional convenience wrapper)
@@ -307,22 +297,24 @@ def imagine_rollouts_core(
     dyn_vars: Dict[str, Any],
     task_vars: Dict[str, Any],
     schedule: DenoiseSchedule,
-    z_context: jnp.ndarray,        # (B, context_length, n_spatial, d_spatial)
-    context_actions: jnp.ndarray,  # (B, context_length)
+    z_ctx: jnp.ndarray,        # (B, context_length, n_spatial, d_spatial)
+    actions_ctx: jnp.ndarray,  # (B, context_length)
     task_ids: jnp.ndarray,         # (B,)
     horizon: int,
     policy_fn: PolicyFn,
     policy_state: Any,
     rng_key: jax.Array,
+    use_kv_cache: bool = True,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Core JAX-friendly imagination rollout in latent space.
+    Core JAX-friendly imagination rollout in latent space with KV caching.
 
     This function:
       - Computes initial hidden state from context using dynamics.
       - Uses a generic policy_fn(h, rng, state) to produce actions & logits.
       - Uses denoise_single_latent_static to predict next latents.
       - Rolls context autoregressively.
+      - Each new frame: denoise with cached past, then update cache
 
     Returns:
         imagined_latents: (B, horizon + 1, n_spatial, d_spatial)
@@ -331,10 +323,7 @@ def imagine_rollouts_core(
         imagined_hidden:  (B, horizon + 1, d_model)
         policy_logits:    (B, horizon, A)
     """
-    B, context_length, n_spatial, D_s = z_context.shape
-
-    z_ctx_clean = z_context  # (B, context_length, n_spatial, d_spatial)
-    actions_ctx = context_actions  # (B, context_length)
+    B, context_length, n_spatial, D_s = z_ctx.shape
 
     # Pre-compute agent tokens for entire rollout.
     agent_tokens_full = task_embedder.apply(
@@ -346,15 +335,16 @@ def imagine_rollouts_core(
     step_idx_ctx = jnp.full((B, context_length), e_jax, dtype=jnp.int32)
     signal_idx_ctx = jnp.full((B, context_length), schedule.k_max - 1, dtype=jnp.int32)
 
-    # Initial hidden state from context.
-    _, h_ctx_init = dynamics.apply(
+    # Initial hidden state & KV cache from context
+    _, h_ctx_init, kv_cache = dynamics.apply(
         dyn_vars,
         actions_ctx,
         step_idx_ctx,
         signal_idx_ctx,
-        z_ctx_clean,
+        z_ctx,
         agent_tokens=agent_tokens_full[:, :context_length, :, :],
         deterministic=True,
+        caches=dynamics.create_empty_cache() if use_kv_cache else None,
     )  # (B, context_length, n_agent, d_model)
 
     h_pooled_init = reduce(
@@ -363,25 +353,29 @@ def imagine_rollouts_core(
     h = h_pooled_init  # last context state hidden
 
     # Starting latent is last context latent.
-    z_start = z_ctx_clean[:, -1, :, :]  # (B, n_spatial, D_s)
+    z_start = z_ctx[:, -1, :, :]  # (B, n_spatial, D_s)
+
+    # Stabilization noise for autoregressive rollout
+    z_ctx_noise = jnp.zeros_like(z_ctx) # Zero for ground truth initial context
 
     def scan_body(carry, t):
-        z_ctx_clean_t, actions_ctx_t, h_t, policy_state_t, rng_t = carry
+        z_ctx_t, actions_ctx_t, z_ctx_noise_t, h_t, policy_state_t, rng_t, kv_cache_t = carry
 
-        rng_t, policy_key, z0_key, z0_ctx_key = jax.random.split(rng_t, 4)
+        rng_t, policy_key, z_noise_t_key = jax.random.split(rng_t, 3)
 
         # Policy: actions + logits
         actions_t, logits_t, policy_state_next = policy_fn(h_t, policy_key, policy_state_t)
         actions_t = actions_t.astype(jnp.int32)
         action_curr = actions_t[:, None]  # (B, 1)
 
-        # τ-ladder noise for latent and (optionally) context.
-        z0 = jax.random.normal(
-            z0_key, (B, 1, n_spatial, D_s), dtype=z_ctx_clean_t.dtype
+        # τ-ladder noise for prediction latent
+        z_noise_t = jax.random.normal(
+            z_noise_t_key, (B, 1, n_spatial, D_s), dtype=z_ctx_t.dtype
         )
-        z0_ctx = jax.random.normal(
-            z0_ctx_key, z_ctx_clean_t.shape, dtype=z_ctx_clean_t.dtype
-        )
+
+        # Diffusion forcing stabilization noise for autoregressive rollout
+        # FIXME: use config.tau_ctx
+        z_ctx_noised_t = 0.9 * z_ctx_t + (1.0 - 0.9) * z_ctx_noise_t
 
         # Slice agent tokens for [t : t + context_length + 1]
         # (context + all imagined steps so far, plus one for the new step).
@@ -391,16 +385,16 @@ def imagine_rollouts_core(
             (B, context_length + 1, agent_tokens_full.shape[2], agent_tokens_full.shape[3]),
         )
 
-        z_clean_pred, h_last = denoise_single_latent_static(
+        z_clean_pred, h_last, kv_cache_updated = denoise_single_latent_static(
             dynamics=dynamics,
             dyn_vars=dyn_vars,
             schedule=schedule,
             actions_ctx=actions_ctx_t,
             action_curr=action_curr,
-            z_ctx_clean=z_ctx_clean_t,
-            z_t_init=z0,
+            z_ctx_t=z_ctx_noised_t,
+            z_noise_t=z_noise_t,
             agent_tokens=agent_tokens_seq,
-            z0_ctx=z0_ctx,
+            kv_cache=kv_cache_t,
         )
 
         # h_last: (B, n_agent, d_model) → pool over agents
@@ -408,17 +402,25 @@ def imagine_rollouts_core(
 
         # Autoregressive context update (teacher-free)
         z_ctx_next = jnp.concatenate(
-            [z_ctx_clean_t, z_clean_pred], axis=1
+            [z_ctx_t, z_clean_pred], axis=1
         )[:, -context_length:, :, :]
         actions_ctx_next = jnp.concatenate(
             [actions_ctx_t, action_curr], axis=1
         )[:, -context_length:]
 
-        carry_next = (z_ctx_next, actions_ctx_next, h_next, policy_state_next, rng_t)
+        # Stabilization noise for autoregressive rollout
+        z_ctx_noise_next = jnp.concatenate(
+            [z_ctx_noise_t, z_noise_t], axis=1
+        )[:, -context_length:, :, :]
+
+        # Sliding window update of KV cache
+        kv_cache_next = jax.tree.map(lambda x: x[:, -context_length:, :, :], kv_cache_updated) if use_kv_cache else None
+
+        carry_next = (z_ctx_next, actions_ctx_next, z_ctx_noise_next, h_next, policy_state_next, rng_t, kv_cache_next)
 
         return carry_next, (z_clean_pred[:, 0, :, :], actions_t, h_next, logits_t)
 
-    init_carry = (z_ctx_clean, actions_ctx, h, policy_state, rng_key)
+    init_carry = (z_ctx, actions_ctx, z_ctx_noise, h, policy_state, rng_key, kv_cache)
     _, outputs = jax.lax.scan(
         scan_body,
         init_carry,
@@ -474,8 +476,8 @@ class ImaginationSampler:
         task_embedder: TaskEmbedder,
         dyn_vars: Dict[str, Any],
         task_vars: Dict[str, Any],
-        z_context: jnp.ndarray,
-        context_actions: jnp.ndarray,
+        z_ctx: jnp.ndarray,
+        actions_ctx: jnp.ndarray,
         task_ids: jnp.ndarray,
         policy_fn: PolicyFn,
         policy_state: Any,
@@ -487,8 +489,8 @@ class ImaginationSampler:
             dyn_vars=dyn_vars,
             task_vars=task_vars,
             schedule=self.schedule,
-            z_context=z_context,
-            context_actions=context_actions,
+            z_ctx=z_ctx,
+            actions_ctx=actions_ctx,
             task_ids=task_ids,
             horizon=self.config.horizon,
             policy_fn=policy_fn,
@@ -503,8 +505,8 @@ class ImaginationSampler:
         task_embedder: TaskEmbedder,
         dyn_vars: Dict[str, Any],
         task_vars: Dict[str, Any],
-        z_context: jnp.ndarray,
-        context_actions: jnp.ndarray,
+        z_ctx: jnp.ndarray,
+        actions_ctx: jnp.ndarray,
         task_ids: jnp.ndarray,
         policy_fn: PolicyFn,
         policy_state: Any,
@@ -518,8 +520,8 @@ class ImaginationSampler:
             dyn_vars=dyn_vars,
             task_vars=task_vars,
             schedule=self.schedule,
-            z_context=z_context,
-            context_actions=context_actions,
+            z_ctx=z_ctx,
+            actions_ctx=actions_ctx,
             task_ids=task_ids,
             horizon=self.config.horizon,
             policy_fn=policy_fn,
@@ -692,7 +694,7 @@ def test_single_step_denoise_real_ckpt(use_jit: bool = False):
     )  # (B, T, n_spatial, d_spatial)
 
     # Use first (context_length) frames as context, next frame as target.
-    z_context = z_all[:, : cfg.context_length, :, :]
+    z_ctx = z_all[:, : cfg.context_length, :, :]
     z_target = z_all[:, cfg.context_length : cfg.context_length + 1, :, :]
     actions_ctx = actions[:, : cfg.context_length]
     action_curr = actions[:, cfg.context_length : cfg.context_length + 1]
@@ -705,13 +707,12 @@ def test_single_step_denoise_real_ckpt(use_jit: bool = False):
         d=cfg.imagination_d,
         start_mode="pure",
         tau0_fixed=0.0,
-        match_ctx_tau=False,
     )
     schedule = _build_static_schedule(imag_cfg)
 
     rng = jax.random.PRNGKey(123)
     z0 = jax.random.normal(
-        rng, z_target.shape, dtype=z_context.dtype
+        rng, z_target.shape, dtype=z_ctx.dtype
     )  # (B, 1, n_spatial, d_spatial)
 
     # Warmup + timed call to compare JIT vs non-JIT.
@@ -725,40 +726,37 @@ def test_single_step_denoise_real_ckpt(use_jit: bool = False):
             schedule=schedule,
             actions_ctx=actions_ctx,
             action_curr=action_curr,
-            z_ctx_clean=z_context,
-            z_t_init=z0,
+            z_ctx_t=z_ctx,
+            z_noise_t=z0,
             agent_tokens=None,
-            z0_ctx=None,
         )
         t_compile1 = time.time()
         print(f"[single-step][jit] compile+first-run elapsed={t_compile1 - t_compile0:.4f}s")
         t0 = time.time()
-        z_pred, _ = denoise_single_latent_static_jit(
+        z_pred, _, _ = denoise_single_latent_static_jit(
             dynamics=train_state.dynamics,
             dyn_vars=train_state.dyn_vars,
             schedule=schedule,
             actions_ctx=actions_ctx,
             action_curr=action_curr,
-            z_ctx_clean=z_context,
-            z_t_init=z0,
+            z_ctx_t=z_ctx,
+            z_noise_t=z0,
             agent_tokens=None,
-            z0_ctx=None,
         )
         t1 = time.time()
         print(f"[single-step][jit] elapsed={t1 - t0:.4f}s (after warmup)")
     else:
         print("[single-step] Using non-JIT denoiser.")
         t0 = time.time()
-        z_pred, _ = denoise_single_latent_static(
+        z_pred, _, _ = denoise_single_latent_static(
             dynamics=train_state.dynamics,
             dyn_vars=train_state.dyn_vars,
             schedule=schedule,
             actions_ctx=actions_ctx,
             action_curr=action_curr,
-            z_ctx_clean=z_context,
-            z_t_init=z0,
+            z_ctx_t=z_ctx,
+            z_noise_t=z0,
             agent_tokens=None,
-            z0_ctx=None,
         )
         t1 = time.time()
         print(f"[single-step][nonjit] elapsed={t1 - t0:.4f}s")
@@ -838,12 +836,12 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
         z_btLd, n_spatial=n_spatial, k=cfg.packing_factor
     )  # (B, T, n_spatial, d_spatial)
 
-    z_context = z_all[:, : cfg.context_length, :, :]
+    z_ctx = z_all[:, : cfg.context_length, :, :]
     z_future = z_all[
         :, cfg.context_length : cfg.context_length + cfg.horizon, :, :
     ]  # (B, horizon, ...)
 
-    context_actions = actions[:, : cfg.context_length]
+    actions_ctx = actions[:, : cfg.context_length]
 
     # Common sampler configuration
     imag_cfg = ImaginationConfig(
@@ -854,7 +852,6 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
         d=cfg.imagination_d,
         start_mode="pure",
         tau0_fixed=0.0,
-        match_ctx_tau=False,
     )
     sampler = ImaginationSampler(imag_cfg)
 
@@ -894,8 +891,8 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
                 task_embedder=train_state.task_embedder,
                 dyn_vars=train_state.dyn_vars,
                 task_vars=train_state.task_vars,
-                z_context=z_context,
-                context_actions=context_actions,
+                z_ctx=z_ctx,
+                actions_ctx=actions_ctx,
                 task_ids=task_ids,
                 policy_fn=policy_fn,
                 policy_state=policy_state,
@@ -909,8 +906,8 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
             task_embedder=train_state.task_embedder,
             dyn_vars=train_state.dyn_vars,
             task_vars=train_state.task_vars,
-            z_context=z_context,
-            context_actions=context_actions,
+            z_ctx=z_ctx,
+            actions_ctx=actions_ctx,
             task_ids=task_ids,
             policy_fn=policy_fn,
             policy_state=policy_state,
@@ -940,8 +937,8 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
                 task_embedder=train_state.task_embedder,
                 dyn_vars=train_state.dyn_vars,
                 task_vars=train_state.task_vars,
-                z_context=z_context,
-                context_actions=context_actions,
+                z_ctx=z_ctx,
+                actions_ctx=actions_ctx,
                 task_ids=task_ids,
                 policy_fn=gt_policy_fn,
                 policy_state=gt_policy_state,
@@ -955,8 +952,8 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
             task_embedder=train_state.task_embedder,
             dyn_vars=train_state.dyn_vars,
             task_vars=train_state.task_vars,
-            z_context=z_context,
-            context_actions=context_actions,
+            z_ctx=z_ctx,
+            actions_ctx=actions_ctx,
             task_ids=task_ids,
             policy_fn=gt_policy_fn,
             policy_state=gt_policy_state,

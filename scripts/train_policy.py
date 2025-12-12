@@ -886,7 +886,7 @@ def compute_hidden_from_context(
         T_ctx,
     )  # (B, T_ctx, n_agent, d_model)
 
-    _, h_ctx = dynamics.apply(
+    _, h_ctx, _ = dynamics.apply(
         dyn_vars,
         actions_ctx,
         step_idx_ctx,
@@ -1360,13 +1360,14 @@ def train_step(
                 dyn_vars=dyn_vars,
                 task_vars=task_vars,
                 schedule=schedule,
-                z_context=z_context,
-                context_actions=context_actions,
+                z_ctx=z_context,
+                actions_ctx=context_actions,
                 task_ids=task_ids,
                 horizon=horizon,
                 policy_fn=policy_fn,
                 policy_state=None,
                 rng_key=rng_imag,
+                use_kv_cache=True,
             )
         )
         del imagined_latents  # not needed for losses
@@ -1586,7 +1587,6 @@ def run(cfg: RLConfig):
         d=cfg.imagination_d,
         start_mode="pure",
         tau0_fixed=0.0,
-        match_ctx_tau=False,
     )
     schedule = _build_static_schedule(imag_cfg)
 
