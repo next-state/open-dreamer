@@ -72,32 +72,30 @@ def lpips_on_mae_recon(
 
 # --- viz step ---
 @partial(jax.jit, static_argnames=("tokenizer"))
-def viz_step(tokenizer, params, batch, *, mae_key, drop_key):
-    # batch is 0..1, scale to 0..255
-    videos = batch * 255.0
-
+def viz_step(tokenizer, params, videos, *, mae_key, drop_key):
+    # Model expects -1..1
+    
     # Run full model (no dropout during viz)
+    # recon is -1..1 (output from Decoder)
     recon, (frame_mask, keep_prob) = forward_apply(
         tokenizer, params, videos,
         mae_key=mae_key, drop_key=drop_key, train=False
     )
 
-    masked_input = videos * (1.0 - frame_mask)
-    recon_masked = videos * (1.0 - frame_mask) + recon * frame_mask
-    recon_full = recon
+    # Convert everything to 0..255 for visualization
+    videos_255 = (videos + 1.0) * 127.5
+    recon_255 = (recon + 1.0) * 127.5
+    
+    masked_input = videos_255 * (1.0 - frame_mask)
+    recon_masked = videos_255 * (1.0 - frame_mask) + recon_255 * frame_mask
+    recon_full = recon_255
 
-    return {
-        "target": videos,
-        "masked_input": masked_input,
-        "recon_masked": recon_masked,
-        "recon_full": recon_full,
-        "mae_mask": frame_mask,
-    }
+    return videos_255, masked_input, recon_masked, recon_full, frame_mask
 
 
 # --- train step ---
 @partial(jax.jit, static_argnames=("tokenizer","tx","patch","H","W","C", "lpips_weight", "lpips_frac"))
-def train_step(tokenizer, tx, params, opt_state, batch, *,
+def train_step(tokenizer, tx, params, opt_state, videos, *,
                patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0):
     """
     (master_key, params, opt_state, model_state, batch)
@@ -112,14 +110,11 @@ def train_step(tokenizer, tx, params, opt_state, batch, *,
         ▼
     return (new_params, new_opt_state, new_model_state, metrics)
     """
-    # 1) Prepare data
-    videos = batch['videos']/127.5 - 1   # (B,T,H,W,C)
-
-    # 2) Make per-step RNGs (fold_in ensures different masks per step even if base key repeats)
+    # Make per-step RNGs (fold_in ensures different masks per step even if base key repeats)
     step_key  = jax.random.fold_in(master_key, step)
     mae_key, drop_key = jax.random.split(step_key)
 
-    # 3) Define loss fn (closes over encoder/decoder + non-param states)
+    # Define loss fn (closes over encoder/decoder + non-param states)
     def loss_fn(p):
         pred, mae_info = forward_apply(tokenizer, p, videos,
                                        mae_key=mae_key, drop_key=drop_key, train=True)
@@ -136,11 +131,11 @@ def train_step(tokenizer, tx, params, opt_state, batch, *,
 
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
 
-    # 4) Update
+    # Update
     updates, opt_state = tx.update(grads, opt_state, params)
     new_params = optax.apply_updates(params, updates)
 
-    # 5) Return
+    # Return
     return new_params, opt_state, aux
 
 def run(cfg: TokenizerConfig):
@@ -216,8 +211,9 @@ def run(cfg: TokenizerConfig):
 
             rng, master_key = jax.random.split(rng)
             train_start_t = time.perf_counter()
+            videos = batch['videos']/127.5 - 1   # (B,T,H,W,C)
             params, opt_state, aux = train_step(
-                tokenizer, tx, params, opt_state, batch,
+                tokenizer, tx, params, opt_state, videos,
                 patch=cfg.patch_size, H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, 
                 master_key=master_key, step=step, 
                 lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
@@ -250,6 +246,26 @@ def run(cfg: TokenizerConfig):
             # state = make_state(params, opt_state, rng, step)
             # maybe_save(mngr, step, state, meta_example)
 
+            # Viz
+            if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
+                rng, viz_key = jax.random.split(rng)
+                mae_key, drop_key, vis_batch_key = jax.random.split(viz_key, 3)
+                
+                # Take first 8 examples, first frame: (8, 1, H, W, C)
+                viz_batch = videos[:8, :1]
+                # Normalize to 0..1 for viz_step
+                viz_batch = viz_batch.astype(jnp.float32) 
+                
+                target, masked_in, rec_masked, rec_full, frame_mask = viz_step(tokenizer, params, viz_batch, mae_key=mae_key, drop_key=drop_key)
+                
+                grid = jnp.concatenate([target, masked_in, rec_masked, rec_full], axis=2)
+                grid = einops.rearrange(grid[:,0], "b h w c -> h (b w) c")
+                grid = grid.clip(0, 255).astype(jnp.uint8)
+                
+                vis_path = run_dir / "viz"
+                if not vis_path.exists():
+                    vis_path.mkdir(parents=True)
+                imageio.imwrite(vis_path / f"step_{step:03d}.png", grid)
     finally:
         # Make sure any background saves finish before exit.
         # mngr.wait_until_finished()

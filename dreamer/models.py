@@ -491,7 +491,7 @@ class Decoder(nn.Module):
         x = self.transformer(tokens, mask=mask, deterministic=deterministic)
         # 7) Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
-        pred_btnd = nn.sigmoid(self.patch_head(x_patches))  # (B,T,Np,D_patch)
+        pred_btnd = nn.tanh(self.patch_head(x_patches))  # (B,T,Np,D_patch)
         out_frames = unpatchify(pred_btnd, patch=self.patch_size, H=self.H, W=self.W)
         return out_frames
 
