@@ -25,7 +25,8 @@ import wandb
 
 # UPDATED: bring in heads + task embedder
 from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
-from dreamer.data import make_iterator, DatasetConfig
+from dreamer.data import make_iterator
+from dreamer.configs import BCRewConfig
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -41,71 +42,7 @@ from dreamer.sampler import SamplerConfig, sample_video
 # Config
 # ---------------------------
 
-@dataclass(frozen=True)
-class RealismConfig:
-    # IO / ckpt
-    run_name: str
-    tokenizer_ckpt: str
-    dynamics_ckpt: str
-    ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
 
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None  # if None, uses default entity
-    wandb_project: str | None = None  # if None, uses run_name as project
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    action_dim: int = 4 # number of categorical actions
-
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4 # number of register tokens for dynamics
-    n_agent: int = 1 # number of agent tokens for dynamics
-
-    # UPDATED: default to wm_agent (fine-tuning with agent readouts)
-    agent_space_mode: str = "wm_agent"
-
-    # schedule
-    k_max: int = 8
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
-    self_fraction: float = 0.25   # used once we pass bootstrap_start
-
-    # train
-    max_steps: int = 1_000_000_000
-    log_every: int = 5_000
-    lr: float = 3e-4
-
-    # eval media toggle
-    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
-
-    # NEW: multi-token prediction (MTP) settings
-    L: int = 2                      # predict next L actions/rewards
-    num_reward_bins: int = 101      # twohot bins for symexp rewards
-    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
-    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
-    n_tasks: int = 128              # task-ID space for TaskEmbedder
-    use_task_ids: bool = True       # True: discrete task IDs; False: vector embed
-    
-    # Loss weighting (to balance scales across different loss components)
-    loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
-    loss_weight_policy: float = 1.0      # weight for policy CE loss (nats)
-    loss_weight_reward: float = 1.0      # weight for reward CE loss (nats)
-
-# ---------------------------
 # Small helpers
 # ---------------------------
 
@@ -688,7 +625,7 @@ def load_pretrained_dynamics_params(ckpt_dir: str, dyn_vars: dict) -> dict:
     return p["dyn"] if isinstance(p, dict) and "dyn" in p else p
 
 def initialize_models_and_tokenizer(
-    cfg: RealismConfig,
+    cfg: BCRewConfig,
     frames_init: jnp.ndarray,
     actions_init: jnp.ndarray,
 ) -> TrainState:
@@ -825,7 +762,7 @@ def initialize_models_and_tokenizer(
 # ---------------------------
 
 def run_evaluation(
-    cfg: RealismConfig,
+    cfg: BCRewConfig,
     step: int,
     train_state: TrainState,
     next_batch,
@@ -890,7 +827,7 @@ def run_evaluation(
 # Main
 # ---------------------------
 
-def run(cfg: RealismConfig):
+def run(cfg: BCRewConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
@@ -1048,7 +985,7 @@ def run(cfg: RealismConfig):
 @hydra.main(version_base=None, config_path="../configs", config_name="bc_rew")
 def main(cfg: DictConfig):
     # Merge with structured schema to fill defaults and type check
-    schema = OmegaConf.structured(RealismConfig)
+    schema = OmegaConf.structured(BCRewConfig)
     cfg = OmegaConf.merge(schema, cfg)
     realism_cfg = OmegaConf.to_object(cfg)
     

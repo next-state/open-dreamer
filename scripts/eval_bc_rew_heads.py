@@ -19,7 +19,8 @@ import orbax.checkpoint as ocp
 
 # Project imports
 from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
-from dreamer.data import make_iterator, DatasetConfig
+from dreamer.data import make_iterator
+from dreamer.configs import EvalConfig
 from dreamer.utils import (
     temporal_patchify, pack_bottleneck_to_spatial, 
     with_params, make_state, make_manager, pack_mae_params,
@@ -32,56 +33,7 @@ from dreamer.sampler import SamplerConfig, sample_video
 # Config
 # ---------------------------
 
-@dataclass(frozen=True)
-class EvalConfig:
-    # Paths
-    run_ckpt_dir: str                         # training run checkpoints dir to restore params from
-    tokenizer_ckpt: str                       # tokenizer ckpt (for enc/dec)
 
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    action_dim: int = 4
-
-    # Tokenizer / dynamics
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4
-    n_agent: int = 1
-    agent_space_mode: str = "wm_agent"
-    k_max: int = 8
-
-    # Heads
-    L: int = 2
-    num_reward_bins: int = 101
-    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
-    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
-    n_tasks: int = 128
-    use_task_ids: bool = True
-
-    # Sampler/eval
-    ctx_length: int = 32
-    horizon: int = 16
-    schedule: str = "finest"  # "finest" or "shortcut"
-    d: float | None = None    # e.g., 0.25 for shortcut
-    ctx_signal_tau: float = 1.0
-    match_ctx_tau: bool = False
-
-    # Visualization
-    max_examples_to_plot: int = 4  # number of sequences to render as strips
-
-    # Safety: ensure heads never see future actions when predicting next actions
-    paranoid_no_leak: bool = True
 
 # ---------------------------
 # Utilities (reward bins, gatherers, plotting)

@@ -25,7 +25,8 @@ import orbax.checkpoint as ocp
 import wandb
 
 from dreamer.models import Encoder, Decoder, Dynamics
-from dreamer.data import make_iterator, DatasetConfig
+from dreamer.data import make_iterator
+from dreamer.configs import DynamicsConfig
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -41,51 +42,7 @@ from dreamer.sampler import SamplerConfig, sample_video
 # Config
 # ---------------------------
 
-@dataclass(frozen=True)
-class RealismConfig:
-    # IO / ckpt
-    run_name: str
-    tokenizer_ckpt: str
-    ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
 
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None  # if None, uses default entity
-    wandb_project: str | None = None  # if None, uses run_name as project
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4 # number of register tokens for dynamics
-    n_agent: int = 1 # number of agent tokens for dynamics
-
-    # schedule
-    k_max: int = 8
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
-    self_fraction: float = 0.25   # used once we pass bootstrap_start
-
-    # train
-    max_steps: int = 1_000_000_000
-    log_every: int = 5_000
-    lr: float = 3e-4
-
-    # eval media toggle
-    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
 # ---------------------------
 # Small helpers
@@ -524,7 +481,7 @@ class TrainState:
 # ---------------------------
 
 def initialize_models_and_tokenizer(
-    cfg: RealismConfig,
+    cfg: DynamicsConfig,
     frames_init: jnp.ndarray,
     actions_init: jnp.ndarray,
 ) -> TrainState:
@@ -635,7 +592,7 @@ def initialize_models_and_tokenizer(
 # ---------------------------
 
 def run_evaluation(
-    cfg: RealismConfig,
+    cfg: DynamicsConfig,
     step: int,
     train_state: TrainState,
     next_batch,
@@ -714,7 +671,7 @@ def run_evaluation(
 # Main
 # ---------------------------
 
-def run(cfg: RealismConfig):
+def run(cfg: DynamicsConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
@@ -854,7 +811,7 @@ def run(cfg: RealismConfig):
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")
 def main(cfg: DictConfig):
-    schema = OmegaConf.structured(RealismConfig)
+    schema = OmegaConf.structured(DynamicsConfig)
     cfg = OmegaConf.merge(schema, cfg)
     realism_cfg = OmegaConf.to_object(cfg)
     

@@ -5,41 +5,7 @@ import jax.numpy as jnp
 import imageio.v2 as imageio
 from einops import rearrange
 import coinrun_data.dataloader as coinrun_loader
-
-
-# ============================================================
-# Dataset Configuration
-# ============================================================
-
-@dataclass
-class DatasetConfig:
-    """Configuration for dataset parameters.
-    
-    This config is shared across all experiments (tokenizer, dynamics, policy)
-    to ensure consistent data loading.
-    """
-    name: str = "bouncing_square"
-    
-    # Batch and sequence dimensions
-    B: int = 4  # batch size
-    T: int = 16  # sequence length
-    H: int = 64  # height
-    W: int = 64  # width
-    C: int = 3   # channels
-    
-    # Bouncing square specific parameters
-    pixels_per_step: int = 2
-    size_min: int = 6
-    size_max: int = 14
-    hold_min: int = 4
-    hold_max: int = 9
-    diversify_data: bool = True
-    
-    # Dataset selection
-    source: str = "custom"  # "bouncing_square" or "custom"
-    action_dim: int = 1  # For bouncing square it's discrete (1 dim), for others might be >1 or continuous
-    array_record_path: str = "datasets/coinrun_episodes/train" 
-
+from .configs import DatasetConfig
 
 
 # ============================================================

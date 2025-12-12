@@ -8,7 +8,8 @@ import jax
 import jax.numpy as jnp
 import optax
 from dreamer.models import Encoder, Decoder
-from dreamer.data import make_iterator, DatasetConfig
+from dreamer.data import make_iterator
+from dreamer.configs import TokenizerConfig, EncoderConfig, DecoderConfig, DatasetConfig
 import imageio
 from jaxlpips import LPIPS
 from pathlib import Path
@@ -17,68 +18,6 @@ from hydra.core.hydra_config import HydraConfig
 from dreamer.utils import patchify, unpatchify, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
 from dreamer.logging import MetricLogger
 
-
-# ---------------------------
-# Config
-# ---------------------------
-
-@dataclass
-class EncoderConfig:
-    n_latents: int = 16
-    d_bottleneck: int = 32
-    d_model: int = 64
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    n_patches: int = 64  # Will be computed from H, W, patch_size
-    depth: int = 8
-    dropout_rate: float = 0.05
-    qk_norm_type: str | None = None
-    rope_theta: float = 10000.0
-    time_every: int = 4
-    mae_p_min: float = 0.0
-    mae_p_max: float = 0.9
-
-@dataclass
-class DecoderConfig:
-    d_model: int = 64
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    n_latents: int = 16
-    n_patches: int = 64  # Will be computed from H, W, patch_size
-    d_patch: int = 48    # Will be computed from patch_size, C
-    depth: int = 8
-    dropout_rate: float = 0.05
-    qk_norm_type: str | None = None
-    rope_theta: float = 10000.0
-    time_every: int = 4
-
-@dataclass(frozen=True)
-class TokenizerConfig:
-    # IO / ckpt
-    run_name: str
-    ckpt_max_to_keep: int = 5
-    ckpt_save_every: int = 10_000
-
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None
-    wandb_project: str | None = None
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-
-    # model parameters
-    patch_size: int = 4
-    encoder: EncoderConfig = field(default_factory=EncoderConfig)
-    decoder: DecoderConfig = field(default_factory=DecoderConfig)
-
-    # training
-    lr: float = 1e-4
-    max_steps: int = 1_000_000_000
-    log_every: int = 100
-    lpips_weight: float = 0.2
-    lpips_frac: float = 0.5
-    visualize_every: int = 10_000
 
 def _ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)

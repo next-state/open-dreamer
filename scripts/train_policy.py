@@ -49,7 +49,8 @@ from dreamer.models import (
     RewardHeadMTP,
     ValueHead,
 )
-from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn, DatasetConfig
+from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn
+from dreamer.configs import RLConfig
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -74,77 +75,7 @@ from dreamer.logging import MetricLogger
 # ---------------------------
 
 
-@dataclass(frozen=True)
-class RLConfig:
-    # IO / ckpt
-    run_name: str
-    bc_rew_ckpt: str  # checkpoint from train_bc_rew_heads.py
-    ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
 
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None
-    wandb_project: str | None = None
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    action_dim: int = 4
-
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4
-    n_agent: int = 1
-    agent_space_mode: str = "wm_agent"
-
-    # schedule
-    k_max: int = 8
-
-    # train
-    max_steps: int = 1_000_000_000
-    log_every: int = 5_000
-    lr: float = 3e-4
-
-    # eval media toggle
-    write_video_every: int = 10_000
-    visualize_every: int = 25_000
-
-    # RL-specific
-    L: int = 2
-    num_reward_bins: int = 101
-    reward_log_low: float = -3.0
-    reward_log_high: float = 3.0
-    num_value_bins: int = 101
-    n_tasks: int = 128
-    use_task_ids: bool = True
-
-    # RL hyperparameters
-    gamma: float = 0.997
-    lambda_: float = 0.95
-    horizon: int = 32
-    context_length: int = 16
-    imagination_d: float = 1.0 / 4
-    alpha: float = 0.5
-    beta: float = 0.3
-
-    # Evaluation
-    eval_every: int = 50_000
-    eval_episodes: int = 4
-    eval_horizon: int = 32
-    eval_batch_size: int = 4
-    max_eval_examples_to_plot: int = 4
 
 
 # ---------------------------

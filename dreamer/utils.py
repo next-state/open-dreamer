@@ -99,7 +99,7 @@ class TokenLayout:
             raise ValueError(f"Unknown mode {mode}")
 
         # Save (S,S)
-        mask = repeat(modality_mask, "q k -> (b t) h q k", b=B, t=T, h=1)
+        mask = repeat(mask, "q k -> (b t) h q k", b=B, t=T, h=1)
         mask = jax.lax.stop_gradient(mask)
         return mask
 
