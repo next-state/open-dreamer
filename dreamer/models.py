@@ -14,15 +14,63 @@ from .utils import make_mask, Modality
 @flax.struct.dataclass
 class KVCache:
     """
-    KV cache for a single attention layer.
-    k: (B, T_cached, K, H) - cached keys
-    v: (B, T_cached, K, H) - cached values
+    Ring buffer KV cache for JIT compilation.
     """
-    k: Optional[jnp.ndarray] = None
-    v: Optional[jnp.ndarray] = None
+    k: jnp.ndarray      # (B, Max_T, K, H)
+    v: jnp.ndarray      # (B, Max_T, K, H)
+    index: jnp.ndarray  # scalar integer (i32)
+    window_size: int = flax.struct.field(pytree_node=False)
 
+    @classmethod
+    def init(cls, batch_size, window_size, num_kv_heads, head_dim, dtype=jnp.float32):
+        return cls(
+            k=jnp.zeros((batch_size, window_size, num_kv_heads, head_dim), dtype=dtype),
+            v=jnp.zeros((batch_size, window_size, num_kv_heads, head_dim), dtype=dtype),
+            index=jnp.array(0, dtype=jnp.int32),
+            window_size=window_size
+        )
 
-@flax.struct.dataclass  # immutable, PyTree-friendly
+    def update(self, k_new, v_new):
+        """
+        Writes k_new/v_new into the buffer.
+        We make two assumptions: 
+            - The prefill prompt is smaller than the window size
+            - One frame is generated at a time
+        Returns updated cache with index incremented by the length of new data.
+        """
+        t_new = k_new.shape[1]
+        write_idx = self.index % self.window_size
+
+        k_to_write = k_new
+        v_to_write = v_new
+                    
+        # we assume only T=1 can cross the boundary of the window
+        # to add support for T>1, we would need a `jax.lax.cond` to split the write into two chunks
+        k_updated = jax.lax.dynamic_update_slice(self.k, k_to_write, (0, write_idx, 0, 0))
+        v_updated = jax.lax.dynamic_update_slice(self.v, v_to_write, (0, write_idx, 0, 0))
+        
+        return self.replace(k=k_updated, v=v_updated, index=self.index + t_new)
+
+    def get_ordered_kv(self):
+        """
+        Returns rolled K, V, and a mask indicating valid data.
+        """
+        write_idx = self.index % self.window_size
+        shift = -1 * write_idx
+
+        # newest is at index -1
+        k_ordered = jnp.roll(self.k, shift, axis=1)
+        v_ordered = jnp.roll(self.v, shift, axis=1)
+
+        # during warmup, window is not full, so we need to mask the pre-allocated invalid data
+        valid_len = jnp.minimum(self.index, self.window_size)
+        idx_seq = jnp.arange(self.window_size)[None, None, None, :] # (1, 1, 1, Window)
+        start_valid = self.window_size - valid_len
+        mask = idx_seq >= start_valid
+
+        return k_ordered, v_ordered, mask
+
+@flax.struct.dataclass
 class TokenLayout:
     """
     Ordered token layout for a single timestep: latents first (if any),
@@ -69,62 +117,6 @@ def sinusoid_table(n: int, d: int, base: float = 10000.0, dtype=jnp.float32) -> 
     return table.astype(dtype)
 
 
-@lru_cache(maxsize=8)
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype=jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
-    Returns:
-        freqs_cos: (end, dim//2)
-        freqs_sin: (end, dim//2)
-    """
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
-    t = jnp.arange(end, dtype=dtype)
-    freqs = jnp.outer(t, freqs)  # (end, dim//2)
-    return jnp.cos(freqs), jnp.sin(freqs)
-
-
-def apply_rotary_emb(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cos: jnp.ndarray, freqs_sin: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Apply Rotary Positional Embeddings (RoPE) to queries and keys using real sin/cos.
-    xq: (B, T, N, H)
-    xk: (B, S, K, H)
-    freqs_cos: (L, H/2)
-    freqs_sin: (L, H/2)
-    """
-    # Rearrange to (..., H/2, 2)
-    xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
-    xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
-
-    xq_r, xq_i = xq_pairs[..., 0], xq_pairs[..., 1]
-    xk_r, xk_i = xk_pairs[..., 0], xk_pairs[..., 1]
-
-    T, S = xq.shape[1], xk.shape[1]
-    
-    # Broadcast freqs (L, H/2) -> (1, L, 1, H/2)
-    cos_q = freqs_cos[None, :T, None, :]
-    sin_q = freqs_sin[None, :T, None, :]
-    cos_k = freqs_cos[None, :S, None, :]
-    sin_k = freqs_sin[None, :S, None, :]
-
-    # Rotation:
-    # x' = x cos - y sin
-    # y' = x sin + y cos
-    xq_out_r = xq_r * cos_q - xq_i * sin_q
-    xq_out_i = xq_r * sin_q + xq_i * cos_q
-    
-    xk_out_r = xk_r * cos_k - xk_i * sin_k
-    xk_out_i = xk_r * sin_k + xk_i * cos_k
-
-    # Stack back and flatten
-    xq_out = jnp.stack([xq_out_r, xq_out_i], axis=-1)
-    xk_out = jnp.stack([xk_out_r, xk_out_i], axis=-1)
-
-    xq_out = rearrange(xq_out, '... d two -> ... (d two)')
-    xk_out = rearrange(xk_out, '... d two -> ... (d two)')
-    
-    return xq_out, xk_out
-
-
 def add_sinusoidal_positions(tokens_btSd: jnp.ndarray) -> jnp.ndarray:
     """tokens: (B,T,S,D) -> adds time and step sinusoids and returns same shape."""
     B, T, S, D = tokens_btSd.shape
@@ -133,6 +125,68 @@ def add_sinusoidal_positions(tokens_btSd: jnp.ndarray) -> jnp.ndarray:
     # Optionally scale to keep variance stable (common trick)
     scale = 1.0 / jnp.sqrt(jnp.array(D, dtype=tokens_btSd.dtype))
     return tokens_btSd + scale * (pos_t[None, :, None, :] + pos_s[None, None, :, :])
+
+
+class RotaryEmbedding1D(nn.Module):
+    dim: int
+    theta: float = 10000.0
+    dtype: Any = jnp.float32
+
+    def setup(self):
+        inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
+        self.inv_freq = self.variable('constants', 'inv_freq', lambda: inv_freq)
+
+    def __call__(self, q, k, start_pos=0):
+        """
+        q: (B, T, N, H)
+        k: (B, T, K, H)
+        start_pos: scalar int (the absolute position of the first frame in T)
+        """
+        T = q.shape[1]
+        t_indices = jnp.arange(T, dtype=self.dtype) + start_pos
+        freqs = jnp.outer(t_indices, self.inv_freq.value) # (T, dim//2)
+
+        freqs_cos = jnp.cos(freqs)
+        freqs_sin = jnp.sin(freqs)
+
+        # (1, T, 1, Dim//2)
+        freqs_cos = freqs_cos[None, :, None, :]
+        freqs_sin = freqs_sin[None, :, None, :]
+
+        return self._apply(q, k, freqs_cos, freqs_sin)
+
+    def _apply(self, xq, xk, freqs_cos, freqs_sin):
+        """
+        Apply Rotary Positional Embeddings (RoPE) to queries and keys using real sin/cos.
+        xq: (B, T, N, H)
+        xk: (B, T, K, H)
+        freqs_cos: (L, H/2)
+        freqs_sin: (L, H/2)
+        """
+        # Rearrange to (..., H/2, 2)
+        xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
+        xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
+
+        xq_r, xq_i = xq_pairs[..., 0], xq_pairs[..., 1]
+        xk_r, xk_i = xk_pairs[..., 0], xk_pairs[..., 1]
+
+        # Rotation:
+        # x' = x cos - y sin
+        # y' = x sin + y cos
+        xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
+        xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
+        
+        xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
+        xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
+
+        # Stack back and flatten
+        xq_out = jnp.stack([xq_out_r, xq_out_i], axis=-1)
+        xk_out = jnp.stack([xk_out_r, xk_out_i], axis=-1)
+
+        xq_out = rearrange(xq_out, '... d two -> ... (d two)')
+        xk_out = rearrange(xk_out, '... d two -> ... (d two)')
+        
+        return xq_out, xk_out
 
 class MAEReplacer(nn.Module):
     p_min: float = 0.0
@@ -249,6 +303,12 @@ class GroupedQueryAttention(nn.Module):
             self.q_ln = nn.RMSNorm(use_scale=True)
             self.k_ln = nn.RMSNorm(use_scale=True)
 
+        if self.use_rope:
+            self.rope = RotaryEmbedding1D(
+                dim=head_dim,
+                theta=self.rope_theta
+            )
+
     def __call__(self, x, mask, *args, cache: Optional[KVCache] = None):
         """
         https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html
@@ -262,39 +322,10 @@ class GroupedQueryAttention(nn.Module):
         """
         q = self.to_q(x)
         q = rearrange(q, "B T (N H) -> B T N H", N=self.num_heads)
+        kv = self.to_kv(x)
+        k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
 
-        def compute_kv(x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-            kv = self.to_kv(x)
-            k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
-            return k, v
-
-        new_cache = None
-        if cache is not None and self.is_causal and cache.k is not None and cache.v is not None:
-            cache_len = cache.k.shape[1]
-            seq_len = x.shape[1]
-            
-            if seq_len > cache_len:
-                x_new = x[:, cache_len:, :]
-                k_new, v_new = compute_kv(x_new)
-                
-                k = jnp.concatenate([cache.k, k_new], axis=1)
-                v = jnp.concatenate([cache.v, v_new], axis=1)
-            else:
-                k = cache.k[:, :seq_len, :, :]
-                v = cache.v[:, :seq_len, :, :]
-            
-            new_cache = KVCache(k=k, v=v)
-        else:
-            k, v = compute_kv(x)
-            if cache is not None and self.is_causal:
-                new_cache = KVCache(k=k, v=v)
-
-        if self.use_rope:
-            head_dim = q.shape[-1]
-            max_len = max(q.shape[1], k.shape[1])
-            freqs_cos, freqs_sin = precompute_freqs_cis(head_dim, max_len, self.rope_theta, dtype=q.dtype)
-            q, k = apply_rotary_emb(q, k, freqs_cos, freqs_sin)
-
+        # QK normalization
         scale = q.shape[-1] ** -0.5
         if self.qk_norm_type == 'qknorm':
             q = self.q_ln(q)
@@ -304,7 +335,45 @@ class GroupedQueryAttention(nn.Module):
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
             scale = 1.0 
 
-        attn = jax.nn.dot_product_attention(q, k, v, mask=mask, scale=scale, is_causal=self.is_causal)  # TODO: try setting implementation="cudnn"
+        # RoPE
+        if self.use_rope:
+            start_pos = cache.index if cache is not None else 0
+            q, k = self.rope(q, k, start_pos=start_pos)
+
+        # KV cache
+        if self.is_causal and cache is not None:
+            # CACHED INFERENCE MODE
+            new_cache = cache.update(k, v)
+            T = q.shape[1]
+
+            if T > 1:
+                # [PREFILL] process the prompt (history frames)
+                k_attn, v_attn = k, v
+                mask_attn = mask
+                attn_is_causal = True
+            else:
+                # [DECODE] process the current frame (assume T=1)
+                k_attn, v_attn, valid_mask = new_cache.get_ordered_kv()
+                attn_is_causal = False
+
+                if mask is not None:
+                    mask_attn = jnp.logical_and(mask, valid_mask)
+                else:
+                    mask_attn = valid_mask
+        else:
+            # TRAINING or NON-CAUSAL (SPACE) ATTENTION
+            new_cache = None
+            k_attn, v_attn = k, v
+            mask_attn = mask
+            attn_is_causal = self.is_causal
+
+        # SDPA
+        attn = jax.nn.dot_product_attention(
+            q, k_attn, v_attn, 
+            mask=mask_attn, 
+            scale=scale, 
+            is_causal=attn_is_causal
+        )  # TODO: try setting implementation="cudnn"
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
@@ -312,7 +381,7 @@ class GroupedQueryAttention(nn.Module):
         
         return out, new_cache
 
-class SpaceSelfAttentionModality(nn.Module):
+class SpaceSelfAttention(nn.Module):
     """Space self-attention with modality routing."""
     dim: int
     num_heads: int
@@ -357,9 +426,10 @@ class TimeSelfAttention(nn.Module):
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None):
         # mask does nothing, but is required for API consistency
-        # x: (B, T, S, D) -> attend across T, causal
+        # x: (B, T, S, D) -> attention across T, causal
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
+
         out, new_cache = GroupedQueryAttention(
             dim=self.dim,
             num_heads=self.num_heads,
@@ -371,6 +441,7 @@ class TimeSelfAttention(nn.Module):
             deterministic=deterministic,
             is_causal=True,
         )(x, mask=None, cache=cache)
+
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         return out, new_cache
 
@@ -392,7 +463,7 @@ class BlockCausalLayer(nn.Module):
 
         # --- Time or space attention ---
         self.use_time = (self.layer_index + 1) % self.time_every == 0
-        attention_module = TimeSelfAttention if self.use_time else SpaceSelfAttentionModality
+        attention_module = TimeSelfAttention if self.use_time else SpaceSelfAttention
         self.attn = attention_module(
             dim=self.dim,
             num_heads=self.num_heads,
@@ -419,6 +490,7 @@ class BlockCausalLayer(nn.Module):
         y = self.mlp(y, deterministic=deterministic)
         x = x + y
         return x, new_cache
+
 # ---------- the transformer stack ----------
 
 class BlockCausalTransformer(nn.Module):
@@ -723,12 +795,33 @@ class Dynamics(nn.Module):
         self.flow_x_head = nn.Dense(self.d_spatial, name="flow_x_head", kernel_init=nn.initializers.zeros,
                             bias_init=nn.initializers.zeros)  # zero-init
 
-    def create_empty_cache(self) -> Dict[int, KVCache]:
+    def create_static_caches(self, 
+                             batch_size: int, 
+                             window_size: int = 1024,
+                             dtype=jnp.float32) -> Dict[int, KVCache]:
         """
-        Create an empty cache dictionary for this dynamics model.
+        Creates concrete, zero-filled buffers for JIT compilation.
+
+        Args:
+            batch_size: Global batch size (B)
+            window_size: Maximum sequence length (T) to support.
         """
-        num_time_layers = self.depth // self.time_every
-        return {i: KVCache(k=None, v=None) for i in range(num_time_layers)}
+        # Time attention sees (B*S) independent sequences
+        flattened_batch_size = batch_size * self.n_spatial
+        head_dim = self.d_model // self.n_heads
+
+        caches = {}
+        for i in range(self.depth):
+            time_index, time_offset = divmod(i, self.time_every)
+            if time_offset == 0:
+                caches[time_index] = KVCache.init(
+                    batch_size=flattened_batch_size,
+                    window_size=window_size,
+                    num_kv_heads=self.n_kv_heads,
+                    head_dim=head_dim,
+                    dtype=dtype
+                )
+        return caches
 
     @nn.compact
     def __call__(

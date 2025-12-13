@@ -154,7 +154,7 @@ def denoise_single_latent_static(
     z_ctx_t: jnp.ndarray,                     # (B, T_ctx, n_spatial, D_s)
     z_noise_t: jnp.ndarray,                   # (B, 1, n_spatial, D_s)
     agent_tokens: jnp.ndarray | None = None,  # (B, T_ctx+1, n_agent, d_model)
-    kv_cache: Dict[int, Any] | None = None,
+    caches: Dict[int, Any] | None = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[int, Any] | None]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
@@ -173,56 +173,74 @@ def denoise_single_latent_static(
         z_ctx_noise_t: (B, T_ctx, n_spatial, D_s) stabilization noise for context
         z_noise_t: (B, 1, n_spatial, D_s) initial noisy latent at τ_0
         agent_tokens: optional agent tokens (B, T_ctx+1, n_agent, d_model)
-        kv_cache: KV cache for context frames (from previous finalized frames)
+        caches: KV cache for context frames (from previous finalized frames)
     """
     B, T_ctx, n_spatial, D_s = z_ctx_t.shape
-
     S = schedule.alpha_seq.shape[0]
 
     def refinement_step(z_t, s):
         alpha = schedule.alpha_seq[s]
         signal_idx_scalar = schedule.signal_idx_seq[s + 1]
 
-        # Build sequence and indices
-        z_seq = jnp.concatenate([z_ctx_t, z_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
-        actions_full = jnp.concatenate([actions_ctx, action_curr], axis=1)  # (B, T_ctx+1)
+        # Input preparation
+        if caches is not None:
+            # Denoise only the current frame
+            z_input = z_t
+            actions_input = action_curr
 
-        step_idx = jnp.full((B, T_ctx + 1), schedule.step_idx, dtype=jnp.int32)
-        signal_idx_ctx = jnp.full((B, T_ctx), (0.9 * schedule.k_max).astype(jnp.int32), dtype=jnp.int32)
-        signal_idx_curr = jnp.full((B, 1), signal_idx_scalar, dtype=jnp.int32)
-        signal_idx = jnp.concatenate([signal_idx_ctx, signal_idx_curr], axis=1)
+            step_idx_input = jnp.full((B, 1), schedule.step_idx, dtype=jnp.int32)
+            signal_idx_input = jnp.full((B, 1), signal_idx_scalar, dtype=jnp.int32)
 
-        z_clean_pred_seq, h_seq, kv_cache_updated = dynamics.apply(
+            if agent_tokens is not None:
+                agent_tokens_input = agent_tokens[:, -1:, :, :]
+            else:
+                agent_tokens_input = None
+        
+        else:
+            # Denoise [context, current_frame]
+            z_input = jnp.concatenate([z_ctx_t, z_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
+            actions_input = jnp.concatenate([actions_ctx, action_curr], axis=1)  # (B, T_ctx+1)
+
+            step_idx_input = jnp.full((B, T_ctx + 1), schedule.step_idx, dtype=jnp.int32)
+            signal_idx_ctx = jnp.full((B, T_ctx), (0.9 * schedule.k_max).astype(jnp.int32), dtype=jnp.int32)
+            signal_idx_curr = jnp.full((B, 1), signal_idx_scalar, dtype=jnp.int32)
+            signal_idx_input = jnp.concatenate([signal_idx_ctx, signal_idx_curr], axis=1)
+
+            agent_tokens_input = agent_tokens
+
+        # Dynamics call
+        z_clean_pred_seq, h_seq, caches_updated = dynamics.apply(
             dyn_vars,
-            actions_full,
-            step_idx,
-            signal_idx,
-            z_seq,
-            agent_tokens=agent_tokens,
+            actions_input,
+            step_idx_input,
+            signal_idx_input,
+            z_input,
+            agent_tokens=agent_tokens_input,
             deterministic=True,
-            caches=kv_cache,
+            caches=caches,
         )
 
         z_clean_pred = z_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
-
-        # h_seq: (B, T_ctx+1, n_agent, d_model) – use last time index
         h_last = h_seq[:, -1, :, :]  # (B, n_agent, d_model)
 
         # Per-step mixing toward clean latent
         z_t_new = (1.0 - alpha) * z_t + alpha * z_clean_pred
 
-        return z_t_new, (h_last, kv_cache_updated)
+        return z_t_new, (h_last, caches_updated)
 
     # Run τ-ladder with JAX control flow using scan to keep carry/output structure consistent.
-    z_t_final, (h_history, kv_cache_final) = jax.lax.scan(
+    z_t_final, (h_history, caches_history) = jax.lax.scan(
         refinement_step,
         z_noise_t,
         jnp.arange(S),
     )
 
     h_last = h_history[-1]  # (B, n_agent, d_model)
+    caches_last = None
+    if caches_history is not None:
+        caches_last = jax.tree.map(lambda x: x[-1], caches_history)
 
-    return z_t_final, h_last, kv_cache_final  # (B, 1, n_spatial, D_s), (B, n_agent, d_model), Dict[int, KVCache] | None
+    return z_t_final, h_last, caches_last  # (B, 1, n_spatial, D_s), (B, n_agent, d_model), Dict[int, KVCache] | None
 
 
 # JIT-compiled variant (optional convenience wrapper)
@@ -304,7 +322,7 @@ def imagine_rollouts_core(
     policy_fn: PolicyFn,
     policy_state: Any,
     rng_key: jax.Array,
-    use_kv_cache: bool = True,
+    use_kv_caching: bool = True,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Core JAX-friendly imagination rollout in latent space with KV caching.
@@ -335,8 +353,11 @@ def imagine_rollouts_core(
     step_idx_ctx = jnp.full((B, context_length), e_jax, dtype=jnp.int32)
     signal_idx_ctx = jnp.full((B, context_length), schedule.k_max - 1, dtype=jnp.int32)
 
-    # Initial hidden state & KV cache from context
-    _, h_ctx_init, kv_cache = dynamics.apply(
+    # [PREFILL]: initial hidden state & KV cache from context
+    MAX_WINDOW = 4096  # must accomodate all tokens processed by time layers
+    initial_caches = (dynamics.create_static_caches(batch_size=B, window_size=MAX_WINDOW, dtype=z_ctx.dtype) 
+                      if use_kv_caching else None)
+    _, h_ctx_init, filled_caches = dynamics.apply(
         dyn_vars,
         actions_ctx,
         step_idx_ctx,
@@ -344,7 +365,7 @@ def imagine_rollouts_core(
         z_ctx,
         agent_tokens=agent_tokens_full[:, :context_length, :, :],
         deterministic=True,
-        caches=dynamics.create_empty_cache() if use_kv_cache else None,
+        caches=initial_caches,
     )  # (B, context_length, n_agent, d_model)
 
     h_pooled_init = reduce(
@@ -358,8 +379,9 @@ def imagine_rollouts_core(
     # Stabilization noise for autoregressive rollout
     z_ctx_noise = jnp.zeros_like(z_ctx) # Zero for ground truth initial context
 
-    def scan_body(carry, t):
-        z_ctx_t, actions_ctx_t, z_ctx_noise_t, h_t, policy_state_t, rng_t, kv_cache_t = carry
+    # [DECODE]
+    def scan_step(carry, t):
+        z_ctx_t, actions_ctx_t, z_ctx_noise_t, h_t, policy_state_t, rng_t, caches_t = carry
 
         rng_t, policy_key, z_noise_t_key = jax.random.split(rng_t, 3)
 
@@ -385,7 +407,7 @@ def imagine_rollouts_core(
             (B, context_length + 1, agent_tokens_full.shape[2], agent_tokens_full.shape[3]),
         )
 
-        z_clean_pred, h_last, kv_cache_updated = denoise_single_latent_static(
+        z_clean_pred, h_last, caches_next = denoise_single_latent_static(
             dynamics=dynamics,
             dyn_vars=dyn_vars,
             schedule=schedule,
@@ -394,7 +416,7 @@ def imagine_rollouts_core(
             z_ctx_t=z_ctx_noised_t,
             z_noise_t=z_noise_t,
             agent_tokens=agent_tokens_seq,
-            kv_cache=kv_cache_t,
+            caches=caches_t,
         )
 
         # h_last: (B, n_agent, d_model) → pool over agents
@@ -413,16 +435,13 @@ def imagine_rollouts_core(
             [z_ctx_noise_t, z_noise_t], axis=1
         )[:, -context_length:, :, :]
 
-        # Sliding window update of KV cache
-        kv_cache_next = jax.tree.map(lambda x: x[:, -context_length:, :, :], kv_cache_updated) if use_kv_cache else None
-
-        carry_next = (z_ctx_next, actions_ctx_next, z_ctx_noise_next, h_next, policy_state_next, rng_t, kv_cache_next)
+        carry_next = (z_ctx_next, actions_ctx_next, z_ctx_noise_next, h_next, policy_state_next, rng_t, caches_next)
 
         return carry_next, (z_clean_pred[:, 0, :, :], actions_t, h_next, logits_t)
 
-    init_carry = (z_ctx, actions_ctx, z_ctx_noise, h, policy_state, rng_key, kv_cache)
+    init_carry = (z_ctx, actions_ctx, z_ctx_noise, h, policy_state, rng_key, filled_caches)
     _, outputs = jax.lax.scan(
-        scan_body,
+        scan_step,
         init_carry,
         jnp.arange(horizon),
     )

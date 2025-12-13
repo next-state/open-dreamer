@@ -1367,7 +1367,7 @@ def train_step(
                 policy_fn=policy_fn,
                 policy_state=None,
                 rng_key=rng_imag,
-                use_kv_cache=True,
+                use_kv_caching=True,
             )
         )
         del imagined_latents  # not needed for losses
