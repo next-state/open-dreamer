@@ -11,8 +11,8 @@ patch_size: 4
 dataset:
   source: "custom"
   array_record_path: "datasets/coinrun_episodes/train"
-  B: 64
-  T: 32
+  B: 16
+  T: 16
   H: 64
   W: 64
   C: 3
@@ -20,9 +20,9 @@ dataset:
 encoder:
   n_latents: 16
   d_bottleneck: 32
-  d_model: 64
-  n_heads: 4
-  n_kv_heads: 2
+  d_model: 256
+  n_heads: 8
+  n_kv_heads: 4
   depth: 8
   dropout_rate: 0.05
   qk_norm_type: null  # options: qknorm, quest, null
@@ -47,4 +47,4 @@ max_steps: 1_000_000_000
 log_every: 100
 lpips_weight: 0.2
 lpips_frac: 0.5
-visualize_every: 100
+visualize_every: 1000
