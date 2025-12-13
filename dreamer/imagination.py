@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, NamedTuple, Tuple
-from hydra.core.hydra_config import HydraConfig
 
 import jax
 import jax.numpy as jnp
@@ -246,7 +245,7 @@ def denoise_single_latent_static(
 # JIT-compiled variant (optional convenience wrapper)
 denoise_single_latent_static_jit = jax.jit(
     denoise_single_latent_static,
-    static_argnames=("dynamics", "schedule"),
+    static_argnames=("dynamics",),
 )
 
 
@@ -308,7 +307,7 @@ def make_gt_action_policy_fn(
     return policy_fn, init_state
 
 
-def imagine_rollouts_core(
+def imagine_rollouts(
     *,
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
@@ -466,9 +465,9 @@ def imagine_rollouts_core(
     return imagined_latents, imagined_actions, imagined_hidden, policy_logits
 
 
-imagine_rollouts_core_jit = jax.jit(
-    imagine_rollouts_core,
-    static_argnames=("dynamics", "task_embedder", "policy_fn", "horizon"),
+imagine_rollouts_jit = jax.jit(
+    imagine_rollouts,
+    static_argnames=("dynamics", "task_embedder", "policy_fn", "horizon", "use_kv_caching"),
 )
 
 
@@ -501,8 +500,9 @@ class ImaginationSampler:
         policy_fn: PolicyFn,
         policy_state: Any,
         rng_key: jax.Array,
+        use_kv_caching: bool,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        return imagine_rollouts_core(
+        return imagine_rollouts(
             dynamics=dynamics,
             task_embedder=task_embedder,
             dyn_vars=dyn_vars,
@@ -515,6 +515,7 @@ class ImaginationSampler:
             policy_fn=policy_fn,
             policy_state=policy_state,
             rng_key=rng_key,
+            use_kv_caching=use_kv_caching,
         )
 
     def rollout_latents_jit(
@@ -530,10 +531,11 @@ class ImaginationSampler:
         policy_fn: PolicyFn,
         policy_state: Any,
         rng_key: jax.Array,
+        use_kv_caching: bool,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         # Use the module-level jitted core, which treats dynamics/task_embedder/policy_fn
         # as static arguments.
-        return imagine_rollouts_core_jit(
+        return imagine_rollouts_jit(
             dynamics=dynamics,
             task_embedder=task_embedder,
             dyn_vars=dyn_vars,
@@ -546,6 +548,7 @@ class ImaginationSampler:
             policy_fn=policy_fn,
             policy_state=policy_state,
             rng_key=rng_key,
+            use_kv_caching=use_kv_caching,
         )
 
 
@@ -660,9 +663,8 @@ def _make_real_world_models_and_batch():
     # adjust the batch/time dimensions here if desired.
     cfg = RLConfig(
         run_name="jit_sampler_test",
-        bc_rew_ckpt="./train_bc_rew_4actions/checkpoints",
+        bc_rew_ckpt="logs/bc_rew/checkpoints",
         use_wandb=False,
-        wandb_entity="edhu",  # FIXME
         wandb_project="tiny_dreamer_4",
     )
 
@@ -807,7 +809,7 @@ def test_single_step_denoise_real_ckpt(use_jit: bool = False):
     print(f"[single-step] MSE={mse:.6f}, PSNR={psnr:.2f} dB")
 
     # ---- Visualization: simple side-by-side PNG for a few examples ----
-    out_dir = Path(HydraConfig.get().runtime.output_dir) / "jit_sampler_single"
+    out_dir = Path("logs/imagination_test/jit_sampler_single")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # gt_frames, pred_frames: (B, 1, H, W, C) → treat as T=1 strip
@@ -827,7 +829,7 @@ def test_single_step_denoise_real_ckpt(use_jit: bool = False):
         print(f"[single-step] wrote {fig_path}")
 
 
-def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = False):
+def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = False, use_kv_caching: bool = False):
     """
     Full imagination rollout test using real checkpoints.
 
@@ -916,6 +918,7 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
                 policy_fn=policy_fn,
                 policy_state=policy_state,
                 rng_key=rng_imag,
+                use_kv_caching=use_kv_caching,
             )
             t_compile1 = time.time()
             print(f"[rollout][mode=policy][jit] compile+first-run elapsed={t_compile1 - t_compile0:.4f}s")
@@ -931,6 +934,7 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
             policy_fn=policy_fn,
             policy_state=policy_state,
             rng_key=rng_imag,
+            use_kv_caching=use_kv_caching,
         )
         t1 = time.time()
         print(f"[rollout][mode=policy][{'jit' if use_jit else 'nonjit'}] elapsed={t1 - t0:.4f}s")
@@ -962,6 +966,7 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
                 policy_fn=gt_policy_fn,
                 policy_state=gt_policy_state,
                 rng_key=rng_imag,
+                use_kv_caching=use_kv_caching,
             )
             t_compile1 = time.time()
             print(f"[rollout][mode=gt][jit] compile+first-run elapsed={t_compile1 - t_compile0:.4f}s")
@@ -977,6 +982,7 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
             policy_fn=gt_policy_fn,
             policy_state=gt_policy_state,
             rng_key=rng_imag,
+            use_kv_caching=use_kv_caching,
         )
         t1 = time.time()
         print(f"[rollout][mode=gt][{'jit' if use_jit else 'nonjit'}] elapsed={t1 - t0:.4f}s")
@@ -1019,7 +1025,7 @@ def test_imagination_rollout_real_ckpt(mode: str = "policy", use_jit: bool = Fal
 
     # Visualization: MP4 grid (GT | Imagined) and a few strips
     suffix = "policy" if mode == "policy" else "gt_actions"
-    out_dir = Path(HydraConfig.get().runtime.output_dir) / f"jit_sampler_rollout_{suffix}"
+    out_dir = Path("logs/imagination_test") / f"jit_sampler_rollout_{suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     gt_np = np.asarray(gt_frames)          # (B, horizon, H, W, C)
@@ -1076,12 +1082,17 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, use JIT-compiled versions of the sampler/denoiser in tests.",
     )
+    parser.add_argument(
+        "--use_kv_caching",
+        action="store_true",
+        help="If set, use KV caching during imagination rollouts.",
+    )
     args = parser.parse_args()
 
     if args.test == "single":
         test_single_step_denoise_real_ckpt(use_jit=args.jit)
     elif args.test == "rollout":
-        test_imagination_rollout_real_ckpt(mode=args.rollout_mode, use_jit=args.jit)
+        test_imagination_rollout_real_ckpt(mode=args.rollout_mode, use_jit=args.jit, use_kv_caching=args.use_kv_caching)
     else:
         print(
             "No test selected. Use --test=single or --test=rollout to run "

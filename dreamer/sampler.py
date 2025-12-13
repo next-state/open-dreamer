@@ -259,10 +259,11 @@ def sample_video(
     enc_vars: Dict[str, Any],
     dec_vars: Dict[str, Any],
     dyn_vars: Dict[str, Any],
-    frames: jnp.ndarray,     # (B,T,H,W,C)
-    actions: jnp.ndarray,    # (B,T)
+    frames: jnp.ndarray,     # (B, T, H, W, C)
+    actions: jnp.ndarray,    # (B, T)
     config: SamplerConfig,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+
     B, T, H, W, C = frames.shape
     assert config.ctx_length < T, "ctx_length must be < T"
     _validate_modes(config)

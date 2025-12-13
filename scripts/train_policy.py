@@ -64,7 +64,7 @@ from dreamer.imagination import (
     ImaginationConfig,
     DenoiseSchedule,
     _build_static_schedule,
-    imagine_rollouts_core,
+    imagine_rollouts,
 )
 from dreamer.logging import MetricLogger
 
@@ -1354,7 +1354,7 @@ def train_step(
             return actions.astype(jnp.int32), logits_t0, state
 
         imagined_latents, imagined_actions, imagined_hidden_states, policy_logits = (
-            imagine_rollouts_core(
+            imagine_rollouts(
                 dynamics=dynamics,
                 task_embedder=task_embedder,
                 dyn_vars=dyn_vars,
