@@ -1,4 +1,3 @@
-from functools import lru_cache
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
@@ -124,26 +123,26 @@ class TokenLayout:
         return out
 
     
-def sinusoid_table(n: int, d: int, base: float = 10000.0, dtype=jnp.float32) -> jnp.ndarray:
+def sinusoid_table(n: int, d: int, start_pos: int = 0, base: float = 10000.0, dtype=jnp.float32) -> jnp.ndarray:
     """
     Standard Transformer sinusoid: even dims use sin, odd dims use cos with frequencies
     base^{-2k/d}. Works for odd d too.
     """
-    pos = jnp.arange(n, dtype=dtype)[:, None]            # (n,1)
-    i = jnp.arange(d, dtype=dtype)[None, :]              # (1,d)
+    pos = jnp.arange(n, dtype=dtype)[:, None] + start_pos # (N, 1)
+    i = jnp.arange(d, dtype=dtype)[None, :]               # (1, D)
     # k = floor(i/2)
     k = jnp.floor(i / 2.0)
     div = jnp.power(base, -(2.0 * k) / jnp.maximum(1.0, jnp.array(d, dtype)))
-    angles = pos * div                                    # (n,d)
+    angles = pos * div                                    # (N, D)
     table = jnp.where((i % 2) == 0, jnp.sin(angles), jnp.cos(angles))
     return table.astype(dtype)
 
 
-def add_sinusoidal_positions(tokens_btSd: jnp.ndarray) -> jnp.ndarray:
-    """tokens: (B,T,S,D) -> adds time and step sinusoids and returns same shape."""
+def add_sinusoidal_positions(tokens_btSd: jnp.ndarray, start_pos: int = 0) -> jnp.ndarray:
+    """tokens: (B, T, S, D) -> adds time and step sinusoids and returns same shape."""
     B, T, S, D = tokens_btSd.shape
-    pos_t = sinusoid_table(T, D)     # (T,D)
-    pos_s = sinusoid_table(S, D)     # (S,D)
+    pos_t = sinusoid_table(T, D, start_pos=start_pos) # (T, D)
+    pos_s = sinusoid_table(S, D, start_pos=0)         # (S, D)
     # Optionally scale to keep variance stable (common trick)
     scale = 1.0 / jnp.sqrt(jnp.array(D, dtype=tokens_btSd.dtype))
     return tokens_btSd + scale * (pos_t[None, :, None, :] + pos_s[None, None, :, :])
@@ -878,7 +877,7 @@ class Dynamics(nn.Module):
         )
 
         # --- 4) Shortcut embeddings (discrete lookup)
-        step_tok   = self.step_embed(step_idxs)[:, :, None, :]      # (B, T, 1, d_model)
+        step_tok   = self.step_embed(step_idxs)[:, :, None, :]         # (B, T, 1, d_model)
         signal_tok = self.signal_embed(signal_idxs)[:, :, None, :]     # (B, T, 1, d_model)
         
         # --- 5) Concatenate in your declared layout order
@@ -891,7 +890,11 @@ class Dynamics(nn.Module):
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
         if not self.use_rope:
-            tokens = add_sinusoidal_positions(tokens)      # (B, T, N_total, d_model)
+            start_pos = 0
+            if caches is not None and len(caches) > 0:
+                first_cache = list(caches.values())[0]
+                start_pos = first_cache.index
+            tokens = add_sinusoidal_positions(tokens, start_pos=start_pos) # (B, T, N_total, d_model)
         
         mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
         x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches)
