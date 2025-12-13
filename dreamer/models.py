@@ -491,10 +491,9 @@ class Decoder(nn.Module):
         x = self.transformer(tokens, mask=mask, deterministic=deterministic)
         # 7) Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
-        pred_btnd = nn.tanh(self.patch_head(x_patches))  # (B,T,Np,D_patch)
+        pred_btnd = self.patch_head(x_patches)  # (B, T, Np, D_patch)
         out_frames = unpatchify(pred_btnd, patch=self.patch_size, H=self.H, W=self.W)
         return out_frames
-
 
 class Tokenizer(nn.Module):
     config: TokenizerConfig
@@ -514,7 +513,6 @@ class Tokenizer(nn.Module):
         z, aux = self.encoder(videos, deterministic=deterministic)
         recon = self.decoder(z, deterministic=deterministic)
         return recon, aux
-
 class ActionEncoder(nn.Module):
     d_model: int
     n_keyboard: int = 5  # up, down, left, right, null (categorical actions)

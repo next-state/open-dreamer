@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
 
-@dataclass(unsafe_hash=True)
+@dataclass
 class DatasetConfig:
     """Configuration for dataset parameters.
     
@@ -11,8 +11,8 @@ class DatasetConfig:
     name: str = "bouncing_square"
     
     # Batch and sequence dimensions
-    B: int = 4  # batch size
-    T: int = 16  # sequence length
+    B: int = 32  # batch size
+    T: int = 64  # sequence length
     H: int = 64  # height
     W: int = 64  # width
     C: int = 3   # channels
@@ -29,6 +29,10 @@ class DatasetConfig:
     source: str = "custom"  # "bouncing_square" or "custom"
     action_dim: int = 1  # For bouncing square it's discrete (1 dim), for others might be >1 or continuous
     array_record_path: str = "datasets/coinrun_episodes/train" 
+
+    # Dataset normalization statistics (for pixel values in [0, 1])
+    dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
+    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 @dataclass(unsafe_hash=True)
 class EncoderConfig:
@@ -60,7 +64,7 @@ class DecoderConfig:
     rope_theta: float = 10000.0
     time_every: int = 4
 
-@dataclass(frozen=True)
+@dataclass(unsafe_hash=True)
 class TokenizerConfig:
     # IO / ckpt
     run_name: str

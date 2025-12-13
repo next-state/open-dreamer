@@ -104,6 +104,50 @@ class TokenLayout:
         return mask
 
 
+def normalize_with_dataset_stats(videos, *, mean, std):
+    """
+    Normalize videos using dataset-level statistics.
+    
+    Handles spatial images (B, T, H, W, C).
+    For flattened patches, tiles the per-channel stats to match the interleaved layout.
+    
+    Args:
+        videos: input videos/patches
+        mean: dataset mean (list of C floats for per-channel)
+        std: dataset std (list of C floats for per-channel)
+    Returns:
+        normalized videos
+    """
+    mean_arr = jnp.asarray(mean, dtype=videos.dtype)
+    std_arr = jnp.asarray(std, dtype=videos.dtype)
+    
+    mean_c = jnp.expand_dims(mean_arr, axis=(0, 1, 2, 3)) 
+    std_c =  jnp.expand_dims(std_arr, axis=(0, 1, 2, 3)) 
+    
+    return (videos - mean_c) / std_c
+
+def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
+    """
+    Unnormalize videos using dataset-level statistics.
+    
+    Handles both flattened patches (B, T, N, patch*patch*C) and spatial images (B, T, H, W, C).
+    For flattened patches, tiles the per-channel stats to match the interleaved layout.
+    
+    Args:
+        normalized_videos: normalized videos/patches
+        mean: dataset mean (list of C floats for per-channel)
+        std: dataset std (list of C floats for per-channel)
+    Returns:
+        unnormalized videos
+    """
+    mean_arr = jnp.asarray(mean, dtype=normalized_videos.dtype)
+    std_arr = jnp.asarray(std, dtype=normalized_videos.dtype)
+    
+    mean_c = jnp.expand_dims(mean_arr, axis=(0, 1, 2, 3)) 
+    std_c =  jnp.expand_dims(std_arr, axis=(0, 1, 2, 3)) 
+    
+    return normalized_videos * std_c + mean_c
+
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.

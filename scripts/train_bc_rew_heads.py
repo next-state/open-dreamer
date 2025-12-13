@@ -30,6 +30,7 @@ from dreamer.configs import BCRewConfig
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
+    normalize_with_dataset_stats,
     with_params,
     make_state, make_manager, try_restore, maybe_save,
     pack_mae_params,
@@ -226,6 +227,7 @@ def train_step_efficient(
     loss_weight_shortcut: float,
     loss_weight_policy: float,
     loss_weight_reward: float,
+    dataset_mean, dataset_std,
 ):
     """
     Deterministic two-branch training (one fused main forward):
@@ -260,7 +262,8 @@ def train_step_efficient(
      drop_key, drop_pi, drop_rw, task_key) = jax.random.split(step_key, 8)
 
     # Frozen encoder → spatial tokens (clean target z1)
-    z_bottleneck, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": enc_key}, deterministic=True)
+    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=dataset_mean, std=dataset_std)
+    z_bottleneck, _ = encoder.apply(enc_vars, patches_norm, rngs={"mae": enc_key}, deterministic=True)
     z1 = pack_bottleneck_to_spatial(z_bottleneck, n_spatial=n_spatial, k=packing_factor)  # (B,T,Sz,Dz)
 
     # Deterministic batch split
@@ -411,6 +414,8 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=cfg.enc_n_latents // cfg.packing_factor,
         packing_factor=cfg.packing_factor,
+        dataset_mean=cfg.dataset.dataset_mean,
+        dataset_std=cfg.dataset.dataset_std,
         start_mode="pure",
         rollout="autoregressive",
     )
@@ -700,7 +705,8 @@ def initialize_models_and_tokenizer(
 
     # Build initial z1 to shape dynamics init
     mae_eval_key = jax.random.PRNGKey(777)
-    z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True)
+    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
+    z_btLd, _ = encoder.apply(enc_vars, patches_norm, rngs={"mae": mae_eval_key}, deterministic=True)
     z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
     emax = jnp.log2(k_max).astype(jnp.int32)
     step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
@@ -935,6 +941,7 @@ def run(cfg: BCRewConfig):
             loss_weight_shortcut=cfg.loss_weight_shortcut,
             loss_weight_policy=cfg.loss_weight_policy,
             loss_weight_reward=cfg.loss_weight_reward,
+            dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
         )
         train_t = time.perf_counter() - train_start_t
         total_t = data_t + train_t

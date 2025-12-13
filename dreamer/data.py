@@ -1,5 +1,5 @@
 from functools import partial
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import jax
 import jax.numpy as jnp
 import imageio.v2 as imageio
@@ -699,12 +699,8 @@ def unpatchify(patches: jnp.ndarray, patch: int, H: int, W: int) -> jnp.ndarray:
       where N = (H/patch)*(W/patch), D = patch*patch*C
     """
     image = rearrange(patches, "... (hp wp) (p1 p2 c) -> ... (hp p1) (wp p2) c", hp=H//patch, wp=W//patch, p1=patch, p2=patch)
-    if image.dtype == jnp.bool_:
-        return image
-
-    # image = image.clip(-1, 1)
-    # image = (image+1)*127.5
     return image
+
 
 
 
