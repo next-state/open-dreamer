@@ -1,5 +1,6 @@
 from functools import partial
 import einops
+import numpy as np
 from tqdm import tqdm
 from dataclasses import asdict
 import time
@@ -63,7 +64,7 @@ def recon_loss_from_mae(pred, target, mae_mask):
 
 lpips_loss_fn = LPIPS(pretrained_network="alexnet")
 
-def lpips_on_mae_recon(pred, target, mae_mask, subsample_frac=1.0):
+def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
     if subsample_frac < 1.0:
         B, T = pred.shape[:2]
         step = max(1, int(1.0 / subsample_frac))
@@ -91,7 +92,7 @@ def train_step(apply_fn, tx, params, opt_state, videos, *, master_key, step, lpi
         pred, (mae_mask, keep_prob) = forward_apply(apply_fn, p, videos, mae_key=mae_key, drop_key=drop_key, train=True)    
 
         mse = recon_loss_from_mae(pred, videos, mae_mask)
-        lp = lpips_on_mae_recon(pred, videos, mae_mask, lpips_frac)
+        lp = lpips_on_mae_recon(pred, videos, lpips_frac)
         total = mse + lpips_weight * lp
 
         aux = {"loss_total": total, "loss_mse": mse, "loss_lpips": lp, "keep_prob": keep_prob}
@@ -128,23 +129,18 @@ def viz_step_jit(apply_fn, params, videos, *, mae_key, drop_key, mean, std):
     grid = einops.rearrange(grid[:, 0], "b h w c -> h (b w) c")
     return grid.clip(0, 255).astype(jnp.uint8)
 
-def viz_step(apply_fn, params, videos, rng, step, run_dir, mean, std):
+def viz_step(apply_fn, params, videos, rng, step, run_dir, mean, std, use_wandb=False):
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
-    grid = viz_step_jit(
-        apply_fn, 
-        params, 
-        videos[:8, :1], 
-        mae_key=mae_key, 
-        drop_key=drop_key,
-        mean=jnp.array(mean),
-        std=jnp.array(std)
-    )
+    grid = viz_step_jit(apply_fn, params, videos[:8,:1], mae_key=mae_key, drop_key=drop_key, mean=jnp.array(mean), std=jnp.array(std))
 
     out = run_dir / "viz"
     out.mkdir(exist_ok=True, parents=True)
     imageio.imwrite(out / f"step_{step:06d}.png", grid)
+
+    if use_wandb:
+        wandb.log({"reconstruction": wandb.Image(np.array(grid), caption=f"Step {step}")}, step=step)
 
 # ------------------------
 # Run
@@ -181,11 +177,7 @@ def run(cfg: TokenizerConfig):
 
     # ---------- Checkpointing ----------
     ckpt_dir = run_dir / "checkpoints"
-    mngr = make_manager(
-        ckpt_dir,
-        max_to_keep=cfg.ckpt_max_to_keep,
-        save_interval_steps=cfg.ckpt_save_every,
-    )
+    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
 
     state_example = make_state(params, opt_state, rng, step=0)
     meta_example = {
@@ -228,19 +220,9 @@ def run(cfg: TokenizerConfig):
             std=cfg.dataset.dataset_std
         )
 
-        params, opt_state, aux = train_step(
-            apply_fn,
-            tx,
-            params,
-            opt_state,
-            videos,
-            master_key=master_key,
-            step=step,
-            lpips_weight=cfg.lpips_weight,
-            lpips_frac=cfg.lpips_frac,
-        )
+        params, opt_state, aux = train_step(apply_fn, tx, params, opt_state, videos, master_key=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac)
 
-        if step % cfg.log_every == 0:
+        if step % cfg.log_every == 0 and step > 0:
             mse = aux["loss_mse"]
             psnr = 10 * jnp.log10(1.0 / jnp.maximum(mse, 1e-10))
             logger.log(
@@ -258,16 +240,7 @@ def run(cfg: TokenizerConfig):
         maybe_save(mngr, step, state, meta_example)
 
         if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
-            viz_step(
-                apply_fn, 
-                params, 
-                videos, 
-                rng, 
-                step, 
-                run_dir,
-                mean=cfg.dataset.dataset_mean,
-                std=cfg.dataset.dataset_std
-            )
+            viz_step(apply_fn, params, videos, rng, step, run_dir, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std, use_wandb=cfg.use_wandb)
 
     mngr.wait_until_finished()
 
