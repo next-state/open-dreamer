@@ -33,25 +33,39 @@ class KVCache:
     def update(self, k_new, v_new):
         """
         Writes k_new/v_new into the buffer.
-        We make two assumptions: 
-            - The prefill prompt is smaller than the window size
-            - One frame is generated at a time
+        Handles both contiguous writes and wrapping writes (T > 1) via branching.
         Returns updated cache with index incremented by the length of new data.
         """
-        t_new = k_new.shape[1]
+        T = k_new.shape[1]
         write_idx = self.index % self.window_size
 
-        k_to_write = k_new
-        v_to_write = v_new
-                    
-        # we assume only T=1 can cross the boundary of the window
-        # to add support for T>1, we would need a `jax.lax.cond` to split the write into two chunks
-        k_updated = jax.lax.dynamic_update_slice(self.k, k_to_write, (0, write_idx, 0, 0))
-        v_updated = jax.lax.dynamic_update_slice(self.v, v_to_write, (0, write_idx, 0, 0))
-        
-        return self.replace(k=k_updated, v=v_updated, index=self.index + t_new)
+        def _update_contiguous(operand, update, start_idx):
+            # Fast path
+            return jax.lax.dynamic_update_slice(operand, update, (0, start_idx, 0, 0))
 
-    def get_ordered_kv(self):
+        def _update_wrap(operand, update, start_idx):
+            # Slow path
+            indices = (jnp.arange(T) + start_idx) % self.window_size
+            operand.at[:, indices, :, :].set(update)
+
+        fits_contiguous = (write_idx + T) <= self.window_size
+
+        k_updated = jax.lax.cond(
+            fits_contiguous,
+            _update_contiguous,
+            _update_wrap,
+            self.k, k_new, write_idx
+        )
+        v_updated = jax.lax.cond(
+            fits_contiguous,
+            _update_contiguous,
+            _update_wrap,
+            self.v, v_new, write_idx
+        )
+        
+        return self.replace(k=k_updated, v=v_updated, index=self.index + T)
+
+    def get_ordered_kv(self, query_len):
         """
         Returns rolled K, V, and a mask indicating valid data.
         """
@@ -62,13 +76,21 @@ class KVCache:
         k_ordered = jnp.roll(self.k, shift, axis=1)
         v_ordered = jnp.roll(self.v, shift, axis=1)
 
-        # during warmup, window is not full, so we need to mask the pre-allocated invalid data
+        # Valid data is at the END of the buffer: indices [Window-valid_len : Window]
         valid_len = jnp.minimum(self.index, self.window_size)
-        idx_seq = jnp.arange(self.window_size)[None, None, None, :] # (1, 1, 1, Window)
-        start_valid = self.window_size - valid_len
-        mask = idx_seq >= start_valid
 
-        return k_ordered, v_ordered, mask
+        # Block garbage data during warmup
+        k_idx = jnp.arange(self.window_size)[None, None, None, :] # (1, 1, 1, Window)
+        start_valid = self.window_size - valid_len
+        valid_mask = k_idx >= start_valid
+
+        # Shifted causal mask
+        q_idx = jnp.arange(query_len)[None, :, None, None]
+        causal_mask = k_idx <= (self.window_size - query_len + q_idx)
+
+        final_mask = jnp.logical_and(valid_mask, causal_mask)
+
+        return k_ordered, v_ordered, final_mask
 
 @flax.struct.dataclass
 class TokenLayout:
@@ -344,22 +366,15 @@ class GroupedQueryAttention(nn.Module):
         if self.is_causal and cache is not None:
             # CACHED INFERENCE MODE
             new_cache = cache.update(k, v)
+
             T = q.shape[1]
+            k_attn, v_attn, cache_mask = new_cache.get_ordered_kv(query_len=T)
 
-            if T > 1:
-                # [PREFILL] process the prompt (history frames)
-                k_attn, v_attn = k, v
-                mask_attn = mask
-                attn_is_causal = True
+            attn_is_causal = False # Handled manually by cache_mask
+            if mask is not None:
+                mask_attn = jnp.logical_and(mask, cache_mask)
             else:
-                # [DECODE] process the current frame (assume T=1)
-                k_attn, v_attn, valid_mask = new_cache.get_ordered_kv()
-                attn_is_causal = False
-
-                if mask is not None:
-                    mask_attn = jnp.logical_and(mask, valid_mask)
-                else:
-                    mask_attn = valid_mask
+                mask_attn = cache_mask
         else:
             # TRAINING or NON-CAUSAL (SPACE) ATTENTION
             new_cache = None
