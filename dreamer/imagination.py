@@ -200,7 +200,7 @@ def denoise_single_latent_static(
             z_input = jnp.concatenate([z_ctx_t, z_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
             actions_input = jnp.concatenate([actions_ctx, action_curr], axis=1)  # (B, T_ctx+1)
 
-            step_idx_input = jnp.full((B, T_ctx + 1), schedule.step_idx, dtype=jnp.int32)
+            step_idx_input = jnp.full((B, T_ctx + 1), schedule.step_idx, dtype=jnp.int32) # TODO: check this
             signal_idx_ctx = jnp.full((B, T_ctx), (0.9 * schedule.k_max).astype(jnp.int32), dtype=jnp.int32)
             signal_idx_curr = jnp.full((B, 1), signal_idx_scalar, dtype=jnp.int32)
             signal_idx_input = jnp.concatenate([signal_idx_ctx, signal_idx_curr], axis=1)

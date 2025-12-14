@@ -534,8 +534,8 @@ class BlockCausalTransformer(nn.Module):
         new_caches = {} if caches is not None else None
         
         for i in range(self.depth):
-            time_index, time_offset = divmod(i, self.time_every)
-            is_time_layer = time_offset == 0
+            time_index = i // self.time_every
+            is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
             x, new_cache_i = BlockCausalLayer(
                 self.d_model, self.n_heads, self.n_kv_heads,
@@ -821,7 +821,10 @@ class Dynamics(nn.Module):
             window_size: Maximum sequence length (T) to support.
         """
         # Time attention sees (B*S) independent sequences
-        flattened_batch_size = batch_size * self.n_spatial
+        # Time attention sees (B*S) independent sequences. S includes all tokens (action, signal, step, spatial, register, agent)
+        S_total = 1 + 1 + 1 + self.n_spatial + self.n_register + (self.n_agent if self.n_agent > 0 else 0)
+
+        flattened_batch_size = batch_size * S_total
         head_dim = self.d_model // self.n_heads
 
         caches = {}
@@ -889,12 +892,12 @@ class Dynamics(nn.Module):
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
-        if not self.use_rope:
-            start_pos = 0
-            if caches is not None and len(caches) > 0:
-                first_cache = list(caches.values())[0]
-                start_pos = first_cache.index
-            tokens = add_sinusoidal_positions(tokens, start_pos=start_pos) # (B, T, N_total, d_model)
+        # if not self.use_rope:
+        #     start_pos = 0
+        #     if caches is not None and len(caches) > 0:
+        #         first_cache = list(caches.values())[0]
+        #         start_pos = first_cache.index
+        #     tokens = add_sinusoidal_positions(tokens, start_pos=start_pos) # (B, T, N_total, d_model)
         
         mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
         x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches)
