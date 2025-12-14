@@ -49,10 +49,12 @@ from dreamer.models import (
     RewardHeadMTP,
     ValueHead,
 )
-from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn, DatasetConfig
+from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn
+from dreamer.configs import RLConfig
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
+    normalize_with_dataset_stats,
     with_params,
     make_state,
     make_manager,
@@ -74,78 +76,7 @@ from dreamer.logging import MetricLogger
 # ---------------------------
 
 
-@dataclass(frozen=True)
-class RLConfig:
-    # IO / ckpt
-    run_name: str
-    bc_rew_ckpt: str  # checkpoint from train_bc_rew_heads.py
-    ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
 
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None
-    wandb_project: str | None = None
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    action_dim: int = 4
-
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    use_rope: bool = True
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4
-    n_agent: int = 1
-    agent_space_mode: str = "wm_agent"
-
-    # schedule
-    k_max: int = 8
-
-    # train
-    max_steps: int = 1_000_000_000
-    log_every: int = 5_000
-    lr: float = 3e-4
-
-    # eval media toggle
-    write_video_every: int = 10_000
-    visualize_every: int = 25_000
-
-    # RL-specific
-    L: int = 2
-    num_reward_bins: int = 101
-    reward_log_low: float = -3.0
-    reward_log_high: float = 3.0
-    num_value_bins: int = 101
-    n_tasks: int = 128
-    use_task_ids: bool = True
-
-    # RL hyperparameters
-    gamma: float = 0.997
-    lambda_: float = 0.95
-    horizon: int = 32
-    context_length: int = 16
-    imagination_d: float = 1.0 / 4
-    alpha: float = 0.5
-    beta: float = 0.3
-
-    # Evaluation
-    eval_every: int = 50_000
-    eval_episodes: int = 4
-    eval_horizon: int = 32
-    eval_batch_size: int = 4
-    max_eval_examples_to_plot: int = 4
 
 
 # ---------------------------
@@ -543,7 +474,6 @@ def initialize_models(
         depth=cfg.enc_depth,
         dropout_rate=0.0,
         qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
         rope_theta=cfg.rope_theta,
         d_bottleneck=cfg.enc_d_bottleneck,
         mae_p_min=0.0,
@@ -560,7 +490,6 @@ def initialize_models(
         d_patch=D_patch,
         dropout_rate=0.0,
         qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
         rope_theta=cfg.rope_theta,
         mlp_ratio=4.0,
         time_every=4,
@@ -577,7 +506,6 @@ def initialize_models(
         depth=cfg.dyn_depth,
         dropout_rate=0.0,
         qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
         rope_theta=cfg.rope_theta,
         k_max=k_max,
         time_every=4,
@@ -661,9 +589,10 @@ def initialize_models(
     )
 
     mae_eval_key = jax.random.PRNGKey(777)
+    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
     z_btLd, _ = encoder.apply(
         enc_vars,
-        patches_btnd,
+        patches_norm,
         rngs={"mae": mae_eval_key},
         deterministic=True,
     )
@@ -819,6 +748,8 @@ def encode_frames_to_spatial(
     patch: int,
     n_spatial: int,
     packing_factor: int,
+    dataset_mean,
+    dataset_std,
 ) -> jnp.ndarray:
     """
     Encode input frames into packed spatial tokens suitable for the dynamics model.
@@ -830,9 +761,10 @@ def encode_frames_to_spatial(
         z_ctx: (B, T_ctx, n_spatial, d_spatial)
     """
     patches_btnd = temporal_patchify(frames, patch)
+    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=dataset_mean, std=dataset_std)
     z_btLd, _ = encoder.apply(
         enc_vars,
-        patches_btnd,
+        patches_norm,
         rngs={"mae": mae_eval_key},
         deterministic=True,
     )
@@ -981,6 +913,8 @@ def eval_rollout_real_env(
     max_context: int,
     schedule_step_idx: int,
     k_max: int,
+    dataset_mean,
+    dataset_std,
     rng_key: jax.Array,
 ) -> EpisodeResult:
     """
@@ -1008,6 +942,8 @@ def eval_rollout_real_env(
         patch=patch,
         n_spatial=n_spatial,
         packing_factor=packing_factor,
+        dataset_mean=dataset_mean,
+        dataset_std=dataset_std,
     )  # (B, 1, n_spatial, d_spatial)
 
     # Initialize sliding context by tiling the initial frame and action.
@@ -1056,6 +992,8 @@ def eval_rollout_real_env(
             patch=patch,
             n_spatial=n_spatial,
             packing_factor=packing_factor,
+            dataset_mean=dataset_mean,
+            dataset_std=dataset_std,
         )  # (B, 1, n_spatial, d_spatial)
 
         z_ctx_next = jnp.concatenate([z_ctx_t, z_next], axis=1)[
@@ -1193,6 +1131,8 @@ def evaluate_policy_real_env(
             max_context=cfg.context_length,
             schedule_step_idx=schedule_step_idx,
             k_max=k_max,
+            dataset_mean=cfg.dataset.dataset_mean,
+            dataset_std=cfg.dataset.dataset_std,
             rng_key=subkey,
         )
 
@@ -1282,6 +1222,8 @@ def train_step(
     patch: int,
     n_spatial: int,
     packing_factor: int,
+    dataset_mean,
+    dataset_std,
     rng_key: jax.Array,
 ):
     """
@@ -1310,9 +1252,10 @@ def train_step(
 
     # ----- Encode context frames to latents -----
     context_patches = temporal_patchify(context_frames, patch)
+    context_patches_norm = normalize_with_dataset_stats(context_patches, mean=dataset_mean, std=dataset_std)
     z_btLd, _ = encoder.apply(
         enc_vars,
-        context_patches,
+        context_patches_norm,
         rngs={"mae": mae_eval_key},
         deterministic=True,
     )
@@ -1550,22 +1493,7 @@ def run(cfg: RLConfig):
         )
 
     # Data iterator
-    next_batch = make_iterator(
-        cfg.dataset.B,
-        cfg.dataset.T,
-        cfg.dataset.H,
-        cfg.dataset.W,
-        cfg.dataset.C,
-        pixels_per_step=cfg.dataset.pixels_per_step,
-        size_min=cfg.dataset.size_min,
-        size_max=cfg.dataset.size_max,
-        hold_min=cfg.dataset.hold_min,
-        hold_max=cfg.dataset.hold_max,
-        fg_min_color=0 if cfg.dataset.diversify_data else 128,
-        fg_max_color=255 if cfg.dataset.diversify_data else 128,
-        bg_min_color=0 if cfg.dataset.diversify_data else 255,
-        bg_max_color=255 if cfg.dataset.diversify_data else 255,
-    )
+    next_batch = make_iterator(cfg.dataset)
 
     # Initialize models and load checkpoints
     init_rng = jax.random.PRNGKey(0)
@@ -1723,6 +1651,8 @@ def run(cfg: RLConfig):
             patch=patch,
             n_spatial=n_spatial,
             packing_factor=cfg.packing_factor,
+            dataset_mean=cfg.dataset.dataset_mean,
+            dataset_std=cfg.dataset.dataset_std,
             rng_key=step_key,
         )
         train_t = time.perf_counter() - train_start_t

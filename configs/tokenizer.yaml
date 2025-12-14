@@ -8,16 +8,24 @@ ckpt_save_every: 10_000
 
 patch_size: 4
 
+dataset:
+  source: "custom"
+  array_record_path: "datasets/coinrun_episodes/train"
+  B: 16
+  T: 16
+  H: 64
+  W: 64
+  C: 3
+
 encoder:
   n_latents: 16
   d_bottleneck: 32
-  d_model: 64
-  n_heads: 4
-  n_kv_heads: 2
+  d_model: 256
+  n_heads: 8
+  n_kv_heads: 4
   depth: 8
   dropout_rate: 0.05
   qk_norm_type: null  # options: qknorm, quest, null
-  use_rope: true
   rope_theta: 10000.0
   time_every: 4
   mae_p_min: 0.0
@@ -31,13 +39,12 @@ decoder:
   depth: ${encoder.depth}
   dropout_rate: ${encoder.dropout_rate}
   qk_norm_type: ${encoder.qk_norm_type}
-  use_rope: ${encoder.use_rope}
   rope_theta: ${encoder.rope_theta}
   time_every: ${encoder.time_every}
 
-lr: 1e-4
+lr: 3e-4
 max_steps: 1_000_000_000
 log_every: 100
 lpips_weight: 0.2
 lpips_frac: 0.5
-visualize_every: 10_000
+visualize_every: 1000

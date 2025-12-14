@@ -1,0 +1,327 @@
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional
+
+@dataclass
+class DatasetConfig:
+    """Configuration for dataset parameters.
+    
+    This config is shared across all experiments (tokenizer, dynamics, policy)
+    to ensure consistent data loading.
+    """
+    name: str = "bouncing_square"
+    
+    # Batch and sequence dimensions
+    B: int = 32  # batch size
+    T: int = 64  # sequence length
+    H: int = 64  # height
+    W: int = 64  # width
+    C: int = 3   # channels
+    
+    # Bouncing square specific parameters
+    pixels_per_step: int = 2
+    size_min: int = 6
+    size_max: int = 14
+    hold_min: int = 4
+    hold_max: int = 9
+    diversify_data: bool = True
+    
+    # Dataset selection
+    source: str = "custom"  # "bouncing_square" or "custom"
+    action_dim: int = 1  # For bouncing square it's discrete (1 dim), for others might be >1 or continuous
+    array_record_path: str = "datasets/coinrun_episodes/train" 
+
+    # Dataset normalization statistics (for pixel values in [0, 1])
+    dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
+    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
+
+@dataclass(unsafe_hash=True)
+class EncoderConfig:
+    n_latents: int = 16
+    d_bottleneck: int = 32
+    d_model: int = 64
+    n_heads: int = 4
+    n_kv_heads: int = 2
+    patch_size: int = 4
+    depth: int = 8
+    dropout_rate: float = 0.05
+    qk_norm_type: str | None = None
+    rope_theta: float = 10000.0
+    time_every: int = 4
+    mae_p_min: float = 0.0
+    mae_p_max: float = 0.9
+
+@dataclass(unsafe_hash=True)
+class DecoderConfig:
+    d_model: int = 64
+    n_heads: int = 4
+    n_kv_heads: int = 2
+    n_latents: int = 16
+    patch_size: int = 4
+    d_patch: int = 48    # Will be computed from patch_size, C
+    depth: int = 8
+    dropout_rate: float = 0.05
+    qk_norm_type: str | None = None
+    rope_theta: float = 10000.0
+    time_every: int = 4
+
+@dataclass(unsafe_hash=True)
+class TokenizerConfig:
+    # IO / ckpt
+    run_name: str
+    ckpt_max_to_keep: int = 5
+    ckpt_save_every: int = 10_000
+
+    patch_size: int = 4
+
+    # wandb config
+    use_wandb: bool = False
+    wandb_entity: str | None = None
+    wandb_project: str | None = None
+
+    # dataset config
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+
+    # model parameters
+    encoder: EncoderConfig = field(default_factory=EncoderConfig)
+    decoder: DecoderConfig = field(default_factory=DecoderConfig)
+
+    # training
+    lr: float = 1e-4
+    max_steps: int = 1_000_000_000
+    log_every: int = 100
+    lpips_weight: float = 0.2
+    lpips_frac: float = 0.5
+    visualize_every: int = 10_000
+
+@dataclass(frozen=True)
+class RLConfig:
+    # IO / ckpt
+    run_name: str
+    bc_rew_ckpt: str  # checkpoint from train_bc_rew_heads.py
+    ckpt_max_to_keep: int = 2
+    ckpt_save_every: int = 10_000
+
+    # wandb config
+    use_wandb: bool = False
+    wandb_entity: str | None = None
+    wandb_project: str | None = None
+
+    # dataset config
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    action_dim: int = 4
+
+    # tokenizer / dynamics config
+    patch: int = 4
+    enc_n_latents: int = 16
+    enc_d_bottleneck: int = 32
+    d_model_enc: int = 64
+    d_model_dyn: int = 128
+    enc_depth: int = 8
+    dec_depth: int = 8
+    dyn_depth: int = 8
+    n_heads: int = 4
+    n_kv_heads: int = 2
+    qk_norm_type: str | None = None
+    rope_theta: float = 10000.0
+    packing_factor: int = 2
+    n_register: int = 4
+    n_agent: int = 1
+    agent_space_mode: str = "wm_agent"
+
+    # schedule
+    k_max: int = 8
+
+    # train
+    max_steps: int = 1_000_000_000
+    log_every: int = 5_000
+    lr: float = 3e-4
+
+    # eval media toggle
+    write_video_every: int = 10_000
+    visualize_every: int = 25_000
+
+    # RL-specific
+    L: int = 2
+    num_reward_bins: int = 101
+    reward_log_low: float = -3.0
+    reward_log_high: float = 3.0
+    num_value_bins: int = 101
+    n_tasks: int = 128
+    use_task_ids: bool = True
+
+    # RL hyperparameters
+    gamma: float = 0.997
+    lambda_: float = 0.95
+    horizon: int = 32
+    context_length: int = 16
+    imagination_d: float = 1.0 / 4
+    alpha: float = 0.5
+    beta: float = 0.3
+
+    # Evaluation
+    eval_every: int = 50_000
+    eval_episodes: int = 4
+    eval_horizon: int = 32
+    eval_batch_size: int = 4
+    max_eval_examples_to_plot: int = 4
+
+@dataclass(frozen=True)
+class DynamicsConfig:
+    # IO / ckpt
+    run_name: str
+    tokenizer_ckpt: str
+    ckpt_max_to_keep: int = 2
+    ckpt_save_every: int = 10_000
+
+    # wandb config
+    use_wandb: bool = False
+    wandb_entity: str | None = None  # if None, uses default entity
+    wandb_project: str | None = None  # if None, uses run_name as project
+
+    # dataset config
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+
+    # tokenizer / dynamics config
+    patch: int = 4
+    enc_n_latents: int = 16
+    enc_d_bottleneck: int = 32
+    d_model_enc: int = 64
+    d_model_dyn: int = 128
+    enc_depth: int = 8
+    dec_depth: int = 8
+    dyn_depth: int = 8
+    n_heads: int = 4
+    n_kv_heads: int = 2
+    qk_norm_type: str | None = None
+    rope_theta: float = 10000.0
+    packing_factor: int = 2
+    n_register: int = 4 # number of register tokens for dynamics
+    n_agent: int = 1 # number of agent tokens for dynamics
+
+    # schedule
+    k_max: int = 8
+    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
+    self_fraction: float = 0.25   # used once we pass bootstrap_start
+
+    # train
+    max_steps: int = 1_000_000_000
+    log_every: int = 5_000
+    lr: float = 3e-4
+
+    # eval media toggle
+    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
+
+@dataclass(frozen=True)
+class BCRewConfig:
+    # IO / ckpt
+    run_name: str
+    tokenizer_ckpt: str
+    dynamics_ckpt: str
+    ckpt_max_to_keep: int = 2
+    ckpt_save_every: int = 10_000
+
+    # wandb config
+    use_wandb: bool = False
+    wandb_entity: str | None = None  # if None, uses default entity
+    wandb_project: str | None = None  # if None, uses run_name as project
+
+    # dataset config
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    action_dim: int = 4 # number of categorical actions
+
+    # tokenizer / dynamics config
+    patch: int = 4
+    enc_n_latents: int = 16
+    enc_d_bottleneck: int = 32
+    d_model_enc: int = 64
+    d_model_dyn: int = 128
+    enc_depth: int = 8
+    dec_depth: int = 8
+    dyn_depth: int = 8
+    n_heads: int = 4
+    n_kv_heads: int = 2
+    qk_norm_type: str | None = None
+    rope_theta: float = 10000.0
+    packing_factor: int = 2
+    n_register: int = 4 # number of register tokens for dynamics
+    n_agent: int = 1 # number of agent tokens for dynamics
+
+    # UPDATED: default to wm_agent (fine-tuning with agent readouts)
+    agent_space_mode: str = "wm_agent"
+
+    # schedule
+    k_max: int = 8
+    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
+    self_fraction: float = 0.25   # used once we pass bootstrap_start
+
+    # train
+    max_steps: int = 1_000_000_000
+    log_every: int = 5_000
+    lr: float = 3e-4
+
+    # eval media toggle
+    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
+
+    # NEW: multi-token prediction (MTP) settings
+    L: int = 2                      # predict next L actions/rewards
+    num_reward_bins: int = 101      # twohot bins for symexp rewards
+    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
+    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
+    n_tasks: int = 128              # task-ID space for TaskEmbedder
+    use_task_ids: bool = True       # True: discrete task IDs; False: vector embed
+    
+    # Loss weighting (to balance scales across different loss components)
+    loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
+    loss_weight_policy: float = 1.0      # weight for policy CE loss (nats)
+    loss_weight_reward: float = 1.0      # weight for reward CE loss (nats)
+
+@dataclass(frozen=True)
+class EvalConfig:
+    # Paths
+    run_ckpt_dir: str                         # training run checkpoints dir to restore params from
+    tokenizer_ckpt: str                       # tokenizer ckpt (for enc/dec)
+
+    # dataset config
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    action_dim: int = 4
+
+    # Tokenizer / dynamics
+    patch: int = 4
+    enc_n_latents: int = 16
+    enc_d_bottleneck: int = 32
+    d_model_enc: int = 64
+    d_model_dyn: int = 128
+    enc_depth: int = 8
+    dec_depth: int = 8
+    dyn_depth: int = 8
+    n_heads: int = 4
+    n_kv_heads: int = 2
+    qk_norm_type: str | None = None
+    rope_theta: float = 10000.0
+    packing_factor: int = 2
+    n_register: int = 4
+    n_agent: int = 1
+    agent_space_mode: str = "wm_agent"
+    k_max: int = 8
+
+    # Heads
+    L: int = 2
+    num_reward_bins: int = 101
+    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
+    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
+    n_tasks: int = 128
+    use_task_ids: bool = True
+
+    # Sampler/eval
+    ctx_length: int = 32
+    horizon: int = 16
+    schedule: str = "finest"  # "finest" or "shortcut"
+    d: float | None = None    # e.g., 0.25 for shortcut
+    ctx_signal_tau: float = 1.0
+    match_ctx_tau: bool = False
+
+    # Visualization
+    max_examples_to_plot: int = 4  # number of sequences to render as strips
+
+    # Safety: ensure heads never see future actions when predicting next actions
+    paranoid_no_leak: bool = True

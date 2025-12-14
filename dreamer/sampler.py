@@ -1,6 +1,6 @@
 # sampling logic for debugging / visualization. Not JIT friendly.
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Tuple, Optional, Dict, Any, Callable
 from einops import reduce
 
@@ -12,6 +12,7 @@ from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadM
 from dreamer.utils import (
     temporal_patchify, temporal_unpatchify,
     pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck,
+    normalize_with_dataset_stats, unnormalize_with_dataset_stats,
 )
 
 # ---------------------------
@@ -41,6 +42,9 @@ class SamplerConfig:
     # tokenizer shapes
     n_spatial: int = 8
     packing_factor: int = 2
+    # dataset normalization
+    dataset_mean: list[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
+    dataset_std: list[float] = field(default_factory=lambda: [0.288675, 0.288675, 0.288675])
     # debugging (host-side only)
     debug: bool = False
     # Called with a dict. We call it twice: once with a high-level run "plan" (kind="plan"),
@@ -278,7 +282,8 @@ def sample_video(
 
     # 1) encode once (deterministic key)
     patches = temporal_patchify(frames, config.patch)
-    z_btLd, _ = encoder.apply(enc_vars, patches, rngs={"mae": mae_key}, deterministic=True)
+    patches_norm = normalize_with_dataset_stats(patches, mean=config.dataset_mean, std=config.dataset_std)
+    z_btLd, _ = encoder.apply(enc_vars, patches_norm, rngs={"mae": mae_key}, deterministic=True)
     z_all = pack_bottleneck_to_spatial(z_btLd, n_spatial=config.n_spatial, k=config.packing_factor)  # (B,T,n_spatial,D_s)
 
     # 2) split context vs future
@@ -300,7 +305,9 @@ def sample_video(
         unpack_spatial_to_bottleneck(z_ctx_for_floor, n_spatial=config.n_spatial, k=config.packing_factor),
         unpack_spatial_to_bottleneck(gt_future_latents, n_spatial=config.n_spatial, k=config.packing_factor)
     ], axis=1)
-    floor_patches = decoder.apply(dec_vars, floor_btLd, deterministic=True)
+    floor_patches_norm = decoder.apply(dec_vars, floor_btLd, deterministic=True)
+    floor_patches = unnormalize_with_dataset_stats(floor_patches_norm, mean=config.dataset_mean, std=config.dataset_std)
+    floor_patches = jnp.clip(floor_patches, 0.0, 1.0)
     floor_frames = temporal_unpatchify(floor_patches, H, W, C, config.patch)
 
     # 4) choose schedule/step size
@@ -350,7 +357,9 @@ def sample_video(
         unpack_spatial_to_bottleneck(z_all[:, :config.ctx_length, :, :], n_spatial=config.n_spatial, k=config.packing_factor),
         unpack_spatial_to_bottleneck(pred_latents, n_spatial=config.n_spatial, k=config.packing_factor),
     ], axis=1)
-    pred_patches = decoder.apply(dec_vars, pred_btLd, deterministic=True)
+    pred_patches_norm = decoder.apply(dec_vars, pred_btLd, deterministic=True)
+    pred_patches = unnormalize_with_dataset_stats(pred_patches_norm, mean=config.dataset_mean, std=config.dataset_std)
+    pred_patches = jnp.clip(pred_patches, 0.0, 1.0)
     pred_frames = temporal_unpatchify(pred_patches, H, W, C, config.patch)
 
     gt_frames = frames[:, :config.ctx_length + horizon]

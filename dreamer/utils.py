@@ -3,9 +3,11 @@ import jax.numpy as jnp
 from dreamer.data import patchify, unpatchify
 import orbax.checkpoint as ocp
 from pathlib import Path
+import flax
 from flax.core import freeze, unfreeze, FrozenDict
-from einops import rearrange
+from einops import rearrange, repeat
 from enum import IntEnum
+from typing import Tuple
 
 class Modality(IntEnum):
     LATENT   = -1
@@ -19,18 +21,132 @@ class Modality(IntEnum):
     AGENT = 7
     # add more as needed
 
+@flax.struct.dataclass  # immutable, PyTree-friendly
+class TokenLayout:
+    """
+    Ordered token layout for a single timestep: segments define the order.
+    """
+    segments: Tuple[Tuple[Modality, int], ...]  # e.g., ((Modality.LATENT, n_latents), (Modality.IMAGE, n_patches), ...)
+
+    def S(self) -> int:
+        return sum(n for _, n in self.segments)
+
+    def modality_ids(self) -> jnp.ndarray:
+        parts = [jnp.full((n,), int(m), dtype=jnp.int32) for m, n in self.segments]
+        return jnp.concatenate(parts)
+
+    def slices(self) -> dict:
+        """Convenience: start/stop indices per modality (first occurrence if repeated)."""
+        idx = 0
+        out = {}
+        for m, n in self.segments:
+            out[m] = slice(idx, idx + n)
+            idx += n
+        return out
+
+    def make_mask(self, mode: str, B: int, T: int):
+        """
+        Returns a (B*T, 1, S, S) boolean mask indicating allowed key for each query index, per mode.
+        S = number of tokens in a single frame.
+
+        Modes:
+        - "encoder":
+            - Latent tokens (query) can attend to ALL tokens (key).
+            - Non-latent tokens (query) can ONLY attend to tokens of the SAME modality (key).
+        - "decoder":
+            - Latent tokens (query) can ONLY attend to Latent tokens (key).
+            - Non-latent tokens (query) can attend to tokens of the SAME modality AND Latent tokens (key).
+        - "wm_agent":
+            - Action tokens (query) can ONLY attend to Action tokens (key).
+            - Observation tokens (query) can attend to Observation AND Action tokens (key).
+            - Agent tokens (query) can attend to ALL tokens (key).
+        """
+        modality_ids = self.modality_ids()
+        S = int(modality_ids.shape[0])
+
+        # Broadcast helpers
+        q_idx = jnp.arange(S)[:, None]       # (S,1)
+        k_idx = jnp.arange(S)[None, :]       # (1,S)
+
+        q_mod = modality_ids[q_idx]      # (S,1)
+        k_mod = modality_ids[k_idx]      # (1,S)
+
+        if mode == "encoder":
+            # latents -> all; non-latents -> same modality only
+            mask = (q_mod == k_mod) | (q_mod == Modality.LATENT)
+        elif mode == "decoder":
+            # latents -> latents only; non-latents -> same modality + latents
+            mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
+        elif mode == "wm_agent":
+            # wm_agent:
+
+            # Hierarchy levels: Action=0, Obs=1, Agent=2
+            # mask = level(q) >= level(k)
+            
+            def get_level(mod):
+                # Default to 1 (Obs)
+                lvl = jnp.ones_like(mod, dtype=jnp.int32) # Default to 1 (Obs)
+                lvl = jnp.where(mod == Modality.ACTION, 0, lvl) # Set to 0 if Action
+                lvl = jnp.where(mod == Modality.AGENT, 2, lvl) # Set to 2 if Agent
+                
+                return lvl
+
+            q_level = get_level(q_mod)
+            k_level = get_level(k_mod)
+            
+            mask = q_level >= k_level
+        else:
+            raise ValueError(f"Unknown mode {mode}")
+
+        # Save (S,S)
+        mask = repeat(mask, "q k -> (b t) h q k", b=B, t=T, h=1)
+        mask = jax.lax.stop_gradient(mask)
+        return mask
 
 
-# --- helpers ---
-temporal_patchify = jax.jit(
-    jax.vmap(patchify, in_axes=(1, None), out_axes=1),  # (B,T,H,W,C) -> (B,T,Np,Dp)
-    static_argnames=("patch",),
-)
+def normalize_with_dataset_stats(videos, *, mean, std):
+    """
+    Normalize videos using dataset-level statistics.
+    
+    Handles spatial images (B, T, H, W, C).
+    For flattened patches, tiles the per-channel stats to match the interleaved layout.
+    
+    Args:
+        videos: input videos/patches
+        mean: dataset mean (list of C floats for per-channel)
+        std: dataset std (list of C floats for per-channel)
+    Returns:
+        normalized videos
+    """
+    mean_arr = jnp.asarray(mean, dtype=videos.dtype)
+    std_arr = jnp.asarray(std, dtype=videos.dtype)
+    
+    mean_c = jnp.expand_dims(mean_arr, axis=(0, 1, 2, 3)) 
+    std_c =  jnp.expand_dims(std_arr, axis=(0, 1, 2, 3)) 
+    
+    return (videos - mean_c) / std_c
 
-temporal_unpatchify = jax.jit(
-    jax.vmap(unpatchify, in_axes=(1, None, None, None, None), out_axes=1),
-    static_argnames=("H", "W", "C", "patch"),
-)
+def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
+    """
+    Unnormalize videos using dataset-level statistics.
+    
+    Handles both flattened patches (B, T, N, patch*patch*C) and spatial images (B, T, H, W, C).
+    For flattened patches, tiles the per-channel stats to match the interleaved layout.
+    
+    Args:
+        normalized_videos: normalized videos/patches
+        mean: dataset mean (list of C floats for per-channel)
+        std: dataset std (list of C floats for per-channel)
+    Returns:
+        unnormalized videos
+    """
+    mean_arr = jnp.asarray(mean, dtype=normalized_videos.dtype)
+    std_arr = jnp.asarray(std, dtype=normalized_videos.dtype)
+    
+    mean_c = jnp.expand_dims(mean_arr, axis=(0, 1, 2, 3)) 
+    std_c =  jnp.expand_dims(std_arr, axis=(0, 1, 2, 3)) 
+    
+    return normalized_videos * std_c + mean_c
 
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     """
@@ -111,59 +227,4 @@ def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict |
 
 
 
-def make_mask(modality_ids: jnp.ndarray, mode: str):
-    """
-    Returns a (S,S) boolean mask indicating allowed key for each query index, per mode.
-    S = number of tokens in a single frame.
 
-    Modes:
-    - "encoder":
-        - Latent tokens (query) can attend to ALL tokens (key).
-        - Non-latent tokens (query) can ONLY attend to tokens of the SAME modality (key).
-    - "decoder":
-        - Latent tokens (query) can ONLY attend to Latent tokens (key).
-        - Non-latent tokens (query) can attend to tokens of the SAME modality AND Latent tokens (key).
-    - "wm_agent":
-        - Action tokens (query) can ONLY attend to Action tokens (key).
-        - Observation tokens (query) can attend to Observation AND Action tokens (key).
-        - Agent tokens (query) can attend to ALL tokens (key).
-    """
-    S = int(modality_ids.shape[0])
-
-    # Broadcast helpers
-    q_idx = jnp.arange(S)[:, None]       # (S,1)
-    k_idx = jnp.arange(S)[None, :]       # (1,S)
-
-    q_mod = modality_ids[q_idx]      # (S,1)
-    k_mod = modality_ids[k_idx]      # (1,S)
-
-    if mode == "encoder":
-        # latents -> all; non-latents -> same modality only
-        mask = (q_mod == k_mod) | (q_mod == Modality.LATENT)
-    elif mode == "decoder":
-        # latents -> latents only; non-latents -> same modality + latents
-        mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
-    elif mode == "wm_agent":
-        # wm_agent:
-
-        # Hierarchy levels: Action=0, Obs=1, Agent=2
-        # mask = level(q) >= level(k)
-        
-        def get_level(mod):
-            # Default to 1 (Obs)
-            lvl = jnp.ones_like(mod, dtype=jnp.int32) # Default to 1 (Obs)
-            lvl = jnp.where(mod == Modality.ACTION, 0, lvl) # Set to 0 if Action
-            lvl = jnp.where(mod == Modality.AGENT, 2, lvl) # Set to 2 if Agent
-            
-            return lvl
-
-        q_level = get_level(q_mod)
-        k_level = get_level(k_mod)
-        
-        mask = q_level >= k_level
-    else:
-        raise ValueError(f"Unknown mode {mode}")
-
-    # Save (S,S)
-    modality_mask = jax.lax.stop_gradient(mask)
-    return modality_mask

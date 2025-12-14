@@ -25,10 +25,12 @@ import orbax.checkpoint as ocp
 import wandb
 
 from dreamer.models import Encoder, Decoder, Dynamics
-from dreamer.data import make_iterator, DatasetConfig
+from dreamer.data import make_iterator
+from dreamer.configs import DynamicsConfig
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
+    normalize_with_dataset_stats,
     with_params,
     make_state, make_manager, try_restore, maybe_save,
     pack_mae_params,
@@ -41,52 +43,7 @@ from dreamer.sampler import SamplerConfig, sample_video
 # Config
 # ---------------------------
 
-@dataclass(frozen=True)
-class RealismConfig:
-    # IO / ckpt
-    run_name: str
-    tokenizer_ckpt: str
-    ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
 
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None  # if None, uses default entity
-    wandb_project: str | None = None  # if None, uses run_name as project
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    use_rope: bool = True
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4 # number of register tokens for dynamics
-    n_agent: int = 1 # number of agent tokens for dynamics
-
-    # schedule
-    k_max: int = 8
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
-    self_fraction: float = 0.25   # used once we pass bootstrap_start
-
-    # train
-    max_steps: int = 1_000_000_000
-    log_every: int = 5_000
-    lr: float = 3e-4
-
-    # eval media toggle
-    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
 # ---------------------------
 # Small helpers
@@ -189,6 +146,7 @@ def train_step_efficient(
     B: int, T: int, B_self: int,            # assume 0 <= B_self < B
     n_spatial: int, k_max: int, packing_factor: int,
     master_key: jnp.ndarray, step: int, bootstrap_start: int,
+    dataset_mean, dataset_std,
 ):
     """
     Deterministic two-branch training (one fused main forward):
@@ -223,7 +181,8 @@ def train_step_efficient(
     enc_key, key_sigma_full, key_step_self, key_noise_full, drop_key = jax.random.split(step_key, 5)
 
     # Frozen encoder → spatial tokens (clean target z1)
-    z_bottleneck, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": enc_key}, deterministic=True)
+    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=dataset_mean, std=dataset_std)
+    z_bottleneck, _ = encoder.apply(enc_vars, patches_norm, rngs={"mae": enc_key}, deterministic=True)
     z1 = pack_bottleneck_to_spatial(z_bottleneck, n_spatial=n_spatial, k=packing_factor)  # (B,T,Sz,Dz)
 
     # Deterministic batch split
@@ -330,6 +289,8 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=cfg.enc_n_latents // cfg.packing_factor,
         packing_factor=cfg.packing_factor,
+        dataset_mean=cfg.dataset.dataset_mean,
+        dataset_std=cfg.dataset.dataset_std,
         start_mode="pure",
         rollout="autoregressive",
     )
@@ -523,7 +484,7 @@ class TrainState:
 # ---------------------------
 
 def initialize_models_and_tokenizer(
-    cfg: RealismConfig,
+    cfg: DynamicsConfig,
     frames_init: jnp.ndarray,
     actions_init: jnp.ndarray,
 ) -> TrainState:
@@ -547,7 +508,6 @@ def initialize_models_and_tokenizer(
         depth=cfg.enc_depth,
         dropout_rate=0.0,
         qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
         rope_theta=cfg.rope_theta,
         d_bottleneck=cfg.enc_d_bottleneck,
         mae_p_min=0.0, mae_p_max=0.0,
@@ -564,7 +524,6 @@ def initialize_models_and_tokenizer(
         d_patch=D_patch,
         dropout_rate=0.0,
         qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
         rope_theta=cfg.rope_theta,
         mlp_ratio=4.0, time_every=4,
     )
@@ -578,7 +537,6 @@ def initialize_models_and_tokenizer(
         n_agent=cfg.n_agent,
         dropout_rate=0.0,
         qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
         rope_theta=cfg.rope_theta,
         k_max=k_max, 
         mlp_ratio=4.0,
@@ -605,7 +563,8 @@ def initialize_models_and_tokenizer(
 
     # Build initial z1 to shape dynamics init
     mae_eval_key = jax.random.PRNGKey(777)
-    z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True)
+    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
+    z_btLd, _ = encoder.apply(enc_vars, patches_norm, rngs={"mae": mae_eval_key}, deterministic=True)
     z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
     emax = jnp.log2(k_max).astype(jnp.int32)
     step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
@@ -637,7 +596,7 @@ def initialize_models_and_tokenizer(
 # ---------------------------
 
 def run_evaluation(
-    cfg: RealismConfig,
+    cfg: DynamicsConfig,
     step: int,
     train_state: TrainState,
     next_batch,
@@ -716,7 +675,7 @@ def run_evaluation(
 # Main
 # ---------------------------
 
-def run(cfg: RealismConfig):
+def run(cfg: DynamicsConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
@@ -734,16 +693,7 @@ def run(cfg: RealismConfig):
         )
 
     # Data iterator (streaming)
-    next_batch = make_iterator(
-        cfg.dataset.B, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C,
-        pixels_per_step=cfg.dataset.pixels_per_step,
-        size_min=cfg.dataset.size_min, size_max=cfg.dataset.size_max,
-        hold_min=cfg.dataset.hold_min, hold_max=cfg.dataset.hold_max,
-        fg_min_color=0 if cfg.dataset.diversify_data else 128,
-        fg_max_color=255 if cfg.dataset.diversify_data else 128,
-        bg_min_color=0 if cfg.dataset.diversify_data else 255,
-        bg_max_color=255 if cfg.dataset.diversify_data else 255,
-    )
+    next_batch = make_iterator(cfg.dataset)
 
     # Initialize models and restore tokenizer
     init_rng = jax.random.PRNGKey(0)
@@ -822,6 +772,7 @@ def run(cfg: RealismConfig):
             patch=cfg.patch, B=cfg.dataset.B, T=cfg.dataset.T, B_self=B_self,
             n_spatial=n_spatial, k_max=k_max, packing_factor=cfg.packing_factor,
             master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
+            dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
         )
         train_t = time.perf_counter() - train_start_t
         total_t = data_t + train_t
@@ -865,7 +816,7 @@ def run(cfg: RealismConfig):
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")
 def main(cfg: DictConfig):
-    schema = OmegaConf.structured(RealismConfig)
+    schema = OmegaConf.structured(DynamicsConfig)
     cfg = OmegaConf.merge(schema, cfg)
     realism_cfg = OmegaConf.to_object(cfg)
     

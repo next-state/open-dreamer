@@ -1,38 +1,11 @@
 from functools import partial
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import jax
 import jax.numpy as jnp
 import imageio.v2 as imageio
 from einops import rearrange
-
-
-# ============================================================
-# Dataset Configuration
-# ============================================================
-
-@dataclass
-class DatasetConfig:
-    """Configuration for dataset parameters.
-    
-    This config is shared across all experiments (tokenizer, dynamics, policy)
-    to ensure consistent data loading.
-    """
-    name: str = "bouncing_square"
-    
-    # Batch and sequence dimensions
-    B: int = 32  # batch size
-    T: int = 64  # sequence length
-    H: int = 32  # height
-    W: int = 32  # width
-    C: int = 3   # channels
-    
-    # Bouncing square specific parameters
-    pixels_per_step: int = 2
-    size_min: int = 6
-    size_max: int = 14
-    hold_min: int = 4
-    hold_max: int = 9
-    diversify_data: bool = True
+import coinrun_data.dataloader as coinrun_loader
+from .configs import DatasetConfig
 
 
 # ============================================================
@@ -257,7 +230,7 @@ def generate_batch(
 # JIT-friendly iterator with stochastic policy
 # ============================================================
 
-def make_iterator(
+def make_bouncing_square_iterator(
     batch_size: int,
     time_steps: int,
     height: int,
@@ -408,6 +381,50 @@ def make_iterator(
         return key, (video, actions, rewards)
 
     return next
+
+
+
+def make_iterator(cfg: DatasetConfig):
+    """
+    Factory function to create a data iterator based on config.
+    """
+    if cfg.source == "bouncing_square":
+        if cfg.diversify_data:
+            fg_min, fg_max = 0, 255
+            bg_min, bg_max = 0, 255
+        else:
+            fg_min, fg_max = 128, 128
+            bg_min, bg_max = 255, 255
+            
+        return make_bouncing_square_iterator(
+            batch_size=cfg.B,
+            time_steps=cfg.T,
+            height=cfg.H,
+            width=cfg.W,
+            channels=cfg.C,
+            pixels_per_step=cfg.pixels_per_step,
+            size_min=cfg.size_min,
+            size_max=cfg.size_max,
+            hold_min=cfg.hold_min,
+            hold_max=cfg.hold_max,
+            fg_min_color=fg_min,
+            fg_max_color=fg_max,
+            bg_min_color=bg_min,
+            bg_max_color=bg_max,
+        )
+    elif cfg.source == "custom":
+        return coinrun_loader.get_dataloader(
+            array_record_paths=cfg.array_record_path,
+            seq_len=cfg.T,
+            global_batch_size=cfg.B,
+            image_h=cfg.H,
+            image_w=cfg.W,
+            image_c=cfg.C, 
+            num_workers=1 # Use 1 worker to avoid multiprocessing complexity issues if any
+        )
+    else:
+        raise ValueError(f"Unknown dataset source: {cfg.source}")
+
 
 
 # ============================================================
@@ -673,16 +690,17 @@ def patchify(x: jnp.ndarray, patch: int) -> jnp.ndarray:
     x: (B, H, W, C)  ->  patches: (B, N, D)
       where N = (H/patch)*(W/patch), D = patch*patch*C
     """
-    patches = rearrange(x, "b (hp p1) (wp p2) c -> b (hp wp) (p1 p2 c)", p1=patch, p2=patch)
+    patches = rearrange(x, "... (hp p1) (wp p2) c -> ... (hp wp) (p1 p2 c)", p1=patch, p2=patch)
     return patches
 
-def unpatchify(patches: jnp.ndarray, H: int, W: int, C: int, patch: int) -> jnp.ndarray:
+def unpatchify(patches: jnp.ndarray, patch: int, H: int, W: int) -> jnp.ndarray:
     """
     patches: (B, N, D)  ->  x: (B, H, W, C)
       where N = (H/patch)*(W/patch), D = patch*patch*C
     """
-    image = rearrange(patches, "b (hp wp) (p1 p2 c) -> b (hp p1) (wp p2) c", hp=H//patch, wp=W//patch, p1=patch, p2=patch, c=C)
+    image = rearrange(patches, "... (hp wp) (p1 p2 c) -> ... (hp p1) (wp p2) c", hp=H//patch, wp=W//patch, p1=patch, p2=patch)
     return image
+
 
 
 
@@ -701,7 +719,7 @@ def test_iterator():
     B, T = 6, 48
     H, W, C = 64, 64, 3
 
-    next_step = make_iterator(
+    next_step = make_bouncing_square_iterator(
         batch_size=B,
         time_steps=T,
         height=H,
