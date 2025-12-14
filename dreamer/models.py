@@ -820,7 +820,6 @@ class Dynamics(nn.Module):
             batch_size: Global batch size (B)
             window_size: Maximum sequence length (T) to support.
         """
-        # Time attention sees (B*S) independent sequences
         # Time attention sees (B*S) independent sequences. S includes all tokens (action, signal, step, spatial, register, agent)
         S_total = 1 + 1 + 1 + self.n_spatial + self.n_register + (self.n_agent if self.n_agent > 0 else 0)
 
@@ -892,12 +891,12 @@ class Dynamics(nn.Module):
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
-        # if not self.use_rope:
-        #     start_pos = 0
-        #     if caches is not None and len(caches) > 0:
-        #         first_cache = list(caches.values())[0]
-        #         start_pos = first_cache.index
-        #     tokens = add_sinusoidal_positions(tokens, start_pos=start_pos) # (B, T, N_total, d_model)
+        if not self.use_rope:
+            start_pos = 0
+            if caches is not None and len(caches) > 0:
+                first_cache = list(caches.values())[0]
+                start_pos = first_cache.index
+            tokens = add_sinusoidal_positions(tokens, start_pos=start_pos) # (B, T, N_total, d_model)
         
         mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
         x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches)
