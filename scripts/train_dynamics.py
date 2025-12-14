@@ -222,7 +222,7 @@ def train_step_efficient(
         drop_main, drop_h1, drop_h2 = jax.random.split(drop_key, 3)
 
         # Main forward (emp + self)
-        z1_hat_full, _ = dynamics.apply(
+        z1_hat_full, *_ = dynamics.apply(
             local_dyn, actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
             rngs={"dropout": drop_main}, deterministic=False,
         )  # (B,T,Sz,Dz)
@@ -239,13 +239,13 @@ def train_step_efficient(
         do_boot = (B_self > 0) & (step >= bootstrap_start)
 
         def _boot_loss():
-            z1_hat_half1, _ = dynamics.apply(
+            z1_hat_half1, *_ = dynamics.apply(
                 local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self,
                 rngs={"dropout": drop_h1}, deterministic=False,
             )
             b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
             z_prime = z_tilde_self + b_prime * d_half[...,None,None]
-            z1_hat_half2, _ = dynamics.apply(
+            z1_hat_half2, *_ = dynamics.apply(
                 local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime,
                 rngs={"dropout": drop_h2}, deterministic=False,
             )
@@ -293,8 +293,6 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
         dataset_std=cfg.dataset.dataset_std,
         start_mode="pure",
         rollout="autoregressive",
-        # optional: see item 3 below
-        # match_ctx_tau=False,
     )
     regs = []
     regs.append(("finest_pure_AR", SamplerConfig(schedule="finest", **common)))

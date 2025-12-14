@@ -311,7 +311,7 @@ def train_step_efficient(
         agent_tokens = task_embedder.apply(local_task, dummy_task_ids, B, T)
 
         # Main forward (emp + self) → z1_hat and agent readouts h
-        z1_hat_full, h_btnd = dynamics.apply(
+        z1_hat_full, h_btnd, _ = dynamics.apply(
             local_dyn, actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
             agent_tokens=agent_tokens, rngs={"dropout": drop_key}, deterministic=False,
         )  # z1_hat_full: (B,T,Sz,Dz), h: (B,T,n_agent,D)
@@ -329,13 +329,13 @@ def train_step_efficient(
         do_boot = (B_self > 0) & (step >= bootstrap_start)
 
         def _boot_loss():
-            z1_hat_half1, _ = dynamics.apply(
+            z1_hat_half1, *_ = dynamics.apply(
                 local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self,
                 agent_tokens=agent_tokens[B_emp:], rngs={"dropout": drop_key}, deterministic=False,
             )
             b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
             z_prime = z_tilde_self + b_prime * d_half[...,None,None]
-            z1_hat_half2, _ = dynamics.apply(
+            z1_hat_half2, *_ = dynamics.apply(
                 local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime,
                 agent_tokens=agent_tokens[B_emp:], rngs={"dropout": drop_key}, deterministic=False,
             )

@@ -1,13 +1,13 @@
 from functools import lru_cache
 from dataclasses import asdict
+
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
 import time
 from flax.core import FrozenDict
 import flax
-from enum import IntEnum
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Dict
 from einops import rearrange, repeat
 import math
 from .utils import Modality, TokenLayout
@@ -16,66 +16,181 @@ from .configs import TokenizerConfig
 
 
 
+@flax.struct.dataclass
+class KVCache:
+    """
+    Ring buffer KV cache for JIT compilation.
+    """
+    k: jnp.ndarray      # (B, Max_T, K, H)
+    v: jnp.ndarray      # (B, Max_T, K, H)
+    index: jnp.ndarray  # scalar integer (i32)
+    window_size: int = flax.struct.field(pytree_node=False)
+
+    @classmethod
+    def init(cls, batch_size, window_size, num_kv_heads, head_dim, dtype=jnp.float32):
+        return cls(
+            k=jnp.zeros((batch_size, window_size, num_kv_heads, head_dim), dtype=dtype),
+            v=jnp.zeros((batch_size, window_size, num_kv_heads, head_dim), dtype=dtype),
+            index=jnp.array(0, dtype=jnp.int32),
+            window_size=window_size
+        )
+
+    def update(self, k_new, v_new):
+        """
+        Writes k_new/v_new into the buffer.
+        Handles both contiguous writes and wrapping writes (T > 1) via branching.
+        Returns updated cache with index incremented by the length of new data.
+        """
+        T = k_new.shape[1]
+        write_idx = self.index % self.window_size
+
+        def _update_contiguous(operand, update, start_idx):
+            # Fast path
+            return jax.lax.dynamic_update_slice(operand, update, (0, start_idx, 0, 0))
+
+        def _update_wrap(operand, update, start_idx):
+            # Slow path
+            indices = (jnp.arange(T) + start_idx) % self.window_size
+            return operand.at[:, indices, :, :].set(update)
+
+        fits_contiguous = (write_idx + T) <= self.window_size
+
+        k_updated = jax.lax.cond(
+            fits_contiguous,
+            _update_contiguous,
+            _update_wrap,
+            self.k, k_new, write_idx
+        )
+        v_updated = jax.lax.cond(
+            fits_contiguous,
+            _update_contiguous,
+            _update_wrap,
+            self.v, v_new, write_idx
+        )
+        
+        return self.replace(k=k_updated, v=v_updated, index=self.index + T)
+
+    def get_ordered_kv(self, query_len):
+        """
+        Returns rolled K, V, and a mask indicating valid data.
+        """
+        write_idx = self.index % self.window_size
+        shift = -1 * write_idx
+
+        # newest is at index -1
+        k_ordered = jnp.roll(self.k, shift, axis=1)
+        v_ordered = jnp.roll(self.v, shift, axis=1)
+
+        # Valid data is at the END of the buffer: indices [Window-valid_len : Window]
+        valid_len = jnp.minimum(self.index, self.window_size)
+
+        # Block garbage data during warmup
+        k_idx = jnp.arange(self.window_size)[None, None, None, :] # (1, 1, 1, Window)
+        start_valid = self.window_size - valid_len
+        valid_mask = k_idx >= start_valid
+
+        # Shifted causal mask
+        q_idx = jnp.arange(query_len)[None, None, :, None]
+        causal_mask = k_idx <= (self.window_size - query_len + q_idx)
+
+        final_mask = jnp.logical_and(valid_mask, causal_mask)
+
+        return k_ordered, v_ordered, final_mask
+
+@flax.struct.dataclass
+class TokenLayout:
+    """
+    Ordered token layout for a single timestep: latents first (if any),
+    then a sequence of (modality, count) segments.
+    """
+    n_latents: int
+    segments: Tuple[Tuple[Modality, int], ...]  # e.g., ((Modality.IMAGE, n_patches), (Modality.ACTION, n_act), ...)
+
+    def S(self) -> int:
+        return self.n_latents + sum(n for _, n in self.segments)
+
+    def modality_ids(self) -> jnp.ndarray:
+        parts = [jnp.full((self.n_latents,), Modality.LATENT, dtype=jnp.int32)] if self.n_latents > 0 else []
+        for m, n in self.segments:
+            if n > 0:
+                parts.append(jnp.full((n,), int(m), dtype=jnp.int32))
+        return jnp.concatenate(parts) if parts else jnp.zeros((0,), dtype=jnp.int32)  # (S,)
+
+    def slices(self) -> dict:
+        """Convenience: start/stop indices per modality (first occurrence if repeated)."""
+        idx = 0
+        out = {}
+        if self.n_latents > 0:
+            out[Modality.LATENT] = slice(idx, idx + self.n_latents); idx += self.n_latents
+        for m, n in self.segments:
+            if n > 0 and m not in out:
+                out[m] = slice(idx, idx + n)
+            idx += n
+        return out
+
     
 
 
+class RotaryEmbedding1D(nn.Module):
+    dim: int
+    theta: float = 10000.0
+    dtype: Any = jnp.float32
 
-@lru_cache(maxsize=8)
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype=jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
-    Returns:
-        freqs_cos: (end, dim//2)
-        freqs_sin: (end, dim//2)
-    """
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
-    t = jnp.arange(end, dtype=dtype)
-    freqs = jnp.outer(t, freqs)  # (end, dim//2)
-    return jnp.cos(freqs), jnp.sin(freqs)
+    def setup(self):
+        inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
+        self.inv_freq = self.variable('constants', 'inv_freq', lambda: inv_freq)
 
+    def __call__(self, q, k, start_pos=0):
+        """
+        q: (B, T, N, H)
+        k: (B, T, K, H)
+        start_pos: scalar int (the absolute position of the first frame in T)
+        """
+        T = q.shape[1]
+        t_indices = jnp.arange(T, dtype=self.dtype) + start_pos
+        freqs = jnp.outer(t_indices, self.inv_freq.value) # (T, dim//2)
 
-def apply_rotary_emb(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cos: jnp.ndarray, freqs_sin: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Apply Rotary Positional Embeddings (RoPE) to queries and keys using real sin/cos.
-    xq: (B, T, N, H)
-    xk: (B, S, K, H)
-    freqs_cos: (L, H/2)
-    freqs_sin: (L, H/2)
-    """
-    # Rearrange to (..., H/2, 2)
-    xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
-    xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
+        freqs_cos = jnp.cos(freqs)
+        freqs_sin = jnp.sin(freqs)
 
-    xq_r, xq_i = xq_pairs[..., 0], xq_pairs[..., 1]
-    xk_r, xk_i = xk_pairs[..., 0], xk_pairs[..., 1]
+        # (1, T, 1, Dim//2)
+        freqs_cos = freqs_cos[None, :, None, :]
+        freqs_sin = freqs_sin[None, :, None, :]
 
-    T, S = xq.shape[1], xk.shape[1]
-    
-    # Broadcast freqs (L, H/2) -> (1, L, 1, H/2)
-    cos_q = freqs_cos[None, :T, None, :]
-    sin_q = freqs_sin[None, :T, None, :]
-    cos_k = freqs_cos[None, :S, None, :]
-    sin_k = freqs_sin[None, :S, None, :]
+        return self._apply(q, k, freqs_cos, freqs_sin)
 
-    # Rotation:
-    # x' = x cos - y sin
-    # y' = x sin + y cos
-    xq_out_r = xq_r * cos_q - xq_i * sin_q
-    xq_out_i = xq_r * sin_q + xq_i * cos_q
-    
-    xk_out_r = xk_r * cos_k - xk_i * sin_k
-    xk_out_i = xk_r * sin_k + xk_i * cos_k
+    def _apply(self, xq, xk, freqs_cos, freqs_sin):
+        """
+        Apply Rotary Positional Embeddings (RoPE) to queries and keys using real sin/cos.
+        xq: (B, T, N, H)
+        xk: (B, T, K, H)
+        freqs_cos: (L, H/2)
+        freqs_sin: (L, H/2)
+        """
+        # Rearrange to (..., H/2, 2)
+        xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
+        xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
 
-    # Stack back and flatten
-    xq_out = jnp.stack([xq_out_r, xq_out_i], axis=-1)
-    xk_out = jnp.stack([xk_out_r, xk_out_i], axis=-1)
+        xq_r, xq_i = xq_pairs[..., 0], xq_pairs[..., 1]
+        xk_r, xk_i = xk_pairs[..., 0], xk_pairs[..., 1]
 
-    xq_out = rearrange(xq_out, '... d two -> ... (d two)')
-    xk_out = rearrange(xk_out, '... d two -> ... (d two)')
-    
-    return xq_out, xk_out
+        # Rotation:
+        # x' = x cos - y sin
+        # y' = x sin + y cos
+        xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
+        xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
+        
+        xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
+        xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
 
+        # Stack back and flatten
+        xq_out = jnp.stack([xq_out_r, xq_out_i], axis=-1)
+        xk_out = jnp.stack([xk_out_r, xk_out_i], axis=-1)
 
+        xq_out = rearrange(xq_out, '... d two -> ... (d two)')
+        xk_out = rearrange(xk_out, '... d two -> ... (d two)')
+        
+        return xq_out, xk_out
 
 
 class MAEReplacer(nn.Module):
@@ -189,10 +304,15 @@ class GroupedQueryAttention(nn.Module):
         self.dropout = nn.Dropout(self.dropout_rate)
 
         if self.qk_norm_type == 'qknorm':
-            self.q_ln = nn.LayerNorm(use_bias=True, use_scale=True)
-            self.k_ln = nn.LayerNorm(use_bias=True, use_scale=True)
+            self.q_ln = nn.RMSNorm(use_scale=True)
+            self.k_ln = nn.RMSNorm(use_scale=True)
 
-    def __call__(self, x, mask, *args):
+        self.rope = RotaryEmbedding1D(
+            dim=head_dim,
+            theta=self.rope_theta
+        )
+
+    def __call__(self, x, mask, *args, cache: Optional[KVCache] = None):
         """
         https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html
         B = batch size
@@ -204,14 +324,10 @@ class GroupedQueryAttention(nn.Module):
         G = number of groups, which equals to N // K
         """
         q = self.to_q(x)
-        kv = self.to_kv(x)
         q = rearrange(q, "B T (N H) -> B T N H", N=self.num_heads)
+        kv = self.to_kv(x)
         k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
 
-        head_dim = q.shape[-1]
-        max_len = max(q.shape[1], k.shape[1])
-        freqs_cos, freqs_sin = precompute_freqs_cis(head_dim, max_len, self.rope_theta, dtype=q.dtype)
-        q, k = apply_rotary_emb(q, k, freqs_cos, freqs_sin)
 
         scale = q.shape[-1] ** -0.5
         if self.qk_norm_type == 'qknorm':
@@ -222,13 +338,45 @@ class GroupedQueryAttention(nn.Module):
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
             scale = 1.0 
 
-        attn = jax.nn.dot_product_attention(q, k, v, mask=mask, scale=scale, is_causal=self.is_causal)  # TODO: try setting implementation="cudnn"
+        # RoPE
+        start_pos = cache.index if cache is not None else 0
+        q, k = self.rope(q, k, start_pos=start_pos)
+
+        # KV cache
+        if self.is_causal and cache is not None:
+            # CACHED INFERENCE MODE
+            new_cache = cache.update(k, v)
+
+            T = q.shape[1]
+            k_attn, v_attn, cache_mask = new_cache.get_ordered_kv(query_len=T)
+
+            attn_is_causal = False # Handled manually by cache_mask
+            if mask is not None:
+                mask_attn = jnp.logical_and(mask, cache_mask)
+            else:
+                mask_attn = cache_mask
+        else:
+            # TRAINING or NON-CAUSAL (SPACE) ATTENTION
+            new_cache = None
+            k_attn, v_attn = k, v
+            mask_attn = mask
+            attn_is_causal = self.is_causal
+
+        # SDPA
+        attn = jax.nn.dot_product_attention(
+            q, k_attn, v_attn, 
+            mask=mask_attn, 
+            scale=scale, 
+            is_causal=attn_is_causal
+        )  # TODO: try setting implementation="cudnn"
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
-        return self.dropout(out, deterministic=self.deterministic)
+        out = self.dropout(out, deterministic=self.deterministic)
+        
+        return out, new_cache
 
-class SpaceSelfAttentionModality(nn.Module):
+class SpaceSelfAttention(nn.Module):
     """Space self-attention with modality routing."""
     dim: int
     num_heads: int
@@ -238,12 +386,13 @@ class SpaceSelfAttentionModality(nn.Module):
     rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool):
+    def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B T) S D")
 
-        out = GroupedQueryAttention(
+        # cache is not used for space attention (non-causal)
+        out, _ = GroupedQueryAttention(
             dim=self.dim,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -252,10 +401,10 @@ class SpaceSelfAttentionModality(nn.Module):
             rope_theta=self.rope_theta,
             deterministic=deterministic,
             is_causal=False,
-        )(x, mask=mask)
+        )(x, mask=mask, cache=None)
 
         out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
-        return out
+        return out, None  # Return None for cache consistency
 
 class TimeSelfAttention(nn.Module):
     """Time self-attention."""
@@ -267,12 +416,13 @@ class TimeSelfAttention(nn.Module):
     rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool):
+    def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None):
         # mask does nothing, but is required for API consistency
-        # x: (B, T, S, D) -> attend across T, causal
+        # x: (B, T, S, D) -> attention across T, causal
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
-        out = GroupedQueryAttention(
+
+        out, new_cache = GroupedQueryAttention(
             dim=self.dim,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -281,9 +431,10 @@ class TimeSelfAttention(nn.Module):
             rope_theta=self.rope_theta,
             deterministic=deterministic,
             is_causal=True,
-        )(x, mask=None)
+        )(x, mask=None, cache=cache)
+
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
-        return out
+        return out, new_cache
 
 # ---------- a single block-causal layer ----------
 class BlockCausalLayer(nn.Module):
@@ -302,7 +453,7 @@ class BlockCausalLayer(nn.Module):
 
         # --- Time or space attention ---
         self.use_time = (self.layer_index + 1) % self.time_every == 0
-        attention_module = TimeSelfAttention if self.use_time else SpaceSelfAttentionModality
+        attention_module = TimeSelfAttention if self.use_time else SpaceSelfAttention
         self.attn = attention_module(
             dim=self.dim,
             num_heads=self.num_heads,
@@ -317,17 +468,18 @@ class BlockCausalLayer(nn.Module):
         self.mlp = MLP(self.dim, self.mlp_ratio, self.dropout_rate)
 
     @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool):
-        # --- Space attention (within timestep, modality-aware) ---
+    def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None):
+        # --- Attention (time or space, depending on layer_index) ---
         y = self.norm(x)
-        y = self.attn(y, mask=mask, deterministic=deterministic)
+        y, new_cache = self.attn(y, mask=mask, deterministic=deterministic, cache=cache)
         x = x + y
 
         # --- MLP ---
         y = self.norm_mlp(x)
         y = self.mlp(y, deterministic=deterministic)
         x = x + y
-        return x
+        return x, new_cache
+
 # ---------- the transformer stack ----------
 
 class BlockCausalTransformer(nn.Module):
@@ -342,15 +494,34 @@ class BlockCausalTransformer(nn.Module):
     rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool):
+    def __call__(self, x, mask, *, deterministic: bool, caches: Optional[Dict[int, KVCache]] = None):
+        """
+        Args:
+            x: input tensor
+            mask: attention mask
+            deterministic: whether to use deterministic mode (no dropout)
+            caches: optional dict mapping layer_index -> KVCache
+        
+        Returns:
+            output tensor and updated caches (always returns tuple, caches can be None)
+        """
+        new_caches = {} if caches is not None else None
+        
         for i in range(self.depth):
-            x = BlockCausalLayer(
+            time_index = i // self.time_every
+            is_time_layer = (i + 1) % self.time_every == 0
+            cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
+            x, new_cache_i = BlockCausalLayer(
                 self.d_model, self.n_heads, self.n_kv_heads,
                 dropout_rate=self.dropout_rate, qk_norm_type=self.qk_norm_type,
                 mlp_ratio=self.mlp_ratio, layer_index=i, time_every=self.time_every,
                 rope_theta=self.rope_theta,
-            )(x, mask=mask, deterministic=deterministic)
-        return x
+            )(x, mask=mask, deterministic=deterministic, cache=cache_i)
+            
+            if new_caches is not None and new_cache_i is not None:
+                new_caches[time_index] = new_cache_i
+        
+        return x, new_caches
 
 class Encoder(nn.Module):
     d_model: int
@@ -412,7 +583,10 @@ class Encoder(nn.Module):
         mask = layout.make_mask("encoder", B, T)
 
         # 5) Feed tokens into transformer
-        encoded_tokens = self.transformer(tokens, mask=mask, deterministic=deterministic)
+
+        encoded_tokens, _ = self.transformer(tokens, mask=mask, deterministic=deterministic)
+        # print(f"encoded_tokens_btSd.shape: {encoded_tokens_btSd.shape}")
+
 
         # 6) Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
@@ -487,9 +661,9 @@ class Decoder(nn.Module):
             ))
         mask = layout.make_mask("decoder", B, T)
 
-        # 6) Axial block-causal transformer
-        x = self.transformer(tokens, mask=mask, deterministic=deterministic)
-        # 7) Prediction head over the patch-query slice
+        x, _ = self.transformer(tokens, mask=mask, deterministic=deterministic)
+        # 6) Prediction head over the patch-query slice
+
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
         pred_btnd = self.patch_head(x_patches)  # (B, T, Np, D_patch)
         out_frames = unpatchify(pred_btnd, patch=self.patch_size, H=self.H, W=self.W)
@@ -611,9 +785,39 @@ class Dynamics(nn.Module):
 
         # Signal level τ ∈ {0, 1/d, 2/d, ..., 1 - 1/d} (grid length = 1/d)
         # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
-        self.signal_embed = nn.Embed(self.k_max + 1, self.d_model, name="signal_embed")
+        self.signal_embed = nn.Embed(self.k_max, self.d_model, name="signal_embed")
         self.flow_x_head = nn.Dense(self.d_spatial, name="flow_x_head", kernel_init=nn.initializers.zeros,
                             bias_init=nn.initializers.zeros)  # zero-init
+
+    def create_static_caches(self, 
+                             batch_size: int, 
+                             window_size: int = 1024,
+                             dtype=jnp.float32) -> Dict[int, KVCache]:
+        """
+        Creates concrete, zero-filled buffers for JIT compilation.
+
+        Args:
+            batch_size: Global batch size (B)
+            window_size: Maximum sequence length (T) to support.
+        """
+        # Time attention sees (B*S) independent sequences. S includes all tokens (action, signal, step, spatial, register, agent)
+        S_total = 1 + 1 + 1 + self.n_spatial + self.n_register + (self.n_agent if self.n_agent > 0 else 0)
+
+        flattened_batch_size = batch_size * S_total
+        head_dim = self.d_model // self.n_heads
+
+        caches = {}
+        for i in range(self.depth):
+            time_index, time_offset = divmod(i, self.time_every)
+            if time_offset == 0:
+                caches[time_index] = KVCache.init(
+                    batch_size=flattened_batch_size,
+                    window_size=window_size,
+                    num_kv_heads=self.n_kv_heads,
+                    head_dim=head_dim,
+                    dtype=dtype
+                )
+        return caches
 
     @nn.compact
     def __call__(
@@ -625,6 +829,7 @@ class Dynamics(nn.Module):
         *,
         agent_tokens: Optional[jnp.ndarray] = None,  # (B,T,n_agent,D) or None
         deterministic: bool = True,
+        caches: Optional[Dict[int, KVCache]] = None,
     ):
         """
         Args:
@@ -632,6 +837,7 @@ class Dynamics(nn.Module):
           actions:    (B, T) int32 in [0, n_keyboard) raw action tokens
           steps:      (B, T) float32 — step sizes, 1/2^x
           signals:    (B, T) float32 - signal values, grid that is reachable by current step size
+          caches:     optional dict of KVCache for each layer
 
         Shapes produced:
           spatial_tokens: (B, T, n_spatial, d_model)
@@ -653,7 +859,7 @@ class Dynamics(nn.Module):
         )
 
         # --- 4) Shortcut embeddings (discrete lookup)
-        step_tok   = self.step_embed(step_idxs)[:, :, None, :]      # (B, T, 1, d_model)
+        step_tok   = self.step_embed(step_idxs)[:, :, None, :]         # (B, T, 1, d_model)
         signal_tok = self.signal_embed(signal_idxs)[:, :, None, :]     # (B, T, 1, d_model)
         
         # --- 5) Concatenate in your declared layout order
@@ -664,15 +870,14 @@ class Dynamics(nn.Module):
         else:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
-
-
         
         mask = self.layout.make_mask("wm_agent", B, T)
-        x = self.transformer(tokens, mask, deterministic=deterministic)
+        x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches)
+
         spatial_tokens = x[:, :, self.spatial_slice, :]
         x1_hat = self.flow_x_head(spatial_tokens)
         h_t = x[:, :, self.agent_slice, :] if self.n_agent > 0 else None  # (B,T,n_agent,D) or None
-        return x1_hat, h_t
+        return x1_hat, h_t, new_caches
 
 class TaskEmbedder(nn.Module):
     d_model: int
