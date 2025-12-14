@@ -513,6 +513,9 @@ class Tokenizer(nn.Module):
         z, aux = self.encoder(videos, deterministic=deterministic)
         recon = self.decoder(z, deterministic=deterministic)
         return recon, aux
+
+        
+
 class ActionEncoder(nn.Module):
     d_model: int
     n_keyboard: int = 5  # up, down, left, right, null (categorical actions)

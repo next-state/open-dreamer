@@ -44,7 +44,7 @@ decoder:
 
 lr: 3e-4
 max_steps: 1_000_000_000
-log_every: 1000
+log_every: 100
 lpips_weight: 0.2
 lpips_frac: 0.5
-visualize_every: 4000
+visualize_every: 1000
