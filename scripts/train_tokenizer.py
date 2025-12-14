@@ -238,6 +238,7 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
             "loss_lpips": lpips,
             "keep_prob": keep_prob,
         }
+        
 
         return total, aux
 

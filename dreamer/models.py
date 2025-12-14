@@ -45,7 +45,7 @@ class KVCache:
         def _update_wrap(operand, update, start_idx):
             # Slow path
             indices = (jnp.arange(T) + start_idx) % self.window_size
-            operand.at[:, indices, :, :].set(update)
+            return operand.at[:, indices, :, :].set(update)
 
         fits_contiguous = (write_idx + T) <= self.window_size
 
@@ -84,7 +84,7 @@ class KVCache:
         valid_mask = k_idx >= start_valid
 
         # Shifted causal mask
-        q_idx = jnp.arange(query_len)[None, :, None, None]
+        q_idx = jnp.arange(query_len)[None, None, :, None]
         causal_mask = k_idx <= (self.window_size - query_len + q_idx)
 
         final_mask = jnp.logical_and(valid_mask, causal_mask)
