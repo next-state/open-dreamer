@@ -6,8 +6,8 @@ defaults:
 ckpt_max_to_keep: 2
 
 # WandB
-use_wandb: True
-wandb_entity: Null
+use_wandb: true
+wandb_entity: null
 wandb_project: tiny_dreamer_4
 
 # Hydra

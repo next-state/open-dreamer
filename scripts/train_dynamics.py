@@ -31,8 +31,12 @@ from dreamer.utils import (
     pack_bottleneck_to_spatial,
     normalize_with_dataset_stats,
     with_params,
-    make_state, make_manager, try_restore, maybe_save,
+    load_config_only,
+    make_manager,
     pack_mae_params,
+    setup_checkpointing,
+    maybe_save_snapshot,
+    load_snapshot_weights
 )
 from dreamer.logging import MetricLogger
 
@@ -46,7 +50,7 @@ from dreamer.sampler import SamplerConfig, sample_video
 class RealismConfig:
     # IO / ckpt
     run_name: str
-    tokenizer_ckpt: str
+    tokenizer_ckpt_path: str
     ckpt_max_to_keep: int = 2
     ckpt_save_every: int = 10_000
 
@@ -126,16 +130,40 @@ def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: 
 # Tokenizer restore (uses your Orbax layout & utils)
 # ---------------------------
 
-def load_pretrained_tokenizer(
-    tokenizer_ckpt_dir: str,
-    *,
-    rng: jnp.ndarray,
-    encoder: Encoder,
-    decoder: Decoder,
-    enc_vars,
-    dec_vars,
-    sample_patches_btnd,
-):
+def load_pretrained_tokenizer(tokenizer_ckpt_dir: str | Path):
+    tokenizer_cfg = load_config_only(tokenizer_ckpt_dir)
+
+    enc_kwargs = tokenizer_cfg.encoder
+    dec_kwargs = tokenizer_cfg.decoder
+
+    encoder = Encoder(**enc_kwargs)
+    decoder = Decoder(**dec_kwargs)
+
+    rng = jax.random.PRNGKey(0)
+    dummy_B, dummy_T = 1, 1
+    d_patch = (tokenizer_cfg.patch_size ** 2) * 3 # FIXME
+    dummy_patches = jnp.zeros((dummy_B, dummy_T, enc_kwargs.n_patches, d_patch))
+
+    enc_vars = encoder.init({"params": rng, "mae": rng, "dropout": rng}, dummy_patches, deterministic=True)
+
+    fake_z = jnp.zeros((dummy_B, dummy_T, enc_kwargs.n_latents, enc_kwargs.d_bottleneck))
+    dec_vars = decoder.init({"params": rng, "dropout": rng}, fake_z, deterministic=True)
+
+    mngr = make_manager(tokenizer_ckpt_dir, item_names=("state",))
+    latest = mngr.latest_step()
+
+    packed_params = pack_mae_params(enc_vars, dec_vars)
+    abstract_params = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, packed_params)
+
+    restored = mngr.restore(latest, args=ocp.args.Composite(state=ocp.args.StandardRestore({"params": abstract_params})))
+
+    loaded_params = restored.state["params"]
+    enc_vars = with_params(enc_vars, loaded_params["enc"])
+    dec_vars = with_params(dec_vars, loaded_params["dec"])
+
+    print(f"[tokenizer] Restored weights from step {latest}")
+    return encoder, decoder, enc_vars, dec_vars, tokenizer_cfg
+    """
     meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
     latest = meta_mngr.latest_step()
     if latest is None:
@@ -171,6 +199,7 @@ def load_pretrained_tokenizer(
     new_dec_vars = with_params(dec_vars, dec_params)
     print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
     return new_enc_vars, new_dec_vars, meta
+    """
 
 # ---------------------------
 # Single efficient training step (always used)
@@ -726,9 +755,10 @@ def run_evaluation(
 
 def run(cfg: RealismConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
-    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+
+    cfg, mngr, start_step = setup_checkpointing(cfg, run_dir)
 
     # Initialize wandb if enabled
     if cfg.use_wandb:
@@ -739,6 +769,7 @@ def run(cfg: RealismConfig):
             name=cfg.run_name,
             config=asdict(cfg),
             dir=str(run_dir),
+            resume="allow"
         )
 
     # Data iterator (streaming)
@@ -758,40 +789,20 @@ def run(cfg: RealismConfig):
     _, (frames_init, actions_init, _) = next_batch(init_rng)
 
     train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
-
-    # Extract some values for checkpointing
-    patch = cfg.patch
-    k_max = cfg.k_max
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
-
-    # -------- Orbax manager & (optional) restore --------
-    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
-    meta = make_dynamics_meta(
-        enc_kwargs=train_state.enc_kwargs,
-        dec_kwargs=train_state.dec_kwargs,
-        dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=patch,
-        k_max=k_max, packing_factor=cfg.packing_factor, n_spatial=n_spatial,
-        tokenizer_ckpt_dir=cfg.tokenizer_ckpt,
-        cfg=asdict(cfg),
-    )
-
     rng = jax.random.PRNGKey(0)
-    state_example = make_state(train_state.params, train_state.opt_state, rng, step=0)
-    restored = try_restore(mngr, state_example, meta)
 
-    start_step = 0
-    if restored is not None:
-        latest_step, r = restored
-        train_state.params = r.state["params"]
-        train_state.opt_state = r.state["opt_state"]
-        rng = r.state["rng"]
-        start_step = int(r.state["step"]) + 1
-        train_state.dyn_vars = with_params(train_state.dyn_vars, train_state.params)
-        print(f"[restore] Resumed from {ckpt_dir} at step={latest_step}")
+    if start_step > 0:
+        params, opt_state, rng = load_snapshot_weights(
+            mngr, start_step, train_state.params, train_state.opt_state, rng
+        )
+
+        train_state.params = params
+        train_state.opt_state = opt_state
+
+        train_state.dyn_vars = with_params(train_state.dyn_vars, params)
 
     # -------- Training loop --------
-    train_rng = jax.random.PRNGKey(2025)
+    train_rng = rng
     data_rng = jax.random.PRNGKey(12345)
 
     logger = MetricLogger(
@@ -828,12 +839,15 @@ def run(cfg: RealismConfig):
             train_state.enc_vars, train_state.dyn_vars,
             frames, actions,
             patch=cfg.patch, B=cfg.dataset.B, T=cfg.dataset.T, B_self=B_self,
-            n_spatial=n_spatial, k_max=k_max, packing_factor=cfg.packing_factor,
+            n_spatial=cfg.enc_n_latents // cfg.packing_factor, 
+            k_max=cfg.k_max, packing_factor=cfg.packing_factor,
             master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
             dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
         )
         train_t = time.perf_counter() - train_start_t
         total_t = data_t + train_t
+
+        train_state.dyn_vars = with_params(train_state.dyn_vars, train_state.params)
 
         # Logging
         if logger.should_log(step):
@@ -850,11 +864,10 @@ def run(cfg: RealismConfig):
             )
 
         # Save (async) when policy says we should
-        state = make_state(train_state.params, train_state.opt_state, train_rng, step)
-        maybe_save(mngr, step, state, meta)
+        maybe_save_snapshot(mngr, step, train_state.params, train_state.opt_state, train_rng, cfg)
 
         # Periodic lightweight AR eval
-        if cfg.write_video_every and (step % cfg.write_video_every == 0):
+        if cfg.write_video_every > 0 and (step % cfg.write_video_every == 0):
             run_evaluation(
                 cfg=cfg,
                 step=step,

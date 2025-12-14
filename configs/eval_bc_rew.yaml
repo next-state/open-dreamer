@@ -2,12 +2,11 @@ defaults:
   - common
   - _self_
 
-run_ckpt_dir: null
-tokenizer_ckpt: null
+bc_rew_dir: logs/bc_rew
+tokenizer_dir: logs/tokenizer
 
 dataset:
   B: 8
-  diversify_data: true
 
 action_dim: 4
 

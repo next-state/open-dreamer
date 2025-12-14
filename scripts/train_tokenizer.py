@@ -14,7 +14,7 @@ from jaxlpips import LPIPS
 from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
-from dreamer.utils import temporal_patchify, temporal_unpatchify, normalize_with_dataset_stats, unnormalize_with_dataset_stats, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
+from dreamer.utils import temporal_patchify, temporal_unpatchify, normalize_with_dataset_stats, unnormalize_with_dataset_stats, setup_checkpointing, maybe_save_snapshot, load_snapshot_weights, pack_mae_params, unpack_mae_params
 from dreamer.logging import MetricLogger
 
 
@@ -270,7 +270,9 @@ def run(cfg: TokenizerConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
-    # Initialize wandb if enabled
+    cfg, mngr, start_step = setup_checkpointing(cfg, run_dir)
+
+    # Iniialize wandb if enabled
     if cfg.use_wandb:
         wandb_project = cfg.wandb_project or cfg.run_name
         wandb.init(
@@ -279,6 +281,7 @@ def run(cfg: TokenizerConfig):
             name=cfg.run_name,
             config=asdict(cfg),
             dir=str(run_dir),
+            resume="allow",
         )
 
     rng = jax.random.PRNGKey(0)
@@ -330,32 +333,10 @@ def run(cfg: TokenizerConfig):
     tx = optax.adamw(cfg.lr)
     opt_state = tx.init(params)
 
-    # ---------- ORBAX: manager + (optional) restore ----------
-    ckpt_dir = run_dir / "checkpoints"
-    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
-
-    # Build example trees for safe restore (use live shapes/dtypes).
-    state_example = make_state(params, opt_state, rng, step=0)
-    meta_example = {
-        "enc_kwargs": enc_kwargs, 
-        "dec_kwargs": dec_kwargs,
-        "H": cfg.dataset.H, "W": cfg.dataset.W, "C": cfg.dataset.C, "patch_size": cfg.patch_size
-    }
-
-    restored = try_restore(mngr, state_example, meta_example)
-    start_step = 0
-    if restored is not None:
-        latest_step, r = restored
-        # Unpack state back to your locals
-        params = r.state["params"]
-        opt_state = r.state["opt_state"]
-        rng = r.state["rng"]
-        start_step = int(r.state["step"])
-        # Optional: you can read r.meta here if you want to sanity-check config.
-
-        # Rebuild enc_vars/dec_vars from params so downstream apply() uses the restored params.
+    # Load weights if checkpoint found
+    if start_step > 0:
+        params, opt_state, rng = load_snapshot_weights(mngr, start_step, params, opt_state, rng)
         enc_vars, dec_vars = unpack_mae_params(params, enc_vars, dec_vars)
-        print(f"Restored checkpoint at step {latest_step} from {ckpt_dir}")
 
     # ---------- Train loop ----------
     try:
@@ -414,8 +395,7 @@ def run(cfg: TokenizerConfig):
                 )
 
             # Save (async)
-            state = make_state(params, opt_state, rng, step)
-            maybe_save(mngr, step, state, meta_example)
+            maybe_save_snapshot(mngr, step, params, opt_state, rng, cfg)
 
             # Viz
             if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
