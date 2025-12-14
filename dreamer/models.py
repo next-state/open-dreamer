@@ -97,38 +97,6 @@ class KVCache:
 
         return k_ordered, v_ordered, final_mask
 
-@flax.struct.dataclass
-class TokenLayout:
-    """
-    Ordered token layout for a single timestep: latents first (if any),
-    then a sequence of (modality, count) segments.
-    """
-    n_latents: int
-    segments: Tuple[Tuple[Modality, int], ...]  # e.g., ((Modality.IMAGE, n_patches), (Modality.ACTION, n_act), ...)
-
-    def S(self) -> int:
-        return self.n_latents + sum(n for _, n in self.segments)
-
-    def modality_ids(self) -> jnp.ndarray:
-        parts = [jnp.full((self.n_latents,), Modality.LATENT, dtype=jnp.int32)] if self.n_latents > 0 else []
-        for m, n in self.segments:
-            if n > 0:
-                parts.append(jnp.full((n,), int(m), dtype=jnp.int32))
-        return jnp.concatenate(parts) if parts else jnp.zeros((0,), dtype=jnp.int32)  # (S,)
-
-    def slices(self) -> dict:
-        """Convenience: start/stop indices per modality (first occurrence if repeated)."""
-        idx = 0
-        out = {}
-        if self.n_latents > 0:
-            out[Modality.LATENT] = slice(idx, idx + self.n_latents); idx += self.n_latents
-        for m, n in self.segments:
-            if n > 0 and m not in out:
-                out[m] = slice(idx, idx + n)
-            idx += n
-        return out
-
-    
 
 
 class RotaryEmbedding1D(nn.Module):

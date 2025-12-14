@@ -17,7 +17,7 @@ from jaxlpips import LPIPS
 from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
-from dreamer.utils import make_state, make_manager, try_restore, maybe_save, normalize_with_dataset_stats, unnormalize_with_dataset_stats
+from dreamer.utils import make_state, make_manager, try_restore, maybe_save, normalize_with_dataset_stats, unnormalize_with_dataset_stats, with_params
 from dreamer.logging import MetricLogger
 
     
@@ -32,19 +32,22 @@ def init_models(rng, tokenizer, videos):
         videos,
         deterministic=True,
     )
-    return rng, variables["params"]
+    return rng, variables
 
 # ------------------------
 # Forward (no module in jit)
 # ------------------------
 
-def forward_apply(apply_fn, params, videos, *, mae_key, drop_key, train: bool):
+def forward_apply(apply_fn, variables, params, videos, *, mae_key, drop_key, train: bool):
     rngs = {"mae": mae_key}
     if train:
         rngs["dropout"] = drop_key
 
+    # Merge optimized params into the state variables (constants, etc.)
+    variables_with_params = with_params(variables, params)
+
     recon, mae_info = apply_fn(
-        {"params": params},
+        variables_with_params,
         videos,
         rngs=rngs,
         deterministic=not train,
@@ -84,12 +87,12 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
     jax.jit,
     static_argnames=("apply_fn", "tx", "lpips_weight", "lpips_frac"),
 )
-def train_step(apply_fn, tx, params, opt_state, videos, *, master_key, step, lpips_weight, lpips_frac):
+def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key, step, lpips_weight, lpips_frac):
     step_key = jax.random.fold_in(master_key, step)
     mae_key, drop_key = jax.random.split(step_key)
 
     def loss_fn(p):
-        pred, (mae_mask, keep_prob) = forward_apply(apply_fn, p, videos, mae_key=mae_key, drop_key=drop_key, train=True)    
+        pred, (mae_mask, keep_prob) = forward_apply(apply_fn, variables, p, videos, mae_key=mae_key, drop_key=drop_key, train=True)    
 
         mse = recon_loss_from_mae(pred, videos, mae_mask)
         lp = lpips_on_mae_recon(pred, videos, lpips_frac)
@@ -109,8 +112,8 @@ def train_step(apply_fn, tx, params, opt_state, videos, *, master_key, step, lpi
 # ------------------------
 
 @partial(jax.jit, static_argnames=("apply_fn",))
-def viz_step_jit(apply_fn, params, videos, *, mae_key, drop_key, mean, std):
-    recon, (mask, _) = forward_apply(apply_fn, params, videos, mae_key=mae_key, drop_key=drop_key, train=False)
+def viz_step_jit(apply_fn, variables, params, videos, *, mae_key, drop_key, mean, std):
+    recon, (mask, _) = forward_apply(apply_fn, variables, params, videos, mae_key=mae_key, drop_key=drop_key, train=False)
 
     # Unnormalize to [0, 1]
     videos_unnorm = unnormalize_with_dataset_stats(videos, mean=mean, std=std)
@@ -129,11 +132,11 @@ def viz_step_jit(apply_fn, params, videos, *, mae_key, drop_key, mean, std):
     grid = einops.rearrange(grid[:, 0], "b h w c -> h (b w) c")
     return grid.clip(0, 255).astype(jnp.uint8)
 
-def viz_step(apply_fn, params, videos, rng, step, run_dir, mean, std, use_wandb=False):
+def viz_step(apply_fn, variables, params, videos, rng, step, run_dir, mean, std, use_wandb=False):
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
-    grid = viz_step_jit(apply_fn, params, videos[:8,:1], mae_key=mae_key, drop_key=drop_key, mean=jnp.array(mean), std=jnp.array(std))
+    grid = viz_step_jit(apply_fn, variables, params, videos[:8,:1], mae_key=mae_key, drop_key=drop_key, mean=jnp.array(mean), std=jnp.array(std))
 
     out = run_dir / "viz"
     out.mkdir(exist_ok=True, parents=True)
@@ -170,7 +173,8 @@ def run(cfg: TokenizerConfig):
 
     tokenizer = Tokenizer(cfg)
     apply_fn = tokenizer.apply
-    rng, params = init_models(rng, tokenizer, dummy)
+    rng, variables = init_models(rng, tokenizer, dummy)
+    params = variables["params"]
 
     tx = optax.adamw(cfg.lr)
     opt_state = tx.init(params)
@@ -220,7 +224,7 @@ def run(cfg: TokenizerConfig):
             std=cfg.dataset.dataset_std
         )
 
-        params, opt_state, aux = train_step(apply_fn, tx, params, opt_state, videos, master_key=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac)
+        params, opt_state, aux = train_step(apply_fn, tx, variables, params, opt_state, videos, master_key=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac)
 
         if step % cfg.log_every == 0 and step > 0:
             mse = aux["loss_mse"]
@@ -240,7 +244,7 @@ def run(cfg: TokenizerConfig):
         maybe_save(mngr, step, state, meta_example)
 
         if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
-            viz_step(apply_fn, params, videos, rng, step, run_dir, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std, use_wandb=cfg.use_wandb)
+            viz_step(apply_fn, variables, params, videos, rng, step, run_dir, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std, use_wandb=cfg.use_wandb)
 
     mngr.wait_until_finished()
 
