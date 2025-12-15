@@ -13,6 +13,7 @@ from jaxlpips import LPIPS
 from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
+from flax.training.train_state import TrainState
 from dreamer.utils import temporal_patchify, temporal_unpatchify, normalize_with_dataset_stats, unnormalize_with_dataset_stats, setup_experiment_checkpointing, maybe_save_snapshot, pack_mae_params, unpack_mae_params, create_tokenizer_models, load_snapshot_weights, init_tokenizer_vars
 from dreamer.logging import MetricLogger
 from dreamer.configs import TokenizerTrainConfig
@@ -114,8 +115,8 @@ def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, dro
 
 
 # --- train step ---
-@partial(jax.jit, static_argnames=("encoder","decoder","tx","patch","H","W","C", "lpips_weight", "lpips_frac", "should_log"))
-def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch, *,
+@partial(jax.jit, static_argnames=("encoder","decoder","patch","H","W","C", "lpips_weight", "lpips_frac", "should_log"))
+def train_step(encoder, decoder, train_state: TrainState, enc_vars, dec_vars, batch, *,
                patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0, should_log=False, dataset_mean, dataset_std):
     """
     (master_key, params, opt_state, model_state, batch)
@@ -178,15 +179,14 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
 
         return total, aux
 
-    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params)
 
     # 4) Update
-    updates, opt_state = tx.update(grads, opt_state, params)
-    new_params = optax.apply_updates(params, updates)
+    new_train_state = train_state.apply_gradients(grads=grads)
 
     # 5) Put params back into variables for next step
-    new_enc_vars, new_dec_vars = unpack_mae_params(new_params, enc_vars, dec_vars)
-    return new_params, opt_state, new_enc_vars, new_dec_vars, aux
+    new_enc_vars, new_dec_vars = unpack_mae_params(new_train_state.params, enc_vars, dec_vars)
+    return new_train_state, new_enc_vars, new_dec_vars, aux
 
 def run(cfg: TokenizerTrainConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
@@ -238,17 +238,21 @@ def run(cfg: TokenizerTrainConfig):
     # optim
     params = pack_mae_params(enc_vars, dec_vars)
     
-    # Create optimizer
-    optimizer = optax.adamw(cfg.experiment.optimizer.lr)
-    opt_state = optimizer.init(params)
+    # Create optimizer and TrainState
+    train_state = TrainState.create(
+        apply_fn=None,  # Not used for tokenizer training
+        params=params,
+        tx=optax.adamw(cfg.experiment.optimizer.lr),
+    )
 
     # Restore weights if resuming
     if start_step > 0:
-        params, opt_state, rng = load_snapshot_weights(
-            mngr, start_step, params, opt_state, rng
+        restored_params, restored_opt_state, rng = load_snapshot_weights(
+            mngr, start_step, train_state.params, train_state.opt_state, rng
         )
+        train_state = train_state.replace(params=restored_params, opt_state=restored_opt_state)
         # Update enc_vars and dec_vars with restored params
-        enc_vars, dec_vars = unpack_mae_params(params, enc_vars, dec_vars)
+        enc_vars, dec_vars = unpack_mae_params(restored_params, enc_vars, dec_vars)
         print(f"[restore] Resumed from checkpoint at step {start_step}")
 
     # Metrics
@@ -277,8 +281,8 @@ def run(cfg: TokenizerTrainConfig):
             rng, master_key = jax.random.split(rng)
             train_start_t = time.perf_counter()
             should_log = logger.should_log(step)
-            params, opt_state, enc_vars, dec_vars, aux = train_step(
-                encoder, decoder, optimizer, params, opt_state, enc_vars, dec_vars, batch,
+            train_state, enc_vars, dec_vars, aux = train_step(
+                encoder, decoder, train_state, enc_vars, dec_vars, batch,
                 patch=cfg.model.patch_size, H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, 
                 master_key=master_key, step=step, 
                 lpips_weight=cfg.experiment.lpips_weight, lpips_frac=cfg.experiment.lpips_frac,
@@ -310,7 +314,7 @@ def run(cfg: TokenizerTrainConfig):
                 )
 
             # Save (async)
-            maybe_save_snapshot(mngr, step, params, opt_state, rng, cfg)
+            maybe_save_snapshot(mngr, step, train_state.params, train_state.opt_state, rng, cfg)
 
             # Viz
             if cfg.experiment.visualize_every > 0 and step % cfg.experiment.visualize_every == 0:

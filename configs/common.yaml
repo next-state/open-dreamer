@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 wandb:
-  enabled: false
+  enabled: true
   entity: null
   project: tiny_dreamer_4
 

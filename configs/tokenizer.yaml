@@ -4,6 +4,3 @@ defaults:
   - model: tokenizer
   - experiment: tokenizer
   - _self_
-
-dataset:
-  B: 64

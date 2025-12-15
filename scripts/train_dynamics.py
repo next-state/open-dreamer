@@ -4,7 +4,7 @@
 # It restores the pretrained tokenizer (enc/dec) and trains the dynamics model.
 
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, Any
 from functools import partial
@@ -21,27 +21,23 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import imageio.v2 as imageio
-import orbax.checkpoint as ocp
 import wandb
+from flax.training.train_state import TrainState
 
 from dreamer.models import Encoder, Decoder, Dynamics
 from dreamer.data import make_iterator
-from dreamer.configs import DynamicsTrainConfig, TokenizerModelConfig, DynamicsExperimentConfig
+from dreamer.configs import DynamicsTrainConfig, DynamicsExperimentConfig
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
     normalize_with_dataset_stats,
     with_params,
-    load_checkpoint_model_config,
-    make_manager,
-    pack_mae_params,
     setup_experiment_checkpointing,
     maybe_save_snapshot,
     load_snapshot_weights,
-    create_tokenizer_models,
-    init_tokenizer_vars,
     create_dynamics_model,
     init_dynamics_vars,
+    load_pretrained_tokenizer,
 )
 from dreamer.logging import MetricLogger
 
@@ -87,11 +83,11 @@ def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: 
 
 @partial(
     jax.jit,
-    static_argnames=("encoder","dynamics","tx","patch","n_spatial","k_max","packing_factor","B","T","B_self"),
+    static_argnames=("encoder","dynamics","patch","n_spatial","k_max","packing_factor","B","T","B_self"),
 )
 def train_step(
-    encoder, dynamics, tx,
-    params, opt_state,
+    encoder, dynamics,
+    train_state: TrainState,
     enc_vars, dyn_vars,
     frames, actions,
     *,
@@ -224,10 +220,9 @@ def train_step(
         }
         return loss, aux
 
-    (loss_val, aux), grads = jax.value_and_grad(loss_and_aux, has_aux=True)(params)
-    updates, opt_state = tx.update(grads, opt_state, params)
-    new_params = optax.apply_updates(params, updates)
-    return new_params, opt_state, aux
+    (loss_val, aux), grads = jax.value_and_grad(loss_and_aux, has_aux=True)(train_state.params)
+    new_train_state = train_state.apply_gradients(grads=grads)
+    return new_train_state, aux
 
 # ---------------------------
 # Eval regimes & plan JSON (unchanged core logic)
@@ -393,7 +388,7 @@ def initialize_models(cfg: DynamicsTrainConfig):
     Restore tokenizer and initialize dynamics model.
     Returns:
         Tuple of (encoder, decoder, dynamics, enc_vars, dec_vars, dyn_vars,
-                  params, opt_state, optimizer, patch_size, packing_factor, mae_eval_key)
+                  train_state, patch_size, packing_factor, mae_eval_key)
     """
     # Load pretrained tokenizer
     tok_ckpt_path = Path(cfg.experiment.tokenizer_ckpt_path)
@@ -410,9 +405,12 @@ def initialize_models(cfg: DynamicsTrainConfig):
 
     params = dyn_vars["params"]
 
-    # Initialize optimizer
-    optimizer = optax.adamw(cfg.experiment.optimizer.lr)
-    opt_state = optimizer.init(params)
+    # Initialize optimizer and create TrainState
+    train_state = TrainState.create(
+        apply_fn=None,  # Not used for dynamics training
+        params=params,
+        tx=optax.adamw(cfg.experiment.optimizer.lr),
+    )
     
     # Create MAE eval key for tokenizer visualization
     mae_eval_key = jax.random.PRNGKey(42)
@@ -420,7 +418,7 @@ def initialize_models(cfg: DynamicsTrainConfig):
     return (
         encoder, decoder, dynamics,
         enc_vars, dec_vars, dyn_vars,
-        params, opt_state, optimizer,
+        train_state,
         tokenizer_cfg.patch_size, cfg.model.packing_factor,
         mae_eval_key
     )
@@ -438,7 +436,7 @@ def run_evaluation(
     enc_vars: dict,
     dec_vars: dict,
     dyn_vars: dict,
-    params: dict,
+    train_state: TrainState,
     patch_size: int,
     packing_factor: int,
     mae_eval_key: jnp.ndarray,
@@ -453,7 +451,7 @@ def run_evaluation(
         step: Current training step
         encoder, decoder, dynamics: Model instances
         enc_vars, dec_vars, dyn_vars: Model variables
-        params: Trainable parameters
+        train_state: Training state containing parameters
         patch_size, packing_factor: Tokenizer metadata
         mae_eval_key: RNG key for MAE
         next_batch: Data iterator function
@@ -461,7 +459,7 @@ def run_evaluation(
     """
     val_rng = jax.random.PRNGKey(9999)
     _, (val_frames, val_actions, _) = next_batch(val_rng)
-    dyn_vars_eval = with_params(dyn_vars, params)
+    dyn_vars_eval = with_params(dyn_vars, train_state.params)
     ctx_length = min(32, cfg.dataset.T - 1)
     regimes = _eval_regimes_for_realism(cfg, patch_size, packing_factor, ctx_length=ctx_length)
 
@@ -553,13 +551,10 @@ def run(cfg: DynamicsTrainConfig):
     )
 
     # Initialize models and restore tokenizer
-    init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init, _) = next_batch(init_rng)
-
     (
         encoder, decoder, dynamics,
         enc_vars, dec_vars, dyn_vars,
-        params, opt_state, optimizer,
+        train_state,
         patch_size, packing_factor,
         mae_eval_key
     ) = initialize_models(cfg)
@@ -567,11 +562,12 @@ def run(cfg: DynamicsTrainConfig):
 
     # Restore if resuming
     if start_step > 0:
-        params, opt_state, rng = load_snapshot_weights(
-            mngr, start_step, params, opt_state, rng
+        restored_params, restored_opt_state, rng = load_snapshot_weights(
+            mngr, start_step, train_state.params, train_state.opt_state, rng
         )
+        train_state = train_state.replace(params=restored_params, opt_state=restored_opt_state)
 
-    dyn_vars = with_params(dyn_vars, params)
+    dyn_vars = with_params(dyn_vars, train_state.params)
 
     # -------- Training loop --------
     train_rng = rng
@@ -605,9 +601,9 @@ def run(cfg: DynamicsTrainConfig):
         B_self = max(0, int(round(cfg.experiment.self_fraction * cfg.dataset.B)))
 
         train_start_t = time.perf_counter()
-        params, opt_state, aux = train_step(
-            encoder, dynamics, optimizer,
-            params, opt_state,
+        train_state, aux = train_step(
+            encoder, dynamics,
+            train_state,
             enc_vars, dyn_vars,
             frames, actions,
             patch=patch_size, B=cfg.dataset.B, T=cfg.dataset.T, B_self=B_self,
@@ -619,7 +615,7 @@ def run(cfg: DynamicsTrainConfig):
         train_t = time.perf_counter() - train_start_t
         total_t = data_t + train_t
 
-        dyn_vars = with_params(dyn_vars, params)
+        dyn_vars = with_params(dyn_vars, train_state.params)
 
         # Logging
         if logger.should_log(step):
@@ -636,7 +632,7 @@ def run(cfg: DynamicsTrainConfig):
             )
 
         # Save (async) when policy says we should
-        maybe_save_snapshot(mngr, step, params, opt_state, train_rng, cfg)
+        maybe_save_snapshot(mngr, step, train_state.params, train_state.opt_state, train_rng, cfg)
 
         # Periodic lightweight AR eval
         if cfg.experiment.write_video_every > 0 and (step % cfg.experiment.write_video_every == 0):
@@ -649,7 +645,7 @@ def run(cfg: DynamicsTrainConfig):
                 enc_vars=enc_vars,
                 dec_vars=dec_vars,
                 dyn_vars=dyn_vars,
-                params=params,
+                train_state=train_state,
                 patch_size=patch_size,
                 packing_factor=packing_factor,
                 mae_eval_key=mae_eval_key,
