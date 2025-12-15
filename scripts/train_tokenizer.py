@@ -17,23 +17,10 @@ from jaxlpips import LPIPS
 from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
-from dreamer.utils import make_state, make_manager, try_restore, maybe_save, normalize_with_dataset_stats, unnormalize_with_dataset_stats, with_params
+from dreamer.utils import make_state, make_manager, try_restore, maybe_save, normalize_with_dataset_stats, unnormalize_with_dataset_stats, with_params, init_tokenizer
 from dreamer.logging import MetricLogger
 
     
-# ------------------------
-# Init
-# ------------------------
-
-def init_models(rng, tokenizer, videos):
-    rng, params_rng, mae_rng, dropout_rng = jax.random.split(rng, 4)
-    variables = tokenizer.init(
-        {"params": params_rng, "mae": mae_rng, "dropout": dropout_rng},
-        videos,
-        deterministic=True,
-    )
-    return rng, variables
-
 # ------------------------
 # Forward (no module in jit)
 # ------------------------
@@ -165,15 +152,9 @@ def run(cfg: TokenizerConfig):
     rng = jax.random.PRNGKey(0)
     dataset = make_iterator(cfg.dataset)
 
-    rng, key = jax.random.split(rng)
-    dummy = jax.random.uniform(
-        key,
-        (cfg.dataset.B, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C),
-    )
-
     tokenizer = Tokenizer(cfg)
     apply_fn = tokenizer.apply
-    rng, variables = init_models(rng, tokenizer, dummy)
+    rng, variables = init_tokenizer(rng, tokenizer, cfg)
     params = variables["params"]
 
     tx = optax.adamw(cfg.lr)

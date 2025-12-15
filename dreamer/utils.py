@@ -228,3 +228,29 @@ def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict |
 
 
 
+def init_tokenizer(rng, tokenizer, tokenizer_cfg):
+    rng, params_rng, mae_rng, dropout_rng, key = jax.random.split(rng, 5)
+    dummy = jax.random.uniform(
+        key,
+        (tokenizer_cfg.dataset.B, tokenizer_cfg.dataset.T, tokenizer_cfg.dataset.H, tokenizer_cfg.dataset.W, tokenizer_cfg.dataset.C),
+    )
+    variables = tokenizer.init(
+        {"params": params_rng, "mae": mae_rng, "dropout": dropout_rng},
+        dummy,
+        deterministic=True,
+    )
+    return rng, variables
+
+def init_dynamics(rng, dynamics, tokenizer_cfg):
+    rng, params_rng, dropout_rng, key = jax.random.split(rng, 4)
+    n_tokens = tokenizer_cfg.dataset.H * tokenizer_cfg.dataset.W // tokenizer_cfg.patch_size ** 2
+    dummy = jax.random.uniform(
+        key,
+        (tokenizer_cfg.dataset.B, tokenizer_cfg.dataset.T, n_tokens, tokenizer_cfg.encoder.d_bottleneck),
+    )
+    variables = dynamics.init(
+        {"params": params_rng, "dropout": dropout_rng},
+        dummy,
+        deterministic=True,
+    )
+    return rng, variables

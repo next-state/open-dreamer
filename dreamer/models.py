@@ -656,6 +656,12 @@ class Tokenizer(nn.Module):
         recon = self.decoder(z, deterministic=deterministic)
         return recon, aux
 
+    def encode(self, videos, deterministic: bool = True):
+        return self.encoder(videos, deterministic=deterministic)
+        
+    def decode(self, z, deterministic: bool = True):
+        return self.decoder(z, deterministic=deterministic)
+
         
 
 class ActionEncoder(nn.Module):
