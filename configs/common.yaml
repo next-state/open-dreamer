@@ -1,16 +1,11 @@
 defaults:
-  - dataset: bouncing_square
   - _self_
 
-# Logging / Checkpointing
-ckpt_max_to_keep: 2
+wandb:
+  enabled: false
+  entity: null
+  project: tiny_dreamer_4
 
-# WandB
-use_wandb: true
-wandb_entity: null
-wandb_project: tiny_dreamer_4
-
-# Hydra
 hydra:
   run:
-    dir: logs/${run_name}
+    dir: logs/${experiment.run_name}

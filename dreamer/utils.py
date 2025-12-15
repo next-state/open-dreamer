@@ -130,26 +130,33 @@ def unpack_mae_params(packed_params, enc_vars, dec_vars):
     return enc_vars, dec_vars
 
 
-def make_manager(ckpt_dir: Path, max_to_keep: int = 5, save_interval: int = 1000):
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, save_interval_steps=save_interval)
-    return ocp.CheckpointManager(ckpt_dir, options=options, item_names=("state", "meta"))
+def make_manager(ckpt_dir, max_to_keep=2, save_every=1000, item_names=("state", "meta")):
+    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, save_interval_steps=save_every)
+    return ocp.CheckpointManager(ckpt_dir, options=options, item_names=item_names)
 
 
-def setup_checkpointing(cfg: DictConfig | object, run_dir: Path):
+def setup_experiment_checkpointing(cfg: DictConfig | object, run_dir: Path):
     """
     Initializes checkpoint manager and merges checkpoint config over current config.
     
+    Strategy:
+    1. Start with Saved config (from checkpoint)
+    2. Merge Current config (from YAML/CLI) OVER Saved
+       -> Allows changing experiment params (LR, max_steps, logging)
+    3. Force 'model' and 'dataset' sections BACK to Saved
+       -> Ensures architecture and data shapes match the weights
+    
     Returns:
-        cfg: The merged configuration (Checkpoint > Current).
+        cfg: The merged configuration.
         mngr: The Orbax CheckpointManager.
         start_step: The step to resume from (0 if no checkpoint).
     """
     # 1. Setup Manager
     ckpt_dir = run_dir / "checkpoints"
 
-    max_to_keep = getattr(cfg, 'ckpt_max_to_keep', 5)
-    save_every = getattr(cfg, 'ckpt_save_every', 10000)
+    ckpt_cfg = getattr(cfg, 'ckpt', None)
+    max_to_keep = ckpt_cfg.max_to_keep if ckpt_cfg else 5
+    save_every = ckpt_cfg.save_every if ckpt_cfg else 10000
     
     mngr = make_manager(ckpt_dir, max_to_keep, save_every)
     latest_step = mngr.latest_step()
@@ -160,26 +167,31 @@ def setup_checkpointing(cfg: DictConfig | object, run_dir: Path):
     if latest_step is not None:
         print(f"[ckpt] Found checkpoint at step {latest_step} in {ckpt_dir}. Loading metadata...")
         
-        # Load ONLY metadata (no params yet, we don't know shapes!)
+        # Load ONLY metadata
         restored = mngr.restore(latest_step, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
         saved_cfg_dict = restored.meta
         
         if saved_cfg_dict:
-            # Current config (defaults + CLI overrides)
-            current_conf = OmegaConf.create(asdict(cfg) if is_dataclass(cfg) else cfg)
             # Saved config (from disk)
             saved_conf = OmegaConf.create(saved_cfg_dict)
             
-            # Merge: Saved overwrites Current
-            # This ensures model architecture matches weights.
-            merged_conf = OmegaConf.merge(current_conf, saved_conf)
+            # Current config (defaults + CLI overrides)
+            current_conf = OmegaConf.create(cfg) 
+            
+            # Use schema to ensure type safety and proper reconstruction
+            cfg_cls = type(cfg)
+            schema = OmegaConf.structured(cfg_cls)
+            
+            # Start with: Schema <- Current (user's config takes precedence)
+            merged_conf = OmegaConf.merge(schema, current_conf)
+            
+            # Override ONLY the model config from checkpoint (architecture must match weights)
+            if "model" in saved_conf:
+                print("[ckpt] Enforcing model config from checkpoint.")
+                merged_conf.model = OmegaConf.merge(schema.model, saved_conf.model)
             
             # Update original cfg object
-            if is_dataclass(cfg):
-                cfg_cls = type(cfg)
-                cfg = cfg_cls(**OmegaConf.to_container(merged_conf))
-            else:
-                cfg = merged_conf
+            cfg = OmegaConf.to_object(merged_conf)
                 
             print("[ckpt] Config merged successfully.")
             start_step = latest_step
@@ -212,12 +224,14 @@ def maybe_save_snapshot(mngr, step: int, params, opt_state, rng, cfg: object):
     mngr.save(step, args=save_args)
 
 
-def load_config_only(ckpt_dir: Path | str) -> DictConfig:
+def load_checkpoint_model_config(ckpt_path: Path | str) -> DictConfig:
     """
-    Loads only the configuration (metadata) from a checkpoint directory.
+    Loads only the 'model' sub-configuration from a checkpoint directory.
     Returns it as an OmegaConf DictConfig.
     """
-    path = Path(ckpt_dir).expanduser().resolve()
+    path = Path(ckpt_path).expanduser().resolve()
+    if (path / "checkpoints").exists():
+        path = path / "checkpoints"
     # We only need 'meta'
     mngr = ocp.CheckpointManager(path, options=ocp.CheckpointManagerOptions(), item_names=("meta",))
     latest = mngr.latest_step()
@@ -226,11 +240,16 @@ def load_config_only(ckpt_dir: Path | str) -> DictConfig:
     
     restored = mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
     
-    # Wrap in OmegaConf so we can access attributes with dot notation
-    return OmegaConf.create(restored.meta)
+    meta = OmegaConf.create(restored.meta)
+    if not "model" in meta:
+         raise ValueError(f"Checkpoint at {path} does not contain 'model' config in metadata.")
+         
+    return meta.model
 
 
 def load_snapshot_weights(mngr, step, params, opt_state, rng):
+    if step == 0:
+        return params, opt_state, rng
     """
     Restores the heavy weights into the provided shapes.
     Should be called AFTER models are initialized with the merged config.
@@ -309,3 +328,129 @@ def make_mask(modality_ids: jnp.ndarray, mode: str):
     # Save (S,S)
     modality_mask = jax.lax.stop_gradient(mask)
     return modality_mask
+
+
+# -------- Model Factory Helpers --------
+
+def create_tokenizer_models(tokenizer_cfg):
+    """
+    Instantiate Encoder and Decoder from config.
+    """
+    from dreamer.models import Encoder, Decoder # Local import to avoid circular dependency
+    
+    enc_kwargs = asdict(tokenizer_cfg.encoder)
+    dec_kwargs = asdict(tokenizer_cfg.decoder)
+    
+    encoder = Encoder(**enc_kwargs)
+    decoder = Decoder(**dec_kwargs)
+    return encoder, decoder
+
+
+def init_tokenizer_vars(encoder, decoder, *, input_shape: tuple[int, int, int, int], rng):
+    """
+    Initialize variables (params + constants) for Encoder and Decoder.
+    input_shape: (B, T, Np, D_patch) - Shape of patches.
+    """
+    rng, enc_rng, dec_rng, mae_rng, drop_rng = jax.random.split(rng, 5)
+    
+    # Encoder init
+    # We need a dummy input to init parameters.
+    # input_shape is (B, T, Np, D_patch)
+    dummy_patches = jnp.zeros(input_shape, dtype=jnp.float32)
+    
+    enc_vars = encoder.init(
+        {"params": enc_rng, "mae": mae_rng, "dropout": drop_rng},
+        dummy_patches, deterministic=True
+    )
+
+    # Decoder init
+    # Decoder takes bottleneck output: (B, T, n_latents, d_bottleneck)
+    n_latents = encoder.n_latents
+    d_bottleneck = encoder.d_bottleneck
+    B, T = input_shape[0], input_shape[1]
+    
+    fake_z = jnp.zeros((B, T, n_latents, d_bottleneck), dtype=jnp.float32)
+    dec_vars = decoder.init(
+        {"params": dec_rng, "dropout": drop_rng},
+        fake_z, deterministic=True
+    )
+    
+    return rng, enc_vars, dec_vars
+
+
+def load_pretrained_tokenizer(tokenizer_ckpt_path: str | Path):
+    tokenizer_model_cfg_dict = load_checkpoint_model_config(tokenizer_ckpt_path)
+    
+    # Cast to TokenizerModelConfig object hierarchy
+    raw_cfg = OmegaConf.create(tokenizer_model_cfg_dict)
+    schema = OmegaConf.structured(TokenizerModelConfig)
+    merged_cfg = OmegaConf.merge(schema, raw_cfg)
+    tokenizer_cfg = OmegaConf.to_object(merged_cfg)
+    
+    encoder, decoder = create_tokenizer_models(tokenizer_cfg)
+
+    rng = jax.random.PRNGKey(0)
+    n_patches = tokenizer_cfg.encoder.n_patches 
+    d_patch = tokenizer_cfg.decoder.d_patch
+    dummy_B, dummy_T = 1, 1
+    input_shape = (dummy_B, dummy_T, n_patches, d_patch)
+    
+    rng, enc_vars, dec_vars = init_tokenizer_vars(encoder, decoder, input_shape=input_shape, rng=rng)
+
+    tokenizer_ckpt_abs = Path(tokenizer_ckpt_path).expanduser().resolve() / "checkpoints"
+    mngr = make_manager(tokenizer_ckpt_abs, item_names=("state",))
+    
+    # Restore full state structure (no abstract params) to avoid mismatch issues
+    latest = mngr.latest_step()
+    restored = mngr.restore(latest, args=ocp.args.Composite(state=ocp.args.StandardRestore()))
+
+    loaded_params = restored.state["params"]
+    enc_vars = with_params(enc_vars, loaded_params["enc"])
+    dec_vars = with_params(dec_vars, loaded_params["dec"])
+
+    print(f"[tokenizer] Restored weights from step {latest}")
+    return encoder, decoder, enc_vars, dec_vars, tokenizer_cfg
+
+
+def create_dynamics_model(dynamics_cfg, tokenizer_cfg):
+    """
+    Instantiate Dynamics model.
+    """
+    from dreamer.models import Dynamics # Local import
+    
+    dynamics_cfg.compute_derived(tokenizer_cfg.encoder)
+        
+    dyn_kwargs = asdict(dynamics_cfg)
+    dyn_kwargs.pop('packing_factor', None) # Helper for validation, not a param
+    
+    dynamics = Dynamics(**dyn_kwargs)
+    return dynamics, dyn_kwargs
+
+
+def init_dynamics_vars(dynamics, *, 
+                       spatial_shape: tuple[int, int, int, int], 
+                       k_max: int, 
+                       rng):
+    """
+    Initialize variables for Dynamics model.
+    spatial_shape: (B, T, n_spatial, d_spatial) - packed spatial tokens
+    """
+    from dreamer.models import Dynamics
+    
+    rng, key_params, key_drop = jax.random.split(rng, 3)
+    
+    B, T = spatial_shape[0], spatial_shape[1]
+    
+    # Dummy inputs for init
+    emax = jnp.log2(k_max).astype(jnp.int32)
+    actions = jnp.zeros((B, T), dtype=jnp.int32)
+    step_idx = jnp.full((B, T), emax, dtype=jnp.int32)
+    sigma_idx = jnp.full((B, T), k_max - 1, dtype=jnp.int32)
+    z1 = jnp.zeros(spatial_shape, dtype=jnp.float32)
+    
+    dyn_vars = dynamics.init(
+        {"params": key_params, "dropout": key_drop}, 
+        actions, step_idx, sigma_idx, z1
+    )
+    
+    return dyn_vars

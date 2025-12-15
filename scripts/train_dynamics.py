@@ -4,7 +4,7 @@
 # It restores the pretrained tokenizer (enc/dec) and trains the dynamics model.
 
 from __future__ import annotations
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Any
 from functools import partial
@@ -25,73 +25,28 @@ import orbax.checkpoint as ocp
 import wandb
 
 from dreamer.models import Encoder, Decoder, Dynamics
-from dreamer.data import make_iterator, DatasetConfig
+from dreamer.data import make_iterator
+from dreamer.configs import DynamicsTrainConfig, TokenizerModelConfig, DynamicsExperimentConfig
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
     normalize_with_dataset_stats,
     with_params,
-    load_config_only,
+    load_checkpoint_model_config,
     make_manager,
     pack_mae_params,
-    setup_checkpointing,
+    setup_experiment_checkpointing,
     maybe_save_snapshot,
-    load_snapshot_weights
+    load_snapshot_weights,
+    create_tokenizer_models,
+    init_tokenizer_vars,
+    create_dynamics_model,
+    init_dynamics_vars,
 )
 from dreamer.logging import MetricLogger
 
 from dreamer.sampler import SamplerConfig, sample_video
 
-# ---------------------------
-# Config
-# ---------------------------
-
-@dataclass(frozen=True)
-class RealismConfig:
-    # IO / ckpt
-    run_name: str
-    tokenizer_ckpt_path: str
-    ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
-
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None  # if None, uses default entity
-    wandb_project: str | None = None  # if None, uses run_name as project
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    use_rope: bool = True
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4 # number of register tokens for dynamics
-    n_agent: int = 1 # number of agent tokens for dynamics
-
-    # schedule
-    k_max: int = 8
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
-    self_fraction: float = 0.25   # used once we pass bootstrap_start
-
-    # train
-    max_steps: int = 1_000_000_000
-    log_every: int = 5_000
-    lr: float = 3e-4
-
-    # eval media toggle
-    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
 # ---------------------------
 # Small helpers
@@ -127,81 +82,6 @@ def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: 
     return grid
 
 # ---------------------------
-# Tokenizer restore (uses your Orbax layout & utils)
-# ---------------------------
-
-def load_pretrained_tokenizer(tokenizer_ckpt_dir: str | Path):
-    tokenizer_cfg = load_config_only(tokenizer_ckpt_dir)
-
-    enc_kwargs = tokenizer_cfg.encoder
-    dec_kwargs = tokenizer_cfg.decoder
-
-    encoder = Encoder(**enc_kwargs)
-    decoder = Decoder(**dec_kwargs)
-
-    rng = jax.random.PRNGKey(0)
-    dummy_B, dummy_T = 1, 1
-    d_patch = (tokenizer_cfg.patch_size ** 2) * 3 # FIXME
-    dummy_patches = jnp.zeros((dummy_B, dummy_T, enc_kwargs.n_patches, d_patch))
-
-    enc_vars = encoder.init({"params": rng, "mae": rng, "dropout": rng}, dummy_patches, deterministic=True)
-
-    fake_z = jnp.zeros((dummy_B, dummy_T, enc_kwargs.n_latents, enc_kwargs.d_bottleneck))
-    dec_vars = decoder.init({"params": rng, "dropout": rng}, fake_z, deterministic=True)
-
-    mngr = make_manager(tokenizer_ckpt_dir, item_names=("state",))
-    latest = mngr.latest_step()
-
-    packed_params = pack_mae_params(enc_vars, dec_vars)
-    abstract_params = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, packed_params)
-
-    restored = mngr.restore(latest, args=ocp.args.Composite(state=ocp.args.StandardRestore({"params": abstract_params})))
-
-    loaded_params = restored.state["params"]
-    enc_vars = with_params(enc_vars, loaded_params["enc"])
-    dec_vars = with_params(dec_vars, loaded_params["dec"])
-
-    print(f"[tokenizer] Restored weights from step {latest}")
-    return encoder, decoder, enc_vars, dec_vars, tokenizer_cfg
-    """
-    meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
-    latest = meta_mngr.latest_step()
-    if latest is None:
-        raise FileNotFoundError(f"No tokenizer checkpoint found in {tokenizer_ckpt_dir}")
-    restored_meta = meta_mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
-    meta = restored_meta.meta
-    enc_kwargs = meta["enc_kwargs"]
-    n_lat, d_b = enc_kwargs["n_latents"], enc_kwargs["d_bottleneck"]
-
-    rng_e1, rng_d1 = jax.random.split(rng)
-    B, T = sample_patches_btnd.shape[:2]
-    fake_z = jnp.zeros((B, T, n_lat, d_b), dtype=jnp.float32)
-    dec_vars = decoder.init({"params": rng_d1, "dropout": rng_d1}, fake_z, deterministic=True)
-
-    packed_example = pack_mae_params(enc_vars, dec_vars)
-    tx_dummy = optax.adamw(1e-4)
-    opt_state_example = tx_dummy.init(packed_example)
-    state_example = make_state(packed_example, opt_state_example, rng_e1, step=0)
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)
-
-    tok_mngr = make_manager(tokenizer_ckpt_dir, item_names=("state", "meta"))
-    restored = tok_mngr.restore(
-        latest,
-        args=ocp.args.Composite(
-            state=ocp.args.StandardRestore(abstract_state),
-            meta=ocp.args.JsonRestore(),
-        ),
-    )
-    packed_params = restored.state["params"]
-    enc_params = packed_params["enc"]
-    dec_params = packed_params["dec"]
-    new_enc_vars = with_params(enc_vars, enc_params)
-    new_dec_vars = with_params(dec_vars, dec_params)
-    print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
-    return new_enc_vars, new_dec_vars, meta
-    """
-
-# ---------------------------
 # Single efficient training step (always used)
 # ---------------------------
 
@@ -209,7 +89,7 @@ def load_pretrained_tokenizer(tokenizer_ckpt_dir: str | Path):
     jax.jit,
     static_argnames=("encoder","dynamics","tx","patch","n_spatial","k_max","packing_factor","B","T","B_self"),
 )
-def train_step_efficient(
+def train_step(
     encoder, dynamics, tx,
     params, opt_state,
     enc_vars, dyn_vars,
@@ -353,15 +233,15 @@ def train_step_efficient(
 # Eval regimes & plan JSON (unchanged core logic)
 # ---------------------------
 
-def _eval_regimes_for_realism(cfg, *, ctx_length: int):
+def _eval_regimes_for_realism(cfg, patch_size: int, packing_factor: int, *, ctx_length: int):
     common = dict(
-        k_max=cfg.k_max,
+        k_max=cfg.experiment.k_max,
         horizon=min(32, cfg.dataset.T - ctx_length),
         ctx_length=ctx_length,
         ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
-        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
-        n_spatial=cfg.enc_n_latents // cfg.packing_factor,
-        packing_factor=cfg.packing_factor,
+        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=patch_size,
+        n_spatial=cfg.model.n_spatial,
+        packing_factor=packing_factor,
         dataset_mean=cfg.dataset.dataset_mean,
         dataset_std=cfg.dataset.dataset_std,
         start_mode="pure",
@@ -505,168 +385,44 @@ def save_evaluation_plan(
         json.dump(plan, f, indent=2)
 
 # ---------------------------
-# Meta for dynamics checkpoints
-# ---------------------------
-
-def make_dynamics_meta(
-    *,
-    enc_kwargs: dict,
-    dec_kwargs: dict,
-    dynamics_kwargs: dict,
-    H: int, W: int, C: int,
-    patch: int,
-    k_max: int,
-    packing_factor: int,
-    n_spatial: int,
-    tokenizer_ckpt_dir: str | None = None,
-    cfg: Dict[str, Any] | None = None,
-):
-    return {
-        "enc_kwargs": enc_kwargs,
-        "dec_kwargs": dec_kwargs,
-        "dynamics_kwargs": dynamics_kwargs,
-        "H": H, "W": W, "C": C, "patch": patch,
-        "k_max": k_max,
-        "packing_factor": packing_factor,
-        "n_spatial": n_spatial,
-        "tokenizer_ckpt_dir": tokenizer_ckpt_dir,
-        "cfg": cfg or {},
-    }
-
-# ---------------------------
-# Training state dataclass
-# ---------------------------
-
-@dataclass
-class TrainState:
-    """Container for all training-related state (models, variables, optimizer, etc.)."""
-    encoder: Encoder
-    decoder: Decoder
-    dynamics: Dynamics
-    enc_vars: dict
-    dec_vars: dict
-    dyn_vars: dict
-    params: dict
-    enc_kwargs: dict
-    dec_kwargs: dict
-    dyn_kwargs: dict
-    tx: optax.Transform
-    opt_state: optax.OptState
-    mae_eval_key: jnp.ndarray
-
-# ---------------------------
 # Model initialization
 # ---------------------------
 
-def initialize_models_and_tokenizer(
-    cfg: RealismConfig,
-    frames_init: jnp.ndarray,
-    actions_init: jnp.ndarray,
-) -> TrainState:
+def initialize_models(cfg: DynamicsTrainConfig):
     """
-    Initialize encoder, decoder, dynamics models and restore tokenizer.
-
+    Restore tokenizer and initialize dynamics model.
     Returns:
-        TrainState containing all initialized models, variables, and optimizer state.
+        Tuple of (encoder, decoder, dynamics, enc_vars, dec_vars, dyn_vars,
+                  params, opt_state, optimizer, patch_size, packing_factor, mae_eval_key)
     """
-    patch = cfg.patch
-    num_patches = (cfg.dataset.H // patch) * (cfg.dataset.W // patch)
-    D_patch = patch * patch * cfg.dataset.C
-    k_max = cfg.k_max
+    # Load pretrained tokenizer
+    tok_ckpt_path = Path(cfg.experiment.tokenizer_ckpt_path)
+    encoder, decoder, enc_vars, dec_vars, tokenizer_cfg = load_pretrained_tokenizer(tok_ckpt_path)
 
-    enc_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_latents=cfg.enc_n_latents,
-        n_patches=num_patches,
-        n_heads=cfg.n_heads,
-        n_kv_heads=cfg.n_kv_heads,
-        depth=cfg.enc_depth,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        d_bottleneck=cfg.enc_d_bottleneck,
-        mae_p_min=0.0, mae_p_max=0.0,
-        mlp_ratio=4.0,
-        time_every=4,
-    )
-    dec_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_heads=cfg.n_heads,
-        n_kv_heads=cfg.n_kv_heads,
-        depth=cfg.dec_depth,
-        n_latents=cfg.enc_n_latents,
-        n_patches=num_patches,
-        d_patch=D_patch,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        mlp_ratio=4.0, time_every=4,
-    )
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor # number of spatial tokens for dynamics
-    dyn_kwargs = dict(
-        d_model=cfg.d_model_dyn,
-        d_bottleneck=cfg.enc_d_bottleneck,
-        d_spatial=cfg.enc_d_bottleneck * cfg.packing_factor,
-        n_spatial=n_spatial, n_register=cfg.n_register,
-        n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.dyn_depth,
-        n_agent=cfg.n_agent,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        k_max=k_max, 
-        mlp_ratio=4.0,
-        time_every=4,
+    # Initialize dynamics model
+    dynamics, dyn_kwargs = create_dynamics_model(cfg.model, tokenizer_cfg)
+    dyn_vars = init_dynamics_vars(
+        dynamics,
+        spatial_shape=(cfg.dataset.B, cfg.dataset.T, cfg.model.n_spatial, cfg.model.d_spatial),
+        k_max=cfg.experiment.k_max,
+        rng=jax.random.PRNGKey(0),
     )
 
-    encoder = Encoder(**enc_kwargs)
-    decoder = Decoder(**dec_kwargs)
-    dynamics = Dynamics(**dyn_kwargs)
-
-    patches_btnd = temporal_patchify(frames_init, patch)
-    rng = jax.random.PRNGKey(0)
-    enc_vars = encoder.init({"params": rng, "mae": rng, "dropout": rng}, patches_btnd, deterministic=True)
-    fake_z = jnp.zeros((cfg.dataset.B, cfg.dataset.T, cfg.enc_n_latents, cfg.enc_d_bottleneck))
-    dec_vars = decoder.init({"params": rng, "dropout": rng}, fake_z, deterministic=True)
-
-    # Restore tokenizer
-    enc_vars, dec_vars, _ = load_pretrained_tokenizer(
-        cfg.tokenizer_ckpt, rng=rng,
-        encoder=encoder, decoder=decoder,
-        enc_vars=enc_vars, dec_vars=dec_vars,
-        sample_patches_btnd=patches_btnd,
-    )
-
-    # Build initial z1 to shape dynamics init
-    mae_eval_key = jax.random.PRNGKey(777)
-    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
-    z_btLd, _ = encoder.apply(enc_vars, patches_norm, rngs={"mae": mae_eval_key}, deterministic=True)
-    z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
-    emax = jnp.log2(k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), k_max - 1, dtype=jnp.int32)
-    dyn_vars = dynamics.init({"params": rng, "dropout": rng}, actions_init, step_idx, sigma_idx, z1)
     params = dyn_vars["params"]
 
-    tx = optax.adam(cfg.lr)
-    opt_state = tx.init(params)
+    # Initialize optimizer
+    optimizer = optax.adamw(cfg.experiment.optimizer.lr)
+    opt_state = optimizer.init(params)
+    
+    # Create MAE eval key for tokenizer visualization
+    mae_eval_key = jax.random.PRNGKey(42)
 
-    return TrainState(
-        encoder=encoder,
-        decoder=decoder,
-        dynamics=dynamics,
-        enc_vars=enc_vars,
-        dec_vars=dec_vars,
-        dyn_vars=dyn_vars,
-        params=params,
-        enc_kwargs=enc_kwargs,
-        dec_kwargs=dec_kwargs,
-        dyn_kwargs=dyn_kwargs,
-        tx=tx,
-        opt_state=opt_state,
-        mae_eval_key=mae_eval_key,
+    return (
+        encoder, decoder, dynamics,
+        enc_vars, dec_vars, dyn_vars,
+        params, opt_state, optimizer,
+        tokenizer_cfg.patch_size, cfg.model.packing_factor,
+        mae_eval_key
     )
 
 # ---------------------------
@@ -674,9 +430,18 @@ def initialize_models_and_tokenizer(
 # ---------------------------
 
 def run_evaluation(
-    cfg: RealismConfig,
+    cfg: DynamicsExperimentConfig,
     step: int,
-    train_state: TrainState,
+    encoder: Encoder,
+    decoder: Decoder,
+    dynamics: Dynamics,
+    enc_vars: dict,
+    dec_vars: dict,
+    dyn_vars: dict,
+    params: dict,
+    patch_size: int,
+    packing_factor: int,
+    mae_eval_key: jnp.ndarray,
     next_batch,
     vis_dir: Path,
 ):
@@ -686,27 +451,31 @@ def run_evaluation(
     Args:
         cfg: Configuration object
         step: Current training step
-        train_state: TrainState containing all models, variables, and optimizer state
+        encoder, decoder, dynamics: Model instances
+        enc_vars, dec_vars, dyn_vars: Model variables
+        params: Trainable parameters
+        patch_size, packing_factor: Tokenizer metadata
+        mae_eval_key: RNG key for MAE
         next_batch: Data iterator function
         vis_dir: Directory for visualization outputs
     """
     val_rng = jax.random.PRNGKey(9999)
     _, (val_frames, val_actions, _) = next_batch(val_rng)
-    dyn_vars_eval = with_params(train_state.dyn_vars, train_state.params)
+    dyn_vars_eval = with_params(dyn_vars, params)
     ctx_length = min(32, cfg.dataset.T - 1)
-    regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length)
+    regimes = _eval_regimes_for_realism(cfg, patch_size, packing_factor, ctx_length=ctx_length)
 
     for tag, sampler_conf in regimes:
-        sampler_conf.mae_eval_key = train_state.mae_eval_key
+        sampler_conf.mae_eval_key = mae_eval_key
         sampler_conf.rng_key = jax.random.PRNGKey(4242)
         t0 = time.time()
 
         pred_frames, floor_frames, gt_frames = sample_video(
-            encoder=train_state.encoder,
-            decoder=train_state.decoder,
-            dynamics=train_state.dynamics,
-            enc_vars=train_state.enc_vars,
-            dec_vars=train_state.dec_vars,
+            encoder=encoder,
+            decoder=decoder,
+            dynamics=dynamics,
+            enc_vars=enc_vars,
+            dec_vars=dec_vars,
             dyn_vars=dyn_vars_eval,
             frames=val_frames, actions=val_actions, config=sampler_conf,
         )
@@ -736,7 +505,7 @@ def run_evaluation(
         print(f"[eval:{tag}] wrote {mp4_path.name} and {plan_path.name} in {tag_dir}")
 
         # Log to wandb
-        if cfg.use_wandb and wandb.run is not None:
+        if cfg.wandb.enabled and wandb.run is not None:
             # Log metrics
             wandb.log({
                 f"eval/{tag}/mse": mse,
@@ -753,20 +522,19 @@ def run_evaluation(
 # Main
 # ---------------------------
 
-def run(cfg: RealismConfig):
+def run(cfg: DynamicsTrainConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
-    cfg, mngr, start_step = setup_checkpointing(cfg, run_dir)
+    cfg, mngr, start_step = setup_experiment_checkpointing(cfg, run_dir)
 
     # Initialize wandb if enabled
-    if cfg.use_wandb:
-        wandb_project = cfg.wandb_project or cfg.run_name
+    if cfg.wandb.enabled:
         wandb.init(
-            entity=cfg.wandb_entity,
-            project=wandb_project,
-            name=cfg.run_name,
+            entity=cfg.wandb.entity,
+            project=cfg.wandb.project,
+            name=cfg.experiment.run_name,
             config=asdict(cfg),
             dir=str(run_dir),
             resume="allow"
@@ -788,33 +556,37 @@ def run(cfg: RealismConfig):
     init_rng = jax.random.PRNGKey(0)
     _, (frames_init, actions_init, _) = next_batch(init_rng)
 
-    train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
+    (
+        encoder, decoder, dynamics,
+        enc_vars, dec_vars, dyn_vars,
+        params, opt_state, optimizer,
+        patch_size, packing_factor,
+        mae_eval_key
+    ) = initialize_models(cfg)
     rng = jax.random.PRNGKey(0)
 
+    # Restore if resuming
     if start_step > 0:
         params, opt_state, rng = load_snapshot_weights(
-            mngr, start_step, train_state.params, train_state.opt_state, rng
+            mngr, start_step, params, opt_state, rng
         )
 
-        train_state.params = params
-        train_state.opt_state = opt_state
-
-        train_state.dyn_vars = with_params(train_state.dyn_vars, params)
+    dyn_vars = with_params(dyn_vars, params)
 
     # -------- Training loop --------
     train_rng = rng
     data_rng = jax.random.PRNGKey(12345)
 
     logger = MetricLogger(
-        use_wandb=cfg.use_wandb,
-        log_every=cfg.log_every,
-        max_steps=cfg.max_steps,
+        use_wandb=cfg.wandb.enabled,
+        log_every=cfg.experiment.log_every,
+        max_steps=cfg.experiment.optimizer.max_steps,
         wandb_obj=wandb,
     )
 
-    pbar = tqdm(range(start_step, cfg.max_steps + 1), 
+    pbar = tqdm(range(start_step, cfg.experiment.optimizer.max_steps + 1), 
                 initial=start_step,
-                total=cfg.max_steps,
+                total=cfg.experiment.optimizer.max_steps,
                 desc="Training Dynamics",
                 dynamic_ncols=True)
     
@@ -830,24 +602,24 @@ def run(cfg: RealismConfig):
 
         # Decide current B_self based on warm-up (static arg requires a single value; we keep B_self fixed
         # and gate its contribution inside the jit via bootstrap_start masking).
-        B_self = max(0, int(round(cfg.self_fraction * cfg.dataset.B)))
+        B_self = max(0, int(round(cfg.experiment.self_fraction * cfg.dataset.B)))
 
         train_start_t = time.perf_counter()
-        train_state.params, train_state.opt_state, aux = train_step_efficient(
-            train_state.encoder, train_state.dynamics, train_state.tx,
-            train_state.params, train_state.opt_state,
-            train_state.enc_vars, train_state.dyn_vars,
+        params, opt_state, aux = train_step(
+            encoder, dynamics, optimizer,
+            params, opt_state,
+            enc_vars, dyn_vars,
             frames, actions,
-            patch=cfg.patch, B=cfg.dataset.B, T=cfg.dataset.T, B_self=B_self,
-            n_spatial=cfg.enc_n_latents // cfg.packing_factor, 
-            k_max=cfg.k_max, packing_factor=cfg.packing_factor,
-            master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
+            patch=patch_size, B=cfg.dataset.B, T=cfg.dataset.T, B_self=B_self,
+            n_spatial=cfg.model.n_spatial, 
+            k_max=cfg.experiment.k_max, packing_factor=packing_factor,
+            master_key=master_key, step=step, bootstrap_start=cfg.experiment.bootstrap_start,
             dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
         )
         train_t = time.perf_counter() - train_start_t
         total_t = data_t + train_t
 
-        train_state.dyn_vars = with_params(train_state.dyn_vars, train_state.params)
+        dyn_vars = with_params(dyn_vars, params)
 
         # Logging
         if logger.should_log(step):
@@ -864,14 +636,23 @@ def run(cfg: RealismConfig):
             )
 
         # Save (async) when policy says we should
-        maybe_save_snapshot(mngr, step, train_state.params, train_state.opt_state, train_rng, cfg)
+        maybe_save_snapshot(mngr, step, params, opt_state, train_rng, cfg)
 
         # Periodic lightweight AR eval
-        if cfg.write_video_every > 0 and (step % cfg.write_video_every == 0):
+        if cfg.experiment.write_video_every > 0 and (step % cfg.experiment.write_video_every == 0):
             run_evaluation(
                 cfg=cfg,
                 step=step,
-                train_state=train_state,
+                encoder=encoder,
+                decoder=decoder,
+                dynamics=dynamics,
+                enc_vars=enc_vars,
+                dec_vars=dec_vars,
+                dyn_vars=dyn_vars,
+                params=params,
+                patch_size=patch_size,
+                packing_factor=packing_factor,
+                mae_eval_key=mae_eval_key,
                 next_batch=next_batch,
                 vis_dir=vis_dir,
             )
@@ -880,18 +661,18 @@ def run(cfg: RealismConfig):
     mngr.wait_until_finished()
 
     # Finish wandb run
-    if cfg.use_wandb and wandb.run is not None:
+    if cfg.wandb.enabled and wandb.run is not None:
         wandb.finish()
         print("[wandb] Finished logging.")
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")
 def main(cfg: DictConfig):
-    schema = OmegaConf.structured(RealismConfig)
+    schema = OmegaConf.structured(DynamicsTrainConfig)
     cfg = OmegaConf.merge(schema, cfg)
-    realism_cfg = OmegaConf.to_object(cfg)
+    dyn_cfg = OmegaConf.to_object(cfg)
     
-    run(realism_cfg)
+    run(dyn_cfg)
 
 
 if __name__ == "__main__":

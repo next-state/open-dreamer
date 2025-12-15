@@ -1,4 +1,3 @@
-from functools import lru_cache
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
@@ -59,7 +58,6 @@ def sinusoid_table(n: int, d: int, base: float = 10000.0, dtype=jnp.float32) -> 
     return table.astype(dtype)
 
 
-@lru_cache(maxsize=8)
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype=jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.

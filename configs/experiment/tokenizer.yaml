@@ -1,0 +1,10 @@
+defaults:
+  - base_experiment
+  - _self_
+
+run_name: tokenizer
+
+lpips_weight: 0.2
+lpips_frac: 0.5
+
+visualize_every: 10_000

@@ -1,0 +1,9 @@
+optimizer:
+  lr: 1e-3
+  max_steps: 1_000_000_000
+
+log_every: 100
+
+ckpt:
+  max_to_keep: 2
+  save_every: 10_000

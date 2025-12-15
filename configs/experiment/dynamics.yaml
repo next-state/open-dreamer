@@ -1,0 +1,13 @@
+defaults:
+  - base_experiment
+  - _self_
+
+run_name: dynamics
+
+tokenizer_ckpt_path: logs/tokenizer  # FIXME: instead of "logs", use the hydra default, which we set to logs in common.yaml
+
+k_max: 8
+bootstrap_start: 5_000
+self_fraction: 0.25
+
+write_video_every: 10_000

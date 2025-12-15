@@ -1,0 +1,14 @@
+d_model: 128
+d_bottleneck: 32
+n_heads: 4
+n_kv_heads: 2
+depth: 8
+dropout_rate: 0.0
+qk_norm_type: null
+use_rope: true
+rope_theta: 10000.0
+time_every: 4
+packing_factor: 2
+n_register: 4
+n_agent: 1
+k_max: ${experiment.k_max}

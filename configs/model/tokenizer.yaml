@@ -1,3 +1,5 @@
+patch_size: 4
+
 encoder:
   n_latents: 16
   d_bottleneck: 32
@@ -14,13 +16,13 @@ encoder:
   mae_p_max: 0.9
 
 decoder:
-  n_latents: ${encoder.n_latents}
-  d_model: ${encoder.d_model}
-  n_heads: ${encoder.n_heads}
-  n_kv_heads: ${encoder.n_kv_heads}
-  depth: ${encoder.depth}
-  dropout_rate: ${encoder.dropout_rate}
-  qk_norm_type: ${encoder.qk_norm_type}
-  use_rope: ${encoder.use_rope}
-  rope_theta: ${encoder.rope_theta}
-  time_every: ${encoder.time_every}
+  n_latents: ${model.encoder.n_latents}
+  d_model: ${model.encoder.d_model}
+  n_heads: ${model.encoder.n_heads}
+  n_kv_heads: ${model.encoder.n_kv_heads}
+  depth: ${model.encoder.depth}
+  dropout_rate: ${model.encoder.dropout_rate}
+  qk_norm_type: ${model.encoder.qk_norm_type}
+  use_rope: ${model.encoder.use_rope}
+  rope_theta: ${model.encoder.rope_theta}
+  time_every: ${model.encoder.time_every}

@@ -1,104 +1,26 @@
 from functools import partial
 from tqdm import tqdm
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict
 import time
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import jax
 import jax.numpy as jnp
 import optax
-from dreamer.models import Encoder, Decoder
-from dreamer.data import make_iterator, DatasetConfig
+from dreamer.data import make_iterator
 import imageio
 from jaxlpips import LPIPS
 from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
-from dreamer.utils import temporal_patchify, temporal_unpatchify, normalize_with_dataset_stats, unnormalize_with_dataset_stats, setup_checkpointing, maybe_save_snapshot, load_snapshot_weights, pack_mae_params, unpack_mae_params
+from dreamer.utils import temporal_patchify, temporal_unpatchify, normalize_with_dataset_stats, unnormalize_with_dataset_stats, setup_experiment_checkpointing, maybe_save_snapshot, pack_mae_params, unpack_mae_params, create_tokenizer_models, load_snapshot_weights, init_tokenizer_vars
 from dreamer.logging import MetricLogger
+from dreamer.configs import TokenizerTrainConfig
 
-
-# ---------------------------
-# Config
-# ---------------------------
-
-@dataclass
-class EncoderConfig:
-    n_latents: int = 16
-    d_bottleneck: int = 32
-    d_model: int = 64
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    n_patches: int = 64  # Will be computed from H, W, patch_size
-    depth: int = 8
-    dropout_rate: float = 0.05
-    qk_norm_type: str | None = None
-    use_rope: bool = False
-    rope_theta: float = 10000.0
-    time_every: int = 4
-    mae_p_min: float = 0.0
-    mae_p_max: float = 0.9
-
-@dataclass
-class DecoderConfig:
-    d_model: int = 64
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    n_latents: int = 16
-    n_patches: int = 64  # Will be computed from H, W, patch_size
-    d_patch: int = 48    # Will be computed from patch_size, C
-    depth: int = 8
-    dropout_rate: float = 0.05
-    qk_norm_type: str | None = None
-    use_rope: bool = False
-    rope_theta: float = 10000.0
-    time_every: int = 4
-
-@dataclass(frozen=True)
-class TokenizerConfig:
-    # IO / ckpt
-    run_name: str
-    ckpt_max_to_keep: int = 5
-    ckpt_save_every: int = 10_000
-
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None
-    wandb_project: str | None = None
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-
-    # model parameters
-    patch_size: int = 4
-    encoder: EncoderConfig = field(default_factory=EncoderConfig)
-    decoder: DecoderConfig = field(default_factory=DecoderConfig)
-
-    # training
-    lr: float = 1e-4
-    max_steps: int = 1_000_000_000
-    log_every: int = 100
-    lpips_weight: float = 0.2
-    lpips_frac: float = 0.5
-    visualize_every: int = 10_000
 
 def _ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
-
-def init_models(rng, encoder, decoder, patch_tokens, B, T, enc_n_latents, enc_d_bottleneck):
-    rng, params_rng, mae_rng, dropout_rng = jax.random.split(rng, 4)
-
-    enc_vars = encoder.init(
-        {"params": params_rng, "mae": mae_rng, "dropout": dropout_rng},
-        patch_tokens, deterministic=True
-    )
-    fake_z = jnp.zeros((B, T, enc_n_latents, enc_d_bottleneck))
-    dec_vars = decoder.init(
-        {"params": params_rng, "dropout": dropout_rng},
-        fake_z, deterministic=True
-    )
-    return rng, enc_vars, dec_vars
 
 # --- forward (no jit; we jit the train_step) ---
 def forward_apply(encoder, decoder, enc_vars, dec_vars, patches_btnd, *, mae_key, drop_key, train: bool):
@@ -266,32 +188,31 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
     new_enc_vars, new_dec_vars = unpack_mae_params(new_params, enc_vars, dec_vars)
     return new_params, opt_state, new_enc_vars, new_dec_vars, aux
 
-def run(cfg: TokenizerConfig):
+def run(cfg: TokenizerTrainConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
-    cfg, mngr, start_step = setup_checkpointing(cfg, run_dir)
+    cfg, mngr, start_step = setup_experiment_checkpointing(cfg, run_dir)
+
+    # Populate derived attributes (n_patches etc)
+    cfg.model.compute_derived(cfg.dataset)
 
     # Iniialize wandb if enabled
-    if cfg.use_wandb:
-        wandb_project = cfg.wandb_project or cfg.run_name
+    if cfg.wandb.enabled:
         wandb.init(
-            entity=cfg.wandb_entity,
-            project=wandb_project,
-            name=cfg.run_name,
+            entity=cfg.wandb.entity,
+            project=cfg.wandb.project,
+            name=cfg.experiment.run_name,
             config=asdict(cfg),
             dir=str(run_dir),
             resume="allow",
         )
 
     rng = jax.random.PRNGKey(0)
-    
-    num_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
-    D_patch = cfg.patch_size * cfg.patch_size * cfg.dataset.C
 
     # instantiate once
     global lpips_loss_fn
-    if cfg.lpips_weight > 0.0:
+    if cfg.experiment.lpips_weight > 0.0:
         lpips_loss_fn = LPIPS(pretrained_network="alexnet")
 
     # data
@@ -307,48 +228,42 @@ def run(cfg: TokenizerConfig):
     rng, batch_rng = jax.random.split(rng)
     rng, first_batch = next_batch(rng)  # warmup
 
-    # models
-    enc_kwargs = asdict(cfg.encoder)
-    enc_kwargs.update({
-        "n_patches": num_patches,
-    })
-    
-    dec_kwargs = asdict(cfg.decoder)
-    dec_kwargs.update({
-        "n_patches": num_patches,
-        "d_patch": D_patch,
-    })
-
-    encoder = Encoder(**enc_kwargs)
-    decoder = Decoder(**dec_kwargs)
-
-    first_patches = temporal_patchify(first_batch, cfg.patch_size)
-    rng, enc_vars, dec_vars = init_models(
-        rng, encoder, decoder, first_patches, 
-        cfg.dataset.B, cfg.dataset.T, cfg.encoder.n_latents, cfg.encoder.d_bottleneck
+    encoder, decoder = create_tokenizer_models(cfg.model)
+    first_patches = temporal_patchify(first_batch, cfg.model.patch_size)
+    input_shape = first_patches.shape
+    rng, enc_vars, dec_vars = init_tokenizer_vars(
+        encoder, decoder, input_shape=input_shape, rng=rng
     )
 
     # optim
     params = pack_mae_params(enc_vars, dec_vars)
-    tx = optax.adamw(cfg.lr)
-    opt_state = tx.init(params)
+    
+    # Create optimizer
+    optimizer = optax.adamw(cfg.experiment.optimizer.lr)
+    opt_state = optimizer.init(params)
 
-    # Load weights if checkpoint found
+    # Restore weights if resuming
     if start_step > 0:
-        params, opt_state, rng = load_snapshot_weights(mngr, start_step, params, opt_state, rng)
+        params, opt_state, rng = load_snapshot_weights(
+            mngr, start_step, params, opt_state, rng
+        )
+        # Update enc_vars and dec_vars with restored params
         enc_vars, dec_vars = unpack_mae_params(params, enc_vars, dec_vars)
+        print(f"[restore] Resumed from checkpoint at step {start_step}")
 
-    # ---------- Train loop ----------
+    # Metrics
     try:
         logger = MetricLogger(
-            use_wandb=cfg.use_wandb, 
-            log_every=cfg.log_every, 
-            max_steps=cfg.max_steps,
-            wandb_obj=wandb
+            use_wandb=cfg.wandb.enabled,
+            log_every=cfg.experiment.log_every,
+            max_steps=cfg.experiment.optimizer.max_steps,
+            wandb_obj=wandb,
         )
-        pbar = tqdm(range(start_step, cfg.max_steps + 1), 
+
+        # Training Loop
+        pbar = tqdm(range(start_step, cfg.experiment.optimizer.max_steps + 1), 
                     initial=start_step, 
-                    total=cfg.max_steps, 
+                    total=cfg.experiment.optimizer.max_steps, 
                     desc="Training Tokenizer", 
                     dynamic_ncols=True)
         
@@ -363,10 +278,10 @@ def run(cfg: TokenizerConfig):
             train_start_t = time.perf_counter()
             should_log = logger.should_log(step)
             params, opt_state, enc_vars, dec_vars, aux = train_step(
-                encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch,
-                patch=cfg.patch_size, H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, 
+                encoder, decoder, optimizer, params, opt_state, enc_vars, dec_vars, batch,
+                patch=cfg.model.patch_size, H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, 
                 master_key=master_key, step=step, 
-                lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
+                lpips_weight=cfg.experiment.lpips_weight, lpips_frac=cfg.experiment.lpips_frac,
                 should_log=should_log,
                 dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
             )
@@ -398,18 +313,18 @@ def run(cfg: TokenizerConfig):
             maybe_save_snapshot(mngr, step, params, opt_state, rng, cfg)
 
             # Viz
-            if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
+            if cfg.experiment.visualize_every > 0 and step % cfg.experiment.visualize_every == 0:
                 rng, viz_key = jax.random.split(rng)
                 mae_key, drop_key, vis_batch_key = jax.random.split(viz_key, 3)
                 _, viz_batch = next_batch(vis_batch_key)
                 viz_batch = viz_batch[:8, :1]
                 out = viz_step(encoder, decoder, enc_vars, dec_vars, viz_batch,
-                               patch=cfg.patch_size, mae_key=mae_key, drop_key=drop_key,
+                               patch=cfg.model.patch_size, mae_key=mae_key, drop_key=drop_key,
                                dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std)
-                target = jnp.concatenate(temporal_unpatchify(out["target"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
-                masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
-                rec_masked  = jnp.concatenate(temporal_unpatchify(out["recon_masked"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
-                rec_unmasked  = jnp.concatenate(temporal_unpatchify(out["recon_full"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
+                target = jnp.concatenate(temporal_unpatchify(out["target"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.model.patch_size).squeeze(), axis=1)
+                masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.model.patch_size).squeeze(), axis=1)
+                rec_masked = jnp.concatenate(temporal_unpatchify(out["recon_masked"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.model.patch_size).squeeze(), axis=1)
+                rec_unmasked = jnp.concatenate(temporal_unpatchify(out["recon_full"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.model.patch_size).squeeze(), axis=1)
                 grid = jnp.concatenate([target, masked_in, rec_masked, rec_unmasked])
                 grid = jnp.asarray(grid * 255.0, dtype=jnp.uint8)
                 vis_path = run_dir / "viz"
@@ -418,13 +333,13 @@ def run(cfg: TokenizerConfig):
     finally:
         # Make sure any background saves finish before exit.
         mngr.wait_until_finished()
-        if cfg.use_wandb and wandb.run is not None:
+        if cfg.wandb.enabled and wandb.run is not None:
             wandb.finish()
             print("[wandb] Finished logging.")
 
 @hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
 def main(cfg: DictConfig):
-    schema = OmegaConf.structured(TokenizerConfig)
+    schema = OmegaConf.structured(TokenizerTrainConfig)
     cfg = OmegaConf.merge(schema, cfg)
     tokenizer_cfg = OmegaConf.to_object(cfg)
     

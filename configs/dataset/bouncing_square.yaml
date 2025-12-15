@@ -1,4 +1,9 @@
+defaults:
+  - base_dataset
+  - _self_
+
 name: bouncing_square
+
 B: 32
 T: 64
 H: 32
@@ -13,6 +18,5 @@ hold_max: 9
 
 diversify_data: true
 
-# Dataset normalization statistics (pixel values in [0, 1])
 dataset_mean: [0.5, 0.5, 0.5]
 dataset_std: [0.288675, 0.288675, 0.288675]

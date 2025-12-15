@@ -3,7 +3,7 @@ defaults:
   - _self_
 
 bc_rew_dir: logs/bc_rew
-tokenizer_dir: logs/tokenizer
+tokenizer_ckpt_path: logs/tokenizer
 
 dataset:
   B: 8
