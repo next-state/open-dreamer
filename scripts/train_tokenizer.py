@@ -207,7 +207,7 @@ def run(cfg: TokenizerConfig):
 
         params, opt_state, aux = train_step(apply_fn, tx, variables, params, opt_state, videos, master_key=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac)
 
-        if step % cfg.log_every == 0 and step > 0:
+        if logger.should_log(step):
             mse = aux["loss_mse"]
             psnr = 10 * jnp.log10(1.0 / jnp.maximum(mse, 1e-10))
             logger.log(

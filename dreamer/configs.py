@@ -178,17 +178,12 @@ class DynamicsConfig:
     wandb_entity: str | None = None  # if None, uses default entity
     wandb_project: str | None = None  # if None, uses run_name as project
 
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-
     # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
+    # Nested Tokenizer Config (contains dataset, encoder, decoder, patch)
+    tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
+
+    # Dynamics Model Config
     d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
     dyn_depth: int = 8
     n_heads: int = 4
     n_kv_heads: int = 2

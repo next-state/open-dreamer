@@ -38,12 +38,17 @@ from dreamer.utils import (
 from dreamer.logging import MetricLogger
 
 from dreamer.sampler import SamplerConfig, sample_video
+from dreamer.utils import init_tokenizer, init_dynamics
 
 # ---------------------------
 # Config
 # ---------------------------
 
 
+def init_models(rng, tokenizer, dynamics, cfg):
+    rng, tokenizer_variables = init_tokenizer(rng, tokenizer, cfg)
+    rng, dynamics_variables = init_dynamics(rng, dynamics, cfg)
+    return rng, tokenizer_variables, dynamics_variables
 
 # ---------------------------
 # Small helpers
@@ -459,27 +464,6 @@ def make_dynamics_meta(
     }
 
 # ---------------------------
-# Training state dataclass
-# ---------------------------
-
-@dataclass
-class TrainState:
-    """Container for all training-related state (models, variables, optimizer, etc.)."""
-    encoder: Encoder
-    decoder: Decoder
-    dynamics: Dynamics
-    enc_vars: dict
-    dec_vars: dict
-    dyn_vars: dict
-    params: dict
-    enc_kwargs: dict
-    dec_kwargs: dict
-    dyn_kwargs: dict
-    tx: optax.Transform
-    opt_state: optax.OptState
-    mae_eval_key: jnp.ndarray
-
-# ---------------------------
 # Model initialization
 # ---------------------------
 
@@ -692,50 +676,19 @@ def run(cfg: DynamicsConfig):
             dir=str(run_dir),
         )
 
-    # Data iterator (streaming)
-    next_batch = make_iterator(cfg.dataset)
-
-    # Initialize models and restore tokenizer
-    init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init, _) = next_batch(init_rng)
-
-    train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
-
-    # Extract some values for checkpointing
-    patch = cfg.patch
-    k_max = cfg.k_max
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
-
-    # -------- Orbax manager & (optional) restore --------
-    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
-    meta = make_dynamics_meta(
-        enc_kwargs=train_state.enc_kwargs,
-        dec_kwargs=train_state.dec_kwargs,
-        dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=patch,
-        k_max=k_max, packing_factor=cfg.packing_factor, n_spatial=n_spatial,
-        tokenizer_ckpt_dir=cfg.tokenizer_ckpt,
-        cfg=asdict(cfg),
-    )
-
     rng = jax.random.PRNGKey(0)
-    state_example = make_state(train_state.params, train_state.opt_state, rng, step=0)
-    restored = try_restore(mngr, state_example, meta)
+    dataset = make_iterator(cfg.tokenizer.dataset)
 
-    start_step = 0
-    if restored is not None:
-        latest_step, r = restored
-        train_state.params = r.state["params"]
-        train_state.opt_state = r.state["opt_state"]
-        rng = r.state["rng"]
-        start_step = int(r.state["step"]) + 1
-        train_state.dyn_vars = with_params(train_state.dyn_vars, train_state.params)
-        print(f"[restore] Resumed from {ckpt_dir} at step={latest_step}")
+    tokenizer = Tokenizer(cfg.tokenizer)
+    dynamics = Dynamics(cfg.dynamics)
+    apply_fn = tokenizer.apply
+    rng, tokenizer_variables, dynamics_variables = init_models(rng, tokenizer, dynamics, cfg)
+    tokenizer_params, dynamics_params = tokenizer_variables["params"], dynamics_variables["params"]
+    
+    tx = optax.adamw(cfg.lr)
+    dynamics_opt_state = tx.init(dynamics_params)
 
     # -------- Training loop --------
-    train_rng = jax.random.PRNGKey(2025)
-    data_rng = jax.random.PRNGKey(12345)
-
     logger = MetricLogger(
         use_wandb=cfg.use_wandb,
         log_every=cfg.log_every,
@@ -743,27 +696,19 @@ def run(cfg: DynamicsConfig):
         wandb_obj=wandb,
     )
 
-    pbar = tqdm(range(start_step, cfg.max_steps + 1), 
-                initial=start_step,
-                total=cfg.max_steps,
-                desc="Training Dynamics",
-                dynamic_ncols=True)
-    
-    for step in pbar:
+    pbar = tqdm(enumerate(dataset))
+    for step, batch in pbar:
         # Data
-        data_start_t = time.perf_counter()
-        data_rng, batch_key = jax.random.split(data_rng)
-        _, (frames, actions, _) = next_batch(batch_key)
-        data_t = time.perf_counter() - data_start_t
+        rng, master_key = jax.random.split(rng)
 
-        # RNG for this step
-        train_rng, master_key = jax.random.split(train_rng)
+        # Normalize videos
+        videos = batch["videos"].astype(jnp.float32) / 255.0
+        videos = normalize_with_dataset_stats(
+            videos, 
+            mean=cfg.dataset.dataset_mean, 
+            std=cfg.dataset.dataset_std
+        )
 
-        # Decide current B_self based on warm-up (static arg requires a single value; we keep B_self fixed
-        # and gate its contribution inside the jit via bootstrap_start masking).
-        B_self = max(0, int(round(cfg.self_fraction * cfg.dataset.B)))
-
-        train_start_t = time.perf_counter()
         train_state.params, train_state.opt_state, aux = train_step_efficient(
             train_state.encoder, train_state.dynamics, train_state.tx,
             train_state.params, train_state.opt_state,
@@ -774,8 +719,6 @@ def run(cfg: DynamicsConfig):
             master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
             dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
         )
-        train_t = time.perf_counter() - train_start_t
-        total_t = data_t + train_t
 
         # Logging
         if logger.should_log(step):
@@ -784,9 +727,6 @@ def run(cfg: DynamicsConfig):
                 metrics={
                     "flow_mse": aux["flow_mse"],
                     "boot_mse": aux["bootstrap_mse"],
-                    "time/data": data_t,
-                    "time/train": train_t,
-                    "time/total": total_t,
                 },
                 pbar=pbar
             )
@@ -797,13 +737,7 @@ def run(cfg: DynamicsConfig):
 
         # Periodic lightweight AR eval
         if cfg.write_video_every and (step % cfg.write_video_every == 0):
-            run_evaluation(
-                cfg=cfg,
-                step=step,
-                train_state=train_state,
-                next_batch=next_batch,
-                vis_dir=vis_dir,
-            )
+            run_evaluation(cfg=cfg, step=step, train_state=train_state, next_batch=next_batch, vis_dir=vis_dir)
 
     # Ensure all writes finished
     mngr.wait_until_finished()
@@ -811,7 +745,6 @@ def run(cfg: DynamicsConfig):
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:
         wandb.finish()
-        print("[wandb] Finished logging.")
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")
