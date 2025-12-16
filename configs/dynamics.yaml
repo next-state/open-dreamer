@@ -5,19 +5,32 @@ defaults:
 run_name: dynamics
 tokenizer_ckpt: 'logs/tokenizer/checkpoints'
 ckpt_save_every: 50_000
+
+# Dataset config for dynamics training (uses coinrun data)
+dataset:
+  source: "custom"
+  array_record_path: "datasets/coinrun_episodes/train"
+  B: 16
+  T: 16
+  H: 64
+  W: 64
+  C: 3
+  # Coinrun dataset statistics (approximate - you may want to compute exact values)
+  dataset_mean: [0.485, 0.456, 0.406]
+  dataset_std: [0.229, 0.224, 0.225]
+
+# Tokenizer architecture params (flattened for easy access in training)
+patch: 4
+enc_n_latents: 16
+enc_d_bottleneck: 32
+d_model_enc: 64
+enc_depth: 8
+dec_depth: 8
+
 tokenizer:
   run_name: ${run_name}_tokenizer_proxy
   tokenizer_ckpt: ${tokenizer_ckpt}  # Pass through if needed by TokenizerConfig logic, though usually loaded manually
   ckpt_save_every: ${ckpt_save_every}
-  
-  dataset:
-    source: "custom"
-    array_record_path: "datasets/coinrun_episodes/train"
-    B: 16
-    T: 16
-    H: 64
-    W: 64
-    C: 3
 
   encoder:
     n_latents: 16
@@ -27,7 +40,7 @@ tokenizer:
     n_kv_heads: 2
     depth: 8
     patch_size: 4
-  
+
   decoder:
     d_model: 64
     n_heads: 4
@@ -35,7 +48,7 @@ tokenizer:
     n_latents: 16
     patch_size: 4
     depth: 8
-  
+
   patch_size: 4
 
 # Dynamics specific

@@ -596,7 +596,7 @@ def run(cfg: DynamicsConfig):
         )
 
     rng = jax.random.PRNGKey(0)
-    dataset = make_iterator(cfg.tokenizer.dataset)
+    dataset = make_iterator(cfg.dataset)
 
     tokenizer = Tokenizer(cfg.tokenizer)
     dynamics = Dynamics(cfg.dynamics)
