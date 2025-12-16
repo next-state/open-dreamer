@@ -34,11 +34,13 @@ from dreamer.utils import (
     with_params,
     make_state, make_manager, try_restore, maybe_save,
     pack_mae_params,
+    init_tokenizer, init_dynamics,
+    _ensure_dir, _to_uint8, _stack_wide, _tile_videos,
+    load_pretrained_tokenizer,
 )
 from dreamer.logging import MetricLogger
 
 from dreamer.sampler import SamplerConfig, sample_video
-from dreamer.utils import init_tokenizer, init_dynamics
 
 # ---------------------------
 # Config
@@ -49,89 +51,6 @@ def init_models(rng, tokenizer, dynamics, cfg):
     rng, tokenizer_variables = init_tokenizer(rng, tokenizer, cfg)
     rng, dynamics_variables = init_dynamics(rng, dynamics, cfg)
     return rng, tokenizer_variables, dynamics_variables
-
-# ---------------------------
-# Small helpers
-# ---------------------------
-
-def _ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-def _to_uint8(img_f32):
-    return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
-
-def _stack_wide(*imgs_hwC):
-    return np.concatenate(imgs_hwC, axis=1)
-
-def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: int = 0) -> np.ndarray:
-    if len(trip_list_hwC) == 0:
-        raise ValueError("Empty video list")
-    H, W3, C = trip_list_hwC[0].shape
-    B = len(trip_list_hwC)
-    nrows = math.ceil(B / ncols)
-    total = nrows * ncols
-    if total > B:
-        blank = np.full((H, W3, C), pad_color, dtype=trip_list_hwC[0].dtype)
-        trip_list_hwC = trip_list_hwC + [blank] * (total - B)
-    rows = []
-    idx = 0
-    for _ in range(nrows):
-        row_imgs = trip_list_hwC[idx:idx + ncols]
-        idx += ncols
-        rows.append(np.concatenate(row_imgs, axis=1))
-    grid = np.concatenate(rows, axis=0)
-    return grid
-
-# ---------------------------
-# Tokenizer restore (uses your Orbax layout & utils)
-# ---------------------------
-
-def load_pretrained_tokenizer(
-    tokenizer_ckpt_dir: str,
-    *,
-    rng: jnp.ndarray,
-    encoder: Encoder,
-    decoder: Decoder,
-    enc_vars,
-    dec_vars,
-    sample_patches_btnd,
-):
-    meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
-    latest = meta_mngr.latest_step()
-    if latest is None:
-        raise FileNotFoundError(f"No tokenizer checkpoint found in {tokenizer_ckpt_dir}")
-    restored_meta = meta_mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
-    meta = restored_meta.meta
-    enc_kwargs = meta["enc_kwargs"]
-    n_lat, d_b = enc_kwargs["n_latents"], enc_kwargs["d_bottleneck"]
-
-    rng_e1, rng_d1 = jax.random.split(rng)
-    B, T = sample_patches_btnd.shape[:2]
-    fake_z = jnp.zeros((B, T, n_lat, d_b), dtype=jnp.float32)
-    dec_vars = decoder.init({"params": rng_d1, "dropout": rng_d1}, fake_z, deterministic=True)
-
-    packed_example = pack_mae_params(enc_vars, dec_vars)
-    tx_dummy = optax.adamw(1e-4)
-    opt_state_example = tx_dummy.init(packed_example)
-    state_example = make_state(packed_example, opt_state_example, rng_e1, step=0)
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)
-
-    tok_mngr = make_manager(tokenizer_ckpt_dir, item_names=("state", "meta"))
-    restored = tok_mngr.restore(
-        latest,
-        args=ocp.args.Composite(
-            state=ocp.args.StandardRestore(abstract_state),
-            meta=ocp.args.JsonRestore(),
-        ),
-    )
-    packed_params = restored.state["params"]
-    enc_params = packed_params["enc"]
-    dec_params = packed_params["dec"]
-    new_enc_vars = with_params(enc_vars, enc_params)
-    new_dec_vars = with_params(dec_vars, dec_params)
-    print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
-    return new_enc_vars, new_dec_vars, meta
 
 # ---------------------------
 # Single efficient training step (always used)

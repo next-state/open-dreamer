@@ -61,6 +61,7 @@ from dreamer.utils import (
     try_restore,
     maybe_save,
     pack_mae_params,
+    _ensure_dir, _to_uint8,
 )
 from dreamer.imagination import (
     ImaginationConfig,
@@ -82,17 +83,6 @@ from dreamer.logging import MetricLogger
 # ---------------------------
 # Small helpers
 # ---------------------------
-
-
-def _ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def _to_uint8(img_f32: np.ndarray) -> np.ndarray:
-    """Convert float32 images in [0,1] to uint8 [0,255]."""
-    return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
-
 
 def _tile_frames_grid(
     frames_b_hwc: np.ndarray,

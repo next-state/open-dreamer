@@ -25,6 +25,7 @@ from dreamer.utils import (
     temporal_patchify, pack_bottleneck_to_spatial,
     normalize_with_dataset_stats,
     with_params, make_state, make_manager, pack_mae_params,
+    _ensure_dir, _to_uint8, _stack_wide, _tile_videos,
 )
 
 from dreamer.sampler import SamplerConfig, sample_video
@@ -33,33 +34,6 @@ from dreamer.sampler import SamplerConfig, sample_video
 # ---------------------------
 # Utilities (reward bins, gatherers, plotting)
 # ---------------------------
-
-def _ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-def _to_uint8(img_f32):
-    return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
-
-def _stack_wide(*imgs_hwC):
-    return np.concatenate(imgs_hwC, axis=1)
-
-def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: int = 0) -> np.ndarray:
-    H, W3, C = trip_list_hwC[0].shape
-    B = len(trip_list_hwC)
-    nrows = math.ceil(B / ncols)
-    total = nrows * ncols
-    if total > B:
-        blank = np.full((H, W3, C), pad_color, dtype=trip_list_hwC[0].dtype)
-        trip_list_hwC = trip_list_hwC + [blank] * (total - B)
-    rows = []
-    idx = 0
-    for _ in range(nrows):
-        row_imgs = trip_list_hwC[idx:idx + ncols]
-        idx += ncols
-        rows.append(np.concatenate(row_imgs, axis=1))
-    grid = np.concatenate(rows, axis=0)
-    return grid
 
 def _symlog(x):
     return jnp.sign(x) * jnp.log1p(jnp.abs(x))
