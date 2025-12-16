@@ -1,0 +1,27 @@
+task_embedder:
+  d_model: 128  # Should match dynamics.d_model from pretrained checkpoint
+  n_agent: 1   # Should match dynamics.n_agent from pretrained checkpoint
+  use_ids: ${experiment.use_task_ids}
+  n_tasks: ${experiment.n_tasks}
+  d_task: 64
+
+policy_head:
+  d_model: 128  # Should match dynamics.d_model from pretrained checkpoint
+  action_dim: ${experiment.action_dim}
+  L: ${experiment.L}
+  kind: categorical
+  mlp_ratio: 2.0
+  dropout_rate: 0.0
+  swiglu: true
+  parity_2over3: false
+
+reward_head:
+  d_model: 128  # Should match dynamics.d_model from pretrained checkpoint
+  L: ${experiment.L}
+  num_bins: ${experiment.num_reward_bins}
+  mlp_ratio: 2.0
+  dropout_rate: 0.0
+  swiglu: true
+  parity_2over3: false
+  log_low: ${experiment.reward_log_low}
+  log_high: ${experiment.reward_log_high}

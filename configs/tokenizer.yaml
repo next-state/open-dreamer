@@ -4,3 +4,5 @@ defaults:
   - model: tokenizer
   - experiment: tokenizer
   - _self_
+
+run_name: tokenizer

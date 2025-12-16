@@ -31,6 +31,8 @@ from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
     normalize_with_dataset_stats,
+)
+from dreamer.checkpoint import (
     with_params,
     setup_experiment_checkpointing,
     maybe_save_snapshot,

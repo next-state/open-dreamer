@@ -1,9 +1,8 @@
 # eval_bc_rew_heads.py
 # Evaluate dynamics + policy/reward heads in teacher-forced and autoregressive modes.
 from __future__ import annotations
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Any, Tuple
 import math
 import csv
 import hydra
@@ -15,75 +14,21 @@ import jax.numpy as jnp
 import numpy as np
 import imageio.v2 as imageio
 import matplotlib.pyplot as plt
-import orbax.checkpoint as ocp
 
 # Project imports
-from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
-from dreamer.data import make_iterator, DatasetConfig
+from dreamer.data import make_iterator
 from dreamer.utils import (
     temporal_patchify, pack_bottleneck_to_spatial,
     normalize_with_dataset_stats,
-    with_params, make_state, make_manager, pack_mae_params,
 )
 
 from dreamer.sampler import SamplerConfig, sample_video
-
-
-# ---------------------------
-# Config
-# ---------------------------
-
-@dataclass(frozen=True)
-class EvalConfig:
-    # Paths
-    run_ckpt_dir: str                         # training run checkpoints dir to restore params from
-    tokenizer_ckpt: str                       # tokenizer ckpt (for enc/dec)
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    action_dim: int = 4
-
-    # Tokenizer / dynamics
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    use_rope: bool = True
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4
-    n_agent: int = 1
-    agent_space_mode: str = "wm_agent"
-    k_max: int = 8
-
-    # Heads
-    L: int = 2
-    num_reward_bins: int = 101
-    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
-    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
-    n_tasks: int = 128
-    use_task_ids: bool = True
-
-    # Sampler/eval
-    ctx_length: int = 32
-    horizon: int = 16
-    schedule: str = "finest"  # "finest" or "shortcut"
-    d: float | None = None    # e.g., 0.25 for shortcut
-    ctx_signal_tau: float = 1.0
-    match_ctx_tau: bool = False
-
-    # Visualization
-    max_examples_to_plot: int = 4  # number of sequences to render as strips
-
-    # Safety: ensure heads never see future actions when predicting next actions
-    paranoid_no_leak: bool = True
+from dreamer.configs import EvalBCRewConfig
+from dreamer.checkpoint import (
+    make_manager,
+    load_pretrained_tokenizer,
+    load_pretrained_bc_rew,
+)
 
 # ---------------------------
 # Utilities (reward bins, gatherers, plotting)
@@ -265,136 +210,28 @@ def _save_strip(fig_path: Path, frames_b_t_hwc: np.ndarray, ctx_len: int, hor: i
     plt.close(fig)
 
 # ---------------------------
-# Restorers
-# ---------------------------
-
-def load_pretrained_tokenizer(
-    tokenizer_ckpt_dir: str,
-    *,
-    rng: jnp.ndarray,
-    encoder: Encoder,
-    decoder: Decoder,
-    enc_vars,
-    dec_vars,
-    sample_patches_btnd,
-):
-    meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
-    latest = meta_mngr.latest_step()
-    if latest is None:
-        raise FileNotFoundError(f"No tokenizer checkpoint found in {tokenizer_ckpt_dir}")
-    restored_meta = meta_mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
-    meta = restored_meta.meta
-    enc_kwargs = meta["enc_kwargs"]
-    n_lat, d_b = enc_kwargs["n_latents"], enc_kwargs["d_bottleneck"]
-
-    rng_e1, rng_d1 = jax.random.split(rng)
-    B, T = sample_patches_btnd.shape[:2]
-    fake_z = jnp.zeros((B, T, n_lat, d_b), dtype=jnp.float32)
-    dec_vars = decoder.init({"params": rng_d1, "dropout": rng_d1}, fake_z, deterministic=True)
-
-    packed_example = pack_mae_params(enc_vars, dec_vars)
-    tx_dummy = optax = __import__("optax").adamw(1e-4)
-    opt_state_example = optax.init(packed_example)
-    state_example = make_state(packed_example, opt_state_example, rng_e1, step=0)
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)
-
-    tok_mngr = make_manager(tokenizer_ckpt_dir, item_names=("state", "meta"))
-    restored = tok_mngr.restore(
-        latest,
-        args=ocp.args.Composite(
-            state=ocp.args.StandardRestore(abstract_state),
-            meta=ocp.args.JsonRestore(),
-        ),
-    )
-    packed_params = restored.state["params"]
-    enc_params = packed_params["enc"]
-    dec_params = packed_params["dec"]
-    new_enc_vars = with_params(enc_vars, enc_params)
-    new_dec_vars = with_params(dec_vars, dec_params)
-    print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
-    return new_enc_vars, new_dec_vars, meta
-
-def restore_run_params(run_ckpt_dir: str, params_example: dict, opt_state_example, rng):
-    mngr = make_manager(run_ckpt_dir, item_names=("state","meta"))
-    abstract_state = make_state(params_example, opt_state_example, rng, step=0)
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, abstract_state)
-    restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(abstract_state),
-        meta=ocp.args.JsonRestore(),
-    )
-    latest = mngr.latest_step()
-    if latest is None:
-        raise FileNotFoundError(f"No training checkpoint found in {run_ckpt_dir}")
-    restored = mngr.restore(latest, args=restore_args)
-    print(f"[restore] Loaded training checkpoint {latest} from {run_ckpt_dir}")
-    return latest, restored
-
-# ---------------------------
 # Model init (mirror of training shapes)
 # ---------------------------
 
-def init_models_and_restore(cfg: EvalConfig):
-    patch = cfg.patch
-    num_patches = (cfg.dataset.H // patch) * (cfg.dataset.W // patch)
-    D_patch = patch * patch * cfg.dataset.C
-    k_max = cfg.k_max
-
-    enc_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_latents=cfg.enc_n_latents,
-        n_patches=num_patches,
-        n_heads=cfg.n_heads,
-        n_kv_heads=cfg.n_kv_heads,
-        depth=cfg.enc_depth,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        d_bottleneck=cfg.enc_d_bottleneck,
-        mae_p_min=0.0, mae_p_max=0.0,
-        time_every=4, latents_only_time=True,
-    )
-    dec_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_heads=cfg.n_heads,
-        n_kv_heads=cfg.n_kv_heads,
-        depth=cfg.dec_depth,
-        n_latents=cfg.enc_n_latents,
-        n_patches=num_patches,
-        d_patch=D_patch,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        mlp_ratio=4.0, time_every=4, latents_only_time=True,
-    )
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
-    dyn_kwargs = dict(
-        d_model=cfg.d_model_dyn,
-        d_bottleneck=cfg.enc_d_bottleneck,
-        d_spatial=cfg.enc_d_bottleneck * cfg.packing_factor,
-        n_spatial=n_spatial, n_register=cfg.n_register,
-        n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.dyn_depth,
-        space_mode=cfg.agent_space_mode, n_agent=cfg.n_agent,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        k_max=k_max,
-        time_every=4,
+def init_models_and_restore(cfg: EvalBCRewConfig):
+    # Load pretrained tokenizer
+    encoder, decoder, enc_vars, dec_vars, tokenizer_cfg = load_pretrained_tokenizer(
+        cfg.experiment.tokenizer_ckpt_path
     )
 
-    encoder = Encoder(**enc_kwargs)
-    decoder = Decoder(**dec_kwargs)
-    dynamics = Dynamics(**dyn_kwargs)
-    task_embedder = TaskEmbedder(d_model=cfg.d_model_dyn, n_agent=cfg.n_agent,
-                                 use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks)
-    policy_head  = PolicyHeadMTP(d_model=cfg.d_model_dyn, action_dim=cfg.action_dim, L=cfg.L)
-    reward_head  = RewardHeadMTP(d_model=cfg.d_model_dyn, L=cfg.L, num_bins=cfg.num_reward_bins,
-                                 log_low=cfg.reward_log_low, log_high=cfg.reward_log_high)
+    # Load pretrained bc_rew models
+    (
+        dynamics, task_embedder, policy_head, reward_head,
+        dyn_vars, task_vars, pi_vars, rew_vars, bc_rew_cfg
+    ) = load_pretrained_bc_rew(cfg.experiment.bc_rew_ckpt_path)
 
-    # shape init
-    rng = jax.random.PRNGKey(0)
+    patch = tokenizer_cfg.patch_size
+    n_spatial = bc_rew_cfg.dynamics.n_spatial
+    k_max = bc_rew_cfg.dynamics.k_max
+    packing_factor = bc_rew_cfg.dynamics.packing_factor
+    d_model_dyn = bc_rew_cfg.dynamics.d_model
+
+    # Data iterator
     next_batch = make_iterator(
         cfg.dataset.B, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C,
         pixels_per_step=cfg.dataset.pixels_per_step,
@@ -405,91 +242,53 @@ def init_models_and_restore(cfg: EvalConfig):
         bg_min_color=0 if cfg.dataset.diversify_data else 255,
         bg_max_color=255 if cfg.dataset.diversify_data else 255,
     )
-    _, (frames_init, actions_init, _) = next_batch(rng)
 
-    patches_btnd = temporal_patchify(frames_init, cfg.patch)
-    enc_vars = encoder.init({"params": rng, "mae": rng, "dropout": rng}, patches_btnd, deterministic=True)
-    fake_z = jnp.zeros((cfg.dataset.B, cfg.dataset.T, cfg.enc_n_latents, cfg.enc_d_bottleneck))
-    dec_vars = decoder.init({"params": rng, "dropout": rng}, fake_z, deterministic=True)
-
-    # restore tokenizer
-    enc_vars, dec_vars, _ = load_pretrained_tokenizer(
-        cfg.tokenizer_ckpt, rng=rng, encoder=encoder, decoder=decoder,
-        enc_vars=enc_vars, dec_vars=dec_vars, sample_patches_btnd=patches_btnd,
-    )
-
-    # init dynamics vars from shapes
     mae_eval_key = jax.random.PRNGKey(777)
-    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
-    z_btLd, _ = encoder.apply(enc_vars, patches_norm, rngs={"mae": mae_eval_key}, deterministic=True)
-    z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
-    emax = jnp.log2(cfg.k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), cfg.k_max - 1, dtype=jnp.int32)
-    dyn_vars = dynamics.init({"params": rng, "dropout": rng}, actions_init, step_idx, sigma_idx, z1)
-
-    # init heads/task
-    rng_task, rng_pi, rng_rw = jax.random.split(jax.random.PRNGKey(1), 3)
-    dummy_task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
-    task_vars = task_embedder.init({"params": rng_task}, dummy_task_ids, cfg.dataset.B, cfg.dataset.T)
-    fake_h = jnp.zeros((cfg.dataset.B, cfg.dataset.T, cfg.d_model_dyn), dtype=jnp.float32)
-    pi_vars  = policy_head.init({"params": rng_pi, "dropout": rng_pi}, fake_h, deterministic=True)
-    rew_vars = reward_head.init({"params": rng_rw, "dropout": rng_rw}, fake_h, deterministic=True)
-
-    # restore training checkpoint (params for dyn/task/pi/rew)
-    params_example = {
-        "dyn": dyn_vars["params"],
-        "task": task_vars["params"],
-        "pi": pi_vars["params"],
-        "rew": rew_vars["params"],
-    }
-    # dummy opt state just to satisfy shape
-    import optax
-    tx = optax.adam(1e-4)
-    opt_state_example = tx.init(params_example)
-    latest, restored = restore_run_params(cfg.run_ckpt_dir, params_example, opt_state_example, rng)
-    params = restored.state["params"]
-
-    # bind into vars used for .apply
-    dyn_vars  = with_params(dyn_vars,  params["dyn"])
-    task_vars = with_params(task_vars, params["task"])
-    pi_vars   = with_params(pi_vars,   params["pi"])
-    rew_vars  = with_params(rew_vars,  params["rew"])
+    
+    # Get latest step from bc_rew checkpoint
+    bc_rew_ckpt_abs = Path(cfg.experiment.bc_rew_ckpt_path).expanduser().resolve() / "checkpoints"
+    bc_mngr = make_manager(bc_rew_ckpt_abs, item_names=("state",))
+    latest_step = bc_mngr.latest_step()
+    if latest_step is None:
+        latest_step = 0
 
     return dict(
         encoder=encoder, decoder=decoder, dynamics=dynamics,
         task_embedder=task_embedder, policy_head=policy_head, reward_head=reward_head,
         enc_vars=enc_vars, dec_vars=dec_vars, dyn_vars=dyn_vars,
         task_vars=task_vars, pi_vars=pi_vars, rew_vars=rew_vars,
-        mae_eval_key=mae_eval_key, latest_step=int(restored.state["step"]),
-        next_batch=next_batch, n_spatial=n_spatial
+        mae_eval_key=mae_eval_key, latest_step=latest_step,
+        next_batch=next_batch, n_spatial=n_spatial, patch=patch, k_max=k_max, packing_factor=packing_factor, d_model_dyn=d_model_dyn
     )
 
 # ---------------------------
 # Teacher-Forced head eval
 # ---------------------------
 
-def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
+def eval_teacher_forced(cfg: EvalBCRewConfig, env, out_dir: Path):
     enc, dec, dyn = env["encoder"], env["decoder"], env["dynamics"]
     task, pi_head, rw_head = env["task_embedder"], env["policy_head"], env["reward_head"]
     enc_vars, dec_vars, dyn_vars = env["enc_vars"], env["dec_vars"], env["dyn_vars"]
     task_vars, pi_vars, rew_vars = env["task_vars"], env["pi_vars"], env["rew_vars"]
     n_spatial = env["n_spatial"]
+    patch = env.get("patch")
+    packing_factor = env.get("packing_factor")
 
     # batch
     rng = jax.random.PRNGKey(123)
     _, (frames, actions, rewards) = env["next_batch"](rng)
 
     # encode to clean latents
-    patches = temporal_patchify(frames, cfg.patch)
+    patches = temporal_patchify(frames, patch)
     patches_norm = normalize_with_dataset_stats(patches, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
     z_btLd, _ = enc.apply(enc_vars, patches_norm, rngs={"mae": env["mae_eval_key"]}, deterministic=True)
-    z_all = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
+    z_all = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=packing_factor)
 
     # run dynamics once per timestep with "pure/clean" inputs: sigma=1 → z_tilde=z1, sigma_idx=k_max-1
-    emax = jnp.log2(cfg.k_max).astype(jnp.int32)
+    k_max = env.get("k_max")
+    emax = jnp.log2(k_max).astype(jnp.int32)
     step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), cfg.k_max - 1, dtype=jnp.int32)
+    sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), k_max - 1, dtype=jnp.int32)
     z_tilde = z_all  # tau=1 ⇒ z_tilde=z1
 
     # agent tokens
@@ -500,10 +299,10 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
         dyn_vars, actions, step_idx, sigma_idx, z_tilde,
         agent_tokens=agents, deterministic=True
     )
-        # run dynamics once per timestep with "pure/clean" inputs: sigma=1 → z_tilde=z1, sigma_idx=k_max-1
-    emax = jnp.log2(cfg.k_max).astype(jnp.int32)
+    # run dynamics once per timestep with "pure/clean" inputs: sigma=1 → z_tilde=z1, sigma_idx=k_max-1
+    emax = jnp.log2(k_max).astype(jnp.int32)
     step_idx_full = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
-    sigma_idx_full = jnp.full((cfg.dataset.B, cfg.dataset.T), cfg.k_max - 1, dtype=jnp.int32)
+    sigma_idx_full = jnp.full((cfg.dataset.B, cfg.dataset.T), k_max - 1, dtype=jnp.int32)
     z_tilde_full = z_all  # tau=1 ⇒ z_tilde=z1
 
     # agent tokens
@@ -515,10 +314,11 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
         dyn_vars, actions, step_idx_full, sigma_idx_full, z_tilde_full,
         agent_tokens=agents_full, deterministic=True
     )
-    h_pooled_bulk = jnp.mean(h_bulk, axis=2) if h_bulk is not None else jnp.zeros((cfg.dataset.B, cfg.dataset.T, cfg.d_model_dyn), z_all.dtype)
+    d_model_dyn = env.get("d_model_dyn")
+    h_pooled_bulk = jnp.mean(h_bulk, axis=2) if h_bulk is not None else jnp.zeros((cfg.dataset.B, cfg.dataset.T, d_model_dyn), z_all.dtype)
 
     # ---- Paranoid no-leak pass: compute h_t with prefix [0..t] only ----
-    if cfg.paranoid_no_leak:
+    if cfg.experiment.paranoid_no_leak:
         h_collect = []
         for t in range(cfg.dataset.T):
             Tt = t + 1
@@ -543,7 +343,8 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
     # ---------------- Heads on h_for_heads ----------------
     # Policy head
     pi_logits = pi_head.apply(pi_vars, h_for_heads, deterministic=True)  # (B,T,L,A)
-    labels_btL, valid_btL = _gather_future_actions(actions, cfg.L)
+    L = cfg.experiment.L
+    labels_btL, valid_btL = _gather_future_actions(actions, L)
     logp = jax.nn.log_softmax(pi_logits, axis=-1)
     A = logp.shape[-1]
     safe_labels = jnp.where(valid_btL, labels_btL, 0)
@@ -556,7 +357,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
 
     # Reward head
     rw_logits, centers_log = rw_head.apply(rew_vars, h_for_heads, deterministic=True)  # (B,T,L,K), (K,)
-    rew_btL, valid_rew_btL = _gather_future_rewards(rewards, cfg.L)
+    rew_btL, valid_rew_btL = _gather_future_rewards(rewards, L)
     twohot = _twohot_symlog_targets(rew_btL, centers_log)
     logq = jax.nn.log_softmax(rw_logits, axis=-1)
     ce_rew = -jnp.sum(twohot * logq, axis=-1)                           # (B,T,L)
@@ -568,7 +369,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
     exp_reward = _symexp(exp_symlog)  # decoded to real space
 
     # Optional: compare with bulk (leak-prone) numbers to flag issues
-    if cfg.paranoid_no_leak:
+    if cfg.experiment.paranoid_no_leak:
         pi_logits_bulk = pi_head.apply(pi_vars, h_pooled_bulk, deterministic=True)
         logp_bulk = jax.nn.log_softmax(pi_logits_bulk, axis=-1)
         nll_bulk = -jnp.sum(tgt * logp_bulk, axis=-1)
@@ -584,14 +385,14 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
 
     # roll visuals with your sampler in TF mode (for the same batch)
     sampler_conf = SamplerConfig(
-        k_max=cfg.k_max, schedule=("finest" if cfg.schedule=="finest" else "shortcut"),
-        d=(cfg.d if cfg.schedule=="shortcut" else None),
+        k_max=k_max, schedule=("finest" if cfg.experiment.schedule=="finest" else "shortcut"),
+        d=(cfg.experiment.d if cfg.experiment.schedule=="shortcut" else None),
         start_mode="pure", rollout="teacher_forced",
-        horizon=cfg.horizon, ctx_length=cfg.ctx_length,
-        ctx_signal_tau=cfg.ctx_signal_tau, match_ctx_tau=cfg.match_ctx_tau,
+        horizon=cfg.experiment.horizon, ctx_length=cfg.experiment.ctx_length,
+        ctx_signal_tau=cfg.experiment.ctx_signal_tau, match_ctx_tau=cfg.experiment.match_ctx_tau,
         rng_key=jax.random.PRNGKey(4242), mae_eval_key=env["mae_eval_key"],
-        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
-        n_spatial=n_spatial, packing_factor=cfg.packing_factor,
+        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=patch,
+        n_spatial=n_spatial, packing_factor=packing_factor,
         dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
     )
     pred_frames, floor_frames, gt_frames = sample_video(
@@ -601,7 +402,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
     )
 
     # Save a grid video (GT|Floor|Pred)
-    Ttot = cfg.ctx_length + cfg.horizon
+    Ttot = cfg.experiment.ctx_length + cfg.experiment.horizon
     grid_frames = []
     for t in range(Ttot):
         trip_list = [_stack_wide(_to_uint8(gt_frames[b, t]),
@@ -618,26 +419,28 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
     # Save a few example strips
     # For strip plots, project L-step predictions to per-frame at offset=0 (current timestep)
     o1 = 0  # use offset 0 to predict current reward r[t]
-    o1 = min(o1, cfg.L - 1)
+    o1 = min(o1, L - 1)
 
     # Full-length (B, T)
     pred_actions_t = pred_top1[:, :, o1]
     pred_rewards_t = exp_reward[:, :, o1]
     # Window to the eval horizon [ctx : ctx+h)
-    pred_actions_h = pred_actions_t[:, cfg.ctx_length : cfg.ctx_length + cfg.horizon]  # (B, h)
-    pred_rewards_h = pred_rewards_t[:, cfg.ctx_length : cfg.ctx_length + cfg.horizon]  # (B, h)
+    ctx_length = cfg.experiment.ctx_length
+    horizon = cfg.experiment.horizon
+    pred_actions_h = pred_actions_t[:, ctx_length : ctx_length + horizon]  # (B, h)
+    pred_rewards_h = pred_rewards_t[:, ctx_length : ctx_length + horizon]  # (B, h)
 
 
     # --- Align GT to CURRENT timestep for fair comparison/visuals ---
     # predictions at each column i correspond to a_{ctx+i}, r_{ctx+i} (current timestep)
-    gt_actions_h = actions[:, cfg.ctx_length : cfg.ctx_length + cfg.horizon]  # (B, horizon)
-    gt_rewards_h = rewards[:, cfg.ctx_length : cfg.ctx_length + cfg.horizon]  # (B, horizon)
+    gt_actions_h = actions[:, ctx_length : ctx_length + horizon]  # (B, horizon)
+    gt_rewards_h = rewards[:, ctx_length : ctx_length + horizon]  # (B, horizon)
 
     # Strips: use horizon-length GT aligned to current timestep
-    for ei in range(min(cfg.max_examples_to_plot, cfg.dataset.B)):
+    for ei in range(min(cfg.experiment.max_examples_to_plot, cfg.dataset.B)):
         fig_path = out_dir / f"tf_strip_b{ei}.png"
         _save_strip(
-            fig_path, np.asarray(gt_frames), cfg.ctx_length, cfg.horizon,
+            fig_path, np.asarray(gt_frames), ctx_length, horizon,
             gt_actions_bt=np.asarray(gt_actions_h),   # (B, horizon)
             pred_actions_bt=np.asarray(pred_actions_h),    # (B, horizon)
             gt_rewards_bt=np.asarray(gt_rewards_h),   # (B, horizon)
@@ -648,7 +451,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
         print(f"[eval:TF] wrote {fig_path}")
 
     # Reward line plots (GT vs Pred) over the horizon, aligned to current timestep
-    for ei in range(min(cfg.max_examples_to_plot, cfg.dataset.B)):
+    for ei in range(min(cfg.experiment.max_examples_to_plot, cfg.dataset.B)):
         gt_line = np.asarray(gt_rewards_h[ei])
         pred_line = np.asarray(pred_rewards_h[ei])
         plot_path = out_dir / f"tf_reward_line_b{ei}.png"
@@ -668,26 +471,31 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
 # Autoregressive head eval (log predicted rewards; compare actions)
 # ---------------------------
 
-def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
+def eval_autoregressive(cfg: EvalBCRewConfig, env, out_dir: Path):
     enc, dec, dyn = env["encoder"], env["decoder"], env["dynamics"]
     task, pi_head, rw_head = env["task_embedder"], env["policy_head"], env["reward_head"]
     enc_vars, dec_vars, dyn_vars = env["enc_vars"], env["dec_vars"], env["dyn_vars"]
     task_vars, pi_vars, rew_vars = env["task_vars"], env["pi_vars"], env["rew_vars"]
     n_spatial = env["n_spatial"]
+    patch = env.get("patch")
+    k_max = env.get("k_max")
+    packing_factor = env.get("packing_factor")
+    ctx_length = cfg.experiment.ctx_length
+    horizon = cfg.experiment.horizon
 
     rng = jax.random.PRNGKey(999)
     _, (frames, actions, rewards) = env["next_batch"](rng)
 
     # Rollout frames autoregressively (using GT actions)
     sampler_conf = SamplerConfig(
-        k_max=cfg.k_max, schedule=("finest" if cfg.schedule=="finest" else "shortcut"),
-        d=(cfg.d if cfg.schedule=="shortcut" else None),
+        k_max=k_max, schedule=("finest" if cfg.experiment.schedule=="finest" else "shortcut"),
+        d=(cfg.experiment.d if cfg.experiment.schedule=="shortcut" else None),
         start_mode="pure", rollout="autoregressive",
-        horizon=cfg.horizon, ctx_length=cfg.ctx_length,
-        ctx_signal_tau=cfg.ctx_signal_tau, match_ctx_tau=cfg.match_ctx_tau,
+        horizon=cfg.experiment.horizon, ctx_length=cfg.experiment.ctx_length,
+        ctx_signal_tau=cfg.experiment.ctx_signal_tau, match_ctx_tau=cfg.experiment.match_ctx_tau,
         rng_key=jax.random.PRNGKey(101010), mae_eval_key=env["mae_eval_key"],
-        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
-        n_spatial=n_spatial, packing_factor=cfg.packing_factor,
+        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=patch,
+        n_spatial=n_spatial, packing_factor=packing_factor,
         dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
     )
     pred_frames, floor_frames, gt_frames = sample_video(
@@ -698,56 +506,56 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
 
     # We want heads' predictions per generated step. We'll compute h on the final τ for each future step.
     # Re-encode context, and for each step t, run a single-step clean call with z_clean_pred (from sampler)
-    patches = temporal_patchify(frames, cfg.patch)
+    patches = temporal_patchify(frames, patch)
     patches_norm = normalize_with_dataset_stats(patches, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
     z_btLd, _ = enc.apply(enc_vars, patches_norm, rngs={"mae": env["mae_eval_key"]}, deterministic=True)
-    z_all = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
-    z_ctx_clean = z_all[:, :cfg.ctx_length, :, :]
+    z_all = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=packing_factor)
+    z_ctx_clean = z_all[:, :ctx_length, :, :]
 
     # Extract the predicted latents we used to decode (ctx + preds already in pred_frames, but we recompute h)
     # For head eval, we only need h at each predicted step.
-    emax = jnp.log2(cfg.k_max).astype(jnp.int32)
-    if cfg.schedule == "finest":
-        d_used = 1.0 / float(cfg.k_max)
+    emax = jnp.log2(k_max).astype(jnp.int32)
+    if cfg.experiment.schedule == "finest":
+        d_used = 1.0 / float(k_max)
         e = int(round(np.log2(1.0 / d_used)))
     else:
-        assert cfg.d is not None, "shortcut schedule requires d"
-        d_used = float(cfg.d)
+        assert cfg.experiment.d is not None, "shortcut schedule requires d"
+        d_used = float(cfg.experiment.d)
         e = int(round(np.log2(1.0 / d_used)))
 
     # Build actions windows and compute h per future step
     B = cfg.dataset.B
-    Lh = cfg.horizon
+    Lh = horizon
     pred_act_top1 = []
     pred_rew_real = []
 
     # For h inference, we approximate σ as the final τ for that step; use z_tilde=z_clean_pred (pure/clean).
     # So sigma_idx = k_max - 1; step_idx = e (consistent with training "finest"/shortcut bin).
-    step_idx_ = jnp.full((B, cfg.ctx_length + 1), e, dtype=jnp.int32)
-    sigma_idx_ = jnp.full((B, cfg.ctx_length + 1), cfg.k_max - 1, dtype=jnp.int32)
+    step_idx_ = jnp.full((B, ctx_length + 1), e, dtype=jnp.int32)
+    sigma_idx_ = jnp.full((B, ctx_length + 1), k_max - 1, dtype=jnp.int32)
 
     # Build agent tokens once for max length, slice per step
     dummy_task_ids = jnp.zeros((B,), dtype=jnp.int32)
-    agents_full = task.apply(task_vars, dummy_task_ids, B, cfg.ctx_length + 1)
+    agents_full = task.apply(task_vars, dummy_task_ids, B, ctx_length + 1)
 
     # We'll also need the predicted latent at each step; we can re-encode pred_frames to get z for viz-aligned heads.
     # (This is slightly heavier but simple and faithful to what was decoded.)
-    pred_patches = temporal_patchify(pred_frames, cfg.patch)
+    pred_patches = temporal_patchify(pred_frames, patch)
     pred_patches_norm = normalize_with_dataset_stats(pred_patches, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
     pred_btLd, _ = enc.apply(enc_vars, pred_patches_norm, rngs={"mae": env["mae_eval_key"]}, deterministic=True)
-    pred_latents_full = pack_bottleneck_to_spatial(pred_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
-    pred_future_latents = pred_latents_full[:, cfg.ctx_length:, :, :]  # (B, horizon, S, D)
+    pred_latents_full = pack_bottleneck_to_spatial(pred_btLd, n_spatial=n_spatial, k=packing_factor)
+    pred_future_latents = pred_latents_full[:, ctx_length:, :, :]  # (B, horizon, S, D)
 
     for t in range(Lh):
-        action_curr = actions[:, cfg.ctx_length + t: cfg.ctx_length + t + 1]  # (B,1)
+        action_curr = actions[:, ctx_length + t: ctx_length + t + 1]  # (B,1)
         z_clean_pred = pred_future_latents[:, t:t+1, :, :]                    # (B,1,S,D)
 
-        z_seq = jnp.concatenate([z_ctx_clean, z_clean_pred], axis=1)                  # (B, ctx+1, S, D)
-        actions_seq = jnp.concatenate([actions[:, :cfg.ctx_length], action_curr], 1)  # (B, ctx+1)
+        z_seq = jnp.concatenate([z_ctx_clean, z_clean_pred], axis=1)              # (B, ctx+1, S, D)
+        actions_seq = jnp.concatenate([actions[:, :ctx_length], action_curr], 1)  # (B, ctx+1)
 
         z1_hat_seq, h_seq = dyn.apply(
             dyn_vars, actions_seq, step_idx_, sigma_idx_, z_seq,
-            agent_tokens=agents_full[:, :cfg.ctx_length+1], deterministic=True
+            agent_tokens=agents_full[:, :ctx_length+1], deterministic=True
         )
         h_pooled = jnp.mean(h_seq, axis=2)[:, -1]  # (B, D)
 
@@ -764,14 +572,14 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
         pred_rew_real.append(exp_reward)
 
         # advance context for next step (AR)
-        z_ctx_clean = jnp.concatenate([z_ctx_clean, z_clean_pred], axis=1)[:, -cfg.ctx_length:, :, :]
+        z_ctx_clean = jnp.concatenate([z_ctx_clean, z_clean_pred], axis=1)[:, -ctx_length:, :, :]
 
     pred_act_top1 = jnp.stack(pred_act_top1, axis=1)        # (B, horizon)
     pred_rew_real = jnp.stack(pred_rew_real, axis=1)        # (B, horizon)
 
     # Save grid video
     grid_frames = []
-    Ttot = cfg.ctx_length + cfg.horizon
+    Ttot = ctx_length + horizon
     for t in range(Ttot):
         trip_list = [_stack_wide(_to_uint8(gt_frames[b, t]),
                                  _to_uint8(floor_frames[b, t]),
@@ -785,19 +593,19 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
     print(f"[eval:AR] wrote {out_mp4}")
 
     # Strip plots (predicted rewards + actions vs GT actions)
-    Ttot = cfg.ctx_length + cfg.horizon   
+    Ttot = ctx_length + horizon   
     # Accuracy against NEXT actions: a_{t+1}
-    gt_next_actions_p1 = actions[:, cfg.ctx_length+1 : cfg.ctx_length + cfg.horizon + 1]  # (B, horizon)
+    gt_next_actions_p1 = actions[:, ctx_length+1 : ctx_length + horizon + 1]  # (B, horizon)
     # Our per-step preds (B, horizon) correspond to next; the very last pred has no GT next-next label
     pred_for_acc = pred_act_top1[:, :-1]                 # (B, horizon-1)
     gt_for_acc   = gt_next_actions_p1[:, :-1]            # (B, horizon-1)
     acc = jnp.mean((pred_for_acc == gt_for_acc).astype(jnp.float32))
 
     # Save strips using +1-shifted GT (so column i shows GT/Pred for a_{ctx+i+1})
-    for ei in range(min(cfg.max_examples_to_plot, cfg.dataset.B)):
+    for ei in range(min(cfg.experiment.max_examples_to_plot, cfg.dataset.B)):
         fig_path = out_dir / f"ar_strip_b{ei}.png"
         _save_strip(
-            fig_path, np.asarray(gt_frames), cfg.ctx_length, cfg.horizon,
+            fig_path, np.asarray(gt_frames), ctx_length, horizon,
             gt_actions_bt=np.asarray(gt_next_actions_p1),  # (B, horizon) ← shifted
             pred_actions_bt=np.asarray(pred_act_top1),     # (B, horizon)
             gt_rewards_bt=None,                            # keep None per your preference
@@ -809,8 +617,8 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
 
     # Reward line plots (we DO have GT; show it for clarity)
     # pred_rew_real[t] predicts r[ctx_length + t] (current reward at timestep ctx_length + t)
-    gt_line_all = np.asarray(rewards[:, cfg.ctx_length : cfg.ctx_length + cfg.horizon])
-    for ei in range(min(cfg.max_examples_to_plot, cfg.B)):
+    gt_line_all = np.asarray(rewards[:, ctx_length : ctx_length + horizon])
+    for ei in range(min(cfg.experiment.max_examples_to_plot, cfg.dataset.B)):
         gt_line = gt_line_all[ei]
         pred_line = np.asarray(pred_rew_real[ei])
         plot_path = out_dir / f"ar_reward_line_b{ei}.png"
@@ -822,7 +630,7 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
         w = csv.writer(f)
         w.writerow(["act_acc_top1_horizon_minus1"])
         w.writerow([float(acc)])
-    print(f"[eval:AR] act_acc_top1 over horizon-1={cfg.horizon-1}: {float(acc):.4f}")
+    print(f"[eval:AR] act_acc_top1 over horizon-1={horizon-1}: {float(acc):.4f}")
     return dict(act_acc_top1=float(acc))
 
 # ---------------------------
@@ -831,7 +639,7 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
 
 @hydra.main(version_base=None, config_path="../configs", config_name="eval_bc_rew")
 def main(cfg: DictConfig):
-    schema = OmegaConf.structured(EvalConfig)
+    schema = OmegaConf.structured(EvalBCRewConfig)
     cfg = OmegaConf.merge(schema, cfg)
     eval_cfg = OmegaConf.to_object(cfg)
 

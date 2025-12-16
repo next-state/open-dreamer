@@ -1,0 +1,25 @@
+# Eval experiment config (no base_experiment since this is evaluation only)
+
+bc_rew_ckpt_path: logs/bc_rew
+tokenizer_ckpt_path: logs/tokenizer
+
+# Head settings
+action_dim: 4
+L: 2
+num_reward_bins: 101
+reward_log_low: -3.0
+reward_log_high: 3.0
+n_tasks: 128
+use_task_ids: true
+
+# Sampler/eval
+ctx_length: 32
+horizon: 16
+schedule: shortcut  # "finest" or "shortcut"
+d: 0.25
+ctx_signal_tau: 1.0
+match_ctx_tau: false
+
+# Visualization
+max_examples_to_plot: 4
+paranoid_no_leak: false

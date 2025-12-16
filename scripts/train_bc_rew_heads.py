@@ -2,7 +2,7 @@
 # given the pretrained world model, train the agent tokens with bc and rew prediction.
 # while still applying the diffusion / shortcut loss.
 from __future__ import annotations
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, Any
 from functools import partial
@@ -20,92 +20,31 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import imageio.v2 as imageio
-import orbax.checkpoint as ocp
 import wandb
+from flax.training.train_state import TrainState
 
 # UPDATED: bring in heads + task embedder
 from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
-from dreamer.data import make_iterator, DatasetConfig
+from dreamer.data import make_iterator
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
     normalize_with_dataset_stats,
     with_params,
-    make_state, make_manager, try_restore, maybe_save,
-    pack_mae_params,
 )
 from dreamer.logging import MetricLogger
+from dreamer.configs import BCRewTrainConfig
+from dreamer.checkpoint import (
+    setup_experiment_checkpointing,
+    maybe_save_snapshot,
+    load_snapshot_weights,
+    load_pretrained_tokenizer,
+    load_pretrained_dynamics,
+    create_bc_rew_models,
+    init_bc_rew_vars,
+)
 
 from dreamer.sampler import SamplerConfig, sample_video
-
-# ---------------------------
-# Config
-# ---------------------------
-
-@dataclass(frozen=True)
-class RealismConfig:
-    # IO / ckpt
-    run_name: str
-    tokenizer_ckpt: str
-    dynamics_ckpt: str
-    ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
-
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None  # if None, uses default entity
-    wandb_project: str | None = None  # if None, uses run_name as project
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    action_dim: int = 4 # number of categorical actions
-
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    use_rope: bool = True
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4 # number of register tokens for dynamics
-    n_agent: int = 1 # number of agent tokens for dynamics
-
-    # UPDATED: default to wm_agent (fine-tuning with agent readouts)
-    agent_space_mode: str = "wm_agent"
-
-    # schedule
-    k_max: int = 8
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
-    self_fraction: float = 0.25   # used once we pass bootstrap_start
-
-    # train
-    max_steps: int = 1_000_000_000
-    log_every: int = 5_000
-    lr: float = 3e-4
-
-    # eval media toggle
-    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
-
-    # NEW: multi-token prediction (MTP) settings
-    L: int = 2                      # predict next L actions/rewards
-    num_reward_bins: int = 101      # twohot bins for symexp rewards
-    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
-    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
-    n_tasks: int = 128              # task-ID space for TaskEmbedder
-    use_task_ids: bool = True       # True: discrete task IDs; False: vector embed
-    
-    # Loss weighting (to balance scales across different loss components)
-    loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
-    loss_weight_policy: float = 1.0      # weight for policy CE loss (nats)
-    loss_weight_reward: float = 1.0      # weight for reward CE loss (nats)
 
 # ---------------------------
 # Small helpers
@@ -140,58 +79,9 @@ def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: 
     grid = np.concatenate(rows, axis=0)
     return grid
 
-# ---------------------------
-# Tokenizer restore (uses your Orbax layout & utils)
-# ---------------------------
-
-def load_pretrained_tokenizer(
-    tokenizer_ckpt_dir: str,
-    *,
-    rng: jnp.ndarray,
-    encoder: Encoder,
-    decoder: Decoder,
-    enc_vars,
-    dec_vars,
-    sample_patches_btnd,
-):
-    meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
-    latest = meta_mngr.latest_step()
-    if latest is None:
-        raise FileNotFoundError(f"No tokenizer checkpoint found in {tokenizer_ckpt_dir}")
-    restored_meta = meta_mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
-    meta = restored_meta.meta
-    enc_kwargs = meta["enc_kwargs"]
-    n_lat, d_b = enc_kwargs["n_latents"], enc_kwargs["d_bottleneck"]
-
-    rng_e1, rng_d1 = jax.random.split(rng)
-    B, T = sample_patches_btnd.shape[:2]
-    fake_z = jnp.zeros((B, T, n_lat, d_b), dtype=jnp.float32)
-    dec_vars = decoder.init({"params": rng_d1, "dropout": rng_d1}, fake_z, deterministic=True)
-
-    packed_example = pack_mae_params(enc_vars, dec_vars)
-    tx_dummy = optax.adamw(1e-4)
-    opt_state_example = tx_dummy.init(packed_example)
-    state_example = make_state(packed_example, opt_state_example, rng_e1, step=0)
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)
-
-    tok_mngr = make_manager(tokenizer_ckpt_dir, item_names=("state", "meta"))
-    restored = tok_mngr.restore(
-        latest,
-        args=ocp.args.Composite(
-            state=ocp.args.StandardRestore(abstract_state),
-            meta=ocp.args.JsonRestore(),
-        ),
-    )
-    packed_params = restored.state["params"]
-    enc_params = packed_params["enc"]
-    dec_params = packed_params["dec"]
-    new_enc_vars = with_params(enc_vars, enc_params)
-    new_dec_vars = with_params(dec_vars, dec_params)
-    print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
-    return new_enc_vars, new_dec_vars, meta
 
 # ---------------------------
-# NEW: symexp/twohot helpers for reward targets
+# symexp/twohot helpers for reward targets
 # ---------------------------
 
 def _symlog(x):
@@ -469,15 +359,17 @@ def train_step_efficient(
 # Eval regimes & plan JSON (unchanged core logic)
 # ---------------------------
 
-def _eval_regimes_for_realism(cfg, *, ctx_length: int):
+def _eval_regimes_for_realism(cfg: BCRewTrainConfig, *, ctx_length: int, dynamics_cfg, tokenizer_cfg):
+    patch = tokenizer_cfg.patch_size
+    
     common = dict(
-        k_max=cfg.k_max,
+        k_max=cfg.experiment.k_max,
         horizon=min(32, cfg.dataset.T - ctx_length),
         ctx_length=ctx_length,
         ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
-        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
-        n_spatial=cfg.enc_n_latents // cfg.packing_factor,
-        packing_factor=cfg.packing_factor,
+        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=patch,
+        n_spatial=dynamics_cfg.n_spatial,
+        packing_factor=dynamics_cfg.packing_factor,
         dataset_mean=cfg.dataset.dataset_mean,
         dataset_std=cfg.dataset.dataset_std,
         start_mode="pure",
@@ -645,189 +537,62 @@ def make_dynamics_meta(
         "cfg": cfg or {},
     }
 
-# ---------------------------
-# Training state dataclass
-# ---------------------------
 
-@dataclass
-class TrainState:
-    """Container for all training-related state (models, variables, optimizer, etc.)."""
-    encoder: Encoder
-    decoder: Decoder
-    dynamics: Dynamics
-    # NEW modules
-    task_embedder: TaskEmbedder
-    policy_head: PolicyHeadMTP
-    reward_head: RewardHeadMTP
-
-    # vars/collections
-    enc_vars: dict
-    dec_vars: dict
-    dyn_vars: dict
-    task_vars: dict
-    pi_vars: dict
-    rew_vars: dict
-
-    # params packed for a single optimizer (subtrees: dyn/task/pi/rew)
-    params: dict
-    enc_kwargs: dict
-    dec_kwargs: dict
-    dyn_kwargs: dict
-    tx: optax.Transform
-    opt_state: optax.OptState
-    mae_eval_key: jnp.ndarray
 
 # ---------------------------
 # Model initialization
 # ---------------------------
-def load_pretrained_dynamics_params(ckpt_dir: str, dyn_vars: dict) -> dict:
-    tx_dummy = optax.adam(1e-3)
-    opt_state_example = tx_dummy.init(dyn_vars["params"])
-    rng = jax.random.PRNGKey(0)
-    state_example = {"params": dyn_vars["params"], "opt_state": opt_state_example, "rng": rng, "step": jnp.int32(0)}
-    mngr = make_manager(ckpt_dir, item_names=("state","meta"))
-    restored = try_restore(mngr, state_example, meta_example={})
-    if restored is None:
-        raise FileNotFoundError(f"No dynamics checkpoint found in {ckpt_dir}")
-    _, r = restored
-    p = r.state["params"]
-    return p["dyn"] if isinstance(p, dict) and "dyn" in p else p
-
-def initialize_models_and_tokenizer(
-    cfg: RealismConfig,
-    frames_init: jnp.ndarray,
-    actions_init: jnp.ndarray,
-) -> TrainState:
+def initialize_models(
+    cfg: BCRewTrainConfig,
+):
     """
     Initialize encoder, decoder, dynamics models and restore tokenizer.
     Also initialize TaskEmbedder, PolicyHeadMTP, RewardHeadMTP and pack params.
     """
-    patch = cfg.patch
-    num_patches = (cfg.dataset.H // patch) * (cfg.dataset.W // patch)
-    D_patch = patch * patch * cfg.dataset.C
-    k_max = cfg.k_max
-
-    enc_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_latents=cfg.enc_n_latents,
-        n_patches=num_patches,
-        n_heads=cfg.n_heads,
-        n_kv_heads=cfg.n_kv_heads,
-        depth=cfg.enc_depth,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        d_bottleneck=cfg.enc_d_bottleneck,
-        mae_p_min=0.0, mae_p_max=0.0,
-        time_every=4,
+    # Load pretrained tokenizer
+    encoder, decoder, enc_vars, dec_vars, tokenizer_cfg = load_pretrained_tokenizer(
+        cfg.experiment.tokenizer_ckpt_path
     )
-    dec_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_heads=cfg.n_heads,
-        n_kv_heads=cfg.n_kv_heads,
-        depth=cfg.dec_depth,
-        n_latents=cfg.enc_n_latents,
-        n_patches=num_patches,
-        d_patch=D_patch,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        mlp_ratio=4.0, time_every=4,
+    
+    # Load pretrained dynamics
+    dynamics, dyn_vars, dynamics_cfg = load_pretrained_dynamics(
+        cfg.experiment.dynamics_ckpt_path
     )
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor # number of spatial tokens for dynamics
-    dyn_kwargs = dict(
-        d_model=cfg.d_model_dyn,
-        d_bottleneck=cfg.enc_d_bottleneck,
-        d_spatial=cfg.enc_d_bottleneck * cfg.packing_factor,
-        n_spatial=n_spatial, n_register=cfg.n_register,
-        n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.dyn_depth,
-        n_agent=cfg.n_agent,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        k_max=k_max, 
-        time_every=4,
-    )
-
-    encoder = Encoder(**enc_kwargs)
-    decoder = Decoder(**dec_kwargs)
-    dynamics = Dynamics(**dyn_kwargs)
-
-    patches_btnd = temporal_patchify(frames_init, patch)
+    
+    # Compute derived values from dynamics config
+    cfg.model.compute_derived(dynamics_cfg)
+    
+    # Create bc_rew models
+    task_embedder, policy_head, reward_head = create_bc_rew_models(cfg.model)
+    
+    # Initialize bc_rew vars
     rng = jax.random.PRNGKey(0)
-    enc_vars = encoder.init({"params": rng, "mae": rng, "dropout": rng}, patches_btnd, deterministic=True)
-    fake_z = jnp.zeros((cfg.dataset.B, cfg.dataset.T, cfg.enc_n_latents, cfg.enc_d_bottleneck))
-    dec_vars = decoder.init({"params": rng, "dropout": rng}, fake_z, deterministic=True)
-
-    # Restore tokenizer
-    enc_vars, dec_vars, _ = load_pretrained_tokenizer(
-        cfg.tokenizer_ckpt, rng=rng,
-        encoder=encoder, decoder=decoder,
-        enc_vars=enc_vars, dec_vars=dec_vars,
-        sample_patches_btnd=patches_btnd,
+    rng, task_vars, pi_vars, rew_vars = init_bc_rew_vars(
+        task_embedder, policy_head, reward_head,
+        B=cfg.dataset.B, T=cfg.dataset.T, rng=rng
     )
-
-    # Build initial z1 to shape dynamics init
-    mae_eval_key = jax.random.PRNGKey(777)
-    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
-    z_btLd, _ = encoder.apply(enc_vars, patches_norm, rngs={"mae": mae_eval_key}, deterministic=True)
-    z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
-    emax = jnp.log2(k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), k_max - 1, dtype=jnp.int32)
-    dyn_vars = dynamics.init({"params": rng, "dropout": rng}, actions_init, step_idx, sigma_idx, z1)
-    print(f"[dynamics] Loading pretrained params from {cfg.dynamics_ckpt}")
-    dyn_pre = load_pretrained_dynamics_params(cfg.dynamics_ckpt, dyn_vars)
-    dyn_vars = with_params(dyn_vars, dyn_pre)
-
-    # NEW: heads & task embedder
-    task_embedder = TaskEmbedder(d_model=cfg.d_model_dyn, n_agent=cfg.n_agent,
-                                 use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks)
-    policy_head  = PolicyHeadMTP(d_model=cfg.d_model_dyn, action_dim=cfg.action_dim, L=cfg.L)
-    reward_head  = RewardHeadMTP(d_model=cfg.d_model_dyn, L=cfg.L, num_bins=cfg.num_reward_bins,
-                                 log_low=cfg.reward_log_low, log_high=cfg.reward_log_high)
-
-    rng_task, rng_pi, rng_rw = jax.random.split(jax.random.PRNGKey(1), 3)
-    dummy_task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
-    task_vars = task_embedder.init({"params": rng_task}, dummy_task_ids, cfg.dataset.B, cfg.dataset.T)
-
-    fake_h = jnp.zeros((cfg.dataset.B, cfg.dataset.T, cfg.d_model_dyn), dtype=jnp.float32)
-    pi_vars  = policy_head.init({"params": rng_pi, "dropout": rng_pi}, fake_h, deterministic=True)
-    rew_vars = reward_head.init({"params": rng_rw, "dropout": rng_rw}, fake_h, deterministic=True)
-
+    
+    # Pack params for optimizer
     params = {
         "dyn": dyn_vars["params"],
         "task": task_vars["params"],
         "pi": pi_vars["params"],
         "rew": rew_vars["params"],
     }
-
-    tx = optax.adam(cfg.lr)
-    opt_state = tx.init(params)
-
-    return TrainState(
-        encoder=encoder,
-        decoder=decoder,
-        dynamics=dynamics,
-        task_embedder=task_embedder,
-        policy_head=policy_head,
-        reward_head=reward_head,
-        enc_vars=enc_vars,
-        dec_vars=dec_vars,
-        dyn_vars=dyn_vars,
-        task_vars=task_vars,
-        pi_vars=pi_vars,
-        rew_vars=rew_vars,
+    
+    # Create optimizer and TrainState
+    train_state = TrainState.create(
+        apply_fn=None,  # Not used for bc_rew training
         params=params,
-        enc_kwargs=enc_kwargs,
-        dec_kwargs=dec_kwargs,
-        dyn_kwargs=dyn_kwargs,
-        tx=tx,
-        opt_state=opt_state,
-        mae_eval_key=mae_eval_key,
+        tx=optax.adam(cfg.experiment.optimizer.lr),
+    )
+    
+    mae_eval_key = jax.random.PRNGKey(777)
+    
+    return (
+        encoder, decoder, dynamics, task_embedder, policy_head, reward_head,
+        enc_vars, dec_vars, dyn_vars, task_vars, pi_vars, rew_vars,
+        train_state, mae_eval_key, tokenizer_cfg, dynamics_cfg
     )
 
 # ---------------------------
@@ -835,33 +600,40 @@ def initialize_models_and_tokenizer(
 # ---------------------------
 
 def run_evaluation(
-    cfg: RealismConfig,
+    cfg: BCRewTrainConfig,
     step: int,
+    encoder, decoder, dynamics,
+    enc_vars, dec_vars, dyn_vars,
+    task_embedder, policy_head, reward_head,
+    task_vars, pi_vars, rew_vars,
     train_state: TrainState,
+    mae_eval_key: jnp.ndarray,
     next_batch,
     vis_dir: Path,
+    dynamics_cfg,
+    tokenizer_cfg,
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
     """
     val_rng = jax.random.PRNGKey(9999)
     _, (val_frames, val_actions, val_rewards) = next_batch(val_rng)
-    # UPDATED: bind only the dynamics params
-    dyn_vars_eval = with_params(train_state.dyn_vars, train_state.params["dyn"])
+    # Bind only the dynamics params
+    dyn_vars_eval = with_params(dyn_vars, train_state.params["dyn"])
     ctx_length = min(32, cfg.dataset.T - 1)
-    regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length)
+    regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length, dynamics_cfg=dynamics_cfg, tokenizer_cfg=tokenizer_cfg)
 
     for tag, sampler_conf in regimes:
-        sampler_conf.mae_eval_key = train_state.mae_eval_key
+        sampler_conf.mae_eval_key = mae_eval_key
         sampler_conf.rng_key = jax.random.PRNGKey(4242)
         t0 = time.time()
 
         pred_frames, floor_frames, gt_frames = sample_video(
-            encoder=train_state.encoder,
-            decoder=train_state.decoder,
-            dynamics=train_state.dynamics,
-            enc_vars=train_state.enc_vars,
-            dec_vars=train_state.dec_vars,
+            encoder=encoder,
+            decoder=decoder,
+            dynamics=dynamics,
+            enc_vars=enc_vars,
+            dec_vars=dec_vars,
             dyn_vars=dyn_vars_eval,
             frames=val_frames, actions=val_actions, config=sampler_conf,
         )
@@ -884,7 +656,7 @@ def run_evaluation(
         save_evaluation_video(grid_frames, mp4_path, tag)
         print(f"[eval:{tag}] wrote {mp4_path.name} in {tag_dir}")
 
-        if cfg.use_wandb and wandb.run is not None:
+        if cfg.wandb.enabled and wandb.run is not None:
             wandb.log({
                 f"eval/{tag}/mse": mse,
                 f"eval/{tag}/psnr": psnr,
@@ -900,23 +672,23 @@ def run_evaluation(
 # Main
 # ---------------------------
 
-def run(cfg: RealismConfig):
+def run(cfg: BCRewTrainConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
-    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
+    cfg, mngr, start_step = setup_experiment_checkpointing(cfg, run_dir)
+
     # Initialize wandb if enabled
-    if cfg.use_wandb:
-        wandb_project = cfg.wandb_project or cfg.run_name
+    if cfg.wandb.enabled:
         wandb.init(
-            entity=cfg.wandb_entity,
-            project=wandb_project,
-            name=cfg.run_name,
+            entity=cfg.wandb.entity,
+            project=cfg.wandb.project,
+            name=cfg.experiment.run_name,
             config=asdict(cfg),
             dir=str(run_dir),
+            resume="allow",
         )
-        print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
 
     # Data iterator (streaming)
     next_batch = make_iterator(
@@ -930,61 +702,56 @@ def run(cfg: RealismConfig):
         bg_max_color=255 if cfg.dataset.diversify_data else 255,
     )
 
-    # Initialize models and restore tokenizer
-    init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init, _) = next_batch(init_rng)
+    # Initialize models
+    (
+        encoder, decoder, dynamics, task_embedder, policy_head, reward_head,
+        enc_vars, dec_vars, dyn_vars, task_vars, pi_vars, rew_vars,
+        train_state, mae_eval_key, tokenizer_cfg, dynamics_cfg
+    ) = initialize_models(cfg)
 
-    train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
+    
+    patch = tokenizer_cfg.patch_size
+    k_max = cfg.experiment.k_max
+    n_spatial = dynamics_cfg.n_spatial
+    packing_factor = dynamics_cfg.packing_factor
 
-    # Extract some values for checkpointing
-    patch = cfg.patch
-    k_max = cfg.k_max
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
-
-    # -------- Orbax manager & (optional) restore --------
-    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
-    meta = make_dynamics_meta(
-        enc_kwargs=train_state.enc_kwargs,
-        dec_kwargs=train_state.dec_kwargs,
-        dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=patch,
-        k_max=k_max, packing_factor=cfg.packing_factor, n_spatial=n_spatial,
-        tokenizer_ckpt_dir=cfg.tokenizer_ckpt,
-        cfg=asdict(cfg),
-    )
-
+    # Restore if resuming
     rng = jax.random.PRNGKey(0)
-    state_example = make_state(train_state.params, train_state.opt_state, rng, step=0)
-    restored = try_restore(mngr, state_example, meta)
-
-    start_step = 0
-    if restored is not None:
-        latest_step, r = restored
-        train_state.params = r.state["params"]
-        train_state.opt_state = r.state["opt_state"]
-        rng = r.state["rng"]
-        start_step = int(r.state["step"]) + 1
-        # UPDATED: bind subtrees into module vars
-        train_state.dyn_vars  = with_params(train_state.dyn_vars,  train_state.params["dyn"])
-        train_state.task_vars = with_params(train_state.task_vars, train_state.params["task"])
-        train_state.pi_vars   = with_params(train_state.pi_vars,   train_state.params["pi"])
-        train_state.rew_vars  = with_params(train_state.rew_vars,  train_state.params["rew"])
-        print(f"[restore] Resumed from {ckpt_dir} at step={latest_step}")
+    if start_step > 0:
+        restored_params, restored_opt_state, rng = load_snapshot_weights(
+            mngr, start_step, train_state.params, train_state.opt_state, rng
+        )
+        train_state = train_state.replace(params=restored_params, opt_state=restored_opt_state)
+        # Update vars with restored params
+        dyn_vars = with_params(dyn_vars, restored_params["dyn"])
+        task_vars = with_params(task_vars, restored_params["task"])
+        pi_vars = with_params(pi_vars, restored_params["pi"])
+        rew_vars = with_params(rew_vars, restored_params["rew"])
+        print(f"[restore] Resumed from checkpoint at step {start_step}")
 
     # -------- Training loop --------
     train_rng = jax.random.PRNGKey(2025)
     data_rng = jax.random.PRNGKey(12345)
 
+    # Update vars with current params
+    dyn_vars = with_params(dyn_vars, train_state.params["dyn"])
+    task_vars = with_params(task_vars, train_state.params["task"])
+    pi_vars = with_params(pi_vars, train_state.params["pi"])
+    rew_vars = with_params(rew_vars, train_state.params["rew"])
+
+    # -------- Training loop --------
+    train_rng = rng
+
     logger = MetricLogger(
-        use_wandb=cfg.use_wandb,
-        log_every=cfg.log_every,
-        max_steps=cfg.max_steps,
+        use_wandb=cfg.wandb.enabled,
+        log_every=cfg.experiment.log_every,
+        max_steps=cfg.experiment.optimizer.max_steps,
         wandb_obj=wandb,
     )
 
-    pbar = tqdm(range(start_step, cfg.max_steps + 1), 
+    pbar = tqdm(range(start_step, cfg.experiment.optimizer.max_steps + 1), 
                 initial=start_step, 
-                total=cfg.max_steps,
+                total=cfg.experiment.optimizer.max_steps,
                 desc="Training BC/Rew Heads",
                 dynamic_ncols=True)
 
@@ -998,29 +765,37 @@ def run(cfg: RealismConfig):
         # RNG for this step
         train_rng, master_key = jax.random.split(train_rng)
 
-        # Decide current B_self based on warm-up (static arg requires a single value; we keep B_self fixed
-        # and gate its contribution inside the jit via bootstrap_start masking).
-        B_self = max(0, int(round(cfg.self_fraction * cfg.dataset.B)))
+        # Decide current B_self based on warm-up
+        B_self = max(0, int(round(cfg.experiment.self_fraction * cfg.dataset.B)))
 
         train_start_t = time.perf_counter()
-        train_state.params, train_state.opt_state, aux = train_step_efficient(
-            train_state.encoder, train_state.dynamics, train_state.task_embedder,
-            train_state.policy_head, train_state.reward_head, train_state.tx,
+        new_params, new_opt_state, aux = train_step_efficient(
+            encoder, dynamics, task_embedder,
+            policy_head, reward_head, train_state.tx,
             train_state.params, train_state.opt_state,
-            train_state.enc_vars, train_state.dyn_vars, train_state.task_vars,
-            train_state.pi_vars, train_state.rew_vars,
+            enc_vars, dyn_vars, task_vars,
+            pi_vars, rew_vars,
             frames, actions, rewards,
-            patch=cfg.patch, B=cfg.dataset.B, T=cfg.dataset.T, B_self=B_self,
-            n_spatial=n_spatial, k_max=k_max, packing_factor=cfg.packing_factor,
-            L=cfg.L,
-            master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
-            loss_weight_shortcut=cfg.loss_weight_shortcut,
-            loss_weight_policy=cfg.loss_weight_policy,
-            loss_weight_reward=cfg.loss_weight_reward,
+            patch=patch, B=cfg.dataset.B, T=cfg.dataset.T, B_self=B_self,
+            n_spatial=n_spatial, k_max=k_max, packing_factor=packing_factor,
+            L=cfg.experiment.L,
+            master_key=master_key, step=step, bootstrap_start=cfg.experiment.bootstrap_start,
+            loss_weight_shortcut=cfg.experiment.loss_weight_shortcut,
+            loss_weight_policy=cfg.experiment.loss_weight_policy,
+            loss_weight_reward=cfg.experiment.loss_weight_reward,
             dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
         )
         train_t = time.perf_counter() - train_start_t
         total_t = data_t + train_t
+
+        # Update train_state
+        train_state = train_state.replace(params=new_params, opt_state=new_opt_state)
+        
+        # Update vars with new params
+        dyn_vars = with_params(dyn_vars, train_state.params["dyn"])
+        task_vars = with_params(task_vars, train_state.params["task"])
+        pi_vars = with_params(pi_vars, train_state.params["pi"])
+        rew_vars = with_params(rew_vars, train_state.params["rew"])
 
         # Logging
         if logger.should_log(step):
@@ -1043,36 +818,41 @@ def run(cfg: RealismConfig):
             )
 
         # Save (async) when policy says we should
-        state = make_state(train_state.params, train_state.opt_state, train_rng, step)
-        maybe_save(mngr, step, state, meta)
+        maybe_save_snapshot(mngr, step, train_state.params, train_state.opt_state, train_rng, cfg)
 
         # Periodic lightweight AR eval
-        if cfg.write_video_every and (step % cfg.write_video_every == 0):
+        if cfg.experiment.write_video_every > 0 and (step % cfg.experiment.write_video_every == 0):
             run_evaluation(
                 cfg=cfg,
                 step=step,
+                encoder=encoder, decoder=decoder, dynamics=dynamics,
+                enc_vars=enc_vars, dec_vars=dec_vars, dyn_vars=dyn_vars,
+                task_embedder=task_embedder, policy_head=policy_head, reward_head=reward_head,
+                task_vars=task_vars, pi_vars=pi_vars, rew_vars=rew_vars,
                 train_state=train_state,
+                mae_eval_key=mae_eval_key,
                 next_batch=next_batch,
                 vis_dir=vis_dir,
+                dynamics_cfg=dynamics_cfg,
+                tokenizer_cfg=tokenizer_cfg,
             )
 
     # Ensure all writes finished
     mngr.wait_until_finished()
 
     # Finish wandb run
-    if cfg.use_wandb and wandb.run is not None:
+    if cfg.wandb.enabled and wandb.run is not None:
         wandb.finish()
         print("[wandb] Finished logging.")
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="bc_rew")
 def main(cfg: DictConfig):
-    # Merge with structured schema to fill defaults and type check
-    schema = OmegaConf.structured(RealismConfig)
+    schema = OmegaConf.structured(BCRewTrainConfig)
     cfg = OmegaConf.merge(schema, cfg)
-    realism_cfg = OmegaConf.to_object(cfg)
+    bc_rew_cfg = OmegaConf.to_object(cfg)
     
-    run(realism_cfg)
+    run(bc_rew_cfg)
 
 
 if __name__ == "__main__":

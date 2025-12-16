@@ -1,0 +1,40 @@
+defaults:
+  - base_experiment
+  - _self_
+
+tokenizer_ckpt_path: logs/tokenizer
+bc_rew_ckpt_path: logs/bc_rew
+
+# Head settings
+action_dim: 4
+L: 2
+num_reward_bins: 101
+reward_log_low: -3.0
+reward_log_high: 3.0
+num_value_bins: 101
+n_tasks: 128
+use_task_ids: true
+
+# RL hyperparameters
+gamma: 0.9
+lambda_: 0.95
+horizon: 32
+context_length: 16
+imagination_d: 0.25
+alpha: 0.5
+beta: 0.3
+
+write_video_every: 1
+visualize_every: 1
+
+# Evaluation
+eval_every: 5_000
+eval_episodes: 64
+eval_horizon: 32
+eval_batch_size: 64
+max_eval_examples_to_plot: 4
+
+# Override base_experiment defaults
+optimizer:
+  lr: 1e-4
+  max_steps: 100_000

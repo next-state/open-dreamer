@@ -1,6 +1,8 @@
 defaults:
   - _self_
 
+run_name: ???
+
 wandb:
   enabled: true
   entity: null

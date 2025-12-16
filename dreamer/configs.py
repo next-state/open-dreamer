@@ -130,7 +130,77 @@ class DynamicsModelConfig:
         if encoder_cfg.n_latents % self.packing_factor != 0:
             raise ValueError(f"Encoder n_latents {encoder_cfg.n_latents} not divisible by packing {self.packing_factor}")
         self.n_spatial = encoder_cfg.n_latents // self.packing_factor
+
+
+@dataclass
+class TaskEmbedderModelConfig:
+    d_model: int = 128
+    n_agent: int = 1
+    use_ids: bool = True
+    n_tasks: int = 128
+    d_task: int = 64
+
+
+@dataclass
+class PolicyHeadModelConfig:
+    d_model: int = 128
+    action_dim: int = 4
+    L: int = 2
+    kind: str = "categorical"
+    mlp_ratio: float = 2.0
+    dropout_rate: float = 0.0
+    swiglu: bool = True
+    parity_2over3: bool = False
+
+
+@dataclass
+class RewardHeadModelConfig:
+    d_model: int = 128
+    L: int = 2
+    num_bins: int = 101
+    mlp_ratio: float = 2.0
+    dropout_rate: float = 0.0
+    swiglu: bool = True
+    parity_2over3: bool = False
+    log_low: float = -3.0
+    log_high: float = 3.0
+
+
+@dataclass
+class ValueHeadModelConfig:
+    d_model: int = 128
+    num_bins: int = 101
+    mlp_ratio: float = 2.0
+    dropout_rate: float = 0.0
+    swiglu: bool = True
+    parity_2over3: bool = False
+    log_low: float = -3.0
+    log_high: float = 3.0
+
+
+@dataclass
+class BCRewModelConfig:
+    task_embedder: TaskEmbedderModelConfig = field(default_factory=TaskEmbedderModelConfig)
+    policy_head: PolicyHeadModelConfig = field(default_factory=PolicyHeadModelConfig)
+    reward_head: RewardHeadModelConfig = field(default_factory=RewardHeadModelConfig)
     
+    def compute_derived(self, dynamics_cfg: DynamicsModelConfig):
+        """Set d_model and n_agent from loaded dynamics config to ensure consistency."""
+        self.task_embedder.d_model = dynamics_cfg.d_model
+        self.task_embedder.n_agent = dynamics_cfg.n_agent
+        self.policy_head.d_model = dynamics_cfg.d_model
+        self.reward_head.d_model = dynamics_cfg.d_model
+
+
+@dataclass
+class PolicyModelConfig:
+    policy_head: PolicyHeadModelConfig = field(default_factory=PolicyHeadModelConfig)
+    value_head: ValueHeadModelConfig = field(default_factory=ValueHeadModelConfig)
+    
+    def compute_derived(self, dynamics_cfg: DynamicsModelConfig):
+        """Set d_model from loaded dynamics config to ensure consistency."""
+        self.policy_head.d_model = dynamics_cfg.d_model
+        self.value_head.d_model = dynamics_cfg.d_model
 
 # --- Experiment Configs ---
 
@@ -152,7 +222,6 @@ class WandbConfig:
 
 @dataclass
 class ExperimentConfig:
-    run_name: str = "default"
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     ckpt: CheckpointConfig = field(default_factory=CheckpointConfig)
     
@@ -175,11 +244,100 @@ class DynamicsExperimentConfig(ExperimentConfig):
     
     write_video_every: int = 5_000
 
+
+@dataclass
+class BCRewExperimentConfig(ExperimentConfig):
+    tokenizer_ckpt_path: str = "logs/tokenizer"
+    dynamics_ckpt_path: str = "logs/dynamics"
+    
+    # Schedule
+    k_max: int = 8
+    bootstrap_start: int = 5_000
+    self_fraction: float = 0.25
+    
+    # Head settings
+    action_dim: int = 4
+    L: int = 2
+    num_reward_bins: int = 101
+    reward_log_low: float = -3.0
+    reward_log_high: float = 3.0
+    n_tasks: int = 128
+    use_task_ids: bool = True
+    
+    # Loss weights
+    loss_weight_shortcut: float = 1.0
+    loss_weight_policy: float = 1.0
+    loss_weight_reward: float = 1.0
+    
+    write_video_every: int = 10_000
+
+
+@dataclass
+class PolicyExperimentConfig(ExperimentConfig):
+    tokenizer_ckpt_path: str = "logs/tokenizer"
+    bc_rew_ckpt_path: str = "logs/bc_rew"
+    
+    # Head settings
+    action_dim: int = 4
+    L: int = 2
+    num_reward_bins: int = 101
+    reward_log_low: float = -3.0
+    reward_log_high: float = 3.0
+    num_value_bins: int = 101
+    n_tasks: int = 128
+    use_task_ids: bool = True
+    
+    # RL hyperparameters
+    gamma: float = 0.997
+    lambda_: float = 0.95
+    horizon: int = 32
+    context_length: int = 16
+    imagination_d: float = 0.25
+    alpha: float = 0.5
+    beta: float = 0.3
+    
+    write_video_every: int = 10_000
+    visualize_every: int = 25_000
+    
+    # Evaluation
+    eval_every: int = 50_000
+    eval_episodes: int = 4
+    eval_horizon: int = 32
+    eval_batch_size: int = 4
+    max_eval_examples_to_plot: int = 4
+
+
+@dataclass
+class EvalBCRewExperimentConfig:
+    bc_rew_ckpt_path: str = "logs/bc_rew"
+    tokenizer_ckpt_path: str = "logs/tokenizer"
+    
+    # Head settings
+    action_dim: int = 4
+    L: int = 2
+    num_reward_bins: int = 101
+    reward_log_low: float = -3.0
+    reward_log_high: float = 3.0
+    n_tasks: int = 128
+    use_task_ids: bool = True
+    
+    # Sampler/eval
+    ctx_length: int = 32
+    horizon: int = 16
+    schedule: str = "finest"  # "finest" or "shortcut"
+    d: float | None = None
+    ctx_signal_tau: float = 1.0
+    match_ctx_tau: bool = False
+    
+    # Visualization
+    max_examples_to_plot: int = 4
+    paranoid_no_leak: bool = True
+
 # --- Root Configs (Configuring the whole run) ---
 
 @dataclass
 class TokenizerTrainConfig:
-    # Components
+    run_name: str = "tokenizer"
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     model: TokenizerModelConfig = field(default_factory=TokenizerModelConfig)
     experiment: TokenizerExperimentConfig = field(default_factory=TokenizerExperimentConfig)
@@ -187,7 +345,33 @@ class TokenizerTrainConfig:
 
 @dataclass
 class DynamicsTrainConfig:
+    run_name: str = "dynamics"
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     model: DynamicsModelConfig = field(default_factory=DynamicsModelConfig)
     experiment: DynamicsExperimentConfig = field(default_factory=DynamicsExperimentConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+
+
+@dataclass
+class BCRewTrainConfig:
+    run_name: str = "bc_rew"
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    model: BCRewModelConfig = field(default_factory=BCRewModelConfig)
+    experiment: BCRewExperimentConfig = field(default_factory=BCRewExperimentConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
+
+
+@dataclass
+class PolicyTrainConfig:
+    run_name: str = "policy"
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    model: PolicyModelConfig = field(default_factory=PolicyModelConfig)
+    experiment: PolicyExperimentConfig = field(default_factory=PolicyExperimentConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
+
+
+@dataclass
+class EvalBCRewConfig:
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    model: BCRewModelConfig = field(default_factory=BCRewModelConfig)
+    experiment: EvalBCRewExperimentConfig = field(default_factory=EvalBCRewExperimentConfig)

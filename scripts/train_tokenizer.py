@@ -14,7 +14,21 @@ from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
 from flax.training.train_state import TrainState
-from dreamer.utils import temporal_patchify, temporal_unpatchify, normalize_with_dataset_stats, unnormalize_with_dataset_stats, setup_experiment_checkpointing, maybe_save_snapshot, pack_mae_params, unpack_mae_params, create_tokenizer_models, load_snapshot_weights, init_tokenizer_vars
+from dreamer.utils import (
+    temporal_patchify, 
+    temporal_unpatchify, 
+    normalize_with_dataset_stats, 
+    unnormalize_with_dataset_stats
+)
+from dreamer.checkpoint import (
+    setup_experiment_checkpointing, 
+    maybe_save_snapshot, 
+    pack_mae_params, 
+    unpack_mae_params, 
+    create_tokenizer_models, 
+    load_snapshot_weights, 
+    init_tokenizer_vars
+)
 from dreamer.logging import MetricLogger
 from dreamer.configs import TokenizerTrainConfig
 

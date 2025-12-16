@@ -1,0 +1,37 @@
+defaults:
+  - base_experiment
+  - _self_
+
+run_name: bc_rew
+
+tokenizer_ckpt_path: logs/tokenizer
+dynamics_ckpt_path: logs/dynamics
+
+# Schedule
+k_max: 8
+bootstrap_start: 5000
+self_fraction: 0.25
+
+# Head settings
+action_dim: 4
+L: 2
+num_reward_bins: 101
+reward_log_low: -3.0
+reward_log_high: 3.0
+n_tasks: 128
+use_task_ids: true
+
+# Loss weights
+loss_weight_shortcut: 1.0
+loss_weight_policy: 0.3
+loss_weight_reward: 0.3
+
+write_video_every: 100_000
+
+# Override base_experiment defaults
+optimizer:
+  lr: 1e-4
+  max_steps: 1_000_000_000
+
+log_every: 500
+

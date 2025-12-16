@@ -2,8 +2,6 @@ defaults:
   - base_experiment
   - _self_
 
-run_name: dynamics
-
 tokenizer_ckpt_path: logs/tokenizer  # FIXME: instead of "logs", use the hydra default, which we set to logs in common.yaml
 
 k_max: 8

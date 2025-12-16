@@ -18,7 +18,7 @@ High-level outline (from the docstring plan):
     - Train policy head on (s0…s{T-1}, a1…aT, G0…G{T-1}, V0…V{T-1}) using PMPO.
 """
 from __future__ import annotations
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, Any
 from functools import partial
@@ -33,7 +33,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import orbax.checkpoint as ocp
 from einops import rearrange
 from flax import struct
 import imageio.v2 as imageio
@@ -42,24 +41,27 @@ import wandb
 
 from dreamer.models import (
     Encoder,
-    Decoder,
     Dynamics,
     TaskEmbedder,
     PolicyHeadMTP,
     RewardHeadMTP,
     ValueHead,
 )
-from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn, DatasetConfig
+from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
     normalize_with_dataset_stats,
     with_params,
-    make_state,
-    make_manager,
-    try_restore,
-    maybe_save,
-    pack_mae_params,
+)
+from dreamer.checkpoint import (
+    setup_experiment_checkpointing,
+    maybe_save_snapshot,
+    load_snapshot_weights,
+    load_pretrained_bc_rew,
+    create_policy_models,
+    init_policy_vars,
+    load_pretrained_tokenizer,
 )
 from dreamer.imagination import (
     ImaginationConfig,
@@ -68,85 +70,8 @@ from dreamer.imagination import (
     imagine_rollouts_core,
 )
 from dreamer.logging import MetricLogger
-
-
-# ---------------------------
-# Config
-# ---------------------------
-
-
-@dataclass(frozen=True)
-class RLConfig:
-    # IO / ckpt
-    run_name: str
-    bc_rew_ckpt: str  # checkpoint from train_bc_rew_heads.py
-    ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
-
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None
-    wandb_project: str | None = None
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    action_dim: int = 4
-
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    use_rope: bool = True
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4
-    n_agent: int = 1
-    agent_space_mode: str = "wm_agent"
-
-    # schedule
-    k_max: int = 8
-
-    # train
-    max_steps: int = 1_000_000_000
-    log_every: int = 5_000
-    lr: float = 3e-4
-
-    # eval media toggle
-    write_video_every: int = 10_000
-    visualize_every: int = 25_000
-
-    # RL-specific
-    L: int = 2
-    num_reward_bins: int = 101
-    reward_log_low: float = -3.0
-    reward_log_high: float = 3.0
-    num_value_bins: int = 101
-    n_tasks: int = 128
-    use_task_ids: bool = True
-
-    # RL hyperparameters
-    gamma: float = 0.997
-    lambda_: float = 0.95
-    horizon: int = 32
-    context_length: int = 16
-    imagination_d: float = 1.0 / 4
-    alpha: float = 0.5
-    beta: float = 0.3
-
-    # Evaluation
-    eval_every: int = 50_000
-    eval_episodes: int = 4
-    eval_horizon: int = 32
-    eval_batch_size: int = 4
-    max_eval_examples_to_plot: int = 4
+from dreamer.configs import PolicyTrainConfig
+from flax.training.train_state import TrainState
 
 
 # ---------------------------
@@ -345,168 +270,6 @@ def sample_contexts(
     return context_frames, context_actions, context_rewards
 
 
-# ---------------------------
-# Checkpoint loading helpers
-# ---------------------------
-
-
-def load_pretrained_tokenizer(
-    tokenizer_ckpt_dir: str,
-    *,
-    rng: jnp.ndarray,
-    encoder: Encoder,
-    decoder: Decoder,
-    enc_vars,
-    dec_vars,
-    sample_patches_btnd,
-):
-    """
-    Load pretrained encoder/decoder from tokenizer checkpoint.
-    """
-    meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
-    latest = meta_mngr.latest_step()
-    if latest is None:
-        raise FileNotFoundError(f"No tokenizer checkpoint found in {tokenizer_ckpt_dir}")
-    restored_meta = meta_mngr.restore(
-        latest,
-        args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
-    )
-    meta = restored_meta.meta
-    enc_kwargs = meta["enc_kwargs"]
-    n_lat, d_b = enc_kwargs["n_latents"], enc_kwargs["d_bottleneck"]
-
-    rng_e1, rng_d1 = jax.random.split(rng)
-    B, T = sample_patches_btnd.shape[:2]
-    fake_z = jnp.zeros((B, T, n_lat, d_b), dtype=jnp.float32)
-    dec_vars = decoder.init(
-        {"params": rng_d1, "dropout": rng_d1},
-        fake_z,
-        deterministic=True,
-    )
-
-    packed_example = pack_mae_params(enc_vars, dec_vars)
-    tx_dummy = optax.adamw(1e-4)
-    opt_state_example = tx_dummy.init(packed_example)
-    state_example = make_state(packed_example, opt_state_example, rng_e1, step=0)
-    abstract_state = jax.tree_util.tree_map(
-        ocp.utils.to_shape_dtype_struct, state_example
-    )
-
-    tok_mngr = make_manager(tokenizer_ckpt_dir, item_names=("state", "meta"))
-    restored = tok_mngr.restore(
-        latest,
-        args=ocp.args.Composite(
-            state=ocp.args.StandardRestore(abstract_state),
-            meta=ocp.args.JsonRestore(),
-        ),
-    )
-    packed_params = restored.state["params"]
-    enc_params = packed_params["enc"]
-    dec_params = packed_params["dec"]
-    new_enc_vars = with_params(enc_vars, enc_params)
-    new_dec_vars = with_params(dec_vars, dec_params)
-    print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
-    return new_enc_vars, new_dec_vars, meta
-
-
-def load_bc_rew_checkpoint(
-    bc_rew_ckpt_dir: str,
-    *,
-    rng: jnp.ndarray,
-    dynamics: Dynamics,
-    task_embedder: TaskEmbedder,
-    policy_head_bc: PolicyHeadMTP,
-    reward_head: RewardHeadMTP,
-    dyn_vars,
-    task_vars,
-    pi_bc_vars,
-    rew_vars,
-    sample_actions: jnp.ndarray,
-    sample_z1: jnp.ndarray,
-):
-    """
-    Load pretrained dynamics, task_embedder, BC policy head, and reward head.
-    """
-    params_example = {
-        "dyn": dyn_vars["params"],
-        "task": task_vars["params"],
-        "pi": pi_bc_vars["params"],
-        "rew": rew_vars["params"],
-    }
-    tx_dummy = optax.adam(1e-3)
-    opt_state_example = tx_dummy.init(params_example)
-    state_example = make_state(params_example, opt_state_example, rng, step=0)
-
-    mngr = make_manager(bc_rew_ckpt_dir, item_names=("state", "meta"))
-    restored = try_restore(mngr, state_example, meta_example={})
-    if restored is None:
-        raise FileNotFoundError(f"No BC/rew checkpoint found in {bc_rew_ckpt_dir}")
-
-    latest_step, r = restored
-    loaded_params = r.state["params"]
-
-    dyn_params = loaded_params["dyn"]
-    task_params = loaded_params["task"]
-    pi_bc_params = loaded_params["pi"]
-    rew_params = loaded_params["rew"]
-
-    dyn_vars_loaded = with_params(dyn_vars, dyn_params)
-    task_vars_loaded = with_params(task_vars, task_params)
-    pi_bc_vars_loaded = with_params(pi_bc_vars, pi_bc_params)
-    rew_vars_loaded = with_params(rew_vars, rew_params)
-
-    meta = r.meta if hasattr(r, "meta") and r.meta is not None else {}
-
-    print(
-        f"[bc_rew] Restored dynamics/task/policy_bc/reward "
-        f"from {bc_rew_ckpt_dir} (step {latest_step})"
-    )
-    return dyn_vars_loaded, task_vars_loaded, pi_bc_vars_loaded, rew_vars_loaded, meta
-
-
-# ---------------------------
-# Training state dataclass
-# ---------------------------
-
-
-@dataclass
-class TrainState:
-    """Container for all training-related state (models, variables, optimizer, etc.)."""
-
-    # Frozen models (loaded from checkpoints, not trained)
-    encoder: Encoder
-    decoder: Decoder
-    dynamics: Dynamics
-    task_embedder: TaskEmbedder
-    policy_head_bc: PolicyHeadMTP
-    reward_head: RewardHeadMTP
-
-    # Trainable models
-    policy_head: PolicyHeadMTP
-    value_head: ValueHead
-
-    # vars/collections (frozen)
-    enc_vars: dict
-    dec_vars: dict
-    dyn_vars: dict
-    task_vars: dict
-    pi_bc_vars: dict
-    rew_vars: dict
-
-    # vars/collections (trainable)
-    pi_vars: dict
-    val_vars: dict
-
-    # params for optimizer (pi/val only)
-    params: dict
-    enc_kwargs: dict
-    dec_kwargs: dict
-    dyn_kwargs: dict
-    tx: optax.Transform
-    opt_state: optax.OptState
-    mae_eval_key: jnp.ndarray
-
-
 @struct.dataclass
 class EpisodeResult:
     """JAX-friendly container for a batch of evaluation rollouts."""
@@ -523,288 +286,58 @@ class EpisodeResult:
 
 
 def initialize_models(
-    cfg: RLConfig,
-    frames_init: jnp.ndarray,
-    actions_init: jnp.ndarray,
-) -> TrainState:
+    cfg: PolicyTrainConfig,
+):
     """
-    Initialize all models and load pretrained checkpoints.
+    Initialize models by loading pretrained bc_rew checkpoint and creating new policy/value heads.
+    Returns: encoder, decoder, dynamics, task_embedder, policy_head_bc, reward_head,
+             policy_head, value_head, enc_vars, dec_vars, dyn_vars, task_vars,
+             pi_bc_vars, rew_vars, pi_vars, val_vars, train_state, mae_eval_key, tokenizer_cfg, bc_rew_cfg
     """
-    patch = cfg.patch
-    num_patches = (cfg.dataset.H // patch) * (cfg.dataset.W // patch)
-    D_patch = patch * patch * cfg.dataset.C
-    k_max = cfg.k_max
-
-    enc_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_latents=cfg.enc_n_latents,
-        n_patches=num_patches,
-        n_heads=cfg.n_heads,
-        n_kv_heads=cfg.n_kv_heads,
-        depth=cfg.enc_depth,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        d_bottleneck=cfg.enc_d_bottleneck,
-        mae_p_min=0.0,
-        mae_p_max=0.0,
-        time_every=4,
-    )
-    dec_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_heads=cfg.n_heads,
-        n_kv_heads=cfg.n_kv_heads,
-        depth=cfg.dec_depth,
-        n_latents=cfg.enc_n_latents,
-        n_patches=num_patches,
-        d_patch=D_patch,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        mlp_ratio=4.0,
-        time_every=4,
-    )
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
-    dyn_kwargs = dict(
-        d_model=cfg.d_model_dyn,
-        d_bottleneck=cfg.enc_d_bottleneck,
-        d_spatial=cfg.enc_d_bottleneck * cfg.packing_factor,
-        n_spatial=n_spatial,
-        n_register=cfg.n_register,
-        n_heads=cfg.n_heads,
-        n_kv_heads=cfg.n_kv_heads,
-        depth=cfg.dyn_depth,
-        dropout_rate=0.0,
-        qk_norm_type=cfg.qk_norm_type,
-        use_rope=cfg.use_rope,
-        rope_theta=cfg.rope_theta,
-        k_max=k_max,
-        time_every=4,
-        n_agent=cfg.n_agent,
-    )
-
-    encoder = Encoder(**enc_kwargs)
-    decoder = Decoder(**dec_kwargs)
-    dynamics = Dynamics(**dyn_kwargs)
-    task_embedder = TaskEmbedder(
-        d_model=cfg.d_model_dyn,
-        use_ids=cfg.use_task_ids,
-        n_tasks=cfg.n_tasks,
-    )
-    policy_head_bc = PolicyHeadMTP(
-        d_model=cfg.d_model_dyn,
-        action_dim=cfg.action_dim,
-        L=cfg.L,
-    )
-    reward_head = RewardHeadMTP(
-        d_model=cfg.d_model_dyn,
-        L=cfg.L,
-        num_bins=cfg.num_reward_bins,
-        log_low=cfg.reward_log_low,
-        log_high=cfg.reward_log_high,
-    )
-
-    policy_head = PolicyHeadMTP(
-        d_model=cfg.d_model_dyn,
-        action_dim=cfg.action_dim,
-        L=cfg.L,
-    )
-    value_head = ValueHead(
-        d_model=cfg.d_model_dyn,
-        num_bins=cfg.num_value_bins,
-    )
-
+    # Load pretrained bc_rew models (includes dynamics, task_embedder, policy_head_bc, reward_head)
+    (
+        dynamics, task_embedder, policy_head_bc, reward_head,
+        dyn_vars, task_vars, pi_bc_vars, rew_vars, bc_rew_cfg
+    ) = load_pretrained_bc_rew(cfg.experiment.bc_rew_ckpt_path)
+    
+    # Load pretrained tokenizer
+    encoder, decoder, enc_vars, dec_vars, tokenizer_cfg = load_pretrained_tokenizer(cfg.experiment.tokenizer_ckpt_path)
+    
+    # Compute derived values from dynamics config
+    cfg.model.compute_derived(bc_rew_cfg.dynamics)
+    
+    # Create policy models (new heads for training)
+    policy_head, value_head = create_policy_models(cfg.model)
+    
+    # Initialize policy vars
     rng = jax.random.PRNGKey(0)
-    patches_btnd = temporal_patchify(frames_init, patch)
-    enc_vars = encoder.init(
-        {"params": rng, "mae": rng, "dropout": rng},
-        patches_btnd,
-        deterministic=True,
+    rng, pi_vars, val_vars = init_policy_vars(
+        policy_head, value_head,
+        B=cfg.dataset.B, T=cfg.dataset.T, rng=rng
     )
-    fake_z = jnp.zeros(
-        (cfg.dataset.B, cfg.dataset.T, cfg.enc_n_latents, cfg.enc_d_bottleneck),
-        dtype=jnp.float32,
-    )
-    dec_vars = decoder.init(
-        {"params": rng, "dropout": rng},
-        fake_z,
-        deterministic=True,
-    )
-
-    # Read BC/rew meta to find tokenizer checkpoint directory.
-    bc_rew_mngr = make_manager(cfg.bc_rew_ckpt, item_names=("meta",))
-    bc_rew_latest = bc_rew_mngr.latest_step()
-    if bc_rew_latest is None:
-        raise FileNotFoundError(f"No BC/rew checkpoint found in {cfg.bc_rew_ckpt}")
-    bc_rew_meta_restored = bc_rew_mngr.restore(
-        bc_rew_latest,
-        args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
-    )
-    bc_rew_meta = bc_rew_meta_restored.meta
-    tokenizer_ckpt = bc_rew_meta.get("tokenizer_ckpt_dir") or bc_rew_meta.get(
-        "cfg", {}
-    ).get("tokenizer_ckpt")
-    if tokenizer_ckpt is None:
-        raise ValueError(
-            f"Could not find tokenizer_ckpt in BC/rew checkpoint meta: {bc_rew_meta}"
-        )
-
-    enc_vars, dec_vars, _ = load_pretrained_tokenizer(
-        tokenizer_ckpt,
-        rng=rng,
-        encoder=encoder,
-        decoder=decoder,
-        enc_vars=enc_vars,
-        dec_vars=dec_vars,
-        sample_patches_btnd=patches_btnd,
-    )
-
-    mae_eval_key = jax.random.PRNGKey(777)
-    patches_norm = normalize_with_dataset_stats(patches_btnd, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
-    z_btLd, _ = encoder.apply(
-        enc_vars,
-        patches_norm,
-        rngs={"mae": mae_eval_key},
-        deterministic=True,
-    )
-    z1 = pack_bottleneck_to_spatial(
-        z_btLd,
-        n_spatial=n_spatial,
-        k=cfg.packing_factor,
-    )
-    emax = jnp.log2(k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.dataset.B, cfg.dataset.T), k_max - 1, dtype=jnp.int32)
-    dyn_vars = dynamics.init(
-        {"params": rng, "dropout": rng},
-        actions_init,
-        step_idx,
-        sigma_idx,
-        z1,
-    )
-
-    rng_task, rng_pi_bc, rng_rw = jax.random.split(jax.random.PRNGKey(1), 3)
-    dummy_task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
-    task_vars = task_embedder.init(
-        {"params": rng_task},
-        dummy_task_ids,
-        cfg.dataset.B,
-        cfg.dataset.T,
-    )
-
-    fake_h = jnp.zeros(
-        (cfg.dataset.B, cfg.dataset.T, cfg.d_model_dyn),
-        dtype=jnp.float32,
-    )
-    pi_bc_vars = policy_head_bc.init(
-        {"params": rng_pi_bc, "dropout": rng_pi_bc},
-        fake_h,
-        deterministic=True,
-    )
-    rew_vars = reward_head.init(
-        {"params": rng_rw, "dropout": rng_rw},
-        fake_h,
-        deterministic=True,
-    )
-
-    dyn_vars, task_vars, pi_bc_vars, rew_vars, _ = load_bc_rew_checkpoint(
-        cfg.bc_rew_ckpt,
-        rng=rng,
-        dynamics=dynamics,
-        task_embedder=task_embedder,
-        policy_head_bc=policy_head_bc,
-        reward_head=reward_head,
-        dyn_vars=dyn_vars,
-        task_vars=task_vars,
-        pi_bc_vars=pi_bc_vars,
-        rew_vars=rew_vars,
-        sample_actions=actions_init,
-        sample_z1=z1,
-    )
-
-    rng_pi, rng_val = jax.random.split(jax.random.PRNGKey(2), 2)
-    pi_vars = policy_head.init(
-        {"params": rng_pi, "dropout": rng_pi},
-        fake_h,
-        deterministic=True,
-    )
-    val_vars = value_head.init(
-        {"params": rng_val, "dropout": rng_val},
-        fake_h,
-        deterministic=True,
-    )
-
+    
+    # Pack params for optimizer (only policy and value heads are trainable)
     params = {
         "pi": pi_vars["params"],
         "val": val_vars["params"],
     }
-
-    tx = optax.adam(cfg.lr)
-    opt_state = tx.init(params)
-
-    return TrainState(
-        encoder=encoder,
-        decoder=decoder,
-        dynamics=dynamics,
-        task_embedder=task_embedder,
-        policy_head_bc=policy_head_bc,
-        reward_head=reward_head,
-        policy_head=policy_head,
-        value_head=value_head,
-        enc_vars=enc_vars,
-        dec_vars=dec_vars,
-        dyn_vars=dyn_vars,
-        task_vars=task_vars,
-        pi_bc_vars=pi_bc_vars,
-        rew_vars=rew_vars,
-        pi_vars=pi_vars,
-        val_vars=val_vars,
+    
+    # Create optimizer and TrainState
+    train_state = TrainState.create(
+        apply_fn=None,  # Not used for policy training
         params=params,
-        enc_kwargs=enc_kwargs,
-        dec_kwargs=dec_kwargs,
-        dyn_kwargs=dyn_kwargs,
-        tx=tx,
-        opt_state=opt_state,
-        mae_eval_key=mae_eval_key,
+        tx=optax.adam(cfg.experiment.optimizer.lr),
     )
-
-
-# ---------------------------
-# Meta for RL checkpoints
-# ---------------------------
-
-
-def make_rl_meta(
-    *,
-    enc_kwargs: dict,
-    dec_kwargs: dict,
-    dynamics_kwargs: dict,
-    H: int,
-    W: int,
-    C: int,
-    patch: int,
-    k_max: int,
-    packing_factor: int,
-    n_spatial: int,
-    bc_rew_ckpt_dir: str | None = None,
-    cfg: Dict[str, Any] | None = None,
-):
-    return {
-        "enc_kwargs": enc_kwargs,
-        "dec_kwargs": dec_kwargs,
-        "dynamics_kwargs": dynamics_kwargs,
-        "H": H,
-        "W": W,
-        "C": C,
-        "patch": patch,
-        "k_max": k_max,
-        "packing_factor": packing_factor,
-        "n_spatial": n_spatial,
-        "bc_rew_ckpt_dir": bc_rew_ckpt_dir,
-        "cfg": cfg or {},
-    }
+    
+    mae_eval_key = jax.random.PRNGKey(777)
+    
+    return (
+        encoder, decoder, dynamics, task_embedder, policy_head_bc, reward_head,
+        policy_head, value_head,
+        enc_vars, dec_vars, dyn_vars, task_vars, pi_bc_vars, rew_vars,
+        pi_vars, val_vars,
+        train_state, mae_eval_key, tokenizer_cfg, bc_rew_cfg
+    )
 
 
 # ---------------------------
@@ -1157,24 +690,26 @@ def _twohot_symlog_targets(values, centers_log):
 
 
 def evaluate_policy_real_env(
-    train_state: TrainState,
-    cfg: RLConfig,
+    encoder, decoder, dynamics, task_embedder, policy_head,
+    enc_vars, dyn_vars, task_vars, pi_vars,
+    mae_eval_key: jnp.ndarray,
+    cfg: PolicyTrainConfig,
     env_reset_fn,
     env_step_fn,
     *,
     schedule_step_idx: int,
     k_max: int,
+    patch: int,
+    n_spatial: int,
+    packing_factor: int,
     rng_key: jax.Array,
 ) -> tuple[Dict[str, float], Dict[str, Any], jax.Array]:
     """
     High-level helper that runs `eval_rollout_real_env` for multiple episodes,
     aggregates metrics, and returns episode data for visualization.
     """
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
-    horizon = cfg.eval_horizon
-    batch_size = cfg.eval_batch_size
-
-    num_batches = int(np.ceil(cfg.eval_episodes / batch_size))
+    batch_size = cfg.experiment.eval_batch_size
+    num_batches = int(np.ceil(cfg.experiment.eval_episodes / batch_size))
 
     all_returns = []
     first_result: EpisodeResult | None = None
@@ -1185,23 +720,23 @@ def evaluate_policy_real_env(
         task_ids = jnp.zeros((batch_size,), dtype=jnp.int32)
 
         result = eval_rollout_real_env(
-            encoder=train_state.encoder,
-            dynamics=train_state.dynamics,
-            task_embedder=train_state.task_embedder,
-            policy_head=train_state.policy_head,
-            enc_vars=train_state.enc_vars,
-            dyn_vars=train_state.dyn_vars,
-            task_vars=train_state.task_vars,
-            pi_vars=train_state.pi_vars,
-            mae_eval_key=train_state.mae_eval_key,
+            encoder=encoder,
+            dynamics=dynamics,
+            task_embedder=task_embedder,
+            policy_head=policy_head,
+            enc_vars=enc_vars,
+            dyn_vars=dyn_vars,
+            task_vars=task_vars,
+            pi_vars=pi_vars,
+            mae_eval_key=mae_eval_key,
             env_reset_fn=env_reset_fn,
             env_step_fn=env_step_fn,
             task_ids=task_ids,
-            horizon=horizon,
-            patch=cfg.patch,
+            horizon=cfg.experiment.eval_horizon,
+            patch=patch,
             n_spatial=n_spatial,
-            packing_factor=cfg.packing_factor,
-            max_context=cfg.context_length,
+            packing_factor=packing_factor,
+            max_context=cfg.experiment.context_length,
             schedule_step_idx=schedule_step_idx,
             k_max=k_max,
             dataset_mean=cfg.dataset.dataset_mean,
@@ -1213,7 +748,7 @@ def evaluate_policy_real_env(
         if first_result is None:
             first_result = result
 
-    all_returns_arr = jnp.concatenate(all_returns, axis=0)[: cfg.eval_episodes]
+    all_returns_arr = jnp.concatenate(all_returns, axis=0)[: cfg.experiment.eval_episodes]
 
     metrics: Dict[str, float] = {
         "eval/return_mean": float(jnp.mean(all_returns_arr)),
@@ -1547,21 +1082,22 @@ def train_step(
 # ---------------------------
 
 
-def run(cfg: RLConfig):
+def run(cfg: PolicyTrainConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
-    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
+    cfg, mngr, start_step = setup_experiment_checkpointing(cfg, run_dir)
+
     # Initialize wandb if enabled
-    if cfg.use_wandb:
-        wandb_project = cfg.wandb_project or cfg.run_name
+    if cfg.wandb.enabled:
         wandb.init(
-            entity=cfg.wandb_entity,
-            project=wandb_project,
-            name=cfg.run_name,
+            entity=cfg.wandb.entity,
+            project=cfg.wandb.project,
+            name=cfg.experiment.run_name,
             config=asdict(cfg),
             dir=str(run_dir),
+            resume="allow",
         )
 
     # Data iterator
@@ -1583,23 +1119,26 @@ def run(cfg: RLConfig):
     )
 
     # Initialize models and load checkpoints
-    init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init, rewards_init) = next_batch(init_rng)
-    del rewards_init
-
-    train_state = initialize_models(cfg, frames_init, actions_init)
-
-    patch = cfg.patch
-    k_max = cfg.k_max
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
+    (
+        encoder, decoder, dynamics, task_embedder, policy_head_bc, reward_head,
+        policy_head, value_head,
+        enc_vars, dec_vars, dyn_vars, task_vars, pi_bc_vars, rew_vars,
+        pi_vars, val_vars,
+        train_state, mae_eval_key, tokenizer_cfg, bc_rew_cfg
+    ) = initialize_models(cfg)
+    
+    patch = tokenizer_cfg.patch_size
+    k_max = bc_rew_cfg.dynamics.k_max
+    n_spatial = bc_rew_cfg.dynamics.n_spatial
+    packing_factor = bc_rew_cfg.dynamics.packing_factor
 
     # Imagination schedule (static)
     imag_cfg = ImaginationConfig(
         k_max=k_max,
-        horizon=cfg.horizon,
-        context_length=cfg.context_length,
+        horizon=cfg.experiment.horizon,
+        context_length=cfg.experiment.context_length,
         n_spatial=n_spatial,
-        d=cfg.imagination_d,
+        d=cfg.experiment.imagination_d,
         start_mode="pure",
         tau0_fixed=0.0,
         match_ctx_tau=False,
@@ -1608,7 +1147,7 @@ def run(cfg: RLConfig):
 
     # Real-environment evaluation env fns.
     env_reset_fn = make_env_reset_fn(
-        batch_size=cfg.eval_batch_size,
+        batch_size=cfg.experiment.eval_batch_size,
         height=cfg.dataset.H,
         width=cfg.dataset.W,
         channels=cfg.dataset.C,
@@ -1626,47 +1165,17 @@ def run(cfg: RLConfig):
         channels=cfg.dataset.C,
     )
 
-    # Checkpoint manager and optional restore
-    mngr = make_manager(
-        ckpt_dir,
-        max_to_keep=cfg.ckpt_max_to_keep,
-        save_interval_steps=cfg.ckpt_save_every,
-    )
-    meta = make_rl_meta(
-        enc_kwargs=train_state.enc_kwargs,
-        dec_kwargs=train_state.dec_kwargs,
-        dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.dataset.H,
-        W=cfg.dataset.W,
-        C=cfg.dataset.C,
-        patch=patch,
-        k_max=k_max,
-        packing_factor=cfg.packing_factor,
-        n_spatial=n_spatial,
-        bc_rew_ckpt_dir=cfg.bc_rew_ckpt,
-        cfg=asdict(cfg),
-    )
-
+    # Restore if resuming
     rng = jax.random.PRNGKey(0)
-    state_example = make_state(train_state.params, train_state.opt_state, rng, step=0)
-    restored = try_restore(mngr, state_example, meta)
-
-    start_step = 0
-    if restored is not None:
-        latest_step, r = restored
-        train_state.params = r.state["params"]
-        train_state.opt_state = r.state["opt_state"]
-        rng = r.state["rng"]
-        start_step = int(r.state["step"]) + 1
-        train_state.pi_vars = {
-            **train_state.pi_vars,
-            "params": train_state.params["pi"],
-        }
-        train_state.val_vars = {
-            **train_state.val_vars,
-            "params": train_state.params["val"],
-        }
-        print(f"[restore] Resumed from {ckpt_dir} at step={latest_step}")
+    if start_step > 0:
+        restored_params, restored_opt_state, rng = load_snapshot_weights(
+            mngr, start_step, train_state.params, train_state.opt_state, rng
+        )
+        train_state = train_state.replace(params=restored_params, opt_state=restored_opt_state)
+        # Update vars with restored params
+        pi_vars = with_params(pi_vars, restored_params["pi"])
+        val_vars = with_params(val_vars, restored_params["val"])
+        print(f"[restore] Resumed from checkpoint at step {start_step}")
 
     # Training loop
     train_rng = jax.random.PRNGKey(2025)
@@ -1674,15 +1183,15 @@ def run(cfg: RLConfig):
     eval_rng = jax.random.PRNGKey(98765)
 
     logger = MetricLogger(
-        use_wandb=cfg.use_wandb,
-        log_every=cfg.log_every,
-        max_steps=cfg.max_steps,
+        use_wandb=cfg.wandb.enabled,
+        log_every=cfg.experiment.log_every,
+        max_steps=cfg.experiment.optimizer.max_steps,
         wandb_obj=wandb,
     )
 
-    pbar = tqdm(range(start_step, cfg.max_steps + 1), 
+    pbar = tqdm(range(start_step, cfg.experiment.optimizer.max_steps + 1), 
                 initial=start_step, 
-                total=cfg.max_steps,
+                total=cfg.experiment.optimizer.max_steps,
                 desc="Training Policy",
                 dynamic_ncols=True)
 
@@ -1707,58 +1216,62 @@ def run(cfg: RLConfig):
             aux,
             train_rng,
         ) = train_step(
-            encoder=train_state.encoder,
-            dynamics=train_state.dynamics,
-            task_embedder=train_state.task_embedder,
-            reward_head=train_state.reward_head,
-            value_head=train_state.value_head,
-            policy_head=train_state.policy_head,
-            policy_head_bc=train_state.policy_head_bc,
+            encoder=encoder,
+            dynamics=dynamics,
+            task_embedder=task_embedder,
+            reward_head=reward_head,
+            value_head=value_head,
+            policy_head=policy_head,
+            policy_head_bc=policy_head_bc,
             tx=train_state.tx,
             params=train_state.params,
             opt_state=train_state.opt_state,
-            enc_vars=train_state.enc_vars,
-            dyn_vars=train_state.dyn_vars,
-            task_vars=train_state.task_vars,
-            rew_vars=train_state.rew_vars,
-            val_vars=train_state.val_vars,
-            pi_vars=train_state.pi_vars,
-            pi_bc_vars=train_state.pi_bc_vars,
-            mae_eval_key=train_state.mae_eval_key,
+            enc_vars=enc_vars,
+            dyn_vars=dyn_vars,
+            task_vars=task_vars,
+            rew_vars=rew_vars,
+            val_vars=val_vars,
+            pi_vars=pi_vars,
+            pi_bc_vars=pi_bc_vars,
+            mae_eval_key=mae_eval_key,
             schedule=schedule,
             videos=videos,
             actions_full=actions_full,
             rewards_full=rewards_full,
             task_ids=task_ids,
-            horizon=cfg.horizon,
-            gamma=cfg.gamma,
-            lambda_=cfg.lambda_,
-            alpha=cfg.alpha,
-            beta=cfg.beta,
-            context_length=cfg.context_length,
+            horizon=cfg.experiment.horizon,
+            gamma=cfg.experiment.gamma,
+            lambda_=cfg.experiment.lambda_,
+            alpha=cfg.experiment.alpha,
+            beta=cfg.experiment.beta,
+            context_length=cfg.experiment.context_length,
             patch=patch,
             n_spatial=n_spatial,
-            packing_factor=cfg.packing_factor,
+            packing_factor=packing_factor,
             dataset_mean=cfg.dataset.dataset_mean,
             dataset_std=cfg.dataset.dataset_std,
             rng_key=step_key,
         )
         train_t = time.perf_counter() - train_start_t
         total_t = data_t + train_t
-        train_state.params = new_params
-        train_state.opt_state = new_opt_state
-        train_state.val_vars = new_val_vars
-        train_state.pi_vars = new_pi_vars
+        train_state = train_state.replace(params=new_params, opt_state=new_opt_state)
+        val_vars = new_val_vars
+        pi_vars = new_pi_vars
 
         # Periodically evaluate the policy in the real environment.
-        if cfg.eval_every > 0 and (step % cfg.eval_every == 0):
+        if cfg.experiment.eval_every > 0 and (step % cfg.experiment.eval_every == 0):
             metrics_eval, media_eval, eval_rng = evaluate_policy_real_env(
-                train_state,
+                encoder, decoder, dynamics, task_embedder, policy_head,
+                enc_vars, dyn_vars, task_vars, pi_vars,
+                mae_eval_key,
                 cfg,
                 env_reset_fn,
                 env_step_fn,
                 schedule_step_idx=schedule.step_idx,
                 k_max=k_max,
+                patch=patch,
+                n_spatial=n_spatial,
+                packing_factor=packing_factor,
                 rng_key=eval_rng,
             )
 
@@ -1774,8 +1287,8 @@ def run(cfg: RLConfig):
             video_path: Path | None = None
             strip0_path: Path | None = None
             if (
-                cfg.write_video_every > 0
-                and step % cfg.write_video_every == 0
+                cfg.experiment.write_video_every > 0
+                and step % cfg.experiment.write_video_every == 0
                 and media_eval
             ):
                 frames = media_eval.get("frames")
@@ -1796,7 +1309,7 @@ def run(cfg: RLConfig):
                         _save_real_env_grid_video(video_path, frames_np)
 
                         # Strip plots for a few episodes.
-                        num_examples = min(cfg.max_eval_examples_to_plot, B)
+                        num_examples = min(cfg.experiment.max_eval_examples_to_plot, B)
                         for b_idx in range(num_examples):
                             fig_path = (
                                 vis_dir
@@ -1809,7 +1322,7 @@ def run(cfg: RLConfig):
                                 rewards_np,
                                 title=f"Real Env Eval (step={step}, b={b_idx})",
                                 b_index=b_idx,
-                                max_steps=cfg.eval_horizon,
+                                max_steps=cfg.experiment.eval_horizon,
                             )
                             if b_idx == 0:
                                 strip0_path = fig_path
@@ -1818,7 +1331,7 @@ def run(cfg: RLConfig):
                             f"[viz:eval] Saved real-env eval video/strips to {vis_dir}"
                         )
 
-            if cfg.use_wandb and wandb.run is not None:
+            if cfg.wandb.enabled and wandb.run is not None:
                 log_payload: Dict[str, Any] = {
                     "eval/return_mean": metrics_eval["eval/return_mean"],
                     "eval/return_std": metrics_eval["eval/return_std"],
@@ -1861,23 +1374,22 @@ def run(cfg: RLConfig):
             )
 
         # Save checkpoint
-        state = make_state(train_state.params, train_state.opt_state, train_rng, step)
-        maybe_save(mngr, step, state, meta)
+        maybe_save_snapshot(mngr, step, train_state.params, train_state.opt_state, train_rng, cfg)
 
     mngr.wait_until_finished()
 
-    if cfg.use_wandb and wandb.run is not None:
+    if cfg.wandb.enabled and wandb.run is not None:
         wandb.finish()
         print("[wandb] Finished logging.")
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="policy")
 def main(cfg: DictConfig):
-    schema = OmegaConf.structured(RLConfig)
+    schema = OmegaConf.structured(PolicyTrainConfig)
     cfg = OmegaConf.merge(schema, cfg)
-    rl_cfg = OmegaConf.to_object(cfg)
+    policy_cfg = OmegaConf.to_object(cfg)
     
-    run(rl_cfg)
+    run(policy_cfg)
 
 
 if __name__ == "__main__":

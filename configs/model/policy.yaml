@@ -1,0 +1,19 @@
+policy_head:
+  d_model: 128  # Should match dynamics.d_model from bc_rew checkpoint
+  action_dim: ${experiment.action_dim}
+  L: ${experiment.L}
+  kind: categorical
+  mlp_ratio: 2.0
+  dropout_rate: 0.0
+  swiglu: true
+  parity_2over3: false
+
+value_head:
+  d_model: 128  # Should match dynamics.d_model from bc_rew checkpoint
+  num_bins: ${experiment.num_value_bins}
+  mlp_ratio: 2.0
+  dropout_rate: 0.0
+  swiglu: true
+  parity_2over3: false
+  log_low: -3.0
+  log_high: 3.0

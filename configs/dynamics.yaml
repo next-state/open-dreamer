@@ -4,3 +4,5 @@ defaults:
   - model: dynamics
   - experiment: dynamics
   - _self_
+
+run_name: dynamics
