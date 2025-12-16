@@ -11,16 +11,16 @@ from typing import Tuple
 import numpy as np
 import math
 
-# --- helpers ---
-temporal_patchify = jax.jit(
-    jax.vmap(patchify, in_axes=(1, None), out_axes=1),  # (B,T,H,W,C) -> (B,T,Np,Dp)
-    static_argnames=("patch",),
-)
+# # --- helpers ---
+# temporal_patchify = jax.jit(
+#     jax.vmap(patchify, in_axes=(1, None), out_axes=1),  # (B,T,H,W,C) -> (B,T,Np,Dp)
+#     static_argnames=("patch",),
+# )
 
-temporal_unpatchify = jax.jit(
-    jax.vmap(unpatchify, in_axes=(1, None, None, None, None), out_axes=1),
-    static_argnames=("H", "W", "C", "patch"),
-)
+# temporal_unpatchify = jax.jit(
+#     jax.vmap(unpatchify, in_axes=(1, None, None, None, None), out_axes=1),
+#     static_argnames=("H", "W", "C", "patch"),
+# )
 
 class Modality(IntEnum):
     LATENT   = -1

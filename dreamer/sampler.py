@@ -10,7 +10,6 @@ import numpy as np
 
 from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP
 from dreamer.utils import (
-    temporal_patchify, temporal_unpatchify,
     pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck,
     normalize_with_dataset_stats, unnormalize_with_dataset_stats,
 )

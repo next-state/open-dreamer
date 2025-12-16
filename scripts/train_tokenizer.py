@@ -74,7 +74,7 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
     jax.jit,
     static_argnames=("apply_fn", "tx", "lpips_weight", "lpips_frac"),
 )
-def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key, step, lpips_weight, lpips_frac):
+def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key, step, lpips_weight, lpips_frac, dataset_std):
     step_key = jax.random.fold_in(master_key, step)
     mae_key, drop_key = jax.random.split(step_key)
 
@@ -85,7 +85,10 @@ def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key
         lp = lpips_on_mae_recon(pred, videos, lpips_frac)
         total = mse + lpips_weight * lp
 
-        aux = {"loss_total": total, "loss_mse": mse, "loss_lpips": lp, "keep_prob": keep_prob}
+        var = jnp.mean(dataset_std ** 2)
+        psnr = 10 * jnp.log10((1.0 / jnp.maximum(mse, 1e-10)) / var)
+
+        aux = {"loss_total": total, "loss_mse": mse, "loss_lpips": lp, "keep_prob": keep_prob, "psnr": psnr}
         return total, aux
 
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -190,7 +193,7 @@ def run(cfg: TokenizerConfig):
         wandb_obj=wandb,
     )
 
-    pbar = tqdm(enumerate(dataset), initial=start_step)
+    pbar = tqdm(enumerate(dataset, start = start_step), total=cfg.max_steps)
     for step, batch in pbar:
         if step < start_step:
             continue
@@ -205,11 +208,11 @@ def run(cfg: TokenizerConfig):
             std=cfg.dataset.dataset_std
         )
 
-        params, opt_state, aux = train_step(apply_fn, tx, variables, params, opt_state, videos, master_key=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac)
+        params, opt_state, aux = train_step(apply_fn, tx, variables, params, opt_state, videos, master_key=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac, dataset_std=jnp.array(cfg.dataset.dataset_std))
 
         if logger.should_log(step):
             mse = aux["loss_mse"]
-            psnr = 10 * jnp.log10(1.0 / jnp.maximum(mse, 1e-10))
+            psnr = aux["psnr"]
             logger.log(
                 step,
                 {
