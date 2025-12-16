@@ -662,7 +662,25 @@ class Tokenizer(nn.Module):
     def decode(self, z, deterministic: bool = True):
         return self.decoder(z, deterministic=deterministic)
 
-        
+    @classmethod
+    def from_pretrained(cls, path, *, load_for_training: bool = False):
+        mngr = make_manager(path)
+
+        latest = mngr.latest_step()
+        if latest is None:
+            raise ValueError("No checkpoint found")
+
+        restore_args = ocp.args.Composite(
+            state=ocp.args.StandardRestore(None),  # restore full state, but we'll ignore most of it
+            meta=ocp.args.JsonRestore(),
+        )
+
+        restored = mngr.restore(latest, args=restore_args)
+
+        params = restored.state["params"]
+        cfg = from_dict(TokenizerConfig, restored.meta["cfg"])
+
+        return cls(cfg), params, cfg
 
 class ActionEncoder(nn.Module):
     d_model: int
