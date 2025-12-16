@@ -4,7 +4,7 @@ defaults:
 
 run_name: tokenizer
 ckpt_max_to_keep: 5
-ckpt_save_every: 10_000
+ckpt_save_every: 500
 
 patch_size: 4
 

@@ -213,7 +213,7 @@ def make_manager(ckpt_dir: str, max_to_keep: int = 5, save_interval_steps: int =
     mngr = ocp.CheckpointManager(path, options=options, item_names=item_names)
     return mngr
 
-def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta_example: dict | None = None):
+def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta: dict | None = None):
     """
     Build abstract trees from current shapes/dtypes so Orbax can restore safely
     (StandardRestore wants an abstract tree). :contentReference[oaicite:3]{index=3}
@@ -221,7 +221,7 @@ def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta_example: 
     abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)   # :contentReference[oaicite:4]{index=4}
     restore_args = ocp.args.Composite(
         state=ocp.args.StandardRestore(abstract_state),                                      # :contentReference[oaicite:5]{index=5}
-        meta=ocp.args.JsonRestore() if meta_example is not None else None
+        meta=ocp.args.JsonRestore() if meta is not None else None
     )
     latest = mngr.latest_step()
     if latest is None:
@@ -350,3 +350,14 @@ def load_pretrained_tokenizer(
     new_dec_vars = with_params(dec_vars, dec_params)
     print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
     return new_enc_vars, new_dec_vars, meta
+    
+def from_dict(cls, d):
+    field_types = {f.name: f.type for f in cls.__dataclass_fields__.values()}
+    kwargs = {}
+    for k, v in d.items():
+        t = field_types[k]
+        if hasattr(t, "__dataclass_fields__"):
+            kwargs[k] = from_dict(t, v)
+        else:
+            kwargs[k] = v
+    return cls(**kwargs)

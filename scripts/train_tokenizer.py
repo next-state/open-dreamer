@@ -17,7 +17,7 @@ from jaxlpips import LPIPS
 from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
-from dreamer.utils import make_state, make_manager, try_restore, maybe_save, normalize_with_dataset_stats, unnormalize_with_dataset_stats, with_params, init_tokenizer
+from dreamer.utils import make_state, make_manager, try_restore, maybe_save, normalize_with_dataset_stats, unnormalize_with_dataset_stats, with_params, init_tokenizer, from_dict
 from dreamer.logging import MetricLogger
 
     
@@ -55,6 +55,7 @@ def recon_loss_from_mae(pred, target, mae_mask):
 lpips_loss_fn = LPIPS(pretrained_network="alexnet")
 
 def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
+    # TODO: maybe unnormalize
     if subsample_frac < 1.0:
         B, T = pred.shape[:2]
         step = max(1, int(1.0 / subsample_frac))
@@ -168,14 +169,9 @@ def run(cfg: TokenizerConfig):
     mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
 
     state_example = make_state(params, opt_state, rng, step=0)
-    meta_example = {
-        "H": cfg.dataset.H,
-        "W": cfg.dataset.W,
-        "C": cfg.dataset.C,
-        "patch_size": cfg.patch_size,
-    }
+    meta = {"cfg": asdict(cfg)}
 
-    restored = try_restore(mngr, state_example, meta_example)
+    restored = try_restore(mngr, state_example, meta)
     start_step = 0
     if restored is not None:
         latest_step, r = restored
@@ -183,6 +179,7 @@ def run(cfg: TokenizerConfig):
         opt_state = r.state["opt_state"]
         rng = r.state["rng"]
         start_step = int(r.state["step"])
+        cfg = from_dict(TokenizerConfig, r.meta["cfg"])
         print(f"[ckpt] Restored step {latest_step}")
 
     # ---------- Train loop ----------
@@ -225,7 +222,7 @@ def run(cfg: TokenizerConfig):
             )
 
         state = make_state(params, opt_state, rng, step)
-        maybe_save(mngr, step, state, meta_example)
+        maybe_save(mngr, step, state, meta)
 
         if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
             viz_step(apply_fn, variables, params, videos, rng, step, run_dir, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std, use_wandb=cfg.use_wandb)
