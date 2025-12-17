@@ -707,7 +707,7 @@ class Tokenizer(nn.Module):
 
 class ActionEncoder(nn.Module):
     d_model: int
-    n_keyboard: int = 5  # up, down, left, right, null (categorical actions)
+    n_keyboard: int = 15  # up, down, left, right, null (categorical actions)
 
     @nn.compact
     def __call__(
@@ -868,9 +868,7 @@ class Dynamics(nn.Module):
         signal_tok = self.signal_embed(signal_idxs)[:, :, None, :]     # (B, T, 1, d_model)
         
         # --- 5) Concatenate in your declared layout order
-        if self.n_agent > 0:
-            if agent_tokens is None:
-                agent_tokens = jnp.zeros((B, T, self.n_agent, self.d_model), dtype=spatial_tokens.dtype)
+        if self.n_agent > 0 and agent_tokens is not None:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, agent_tokens]
         else:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]

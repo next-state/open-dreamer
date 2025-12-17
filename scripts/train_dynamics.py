@@ -15,6 +15,7 @@ from einops import rearrange
 
 import jax
 import jax.numpy as jnp
+from flax.core import FrozenDict
 import optax
 import wandb
 
@@ -35,6 +36,7 @@ from dreamer.utils import (
 from dreamer.logging import MetricLogger
 
 from dreamer.sampler import SamplerConfig, sample_video
+# jax.config.update("jax_debug_nans", True)
 
 
 # ---------------------------
@@ -116,9 +118,7 @@ def train_step_efficient(
     sigma_idx_plus    = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
 
     def loss_and_aux(p):
-        local_dyn = {"params": p}
-        if constants:
-            local_dyn["constants"] = constants
+        local_dyn = {"params": p, "constants": constants}
         drop_main, drop_h1, drop_h2 = jax.random.split(drop_key, 3)
 
         # Main forward (emp + self)
@@ -204,7 +204,6 @@ def run(cfg: DynamicsConfig):
     dynamics = Dynamics(cfg.dynamics)
     rng, dynamics_variables = init_dynamics(rng, dynamics, tokenizer_cfg)
     dynamics_params = dynamics_variables["params"]
-    from flax.core import FrozenDict
     dynamics_constants = dynamics_variables.get("constants", FrozenDict())
     
     tx = optax.adamw(cfg.lr)
@@ -227,6 +226,7 @@ def run(cfg: DynamicsConfig):
         # Normalize videos
         videos = batch["videos"].astype(jnp.float32) / 255.0
         actions = batch["actions"]
+        # print(actions)
         videos = normalize_with_dataset_stats(
             videos, 
             mean=cfg.dataset.dataset_mean, 

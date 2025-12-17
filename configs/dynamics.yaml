@@ -15,7 +15,7 @@ dynamics:
   n_kv_heads: 2
   packing_factor: 2
   n_register: 4
-  n_agent: 1
+  n_agent: 0
   qk_norm_type: Null
   rope_theta: 10000.0
   time_every: 4
@@ -27,7 +27,7 @@ bootstrap_start: 5_000
 self_fraction: 0.25
 
 max_steps: 1_000_000_000
-log_every: 500
+log_every: 10
 lr: 1e-3
 
 write_video_every: 5_000
