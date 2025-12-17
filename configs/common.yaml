@@ -10,4 +10,4 @@ wandb:
 
 hydra:
   run:
-    dir: logs/${experiment.run_name}
+    dir: logs/${run_name}

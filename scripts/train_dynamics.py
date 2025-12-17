@@ -534,7 +534,7 @@ def run(cfg: DynamicsTrainConfig):
         wandb.init(
             entity=cfg.wandb.entity,
             project=cfg.wandb.project,
-            name=cfg.experiment.run_name,
+            name=cfg.run_name,
             config=asdict(cfg),
             dir=str(run_dir),
             resume="allow"

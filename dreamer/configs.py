@@ -49,10 +49,6 @@ class EncoderModelConfig:
     
     d_bottleneck: int = 32
 
-    def __post_init__(self):
-         # Validation?
-         pass
-
     def compute_derived(self, H: int, W: int, patch_size: int):
         # n_patches = (H//patch_size) * (W//patch_size)
         self.n_patches = (H // patch_size) * (W // patch_size)

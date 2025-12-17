@@ -14,7 +14,6 @@ policy_head:
   dropout_rate: 0.0
   swiglu: true
   parity_2over3: false
-
 reward_head:
   d_model: 128  # Should match dynamics.d_model from pretrained checkpoint
   L: ${experiment.L}
