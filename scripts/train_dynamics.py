@@ -297,21 +297,6 @@ def main(cfg: DictConfig):
 
     run(realism_cfg)
 
-
-if __name__ == "__main__":
-    main()
-
-    realism_cfg = OmegaConf.to_object(cfg)
-
-    run(realism_cfg)
-
-if __name__ == "__main__":
-    main()
-
-    realism_cfg = OmegaConf.to_object(cfg)
-
-    run(realism_cfg)
-
 if __name__ == "__main__":
     main()
 
