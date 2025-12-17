@@ -1,27 +1,27 @@
 defaults:
-  - common
-  - _self_
+    - common
+    - _self_
 
 run_name: dynamics
-tokenizer_ckpt: 'logs/tokenizer/checkpoints'
-ckpt_save_every: 50_000
+tokenizer_ckpt: "logs/tokenizer/checkpoints"
+ckpt_save_every: 500
 
 # Dynamics specific
 dynamics:
-  d_model: 128
-  d_bottleneck: 32
-  depth: 8
-  n_heads: 4
-  n_kv_heads: 2
-  packing_factor: 2
-  n_register: 4
-  n_agent: 0
-  qk_norm_type: Null
-  rope_theta: 10000.0
-  time_every: 4
-  mlp_ratio: 4
-  dropout_rate: 0.0
-  k_max: 8
+    d_model: 128
+    d_bottleneck: 32
+    depth: 8
+    n_heads: 4
+    n_kv_heads: 2
+    packing_factor: 2
+    n_register: 4
+    n_agent: 0
+    qk_norm_type: Null
+    rope_theta: 10000.0
+    time_every: 4
+    mlp_ratio: 4
+    dropout_rate: 0.0
+    k_max: 8
 
 bootstrap_start: 5_000
 self_fraction: 0.25

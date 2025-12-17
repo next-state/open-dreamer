@@ -4,57 +4,37 @@
 # It restores the pretrained tokenizer (enc/dec) and trains the dynamics model.
 
 from __future__ import annotations
-from dataclasses import dataclass, asdict, field
-from pathlib import Path
-from functools import partial
-import hydra
-from omegaconf import DictConfig, OmegaConf
-from hydra.core.hydra_config import HydraConfig
-from tqdm import tqdm
-from einops import rearrange
 
+from dataclasses import asdict, dataclass, field
+from functools import partial
+from pathlib import Path
+
+import hydra
 import jax
 import jax.numpy as jnp
-from flax.core import FrozenDict
 import optax
 import wandb
+from einops import rearrange
+from flax.core import FrozenDict
+from hydra.core.hydra_config import HydraConfig
+from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
-from dreamer.models import Dynamics, Tokenizer
-from dreamer.data import make_iterator
 from dreamer.configs import DynamicsConfig
-from dreamer.utils import (
-    normalize_with_dataset_stats,
-    with_params,
-    make_state, make_manager, try_restore, maybe_save,
-    pack_mae_params,
-    init_tokenizer, init_dynamics,
-    _ensure_dir, _to_uint8, _stack_wide, _tile_videos,
-    load_pretrained_tokenizer,
-    from_dict,
-    recursive_list_to_tuple,
-)
+from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
-
+from dreamer.models import Dynamics, Tokenizer
 from dreamer.sampler import SamplerConfig, sample_video
-# jax.config.update("jax_debug_nans", True)
-
+from dreamer.utils import _ensure_dir,from_dict,init_dynamics,make_manager,make_state,maybe_save,normalize_with_dataset_stats,try_restore
 
 # ---------------------------
 # Single efficient training step (always used)
 # ---------------------------
-
 @partial(
     jax.jit,
-    static_argnames=("dynamics","tx","k_max","B_self"),
+    static_argnames=("dynamics", "tx", "k_max", "B_self"),
 )
-def train_step_efficient(
-    dynamics, tx,
-    params, opt_state, constants,
-    latents, actions,
-    *,
-    B_self: int, k_max: int,
-    master_key: jnp.ndarray, step: int, bootstrap_start: int,
-):
+def train_step_efficient(dynamics, tx, params, opt_state, constants, latents, actions, *, B_self: int, k_max: int, master_key: jnp.ndarray, step: int, bootstrap_start: int):
     """
     Deterministic two-branch training (one fused main forward):
       - first B_emp rows: empirical flow at d_min = 1/k_max
@@ -62,76 +42,86 @@ def train_step_efficient(
     If step < bootstrap_start, the bootstrap contribution is masked to 0 (but we still
     execute one fused path to keep a single jit and stable shapes).
     """
-    @partial(jax.jit, static_argnames=("shape_bt","k_max",))
-    def _sample_tau_for_step(rng, shape_bt, k_max:int, step_idx:jnp.ndarray, *, dtype=jnp.float32):
+
+    @partial(jax.jit, jstatic_argnames=("shape_bt", "k_max"))
+    def _sample_tau_for_step(rng, shape_bt, k_max: int, step_idx: jnp.ndarray, *, dtype=jnp.float32):
         B_, T_ = shape_bt
-        K = (1 << step_idx)
+        K = 1 << step_idx
         u = jax.random.uniform(rng, (B_, T_), dtype=dtype)
         j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)
         tau = j_idx.astype(dtype) / K.astype(dtype)
         tau_idx = j_idx * (k_max // K)
         return tau, tau_idx
 
-    @partial(jax.jit, static_argnames=("shape_bt","k_max",))
-    def _sample_step_excluding_dmin(rng, shape_bt, k_max:int):
+    @partial(jax.jit, jstatic_argnames=("shape_bt", "k_max"))
+    def _sample_step_excluding_dmin(rng, shape_bt, k_max: int):
         B_, T_ = shape_bt
         emax = jnp.log2(k_max).astype(jnp.int32)
-        step_idx = jax.random.randint(rng, (B_, T_), 0, emax, dtype=jnp.int32)  # exclude emax
+        step_idx = jax.random.randint(
+            rng, (B_, T_), 0, emax, dtype=jnp.int32
+        )  # exclude emax
         d = 1.0 / (1 << step_idx).astype(jnp.float32)
         return d, step_idx
 
     # RNGs
     step_key = jax.random.fold_in(master_key, step)
-    key_sigma_full, key_step_self, key_noise_full, drop_key = jax.random.split(step_key, 4)
+    key_sigma_full, key_step_self, key_noise_full, drop_key = jax.random.split(
+        step_key, 4
+    )
 
     # Deterministic batch split
     B, T, S, D = latents.shape
-    B_emp  = B - B_self
+    B_emp = B - B_self
     actions_full = actions
     emax = jnp.log2(k_max).astype(jnp.int32)
 
     # --- Step indices (encode d) ---
-    step_idx_emp  = jnp.full((B_emp,  T), emax, dtype=jnp.int32)             # d = d_min
+    step_idx_emp = jnp.full((B_emp, T), emax, dtype=jnp.int32)  # d = d_min
     # If B_self == 0, create a dummy 0xT array – slicing below handles it.
-    d_self, step_idx_self = _sample_step_excluding_dmin(key_step_self, (B_self, T), k_max)
-    step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)   # (B,T)
+    d_self, step_idx_self = _sample_step_excluding_dmin(
+        key_step_self, (B_self, T), k_max
+    )
+    step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)  # (B,T)
 
     # --- Signal levels on each row's grid (one call for whole batch) ---
-    sigma_full, sigma_idx_full = _sample_tau_for_step(key_sigma_full, (B, T), k_max, step_idx_full)
-    sigma_emp   = sigma_full[:B_emp]
-    sigma_self  = sigma_full[B_emp:]
+    sigma_full, sigma_idx_full = _sample_tau_for_step(
+        key_sigma_full, (B, T), k_max, step_idx_full
+    )
+    sigma_emp = sigma_full[:B_emp]
+    sigma_self = sigma_full[B_emp:]
     sigma_idx_self = sigma_idx_full[B_emp:]
 
     # --- Corrupt inputs: z_tilde = (1 - sigma) z0 + sigma z1 ---
-    z0_full      = jax.random.normal(key_noise_full, latents.shape, dtype=latents.dtype)
-    z_tilde_full = (1.0 - sigma_full)[...,None,None] * z0_full + sigma_full[...,None,None] * latents
+    z0_full = jax.random.normal(key_noise_full, latents.shape, dtype=latents.dtype)
+    z_tilde_full = (1.0 - sigma_full)[..., None, None] * z0_full + sigma_full[
+        ..., None, None
+    ] * latents
     z_tilde_self = z_tilde_full[B_emp:]
 
     # --- Ramp weights ---
-    w_emp  = 0.9 * sigma_emp  + 0.1
+    w_emp = 0.9 * sigma_emp + 0.1
     w_self = 0.9 * sigma_self + 0.1
 
     # --- Half-step metadata for self rows ---
-    d_half            = d_self / 2.0
-    step_idx_half     = step_idx_self + 1
-    sigma_plus        = sigma_self + d_half
-    sigma_idx_plus    = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
+    d_half = d_self / 2.0
+    step_idx_half = step_idx_self + 1
+    sigma_plus = sigma_self + d_half
+    sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
 
     def loss_and_aux(p):
         local_dyn = {"params": p, "constants": constants}
         drop_main, drop_h1, drop_h2 = jax.random.split(drop_key, 3)
 
         # Main forward (emp + self)
-        z1_hat_full, *_ = dynamics.apply(
-            local_dyn, actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
-            rngs={"dropout": drop_main}, deterministic=False,
-        )  # (B,T,Sz,Dz)
+        z1_hat_full, *_ = dynamics.apply(local_dyn, actions_full, step_idx_full, sigma_idx_full, z_tilde_full, rngs={"dropout": drop_main}, deterministic=False)  # (B,T,Sz,Dz)
 
-        z1_hat_emp  = z1_hat_full[:B_emp]
+        z1_hat_emp = z1_hat_full[:B_emp]
         z1_hat_self = z1_hat_full[B_emp:]
 
         # Flow loss on empirical rows (to z1)
-        flow_per = jnp.mean((z1_hat_emp - latents[:B_emp])**2, axis=(2,3))        # (B_emp,T)
+        flow_per = jnp.mean(
+            (z1_hat_emp - latents[:B_emp]) ** 2, axis=(2, 3)
+        )  # (B_emp,T)
         loss_emp = jnp.mean(flow_per * w_emp)
 
         # Self-consistency (bootstrap) on self rows
@@ -139,27 +129,32 @@ def train_step_efficient(
         do_boot = (B_self > 0) & (step >= bootstrap_start)
 
         def _boot_loss():
-            z1_hat_half1, *_ = dynamics.apply(
-                local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self,
-                rngs={"dropout": drop_h1}, deterministic=False,
-            )
-            b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
-            z_prime = z_tilde_self + b_prime * d_half[...,None,None]
-            z1_hat_half2, *_ = dynamics.apply(
-                local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime,
-                rngs={"dropout": drop_h2}, deterministic=False,
-            )
-            b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[...,None,None]
-            vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
+            z1_hat_half1, *_ = dynamics.apply(local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self, rngs={"dropout": drop_h1}, deterministic=False)
+            b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[
+                ..., None, None
+            ]
+            z_prime = z_tilde_self + b_prime * d_half[..., None, None]
+            z1_hat_half2, *_ = dynamics.apply(local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime, rngs={"dropout": drop_h2}, deterministic=False)
+            b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[
+                ..., None, None
+            ]
+            vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[
+                ..., None, None
+            ]
             vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-            boot_per = (1.0 - sigma_self)**2 * jnp.mean((vhat_sigma - vbar_target)**2, axis=(2,3))  # (B_self,T)
+            boot_per = (1.0 - sigma_self) ** 2 * jnp.mean(
+                (vhat_sigma - vbar_target) ** 2, axis=(2, 3)
+            )  # (B_self,T)
             loss_self = jnp.mean(boot_per * w_self)
             return loss_self, jnp.mean(boot_per)
 
         loss_self, boot_mse = jax.lax.cond(
             do_boot,
             _boot_loss,
-            lambda: (jnp.array(0.0, dtype=latents.dtype), jnp.array(0.0, dtype=latents.dtype)),
+            lambda: (
+                jnp.array(0.0, dtype=latents.dtype),
+                jnp.array(0.0, dtype=latents.dtype),
+            ),
         )
 
         # Combine (row-weighted by nominal B parts; denominator B keeps scale constant)
@@ -176,9 +171,11 @@ def train_step_efficient(
     new_params = optax.apply_updates(params, updates)
     return new_params, opt_state, aux
 
+
 # ---------------------------
 # Main
 # ---------------------------
+
 
 def run(cfg: DynamicsConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
@@ -199,13 +196,18 @@ def run(cfg: DynamicsConfig):
 
     rng = jax.random.PRNGKey(0)
 
-    tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(cfg.tokenizer_ckpt)
-    
+    tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(
+        cfg.tokenizer_ckpt
+    )
+    tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(
+        cfg.tokenizer_ckpt
+    )
+
     dynamics = Dynamics(cfg.dynamics)
     rng, dynamics_variables = init_dynamics(rng, dynamics, tokenizer_cfg)
     dynamics_params = dynamics_variables["params"]
     dynamics_constants = dynamics_variables.get("constants", FrozenDict())
-    
+
     tx = optax.adamw(cfg.lr)
     opt_state = tx.init(dynamics_params)
 
@@ -217,8 +219,29 @@ def run(cfg: DynamicsConfig):
         wandb_obj=wandb,
     )
 
+    ckpt_dir = run_dir / "checkpoints"
+    mngr = make_manager(
+        ckpt_dir,
+        max_to_keep=cfg.ckpt_max_to_keep,
+        save_interval_steps=cfg.ckpt_save_every,
+    )
+
+    state_example = make_state(dynamics_params, opt_state, rng, step=0)
+    meta = {"cfg": asdict(cfg)}
+
+    restored = try_restore(mngr, state_example, meta)
+    start_step = 0
+    if restored is not None:
+        latest_step, r = restored
+        dynamics_params = r.state["params"]
+        opt_state = r.state["opt_state"]
+        rng = r.state["rng"]
+        start_step = int(r.state["step"])
+        cfg = from_dict(DynamicsConfig, r.meta["cfg"])
+        print(f"[ckpt] Restored step {latest_step}")
+
     dataset = make_iterator(tokenizer_cfg.dataset)
-    pbar = tqdm(enumerate(dataset))
+    pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
     for step, batch in pbar:
         # Data
         rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
@@ -228,25 +251,15 @@ def run(cfg: DynamicsConfig):
         actions = batch["actions"]
         # print(actions)
         videos = normalize_with_dataset_stats(
-            videos, 
-            mean=cfg.dataset.dataset_mean, 
-            std=cfg.dataset.dataset_std
+            videos, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std
         )
 
-        latents, _ = tokenizer.apply(
-            tokenizer_vars,
-            videos,
-            rngs={"mae": tokenizer_key},
-            method=tokenizer.encode,
-        )
+        latents, _ = tokenizer.apply(tokenizer_vars, videos, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
 
         # Pack latents for dynamics
-        latents = rearrange(latents, 'b t (n p) d -> b t n (p d)', p=cfg.dynamics.packing_factor)
+        latents = rearrange(latents, "b t (n p) d -> b t n (p d)", p=cfg.dynamics.packing_factor)
 
-        dynamics_params, opt_state, aux = train_step_efficient(
-            dynamics, tx, dynamics_params, opt_state, dynamics_constants, latents, actions,
-            B_self=videos.shape[0]//2, k_max=cfg.dynamics.k_max, master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
-        )
+        dynamics_params, opt_state, aux = train_step_efficient(dynamics, tx, dynamics_params, opt_state, dynamics_constants, latents, actions, B_self=videos.shape[0] // 2, k_max=cfg.dynamics.k_max, master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start)
 
         # Logging
         if logger.should_log(step):
@@ -256,12 +269,12 @@ def run(cfg: DynamicsConfig):
                     "flow_mse": aux["flow_mse"],
                     "boot_mse": aux["bootstrap_mse"],
                 },
-                pbar=pbar
+                pbar=pbar,
             )
 
         # Save (async) when policy says we should
-        # state = make_state(train_state.params, train_state.opt_state, train_rng, step)
-        # maybe_save(mngr, step, state, meta)
+        state = make_state(dynamics_params, opt_state, rng, step)
+        maybe_save(mngr, step, state, meta)
 
         # Periodic lightweight AR eval
         # if cfg.write_video_every and (step % cfg.write_video_every == 0):
@@ -279,15 +292,29 @@ def run(cfg: DynamicsConfig):
 def main(cfg: DictConfig):
     schema = OmegaConf.structured(DynamicsConfig)
     cfg = OmegaConf.merge(schema, cfg)
+
     realism_cfg = OmegaConf.to_object(cfg)
-    
+
+    run(realism_cfg)
+
+
+if __name__ == "__main__":
+    main()
+
+    realism_cfg = OmegaConf.to_object(cfg)
+
     run(realism_cfg)
 
 if __name__ == "__main__":
     main()
 
-    
-    
+    realism_cfg = OmegaConf.to_object(cfg)
+
+    run(realism_cfg)
+
+if __name__ == "__main__":
+    main()
+
 # ------- OLD CODE
 
 # # ---------------------------
@@ -531,7 +558,7 @@ if __name__ == "__main__":
 #         dropout_rate=0.0,
 #         qk_norm_type=cfg.qk_norm_type,
 #         rope_theta=cfg.rope_theta,
-#         k_max=k_max, 
+#         k_max=k_max,
 #         mlp_ratio=4.0,
 #         time_every=4,
 #     )
@@ -663,4 +690,3 @@ if __name__ == "__main__":
 #                 wandb.log({
 #                     f"eval/{tag}/video": wandb.Video(mp4_path, format="mp4"),
 #                 }, step=step)
-
