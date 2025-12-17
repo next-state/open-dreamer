@@ -130,21 +130,13 @@ def train_step_efficient(dynamics, tx, params, opt_state, constants, latents, ac
 
         def _boot_loss():
             z1_hat_half1, *_ = dynamics.apply(local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self, rngs={"dropout": drop_h1}, deterministic=False)
-            b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[
-                ..., None, None
-            ]
+            b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[..., None, None]
             z_prime = z_tilde_self + b_prime * d_half[..., None, None]
             z1_hat_half2, *_ = dynamics.apply(local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime, rngs={"dropout": drop_h2}, deterministic=False)
-            b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[
-                ..., None, None
-            ]
-            vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[
-                ..., None, None
-            ]
+            b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[..., None, None]
+            vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[..., None, None]
             vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-            boot_per = (1.0 - sigma_self) ** 2 * jnp.mean(
-                (vhat_sigma - vbar_target) ** 2, axis=(2, 3)
-            )  # (B_self,T)
+            boot_per = (1.0 - sigma_self) ** 2 * jnp.mean((vhat_sigma - vbar_target) ** 2, axis=(2, 3))  # (B_self,T)
             loss_self = jnp.mean(boot_per * w_self)
             return loss_self, jnp.mean(boot_per)
 
@@ -292,9 +284,7 @@ def run(cfg: DynamicsConfig):
 def main(cfg: DictConfig):
     schema = OmegaConf.structured(DynamicsConfig)
     cfg = OmegaConf.merge(schema, cfg)
-
     realism_cfg = OmegaConf.to_object(cfg)
-
     run(realism_cfg)
 
 if __name__ == "__main__":
