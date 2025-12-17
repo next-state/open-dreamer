@@ -30,10 +30,7 @@ from dreamer.utils import _ensure_dir,from_dict,init_dynamics,make_manager,make_
 # ---------------------------
 # Single efficient training step (always used)
 # ---------------------------
-@partial(
-    jax.jit,
-    static_argnames=("dynamics", "tx", "k_max", "B_self"),
-)
+@partial(jax.jit, static_argnames=("dynamics", "tx", "k_max", "B_self"))
 def train_step_efficient(dynamics, tx, params, opt_state, constants, latents, actions, *, B_self: int, k_max: int, master_key: jnp.ndarray, step: int, bootstrap_start: int):
     """
     Deterministic two-branch training (one fused main forward):
@@ -191,9 +188,6 @@ def run(cfg: DynamicsConfig):
     tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(
         cfg.tokenizer_ckpt
     )
-    tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(
-        cfg.tokenizer_ckpt
-    )
 
     dynamics = Dynamics(cfg.dynamics)
     rng, dynamics_variables = init_dynamics(rng, dynamics, tokenizer_cfg)
@@ -212,11 +206,7 @@ def run(cfg: DynamicsConfig):
     )
 
     ckpt_dir = run_dir / "checkpoints"
-    mngr = make_manager(
-        ckpt_dir,
-        max_to_keep=cfg.ckpt_max_to_keep,
-        save_interval_steps=cfg.ckpt_save_every,
-    )
+    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
 
     state_example = make_state(dynamics_params, opt_state, rng, step=0)
     meta = {"cfg": asdict(cfg)}
@@ -242,13 +232,8 @@ def run(cfg: DynamicsConfig):
         videos = batch["videos"].astype(jnp.float32) / 255.0
         actions = batch["actions"]
         # print(actions)
-        videos = normalize_with_dataset_stats(
-            videos, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std
-        )
-
+        videos = normalize_with_dataset_stats(videos, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
         latents, _ = tokenizer.apply(tokenizer_vars, videos, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
-
-        # Pack latents for dynamics
         latents = rearrange(latents, "b t (n p) d -> b t n (p d)", p=cfg.dynamics.packing_factor)
 
         dynamics_params, opt_state, aux = train_step_efficient(dynamics, tx, dynamics_params, opt_state, dynamics_constants, latents, actions, B_self=videos.shape[0] // 2, k_max=cfg.dynamics.k_max, master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start)
