@@ -475,9 +475,9 @@ class Encoder(nn.Module):
         encoded_tokens = self.transformer(tokens, mask=mask, deterministic=deterministic)
         # print(f"encoded_tokens_btSd.shape: {encoded_tokens_btSd.shape}")
 
-        # 6) Project latent tokens to bottleneck and tanh
+        # 6) Project latent tokens to bottleneck
         latent_tokens = encoded_tokens[:, :, :self.n_latents, :]
-        proj_tokens = nn.tanh(self.bottleneck_proj(latent_tokens))
+        proj_tokens = self.bottleneck_proj(latent_tokens)
 
         return proj_tokens, (patch_mask, keep_prob)  # keep mask if you want diagnostics
 

@@ -80,6 +80,7 @@ class TokenizerConfig:
     log_every: int = 100
     lpips_weight: float = 0.2
     lpips_frac: float = 0.5
+    kl_weight: float = 0.01
     visualize_every: int = 10_000
 
 def _ensure_dir(p: Path) -> Path:
@@ -108,7 +109,7 @@ def forward_apply(encoder, decoder, enc_vars, dec_vars, patches_btnd, *, mae_key
 
     rngs_dec = {} if not train else {"dropout": drop_key}
     pred_btnd = decoder.apply(dec_vars, z_btLd, rngs=rngs_dec, deterministic=not train)
-    return pred_btnd, mae_info  # mae_info = (mae_mask, keep_prob)
+    return pred_btnd, z_btLd, mae_info  # mae_info = (mae_mask, keep_prob)
 
 # --- loss ---
 def recon_loss_from_mae(pred_btnd, target_btnd, mae_mask):
@@ -116,6 +117,32 @@ def recon_loss_from_mae(pred_btnd, target_btnd, mae_mask):
     target_masked = jnp.where(mae_mask, target_btnd, 0.0)
     num = jnp.maximum(mae_mask.sum(), 1.0)
     return jnp.sum((pred_masked - target_masked) ** 2) / (num * pred_btnd.shape[-1])
+
+def kl_divergence_to_standard_normal(z_btLd: jnp.ndarray) -> jnp.ndarray:
+    """
+    Compute KL divergence from the aggregate posterior to the standard normal N(0,1).
+    We treat the tokens as samples from a distribution and compute empirical statistics.
+    
+    Args:
+        z_btLd: (B, T, L, D) projected tokens from encoder
+        
+    Returns:
+        Scalar KL divergence loss
+    """
+    B, T, L, D = z_btLd.shape
+    z_flat = z_btLd.reshape((B * T, L, D))
+    
+    # Compute mean and variance across the batch-time dimension for each (L, D) position
+    # This gives us empirical mean and variance per token position
+    mean = jnp.mean(z_flat, axis=0)  # (L, D)
+    var = jnp.var(z_flat, axis=0)     # (L, D)
+    
+    eps = 1e-8
+    std = jnp.sqrt(var + eps)
+    kl_per_dim = 0.5 * (mean ** 2 + var - 1.0 - 2.0 * jnp.log(std))
+    
+    kl_loss = jnp.mean(kl_per_dim)
+    return kl_loss
 
 # --- instantiate once (top-level / main) ---
 lpips_loss_fn = None
@@ -167,7 +194,7 @@ def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, dro
     target_norm = normalize_with_dataset_stats(target_btnd, mean=dataset_mean, std=dataset_std)
 
     # Run full model (no dropout during viz)
-    pred_norm, (mae_mask_btNp1, keep_prob_bt1) = forward_apply(
+    pred_norm, _, (mae_mask_btNp1, keep_prob_bt1) = forward_apply(
         encoder, decoder, enc_vars, dec_vars, target_norm,
         mae_key=mae_key, drop_key=drop_key, train=False
     )
@@ -192,9 +219,9 @@ def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, dro
 
 
 # --- train step ---
-@partial(jax.jit, static_argnames=("encoder","decoder","tx","patch","H","W","C", "lpips_weight", "lpips_frac", "should_log"))
+@partial(jax.jit, static_argnames=("encoder","decoder","tx","patch","H","W","C", "lpips_weight", "lpips_frac", "kl_weight", "should_log"))
 def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch, *,
-               patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0, should_log=False, dataset_mean, dataset_std):
+               patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0, kl_weight=0.01, should_log=False, dataset_mean, dataset_std):
     """
     (master_key, params, opt_state, model_state, batch)
         │
@@ -220,7 +247,7 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
         # Replace params in vars
         ev, dv = unpack_mae_params(packed_params, enc_vars, dec_vars)
         target_norm = normalize_with_dataset_stats(target_btnd, mean=dataset_mean, std=dataset_std)
-        pred_norm, mae_info = forward_apply(encoder, decoder, ev, dv, target_norm,
+        pred_norm, z_btLd, mae_info = forward_apply(encoder, decoder, ev, dv, target_norm,
                                             mae_key=mae_key, drop_key=drop_key, train=True)
         mae_mask, keep_prob = mae_info
 
@@ -241,15 +268,22 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
                 pred_btnd, target_btnd, mae_mask,
                 H=H, W=W, C=C, patch=patch, subsample_frac=lpips_frac
             )
-            total = mse + lpips_weight * lpips
         else:
             lpips = 0.0
-            total = mse
+
+        # KL divergence regularization
+        if kl_weight > 0.0:
+            kl_loss = kl_divergence_to_standard_normal(z_btLd)
+        else:
+            kl_loss = 0.0
+
+        total = mse + lpips_weight * lpips + kl_weight * kl_loss
 
         aux = {
             "loss_total": total,
             "loss_mse": mse,
             "loss_lpips": lpips,
+            "loss_kl": kl_loss,
             "keep_prob": keep_prob,
             "loss_mse_pix": mse_pix,
         }
@@ -386,6 +420,7 @@ def run(cfg: TokenizerConfig):
                 patch=cfg.patch_size, H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, 
                 master_key=master_key, step=step, 
                 lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
+                kl_weight=cfg.kl_weight,
                 should_log=should_log,
                 dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
             )
@@ -404,6 +439,7 @@ def run(cfg: TokenizerConfig):
                         "total": aux['loss_total'],
                         "rmse": rmse,
                         "lpips": aux['loss_lpips'],
+                        "kl": aux['loss_kl'],
                         "psnr": psnr,
                         "time/data": data_t,
                         "time/train": train_t,

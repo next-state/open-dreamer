@@ -40,4 +40,5 @@ max_steps: 1_000_000_000
 log_every: 100
 lpips_weight: 0.2
 lpips_frac: 0.5
+kl_weight: 0.01
 visualize_every: 10_000
