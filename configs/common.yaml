@@ -1,5 +1,4 @@
 defaults:
-  - dataset: bouncing_square
   - _self_
 
 # Logging / Checkpointing

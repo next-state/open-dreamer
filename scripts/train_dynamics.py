@@ -11,6 +11,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.core.hydra_config import HydraConfig
 from tqdm import tqdm
+from einops import rearrange
 
 import jax
 import jax.numpy as jnp
@@ -28,20 +29,13 @@ from dreamer.utils import (
     init_tokenizer, init_dynamics,
     _ensure_dir, _to_uint8, _stack_wide, _tile_videos,
     load_pretrained_tokenizer,
+    from_dict,
+    recursive_list_to_tuple,
 )
 from dreamer.logging import MetricLogger
 
 from dreamer.sampler import SamplerConfig, sample_video
 
-# ---------------------------
-# Config
-# ---------------------------
-
-
-def init_models(rng, tokenizer, dynamics, cfg):
-    rng, tokenizer_variables = init_tokenizer(rng, tokenizer, cfg)
-    rng, dynamics_variables = init_dynamics(rng, dynamics, cfg)
-    return rng, tokenizer_variables, dynamics_variables
 
 # ---------------------------
 # Single efficient training step (always used)
@@ -53,8 +47,7 @@ def init_models(rng, tokenizer, dynamics, cfg):
 )
 def train_step_efficient(
     dynamics, tx,
-    params, opt_state,
-    dyn_vars,
+    params, opt_state, constants,
     latents, actions,
     *,
     B_self: int, k_max: int,
@@ -123,7 +116,9 @@ def train_step_efficient(
     sigma_idx_plus    = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
 
     def loss_and_aux(p):
-        local_dyn = with_params(dyn_vars, p) # What is this?
+        local_dyn = {"params": p}
+        if constants:
+            local_dyn["constants"] = constants
         drop_main, drop_h1, drop_h2 = jax.random.split(drop_key, 3)
 
         # Main forward (emp + self)
@@ -203,12 +198,14 @@ def run(cfg: DynamicsConfig):
         )
 
     rng = jax.random.PRNGKey(0)
-    dataset = make_iterator(cfg.dataset)
 
-    tokenizer, tokenizer_params, tokenizer_cfg = Tokenizer.from_pretrained(cfg.tokenizer_ckpt)
+    tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(cfg.tokenizer_ckpt)
+    
     dynamics = Dynamics(cfg.dynamics)
     rng, dynamics_variables = init_dynamics(rng, dynamics, tokenizer_cfg)
     dynamics_params = dynamics_variables["params"]
+    from flax.core import FrozenDict
+    dynamics_constants = dynamics_variables.get("constants", FrozenDict())
     
     tx = optax.adamw(cfg.lr)
     opt_state = tx.init(dynamics_params)
@@ -221,6 +218,7 @@ def run(cfg: DynamicsConfig):
         wandb_obj=wandb,
     )
 
+    dataset = make_iterator(tokenizer_cfg.dataset)
     pbar = tqdm(enumerate(dataset))
     for step, batch in pbar:
         # Data
@@ -235,11 +233,19 @@ def run(cfg: DynamicsConfig):
             std=cfg.dataset.dataset_std
         )
 
-        latents = tokenizer.encoder.apply({"params":tokenizer_params}, videos, rngs=tokenizer_key)
+        latents, _ = tokenizer.apply(
+            tokenizer_vars,
+            videos,
+            rngs={"mae": tokenizer_key},
+            method=tokenizer.encode,
+        )
+
+        # Pack latents for dynamics
+        latents = rearrange(latents, 'b t (n p) d -> b t n (p d)', p=cfg.dynamics.packing_factor)
 
         dynamics_params, opt_state, aux = train_step_efficient(
-            dynamics, tx, dynamics_params, opt_state, dynamics_vaes, latents, actions,
-            B_self=videos.shape[0]//2, k_max=cfg.dynamics.k_max, master_key=master_key, step=step, bootstrap_start=cfg.dynamics.bootstrap_start,
+            dynamics, tx, dynamics_params, opt_state, dynamics_constants, latents, actions,
+            B_self=videos.shape[0]//2, k_max=cfg.dynamics.k_max, master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
         )
 
         # Logging
@@ -276,7 +282,6 @@ def main(cfg: DictConfig):
     realism_cfg = OmegaConf.to_object(cfg)
     
     run(realism_cfg)
-
 
 if __name__ == "__main__":
     main()

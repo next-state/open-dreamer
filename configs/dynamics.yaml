@@ -8,17 +8,23 @@ ckpt_save_every: 50_000
 
 # Dynamics specific
 dynamics:
-  d_model_dyn: 128
-  dyn_depth: 8
+  d_model: 128
+  d_bottleneck: 32
+  depth: 8
   n_heads: 4
   n_kv_heads: 2
   packing_factor: 2
   n_register: 4
   n_agent: 1
-
+  qk_norm_type: Null
+  rope_theta: 10000.0
+  time_every: 4
+  mlp_ratio: 4
+  dropout_rate: 0.0
   k_max: 8
-  bootstrap_start: 5_000
-  self_fraction: 0.25
+
+bootstrap_start: 5_000
+self_fraction: 0.25
 
 max_steps: 1_000_000_000
 log_every: 500

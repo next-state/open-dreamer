@@ -5,14 +5,15 @@ import jax.numpy as jnp
 import flax.linen as nn
 import jax
 import time
-from flax.core import FrozenDict
+from flax.core import FrozenDict, freeze, unfreeze
 import flax
 from typing import Optional, Tuple, Any, Dict
 from einops import rearrange, repeat
 import math
-from .utils import Modality, TokenLayout
+import orbax.checkpoint as ocp
+from .utils import Modality, TokenLayout, make_manager, from_dict, recursive_list_to_tuple
 from .data import patchify, unpatchify
-from .configs import TokenizerConfig
+from .configs import TokenizerConfig, DynamicsModelConfig
 
 
 
@@ -664,23 +665,45 @@ class Tokenizer(nn.Module):
 
     @classmethod
     def from_pretrained(cls, path, *, load_for_training: bool = False):
-        mngr = make_manager(path)
-
+        mngr = make_manager(path, item_names=("meta","state"))
+        
+        # 1. Restore metadata to get config
+        # We need to find the latest step first
         latest = mngr.latest_step()
         if latest is None:
             raise ValueError("No checkpoint found")
-
-        restore_args = ocp.args.Composite(
-            state=ocp.args.StandardRestore(None),  # restore full state, but we'll ignore most of it
-            meta=ocp.args.JsonRestore(),
+            
+        # We restore just meta first
+        restored_meta = mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
+        cfg_dict = restored_meta.meta["cfg"]
+        cfg_dict = recursive_list_to_tuple(cfg_dict)
+        cfg = from_dict(TokenizerConfig, cfg_dict)
+        
+        # 2. Init to get structure (params + constants)
+        tokenizer = cls(cfg)
+        rng = jax.random.PRNGKey(0)
+        rng_params, rng_mae, rng_drop = jax.random.split(rng, 3)
+        dummy = jax.random.uniform(rng, (1, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C))
+        variables = tokenizer.init(
+            {"params": rng_params, "mae": rng_mae, "dropout": rng_drop},
+            dummy,
+            deterministic=True
         )
+        
+        # 3. Restore parameters using keys from initialized variables (so shapes/types match)
+        # Note: We only restore 'params', keeping 'constants' from init
+        restored = mngr.restore(latest, args=ocp.args.Composite(
+            state=ocp.args.StandardRestore(None)
+        ))
+        
+        loaded_params = restored.state
+        
+        # 4. Merge loaded params into variables
+        variables = unfreeze(variables)
+        variables["params"] = loaded_params["params"]
+        variables = freeze(variables)
 
-        restored = mngr.restore(latest, args=restore_args)
-
-        params = restored.state["params"]
-        cfg = from_dict(TokenizerConfig, restored.meta["cfg"])
-
-        return cls(cfg), params, cfg
+        return tokenizer, variables, cfg
 
 class ActionEncoder(nn.Module):
     d_model: int
@@ -715,26 +738,30 @@ class ActionEncoder(nn.Module):
         return out
 
 class Dynamics(nn.Module):
-    d_model: int              # dimensionality of each token
-    d_bottleneck: int         # dimensionality of the input bottleneck space
-    d_spatial: int            # dimensionality of each spatial token input
-    n_spatial: int            # number of spatial tokens
-    n_register: int           # number of learned register tokens
-    n_agent: int              # number of agent tokens
-    n_heads: int
-    n_kv_heads: int
-    depth: int
-    k_max: int                 # maximum number of sampling steps (defines finest step 1/)
-    dropout_rate: float = 0.0
-    qk_norm_type: str | None = None
-    mlp_ratio: float = 4.0
-    time_every: int = 4
-    rope_theta: float = 10000.0
+    config: DynamicsModelConfig
 
     def setup(self):
+        # Extract params from configs
+        self.d_model = self.config.d_model
+        self.d_bottleneck = self.config.d_bottleneck
+        self.depth = self.config.depth
+        self.n_heads = self.config.n_heads
+        self.n_kv_heads = self.config.n_kv_heads
+        packing_factor = self.config.packing_factor
+        self.n_register = self.config.n_register
+        self.n_agent = self.config.n_agent
+        self.k_max = self.config.k_max
+        
+        # Defaults
+        dropout_rate = self.config.dropout_rate
+        qk_norm_type = self.config.qk_norm_type
+        mlp_ratio = self.config.mlp_ratio
+        time_every = self.config.time_every
+        rope_theta = self.config.rope_theta
+
         # Want to transform bottleneck inputs (B, T, N_b, D_b) to (B, T, N_b/packing_factor, D_b*packing_factor)
-        assert self.d_spatial % self.d_bottleneck == 0
         self.spatial_proj = nn.Dense(self.d_model, name="proj_spatial") # converts spatial tokens, of dim d_spatial to d_model
+        
         self.register_tokens = self.param(
             "register_tokens",
             nn.initializers.normal(0.02),
@@ -742,31 +769,17 @@ class Dynamics(nn.Module):
         )
         self.action_encoder = ActionEncoder(d_model=self.d_model)
 
-        # Two separate tokens for shortcut conditioning (your current layout):
-        segments = [
-            (Modality.ACTION, 1),
-            (Modality.SHORTCUT_SIGNAL, 1),   # τ (signal level) token
-            (Modality.SHORTCUT_STEP, 1),     # d (step size) token
-            (Modality.SPATIAL, self.n_spatial),
-            (Modality.REGISTER, self.n_register),
-        ]
-        if self.n_agent > 0:
-            segments.append((Modality.AGENT, self.n_agent))
-        self.layout = TokenLayout(segments=tuple(segments))
-        self.spatial_slice = self.layout.slices()[Modality.SPATIAL]
-        self.agent_slice  = self.layout.slices().get(Modality.AGENT, slice(0,0))  # safe if n_agent==0
-        self.modality_ids = self.layout.modality_ids()
 
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
             n_kv_heads=self.n_kv_heads,
             depth=self.depth,
-            dropout_rate=self.dropout_rate,
-            qk_norm_type=self.qk_norm_type,
-            mlp_ratio=self.mlp_ratio,
-            time_every=self.time_every,
-            rope_theta=self.rope_theta,
+            dropout_rate=dropout_rate,
+            qk_norm_type=qk_norm_type,
+            mlp_ratio=mlp_ratio,
+            time_every=time_every,
+            rope_theta=rope_theta,
         )
 
         # -------- Discrete embeddings for shortcut conditioning --------
@@ -778,7 +791,7 @@ class Dynamics(nn.Module):
         # Signal level τ ∈ {0, 1/d, 2/d, ..., 1 - 1/d} (grid length = 1/d)
         # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
         self.signal_embed = nn.Embed(self.k_max, self.d_model, name="signal_embed")
-        self.flow_x_head = nn.Dense(self.d_spatial, name="flow_x_head", kernel_init=nn.initializers.zeros,
+        self.flow_x_head = nn.Dense(self.d_bottleneck * packing_factor, name="flow_x_head", kernel_init=nn.initializers.zeros,
                             bias_init=nn.initializers.zeros)  # zero-init
 
     def create_static_caches(self, 
@@ -863,12 +876,17 @@ class Dynamics(nn.Module):
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
         
-        mask = self.layout.make_mask("wm_agent", B, T)
+        # make the layout for masking
+        modalities = [Modality.ACTION, Modality.SHORTCUT_SIGNAL, Modality.SHORTCUT_STEP, Modality.SPATIAL, Modality.REGISTER, Modality.AGENT]
+        segments = tuple((modality, tok.shape[2]) for modality, tok in zip(modalities, toks))
+        layout = TokenLayout(segments)
+        mask = layout.make_mask("wm_agent", B, T)
+
         x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches)
 
-        spatial_tokens = x[:, :, self.spatial_slice, :]
+        spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
         x1_hat = self.flow_x_head(spatial_tokens)
-        h_t = x[:, :, self.agent_slice, :] if self.n_agent > 0 else None  # (B,T,n_agent,D) or None
+        h_t = x[:, :, layout.slices()[Modality.AGENT], :] if self.n_agent > 0 else None  # (B,T,n_agent,D) or None
         return x1_hat, h_t, new_caches
 
 class TaskEmbedder(nn.Module):

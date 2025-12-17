@@ -256,14 +256,25 @@ def init_tokenizer(rng, tokenizer, tokenizer_cfg):
 
 def init_dynamics(rng, dynamics, tokenizer_cfg):
     rng, params_rng, dropout_rng, key = jax.random.split(rng, 4)
-    n_tokens = tokenizer_cfg.dataset.H * tokenizer_cfg.dataset.W // tokenizer_cfg.patch_size ** 2
-    dummy = jax.random.uniform(
-        key,
-        (tokenizer_cfg.dataset.B, tokenizer_cfg.dataset.T, n_tokens, tokenizer_cfg.encoder.d_bottleneck),
-    )
+    
+    B = tokenizer_cfg.dataset.B
+    T = tokenizer_cfg.dataset.T
+    
+    dyn_cfg = dynamics.config
+    enc_cfg = tokenizer_cfg.encoder
+    
+    packing_factor = dyn_cfg.packing_factor
+    n_spatial = enc_cfg.n_latents // packing_factor
+    d_spatial = enc_cfg.d_bottleneck * packing_factor
+    
+    packed_enc_tokens = jax.random.normal(key, (B, T, n_spatial, d_spatial))
+    actions = jnp.zeros((B, T), dtype=jnp.int32)
+    step_idxs = jnp.zeros((B, T), dtype=jnp.int32)
+    signal_idxs = jnp.zeros((B, T), dtype=jnp.int32)
+
     variables = dynamics.init(
         {"params": params_rng, "dropout": dropout_rng},
-        dummy,
+        actions, step_idxs, signal_idxs, packed_enc_tokens,
         deterministic=True,
     )
     return rng, variables
@@ -361,3 +372,10 @@ def from_dict(cls, d):
         else:
             kwargs[k] = v
     return cls(**kwargs)
+
+def recursive_list_to_tuple(d):
+    if isinstance(d, list):
+        return tuple(recursive_list_to_tuple(x) for x in d)
+    if isinstance(d, dict):
+        return {k: recursive_list_to_tuple(v) for k, v in d.items()}
+    return d

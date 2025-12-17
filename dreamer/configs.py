@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
 
-@dataclass
+@dataclass(frozen=True)
 class DatasetConfig:
     """Configuration for dataset parameters.
     
@@ -34,7 +34,7 @@ class DatasetConfig:
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
-@dataclass(unsafe_hash=True)
+@dataclass(frozen=True)
 class EncoderConfig:
     n_latents: int = 16
     d_bottleneck: int = 32
@@ -50,7 +50,7 @@ class EncoderConfig:
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
 
-@dataclass(unsafe_hash=True)
+@dataclass(frozen=True)
 class DecoderConfig:
     d_model: int = 64
     n_heads: int = 4
@@ -64,7 +64,7 @@ class DecoderConfig:
     rope_theta: float = 10000.0
     time_every: int = 4
 
-@dataclass(unsafe_hash=True)
+@dataclass(frozen=True)
 class TokenizerConfig:
     # IO / ckpt
     run_name: str
@@ -165,7 +165,26 @@ class RLConfig:
     eval_batch_size: int = 4
     max_eval_examples_to_plot: int = 4
 
-@dataclass(frozen=True)
+@dataclass(frozen=False, unsafe_hash=True)
+class DynamicsModelConfig:
+    d_model: int = 128
+    d_bottleneck: int = 32
+    depth: int = 8
+    n_heads: int = 4
+    n_kv_heads: int = 2
+    packing_factor: int = 2
+    n_register: int = 4 # number of register tokens for dynamics
+    n_agent: int = 1 # number of agent tokens for dynamics
+    qk_norm_type: str | None = None
+    rope_theta: float = 10000.0
+    time_every: int = 4
+    mlp_ratio: float = 4.0
+    dropout_rate: float = 0.0
+
+    # schedule
+    k_max: int = 8
+
+@dataclass(frozen=False)
 class DynamicsConfig:
     # IO / ckpt
     run_name: str
@@ -173,46 +192,22 @@ class DynamicsConfig:
     ckpt_max_to_keep: int = 2
     ckpt_save_every: int = 10_000
 
+    # Nested
+    dynamics: DynamicsModelConfig = field(default_factory=DynamicsModelConfig)
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+
     # wandb config
     use_wandb: bool = False
     wandb_entity: str | None = None  # if None, uses default entity
     wandb_project: str | None = None  # if None, uses run_name as project
 
-    # dataset config (used for dynamics training data)
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-
-    # tokenizer / dynamics config
-    # Nested Tokenizer Config (contains dataset, encoder, decoder, patch)
-    tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
-
-    # Tokenizer architecture params (flattened for easy access)
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    enc_depth: int = 8
-    dec_depth: int = 8
-
-    # Dynamics Model Config
-    d_model_dyn: int = 128
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4 # number of register tokens for dynamics
-    n_agent: int = 1 # number of agent tokens for dynamics
-
-    # schedule
-    k_max: int = 8
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
-    self_fraction: float = 0.25   # used once we pass bootstrap_start
-
     # train
     max_steps: int = 1_000_000_000
     log_every: int = 5_000
     lr: float = 3e-4
+    # schedule
+    bootstrap_start: int = 5_000
+    self_fraction: float = 0.25
 
     # eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
