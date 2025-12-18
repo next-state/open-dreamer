@@ -30,4 +30,4 @@ max_steps: 1_000_000_000
 log_every: 100
 lr: 1e-3
 
-write_video_every: 5_000
+write_video_every: 100

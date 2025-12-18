@@ -84,60 +84,77 @@ class DenoiseSchedule(NamedTuple):
     k_max: int
 
 
-def _build_static_schedule(cfg: ImaginationConfig) -> DenoiseSchedule:
+def make_schedule(
+    *,
+    k_max: int,
+    d: float,
+    start_mode: str = "pure",
+    tau0_fixed: float = 0.0,
+    horizon: int = 1,
+    context_length: int = 1,
+    n_spatial: int = 1,
+    tau_ctx: float = 0.9,
+    rng_key: jax.Array | None = None,
+) -> DenoiseSchedule:
     """
-    Host-side helper that constructs a fixed τ-ladder schedule.
-    This is run once at sampler construction time (not inside JIT).
+    Build a DenoiseSchedule from simple scalar arguments.
+
+    Args:
+        k_max: Maximum number of noise levels (must be power of 2)
+        d: Denoising step size (e.g., 1/k_max for finest, 1/4 for shortcut)
+        start_mode: "pure" (tau0=0), "fixed" (use tau0_fixed), or "random" (sample tau0)
+        tau0_fixed: Starting tau when start_mode="fixed"
+        horizon, context_length, n_spatial, tau_ctx: Unused, kept for API compatibility
+        rng_key: Required when start_mode="random"
+
+    Returns:
+        DenoiseSchedule with precomputed tau ladder and mixing coefficients.
     """
-    _assert_power_of_two(cfg.k_max)
+    _assert_power_of_two(k_max)
+    if start_mode not in ("pure", "fixed", "random"):
+        raise ValueError(f"start_mode must be 'pure', 'fixed' or 'random', got {start_mode!r}")
 
-    if cfg.start_mode not in ("pure", "fixed"):
-        raise ValueError(
-            f"ImaginationConfig.start_mode must be 'pure' or 'fixed' for static schedules, "
-            f"got {cfg.start_mode!r}"
-        )
-
-    # Validate and convert step size to step index e.
-    d = float(cfg.d)
-    e = _step_idx_from_d(d, cfg.k_max)
-
-    # Determine starting τ (aligned to the step grid).
-    if cfg.start_mode == "pure":
+    # Resolve tau0
+    if start_mode == "pure":
         tau0 = 0.0
-    else:  # "fixed"
-        # We keep this simple and snap tau0_fixed to the {0, d, 2d, ...} grid.
-        tau0_raw = float(np.clip(cfg.tau0_fixed, 0.0, 1.0))
-        tau0 = float(np.clip(np.floor(tau0_raw / d) * d, 0.0, 1.0))
+    elif start_mode == "fixed":
+        tau0 = float(np.clip(tau0_fixed, 0.0, 1.0))
+    else:  # random
+        if rng_key is None:
+            raise ValueError("rng_key must be provided when start_mode='random'")
+        rng_key, r_tau = jax.random.split(rng_key)
+        tau0 = float(jax.random.uniform(r_tau, (), minval=0.0, maxval=1.0))
 
-    # Build τ sequence τ_0..τ_S and corresponding α_s.
-    # S is chosen so that τ_S ≈ 1.0.
-    S_float = (1.0 - tau0) / d
-    S = int(round(S_float))
+    # Align tau0 to the {0, d, 2d, ...} grid
+    tau0 = float(np.clip(np.floor(tau0 / d) * d, 0.0, 1.0)) if tau0 > 0.0 else 0.0
+
+    # Compute step index e
+    e = _step_idx_from_d(d, k_max)
+
+    # Build τ sequence and α coefficients
+    S = int(round((1.0 - tau0) / d))
     if S <= 0:
-        raise ValueError(f"Invalid ladder length S={S} derived from tau0={tau0}, d={d}")
+        raise ValueError(f"Invalid ladder length S={S} from tau0={tau0}, d={d}")
 
-    tau_seq_np = tau0 + d * np.arange(S + 1, dtype=np.float32)
-    tau_seq_np = np.clip(tau_seq_np, 0.0, 1.0)
+    tau_seq = tau0 + d * np.arange(S + 1, dtype=np.float32)
+    tau_seq = np.clip(tau_seq, 0.0, 1.0)
 
-    alpha_seq_np = np.zeros(S, dtype=np.float32)
+    alpha_seq = np.zeros(S, dtype=np.float32)
     for s in range(S):
-        tau_prev = float(tau_seq_np[s])
-        tau_curr = float(tau_seq_np[s + 1])
-        denom = max(1.0 - tau_prev, 1e-8)
-        alpha_seq_np[s] = (tau_curr - tau_prev) / denom
+        denom = max(1.0 - tau_seq[s], 1e-8)
+        alpha_seq[s] = (tau_seq[s + 1] - tau_seq[s]) / denom
 
-    # Integer signal indices for each τ (same rule as _signal_idx_from_tau, but host-side).
-    signal_idx_np = (tau_seq_np * float(cfg.k_max)).astype(np.int32)
-    signal_idx_np = np.clip(signal_idx_np, 0, cfg.k_max - 1)
+    signal_idx = np.clip((tau_seq * k_max).astype(np.int32), 0, k_max - 1)
 
-    schedule = DenoiseSchedule(
-        tau_seq=jnp.asarray(tau_seq_np, dtype=jnp.float32),
-        alpha_seq=jnp.asarray(alpha_seq_np, dtype=jnp.float32),
-        signal_idx_seq=jnp.asarray(signal_idx_np, dtype=jnp.int32),
+    return DenoiseSchedule(
+        tau_seq=jnp.asarray(tau_seq, dtype=jnp.float32),
+        alpha_seq=jnp.asarray(alpha_seq, dtype=jnp.float32),
+        signal_idx_seq=jnp.asarray(signal_idx, dtype=jnp.int32),
         step_idx=int(e),
-        k_max=int(cfg.k_max),
+        k_max=int(k_max),
     )
-    return schedule
+
+
 
 
 # ---------------------------
@@ -155,7 +172,7 @@ def denoise_single_latent_static(
     z_noise_t: jnp.ndarray,                   # (B, 1, n_spatial, D_s)
     agent_tokens: jnp.ndarray | None = None,  # (B, T_ctx+1, n_agent, d_model)
     caches: Dict[int, Any] | None = None,
-) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[int, Any] | None]:
+) -> Tuple[jnp.ndarray, jnp.ndarray | None, Dict[int, Any] | None]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
 
@@ -202,7 +219,7 @@ def denoise_single_latent_static(
             actions_input = jnp.concatenate([actions_ctx, action_curr], axis=1)  # (B, T_ctx+1)
 
             step_idx_input = jnp.full((B, T_ctx + 1), schedule.step_idx, dtype=jnp.int32) # TODO: check this
-            signal_idx_ctx = jnp.full((B, T_ctx), (0.9 * schedule.k_max).astype(jnp.int32), dtype=jnp.int32)
+            signal_idx_ctx = jnp.full((B, T_ctx), int(0.9 * schedule.k_max), dtype=jnp.int32)
             signal_idx_curr = jnp.full((B, 1), signal_idx_scalar, dtype=jnp.int32)
             signal_idx_input = jnp.concatenate([signal_idx_ctx, signal_idx_curr], axis=1)
 
@@ -221,7 +238,7 @@ def denoise_single_latent_static(
         )
 
         z_clean_pred = z_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
-        h_last = h_seq[:, -1, :, :]  # (B, n_agent, d_model)
+        h_last = None if h_seq is None else h_seq[:, -1, :, :]  # (B, n_agent, d_model)
 
         # Per-step mixing toward clean latent
         z_t_new = (1.0 - alpha) * z_t + alpha * z_clean_pred
@@ -235,7 +252,7 @@ def denoise_single_latent_static(
         jnp.arange(S),
     )
 
-    h_last = h_history[-1]  # (B, n_agent, d_model)
+    h_last = None if h_history is None else h_history[-1]  # (B, n_agent, d_model)
     caches_last = None
     if caches_history is not None:
         caches_last = jax.tree.map(lambda x: x[-1], caches_history)
