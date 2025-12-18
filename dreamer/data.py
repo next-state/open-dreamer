@@ -2,6 +2,7 @@ from functools import partial
 from dataclasses import dataclass, field
 import jax
 import jax.numpy as jnp
+import numpy as np
 import imageio.v2 as imageio
 from einops import rearrange
 import coinrun_data.dataloader as coinrun_loader
@@ -15,10 +16,11 @@ from .configs import DatasetConfig
 # Action space (categorical):
 #   0: up, 1: down, 2: left, 3: right, 4: initial (null)
 # Directions are in (dy, dx) order for image coordinates.
-ACTION_DELTAS_YX = jnp.array(
-    [[-1, 0], [1, 0], [0, -1], [0, 1]], dtype=jnp.int32
+# Use numpy for module-level constants to avoid JAX init in Grain worker subprocesses.
+ACTION_DELTAS_YX = np.array(
+    [[-1, 0], [1, 0], [0, -1], [0, 1]], dtype=np.int32
 )
-NULL_ACTION = jnp.int32(4)
+NULL_ACTION = np.int32(4)
 
 
 # ============================================================
