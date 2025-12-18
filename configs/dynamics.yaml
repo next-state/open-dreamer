@@ -27,7 +27,7 @@ bootstrap_start: 5_000
 self_fraction: 0.25
 
 max_steps: 1_000_000_000
-log_every: 10
+log_every: 100
 lr: 1e-3
 
 write_video_every: 5_000

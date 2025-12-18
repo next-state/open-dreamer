@@ -251,7 +251,7 @@ def build_tiled_video_frames(
             _stack_wide(gt_np_all[b, t_idx], floor_np_all[b, t_idx], pred_np_all[b, t_idx])
             for b in range(batch_size)
         ]
-        grid_img = _tile_videos(trip_list, ncols=ncols, pad_color=0)
+        grid_img = _tile_videos(trip_list, ncols=4, pad_color=0)
         grid_frames.append(grid_img)
 
     return grid_frames
@@ -398,7 +398,10 @@ def run(cfg: DynamicsConfig):
         opt_state = r.state["opt_state"]
         rng = r.state["rng"]
         start_step = int(r.state["step"])
+        # Preserve runtime flags before restoring checkpoint config
+        use_wandb_override = cfg.use_wandb
         cfg = from_dict(DynamicsConfig, r.meta["cfg"])
+        cfg.use_wandb = use_wandb_override  # Keep CLI/YAML wandb setting
         print(f"[ckpt] Restored step {latest_step}")
 
     dataset = make_iterator(tokenizer_cfg.dataset)
@@ -410,11 +413,10 @@ def run(cfg: DynamicsConfig):
         # Normalize videos
         videos = batch["videos"].astype(jnp.float32) / 255.0
         actions = batch["actions"]
+        actions = jnp.concatenate((jnp.full_like(actions[:,0:1], fill_value = 15), actions[:,:-1]), axis=1)
         # print(actions)
-        videos = normalize_with_dataset_stats(videos, 
-            mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
-        latents, _ = tokenizer.apply(tokenizer_vars, videos, 
-            rngs={"mae": tokenizer_key}, method=tokenizer.encode)
+        videos = normalize_with_dataset_stats(videos, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std)
+        latents, _ = tokenizer.apply(tokenizer_vars, videos, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
         latents = rearrange(latents, "b t (n p) d -> b t n (p d)", p=cfg.dynamics.packing_factor)
 
         dynamics_params, opt_state, aux = train_step_efficient(dynamics, tx, 
@@ -438,8 +440,7 @@ def run(cfg: DynamicsConfig):
         maybe_save(mngr, step, state, meta)
 
         # Periodic lightweight AR eval
-        # TODO change step back to > 0 from >= 0
-        if cfg.write_video_every and (step % cfg.write_video_every == 0) and step >= 0:
+        if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
             # Use current batch as validation data (simplest approach)
             val_videos = batch["videos"].astype(jnp.float32) / 255.0
             run_evaluation(

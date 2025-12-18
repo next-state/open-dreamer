@@ -68,7 +68,7 @@ class KVCache:
             _update_wrap,
             self.v, v_new, write_idx
         )
-        
+
         return self.replace(k=k_updated, v=v_updated, index=self.index + T)
 
     def get_ordered_kv(self, query_len):
@@ -148,7 +148,7 @@ class RotaryEmbedding1D(nn.Module):
         # y' = x sin + y cos
         xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
         xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
-        
+
         xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
         xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
 
@@ -158,7 +158,7 @@ class RotaryEmbedding1D(nn.Module):
 
         xq_out = rearrange(xq_out, '... d two -> ... (d two)')
         xk_out = rearrange(xk_out, '... d two -> ... (d two)')
-        
+
         return xq_out, xk_out
 
 
@@ -257,7 +257,7 @@ class GroupedQueryAttention(nn.Module):
     dropout_rate: float = 0.0
     deterministic: bool = True
     qk_norm_type: str | None = None  # "qknorm", or "quest"
-    is_causal: bool = False 
+    is_causal: bool = False
     rope_theta: float = 10000.0
 
     def setup(self):
@@ -305,7 +305,7 @@ class GroupedQueryAttention(nn.Module):
         elif self.qk_norm_type == 'quest':
             # claims to beat qknorm https://openreview.net/pdf?id=HkztQWZfl2
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
-            scale = 1.0 
+            scale = 1.0
 
         # RoPE
         start_pos = cache.index if cache is not None else 0
@@ -333,16 +333,16 @@ class GroupedQueryAttention(nn.Module):
 
         # SDPA
         attn = jax.nn.dot_product_attention(
-            q, k_attn, v_attn, 
-            mask=mask_attn, 
-            scale=scale, 
+            q, k_attn, v_attn,
+            mask=mask_attn,
+            scale=scale,
             is_causal=attn_is_causal
         )  # TODO: try setting implementation="cudnn"
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
         out = self.dropout(out, deterministic=self.deterministic)
-        
+
         return out, new_cache
 
 class SpaceSelfAttention(nn.Module):
@@ -470,12 +470,12 @@ class BlockCausalTransformer(nn.Module):
             mask: attention mask
             deterministic: whether to use deterministic mode (no dropout)
             caches: optional dict mapping layer_index -> KVCache
-        
+
         Returns:
             output tensor and updated caches (always returns tuple, caches can be None)
         """
         new_caches = {} if caches is not None else None
-        
+
         for i in range(self.depth):
             time_index = i // self.time_every
             is_time_layer = (i + 1) % self.time_every == 0
@@ -486,10 +486,10 @@ class BlockCausalTransformer(nn.Module):
                 mlp_ratio=self.mlp_ratio, layer_index=i, time_every=self.time_every,
                 rope_theta=self.rope_theta,
             )(x, mask=mask, deterministic=deterministic, cache=cache_i)
-            
+
             if new_caches is not None and new_cache_i is not None:
                 new_caches[time_index] = new_cache_i
-        
+
         return x, new_caches
 
 class Encoder(nn.Module):
@@ -659,26 +659,26 @@ class Tokenizer(nn.Module):
 
     def encode(self, videos, deterministic: bool = True):
         return self.encoder(videos, deterministic=deterministic)
-        
+
     def decode(self, z, deterministic: bool = True):
         return self.decoder(z, deterministic=deterministic)
 
     @classmethod
     def from_pretrained(cls, path, *, load_for_training: bool = False):
         mngr = make_manager(path, item_names=("meta","state"))
-        
+
         # 1. Restore metadata to get config
         # We need to find the latest step first
         latest = mngr.latest_step()
         if latest is None:
             raise ValueError("No checkpoint found")
-            
+
         # We restore just meta first
         restored_meta = mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
         cfg_dict = restored_meta.meta["cfg"]
         cfg_dict = recursive_list_to_tuple(cfg_dict)
         cfg = from_dict(TokenizerConfig, cfg_dict)
-        
+
         # 2. Init to get structure (params + constants)
         tokenizer = cls(cfg)
         rng = jax.random.PRNGKey(0)
@@ -689,15 +689,15 @@ class Tokenizer(nn.Module):
             dummy,
             deterministic=True
         )
-        
+
         # 3. Restore parameters using keys from initialized variables (so shapes/types match)
         # Note: We only restore 'params', keeping 'constants' from init
         restored = mngr.restore(latest, args=ocp.args.Composite(
             state=ocp.args.StandardRestore(None)
         ))
-        
+
         loaded_params = restored.state
-        
+
         # 4. Merge loaded params into variables
         variables = unfreeze(variables)
         variables["params"] = loaded_params["params"]
@@ -707,7 +707,7 @@ class Tokenizer(nn.Module):
 
 class ActionEncoder(nn.Module):
     d_model: int
-    n_keyboard: int = 15  # up, down, left, right, null (categorical actions)
+    n_keyboard: int = 16  # up, down, left, right, null (categorical actions)
 
     @nn.compact
     def __call__(
@@ -751,7 +751,7 @@ class Dynamics(nn.Module):
         self.n_register = self.config.n_register
         self.n_agent = self.config.n_agent
         self.k_max = self.config.k_max
-        
+
         # Defaults
         dropout_rate = self.config.dropout_rate
         qk_norm_type = self.config.qk_norm_type
@@ -761,7 +761,7 @@ class Dynamics(nn.Module):
 
         # Want to transform bottleneck inputs (B, T, N_b, D_b) to (B, T, N_b/packing_factor, D_b*packing_factor)
         self.spatial_proj = nn.Dense(self.d_model, name="proj_spatial") # converts spatial tokens, of dim d_spatial to d_model
-        
+
         self.register_tokens = self.param(
             "register_tokens",
             nn.initializers.normal(0.02),
@@ -794,8 +794,8 @@ class Dynamics(nn.Module):
         self.flow_x_head = nn.Dense(self.d_bottleneck * packing_factor, name="flow_x_head", kernel_init=nn.initializers.zeros,
                             bias_init=nn.initializers.zeros)  # zero-init
 
-    def create_static_caches(self, 
-                             batch_size: int, 
+    def create_static_caches(self,
+                             batch_size: int,
                              window_size: int = 1024,
                              dtype=jnp.float32) -> Dict[int, KVCache]:
         """
@@ -866,14 +866,14 @@ class Dynamics(nn.Module):
         # --- 4) Shortcut embeddings (discrete lookup)
         step_tok   = self.step_embed(step_idxs)[:, :, None, :]         # (B, T, 1, d_model)
         signal_tok = self.signal_embed(signal_idxs)[:, :, None, :]     # (B, T, 1, d_model)
-        
+
         # --- 5) Concatenate in your declared layout order
         if self.n_agent > 0 and agent_tokens is not None:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, agent_tokens]
         else:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
-        
+
         # make the layout for masking
         modalities = [Modality.ACTION, Modality.SHORTCUT_SIGNAL, Modality.SHORTCUT_STEP, Modality.SPATIAL, Modality.REGISTER, Modality.AGENT]
         segments = tuple((modality, tok.shape[2]) for modality, tok in zip(modalities, toks))
