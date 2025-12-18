@@ -39,7 +39,7 @@ from dreamer.utils import (
 )
 from dreamer.logging import MetricLogger
 
-from dreamer.sampler import SamplerConfig, sample_video
+from dreamer.sampler import SamplerConfig, sample_video, plan_from_sampler_conf
 
 # ---------------------------
 # Config
@@ -344,40 +344,6 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
     return regs
 
 
-def _plan_from_sampler_conf(s: SamplerConfig) -> Dict[str, Any]:
-    def _is_pow2_frac(x: float) -> bool:
-        if x <= 0 or x > 1: return False
-        inv = round(1.0 / x)
-        return abs(1.0 / inv - x) < 1e-8 and (inv & (inv - 1)) == 0
-
-    if s.schedule == "finest":
-        d = 1.0 / float(s.k_max)
-    else:
-        if s.d is None or not _is_pow2_frac(s.d):
-            raise ValueError("shortcut schedule requires d = 1/(power of two)")
-        if s.d < 1.0 / float(s.k_max):
-            raise ValueError("d finer than finest")
-        d = float(s.d)
-
-    tau0 = 0.0
-    S = int(round((1.0 - tau0) / d))
-    e = int(round(np.log2(round(1.0 / d))))
-    tau_seq = [round(tau0 + i*d, 6) for i in range(S + 1)]
-    tau_seq[-1] = 1.0
-    return dict(
-        rollout=s.rollout,
-        start_mode=s.start_mode,
-        ctx_length=s.ctx_length,
-        horizon=s.horizon,
-        schedule=s.schedule,
-        d=d,
-        e=e,
-        S=S,
-        tau_seq=tau_seq,
-        k_max=s.k_max,
-        add_ctx_noise_std=getattr(s, "add_ctx_noise_std", 0.0),
-    )
-
 # ---------------------------
 # Video building and saving utilities
 # ---------------------------
@@ -463,7 +429,7 @@ def save_evaluation_plan(
         psnr: Peak signal-to-noise ratio in dB
         output_path: Path where JSON should be saved
     """
-    plan = _plan_from_sampler_conf(sampler_conf)
+    plan = plan_from_sampler_conf(sampler_conf)
     plan["step"] = int(step)
     plan["mse"] = float(mse)
     plan["psnr_db"] = float(psnr)
