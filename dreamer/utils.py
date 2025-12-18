@@ -11,16 +11,25 @@ from typing import Tuple
 import numpy as np
 import math
 
-# # --- helpers ---
-# temporal_patchify = jax.jit(
-#     jax.vmap(patchify, in_axes=(1, None), out_axes=1),  # (B,T,H,W,C) -> (B,T,Np,Dp)
-#     static_argnames=("patch",),
-# )
+# --- math helpers ---
 
-# temporal_unpatchify = jax.jit(
-#     jax.vmap(unpatchify, in_axes=(1, None, None, None, None), out_axes=1),
-#     static_argnames=("H", "W", "C", "patch"),
-# )
+def is_pow2_frac(x: float) -> bool:
+    """Check if x is a power-of-two fraction (1/2, 1/4, 1/8, etc.)."""
+    if x <= 0 or x > 1:
+        return False
+    inv = round(1.0 / x)
+    return abs(1.0 / inv - x) < 1e-8 and (inv & (inv - 1)) == 0
+
+# --- helpers ---
+temporal_patchify = jax.jit(
+    jax.vmap(patchify, in_axes=(1, None), out_axes=1),  # (B,T,H,W,C) -> (B,T,Np,Dp)
+    static_argnames=("patch",),
+)
+
+temporal_unpatchify = jax.jit(
+    jax.vmap(unpatchify, in_axes=(1, None, None, None), out_axes=1),
+    static_argnames=("patch", "H", "W"),
+)
 
 class Modality(IntEnum):
     LATENT   = -1
