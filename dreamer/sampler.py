@@ -2,16 +2,16 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Tuple, Optional, Dict, Any, Callable
-from einops import reduce
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP
+from dreamer.models import Tokenizer, Dynamics, TaskEmbedder, PolicyHeadMTP
 from dreamer.utils import (
     pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck,
     normalize_with_dataset_stats, unnormalize_with_dataset_stats,
+    is_pow2_frac,
 )
 
 # ---------------------------
@@ -54,10 +54,42 @@ def _assert_power_of_two(k: int):
     if k < 1 or (k & (k - 1)) != 0:
         raise ValueError(f"k_max must be a positive power of two, got {k}")
 
-def _is_power_of_two_fraction(x: float) -> bool:
-    if x <= 0 or x > 1: return False
-    inv = round(1.0 / x)
-    return abs(1.0 / inv - x) < 1e-8 and (inv & (inv - 1)) == 0
+# _is_power_of_two_fraction moved to utils.py as is_pow2_frac
+
+
+def plan_from_sampler_conf(s: SamplerConfig) -> dict:
+    """Convert SamplerConfig to a JSON-serializable plan dict for logging."""
+    if s.schedule == "finest":
+        d = 1.0 / float(s.k_max)
+    else:
+        if s.d is None or not is_pow2_frac(s.d):
+            raise ValueError("shortcut schedule requires d = 1/(power of two)")
+        if s.d < 1.0 / float(s.k_max):
+            raise ValueError("d finer than finest")
+        d = float(s.d)
+
+    tau0 = 0.0
+    S = int(round((1.0 - tau0) / d))
+    e = int(round(np.log2(round(1.0 / d))))
+    tau_seq = [round(tau0 + i * d, 6) for i in range(S + 1)]
+    tau_seq[-1] = 1.0
+    result = dict(
+        rollout=s.rollout,
+        start_mode=s.start_mode,
+        ctx_length=s.ctx_length,
+        horizon=s.horizon,
+        schedule=s.schedule,
+        d=d,
+        e=e,
+        S=S,
+        tau_seq=tau_seq,
+        k_max=s.k_max,
+    )
+    # Optional fields
+    if hasattr(s, "add_ctx_noise_std"):
+        result["add_ctx_noise_std"] = getattr(s, "add_ctx_noise_std", 0.0)
+    return result
+
 
 def _step_idx_from_d(d: float, k_max: int) -> int:
     K = round(1.0 / float(d))
@@ -75,7 +107,7 @@ def _choose_step_size(k_max: int, schedule: Schedule, d: Optional[float]) -> flo
         return 1.0 / float(k_max)
     if d is None:
         raise ValueError("schedule='shortcut' requires config.d (e.g., 1/4)")
-    if not _is_power_of_two_fraction(d):
+    if not is_pow2_frac(d):
         raise ValueError(f"d must be 1/(power of two); got d={d}")
     if d < 1.0 / float(k_max):
         raise ValueError(f"d={d} is finer than d_min=1/{k_max}")
@@ -256,17 +288,31 @@ def denoise_single_latent(
 
 def sample_video(
     *,
-    encoder: Encoder,
-    decoder: Decoder,
+    tokenizer: Tokenizer,
+    tokenizer_vars: Dict[str, Any],
     dynamics: Dynamics,
-    enc_vars: Dict[str, Any],
-    dec_vars: Dict[str, Any],
     dyn_vars: Dict[str, Any],
-    frames: jnp.ndarray,     # (B, T, H, W, C)
+    frames: jnp.ndarray,     # (B, T, H, W, C) in [0, 1]
     actions: jnp.ndarray,    # (B, T)
     config: SamplerConfig,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-
+    """
+    Sample video predictions using Tokenizer and Dynamics.
+    
+    Args:
+        tokenizer: Tokenizer module (has encode/decode methods)
+        tokenizer_vars: Combined variables dict with 'params' and 'constants'
+        dynamics: Dynamics model
+        dyn_vars: Dynamics variables dict
+        frames: Input video frames (B, T, H, W, C) normalized to [0,1]
+        actions: Action sequence (B, T)
+        config: SamplerConfig with rollout parameters
+    
+    Returns:
+        pred_frames: (B, ctx+horizon, H, W, C) predicted frames
+        floor_frames: (B, ctx+horizon, H, W, C) floor reconstruction (GT latents decoded)
+        gt_frames: (B, ctx+horizon, H, W, C) ground truth frames
+    """
     B, T, H, W, C = frames.shape
     assert config.ctx_length < T, "ctx_length must be < T"
     _validate_modes(config)
@@ -279,10 +325,14 @@ def sample_video(
     rng = config.rng_key if config.rng_key is not None else jax.random.PRNGKey(0)
     mae_key = config.mae_eval_key if config.mae_eval_key is not None else jax.random.PRNGKey(777)
 
-    # 1) encode once (deterministic key)
-    patches = temporal_patchify(frames, config.patch)
-    patches_norm = normalize_with_dataset_stats(patches, mean=config.dataset_mean, std=config.dataset_std)
-    z_btLd, _ = encoder.apply(enc_vars, patches_norm, rngs={"mae": mae_key}, deterministic=True)
+    # 1) encode once via tokenizer.encode (handles normalization internally? No - we normalize)
+    frames_norm = normalize_with_dataset_stats(frames, mean=config.dataset_mean, std=config.dataset_std)
+    z_btLd, _ = tokenizer.apply(
+        tokenizer_vars, frames_norm, 
+        method=tokenizer.encode, 
+        rngs={"mae": mae_key}, 
+        deterministic=True
+    )
     z_all = pack_bottleneck_to_spatial(z_btLd, n_spatial=config.n_spatial, k=config.packing_factor)  # (B,T,n_spatial,D_s)
 
     # 2) split context vs future
@@ -304,10 +354,13 @@ def sample_video(
         unpack_spatial_to_bottleneck(z_ctx_for_floor, n_spatial=config.n_spatial, k=config.packing_factor),
         unpack_spatial_to_bottleneck(gt_future_latents, n_spatial=config.n_spatial, k=config.packing_factor)
     ], axis=1)
-    floor_patches_norm = decoder.apply(dec_vars, floor_btLd, deterministic=True)
-    floor_patches = unnormalize_with_dataset_stats(floor_patches_norm, mean=config.dataset_mean, std=config.dataset_std)
-    floor_patches = jnp.clip(floor_patches, 0.0, 1.0)
-    floor_frames = temporal_unpatchify(floor_patches, H, W, C, config.patch)
+    floor_frames_norm = tokenizer.apply(
+        tokenizer_vars, floor_btLd, 
+        method=tokenizer.decode, 
+        deterministic=True
+    )
+    floor_frames = unnormalize_with_dataset_stats(floor_frames_norm, mean=config.dataset_mean, std=config.dataset_std)
+    floor_frames = jnp.clip(floor_frames, 0.0, 1.0)
 
     # 4) choose schedule/step size
     d = _choose_step_size(config.k_max, config.schedule, config.d)
@@ -356,10 +409,13 @@ def sample_video(
         unpack_spatial_to_bottleneck(z_all[:, :config.ctx_length, :, :], n_spatial=config.n_spatial, k=config.packing_factor),
         unpack_spatial_to_bottleneck(pred_latents, n_spatial=config.n_spatial, k=config.packing_factor),
     ], axis=1)
-    pred_patches_norm = decoder.apply(dec_vars, pred_btLd, deterministic=True)
-    pred_patches = unnormalize_with_dataset_stats(pred_patches_norm, mean=config.dataset_mean, std=config.dataset_std)
-    pred_patches = jnp.clip(pred_patches, 0.0, 1.0)
-    pred_frames = temporal_unpatchify(pred_patches, H, W, C, config.patch)
+    pred_frames_norm = tokenizer.apply(
+        tokenizer_vars, pred_btLd, 
+        method=tokenizer.decode, 
+        deterministic=True
+    )
+    pred_frames = unnormalize_with_dataset_stats(pred_frames_norm, mean=config.dataset_mean, std=config.dataset_std)
+    pred_frames = jnp.clip(pred_frames, 0.0, 1.0)
 
     gt_frames = frames[:, :config.ctx_length + horizon]
     return pred_frames, floor_frames, gt_frames
