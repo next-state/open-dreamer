@@ -9,16 +9,17 @@ from omegaconf import DictConfig, OmegaConf
 import jax
 import jax.numpy as jnp
 import optax
-from dreamer.models import Tokenizer
-from dreamer.data import make_iterator
-from dreamer.configs import TokenizerConfig
 import imageio
 from jaxlpips import LPIPS
 from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
+
 from dreamer.utils import make_state, make_manager, try_restore, maybe_save, normalize_with_dataset_stats, unnormalize_with_dataset_stats, with_params, init_tokenizer, from_dict
 from dreamer.logging import MetricLogger
+from dreamer.models import Tokenizer
+from dreamer.data import make_iterator
+from dreamer.configs import TokenizerConfig
 
     
 # ------------------------

@@ -1,14 +1,18 @@
 import math
 import einops
-from flax.typing import VariableDict
 import jax
 import jax.numpy as jnp
-from typing import Dict, Any, Tuple 
+from typing import Tuple 
 
-from .models import Dynamics, KVCache, PolicyHeadMTP
+from .models import Dynamics, KVCache, PolicyHeadMTP, Tokenizer
+from .utils import (
+    pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck,
+    normalize_with_dataset_stats, unnormalize_with_dataset_stats
+)
 
 
 from flax.struct import dataclass
+from flax.typing import VariableDict
 
 
 @dataclass
@@ -193,6 +197,7 @@ def latent_rollout(
         actions: (B, num_steps, ...)
     """
     B, T_ctx, n_spatial, D_s = initial_latents.shape[:2]
+    latent_shape = (B, 1, n_spatial, D_s)
     
     # 1. Initialize caches and process context
     # We need to compute the max window size needed: context + rollout
@@ -220,12 +225,10 @@ def latent_rollout(
         else:
             assert policy_vars is not None
             logits = policy.apply(policy_vars, h_t, deterministic=False) # Use False to enable sampling logic if any
+            assert isinstance(logits, jax.Array), "Logits should be a JAX array"
             action = jax.random.categorical(rng_action, logits) # (B, L) # Sample discrete action
         
         # Predict next latent (denoising)
-        # We need latent shape for a single frame
-        latent_shape = (B, 1, n_spatial, D_s)
-        
         z_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, rng, caches_t)
         
         return (h_next, caches_next, rng), z_next[:,0] # z_next is (B, 1, n_spatial, D_s) 
@@ -239,5 +242,76 @@ def latent_rollout(
     
     # Unpack results
     rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
+    out_latents = jnp.concatenate((initial_latents, rollout_latents), axis=1)
+    return out_latents 
+
+
+
+def video_rollout(
+    tokenizer: Tokenizer,
+    tokenizer_vars: VariableDict,
+    dynamics: Dynamics,
+    dyn_vars: VariableDict,
+    policy: PolicyHeadMTP | jax.Array,
+    policy_vars: VariableDict | None,
+    schedule: DenoiseSchedule,
+    initial_frames: jax.Array,
+    initial_actions: jax.Array,
+    num_steps: int,
+    rng: jax.Array,
+    initial_agent_tokens: jax.Array | None = None,
+    n_spatial: int = 8,
+    packing_factor: int = 2,
+    dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5),
+    dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675),
+):
+    """
+    End-to-end video generation rollout.
+    Args:
+        tokenizer: Tokenizer model.
+        tokenizer_vars: Variables for tokenizer.
+        dynamics: Dynamics model.
+        dyn_vars: Variables for dynamics.
+        policy: Policy model or array of fixed actions.
+        policy_vars: Variables for policy.
+        schedule: DenoiseSchedule.
+        initial_frames: (B, T_ctx, H, W, C) Context frames (0-1 range, unnormalized).
+        initial_actions: (B, T_ctx, ...) Context actions.
+        num_steps: Number of steps to unroll.
+        rng: Random number generator key.
+        initial_agent_tokens: Optional agent tokens.
+        n_spatial: Number of spatial tokens.
+        packing_factor: Packing factor for tokens.
+        dataset_mean: Mean for normalization.
+        dataset_std: Std for normalization.
+    Returns:
+        pred_frames: (B, T_ctx + num_steps, H, W, C)
+    """
     
-    return rollout_latents 
+    # 1. Normalize frames
+    frames_norm = normalize_with_dataset_stats(initial_frames, mean=dataset_mean, std=dataset_std)
+    
+    # 2. Tokenize
+    rng, mae_key = jax.random.split(rng)
+    z_btLd, _ = tokenizer.apply(tokenizer_vars, frames_norm, method=tokenizer.encode, rngs={"mae": mae_key}, deterministic=True) # Encode returns (B, T, L, D)
+    
+    # 3. Pack to spatial format (B, T, n_spatial, D_s)
+    initial_latents = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=packing_factor)
+    
+    # 4. Latent Rollout
+    # Returns (B, num_steps, n_spatial, D_s)
+    rollout_latents = latent_rollout(dynamics, dyn_vars, policy, policy_vars, schedule, initial_latents, initial_actions, num_steps, rng, initial_agent_tokens)
+    
+    # 5. Concatenate context and rollout
+    full_latents = jnp.concatenate([initial_latents, rollout_latents], axis=1)
+    
+    # 6. Unpack to bottleneck format
+    full_btLd = unpack_spatial_to_bottleneck(full_latents, n_spatial=n_spatial, k=packing_factor)
+    
+    # 7. Decode
+    pred_frames_norm = tokenizer.apply(tokenizer_vars, full_btLd, method=tokenizer.decode, deterministic=True)
+    
+    # 8. Unnormalize
+    pred_frames = unnormalize_with_dataset_stats(pred_frames_norm, mean=dataset_mean, std=dataset_std)
+    
+    return jnp.clip(pred_frames, 0.0, 1.0)
