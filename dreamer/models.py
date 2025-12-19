@@ -886,7 +886,7 @@ class Dynamics(nn.Module):
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
         x1_hat = self.flow_x_head(spatial_tokens)
         h_t = x[:, :, layout.slices()[Modality.AGENT], :] if self.n_agent > 0 else None  # (B,T,n_agent,D) or None
-        return x1_hat, h_t, new_caches
+        return x1_hat, (h_t, new_caches)
     
     
     @classmethod

@@ -1,31 +1,47 @@
-from curses import KEY_MAX
+import jax
 import jax.numpy as jnp
-from typing import Dict, Any, Tuple, NamedTuple
+from typing import Dict, Any, Tuple 
 
-from .models import Dynamics
+from .models import Dynamics, KVCache
 
 
+from flax.struct import dataclass
+
+@dataclass
 class DenoiseSchedule:
     """
     Precomputed, JAX-friendly schedule for the τ-ladder.
 
     tau_seq:        (S+1,) τ_0..τ_S (monotone, τ_0 ∈ [0,1), τ_S=1.0)
-    alpha_seq:      (S,)   per-step mixing coefficients α_s
-    signal_idx_seq: (S+1,) integer signal indices for each τ_s
-    step_idx:       scalar integer step index e (same for all steps here)
+    step_idx:       (S+1,) integer step indices
+    step_size:      float step size
     k_max:          scalar integer, copied from config for convenience
+    num_steps:      scalar integer, copied from config for convenience
     """
     
-    num_steps: int
+    tau_seq: jnp.ndarray
+    step_idx: jnp.ndarray
+    step_size: float
     k_max: int
+    num_steps: int
 
-    def __call__(self):
-        assert self.k_max % self.num_steps == 0, f"k_max={self.k_max} must be divisible by num_steps={self.num_steps}"
+    @classmethod
+    def create(cls, num_steps: int, k_max: int) -> "DenoiseSchedule":
+        """
+        Create a DenoiseSchedule object.
+        Args:
+            num_steps: Number of steps in the schedule.
+            k_max: Maximum value of k.
+        Returns:
+            DenoiseSchedule object.
+        """
+        assert k_max % num_steps == 0, f"k_max={k_max} must be divisible by num_steps={num_steps}"
         
-        tau_seq = jnp.linspace(0.0, 1.0, self.num_steps + 1)
-        step_idx = jnp.arange(self.num_steps+1)*self.k_max//self.num_steps
-        k_max = self.k_max
+        tau_seq = jnp.linspace(0.0, 1.0, num_steps + 1)
+        step_idx = jnp.arange(num_steps+1)*(k_max//num_steps)
+        step_size = k_max / num_steps
         
+        return cls(tau_seq, step_idx, step_size, k_max, num_steps)
     
 # ---------------------------
 # Single-step τ-ladder denoiser
@@ -39,10 +55,10 @@ def next_latent(
     action: jnp.ndarray,                 # (B, 1)
     noisy_latent: jnp.ndarray,                   # (B, 1, n_spatial, D_s)
     agent_tokens: jnp.ndarray | None = None,  # (B, T_ctx+1, n_agent, d_model)
-    caches: Dict[int, Any] | None = None,
+    caches: KVCache | None = None,
     latents_ctx: jnp.ndarray| None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: jnp.ndarray | None = None,                 # (B, T_ctx)
-) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[int, Any] | None]:
+) -> Tuple[jnp.ndarray, jnp.ndarray | None, KVCache | None]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
 
@@ -62,47 +78,42 @@ def next_latent(
         agent_tokens: optional agent tokens (B, T_ctx+1, n_agent, d_model)
         caches: KV cache for context frames (from previous finalized frames)
     """
-    B, T_ctx, n_spatial, D_s = latents_ctx.shape
-    S = schedule.alpha_seq.shape[0]
+    B = noisy_latent.shape[0]
+    
+    def refinement_step(lantent_t, s):
+        tau = schedule.tau_seq[s]
+        alpha = 1-tau
+        step_idx = schedule.step_idx[s] # TODO: check if this should be step_idx[s+1]
 
-    def refinement_step(z_t, s):
-        alpha = schedule.alpha_seq[s]
-        signal_idx_scalar = schedule.signal_idx_seq[s + 1]
-
-        # Input preparation
         if caches is not None:
-            # Denoise only the current frame
-            z_input = z_t
-            actions_input = action
+            latent_input, actions_input = lantent_t, action
 
-            step_idx_input = jnp.full((B, 1), schedule.step_idx, dtype=jnp.int32)
-            signal_idx_input = jnp.full((B, 1), signal_idx_scalar, dtype=jnp.int32)
+            step_size = jnp.full((B, 1), schedule.step_size, dtype=jnp.int32)
+            step_idx  = jnp.full((B, 1), step_idx, dtype=jnp.int32)
 
-            if agent_tokens is not None:
-                agent_tokens_input = agent_tokens[:, -1:, :, :]
-            else:
-                agent_tokens_input = None
+            assert agent_tokens is None or agent_tokens.shape[1] == noisy_latent.shape[1] 
         
-        else:
-            # Denoise [context, current_frame]
-            z_input = jnp.concatenate([latents_ctx, z_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
-            actions_input = jnp.concatenate([actions_ctx, action], axis=1)  # (B, T_ctx+1)
+        else: # Used only for debugging.
+            assert latents_ctx is not None and actions_ctx is not None
+            latent_input  = jnp.concatenate([latents_ctx, lantent_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
+            actions_input = jnp.concatenate([actions_ctx, action],    axis=1)  # (B, T_ctx+1)
 
-            step_idx_input = jnp.full((B, T_ctx + 1), schedule.step_idx, dtype=jnp.int32) # TODO: check this
-            signal_idx_ctx = jnp.full((B, T_ctx), (0.9 * schedule.k_max).astype(jnp.int32), dtype=jnp.int32)
-            signal_idx_curr = jnp.full((B, 1), signal_idx_scalar, dtype=jnp.int32)
-            signal_idx_input = jnp.concatenate([signal_idx_ctx, signal_idx_curr], axis=1)
+            T_ctx = latent_input.shape[1]
+            step_size       = jnp.full((B, T_ctx + 1), schedule.step_size,        dtype=jnp.int32)
+            
+            signal_idx_ctx  = jnp.full((B, T_ctx),     int(0.9 * schedule.k_max), dtype=jnp.int32)
+            signal_idx_curr = jnp.full((B, 1),         step_idx,                  dtype=jnp.int32)
+            step_idx = jnp.concatenate([signal_idx_ctx, signal_idx_curr], axis=1) # (B, T_ctx+1)
 
-            agent_tokens_input = agent_tokens
 
         # Dynamics call
-        z_clean_pred_seq, h_seq, caches_updated = dynamics.apply(dyn_vars, actions_input, step_idx_input, signal_idx_input, z_input, agent_tokens=agent_tokens_input, deterministic=True, caches=caches)
+        z_clean_pred_seq, (h_seq, caches_updated) = dynamics.apply(dyn_vars, actions_input, step_size, step_idx, latent_input, agent_tokens=agent_tokens, deterministic=True, caches=caches)
 
         z_clean_pred = z_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
-        h_last = h_seq[:, -1, :, :]  # (B, n_agent, d_model)
+        h_last = h_seq[:, -1, :, :] if isinstance(h_seq, jax.Array) else h_seq # (B, n_agent, d_model)
 
         # Per-step mixing toward clean latent
-        z_t_new = (1.0 - alpha) * z_t + alpha * z_clean_pred
+        z_t_new = (1.0 - alpha) * lantent_t + alpha * z_clean_pred # TODO: on the first step alpha should be 1.0. This step does nothing
 
         return z_t_new, (h_last, caches_updated)
 
@@ -110,12 +121,11 @@ def next_latent(
     z_t_final, (h_history, caches_history) = jax.lax.scan(
         refinement_step,
         noisy_latent,
-        jnp.arange(S),
+        jnp.arange(schedule.num_steps),
     )
 
     h_last = h_history[-1]  # (B, n_agent, d_model)
-    caches_last = None
-    if caches_history is not None:
-        caches_last = jax.tree.map(lambda x: x[-1], caches_history)
+    assert isinstance(h_last, jax.Array) or h_last is None
+    caches_last = jax.tree.map(lambda x: x[-1], caches_history)
 
     return z_t_final, h_last, caches_last  # (B, 1, n_spatial, D_s), (B, n_agent, d_model), Dict[int, KVCache] | None

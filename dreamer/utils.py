@@ -4,6 +4,7 @@ from dreamer.data import patchify, unpatchify
 import orbax.checkpoint as ocp
 from pathlib import Path
 import flax
+from flax.struct import dataclass
 from flax.core import freeze, unfreeze, FrozenDict
 from einops import rearrange, repeat
 from enum import IntEnum
@@ -43,7 +44,7 @@ class Modality(IntEnum):
     AGENT = 7
     # add more as needed
 
-@flax.struct.dataclass  # immutable, PyTree-friendly
+@dataclass  # immutable, PyTree-friendly
 class TokenLayout:
     """
     Ordered token layout for a single timestep: segments define the order.
