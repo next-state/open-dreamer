@@ -660,7 +660,8 @@ class Tokenizer(nn.Module):
     def encode(self, videos, deterministic: bool = True):
         return self.encoder(videos, deterministic=deterministic)
 
-    def decode(self, z, deterministic: bool = True):
+    def decode(self, z, deterministic: bool = True, cache=None):
+        # TODO: Implement caching mechanism for decoding
         return self.decoder(z, deterministic=deterministic)
 
     @classmethod
@@ -886,6 +887,11 @@ class Dynamics(nn.Module):
         x1_hat = self.flow_x_head(spatial_tokens)
         h_t = x[:, :, layout.slices()[Modality.AGENT], :] if self.n_agent > 0 else None  # (B,T,n_agent,D) or None
         return x1_hat, h_t, new_caches
+    
+    
+    @classmethod
+    def from_pretrained(cls, path):
+        pass
 
 class TaskEmbedder(nn.Module):
     d_model: int

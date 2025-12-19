@@ -66,22 +66,6 @@ class ImaginationConfig:
                               # 0.1 in the paper, but it's a typo, they mean 1 - 0.1 = 0.9
 
 
-class DenoiseSchedule(NamedTuple):
-    """
-    Precomputed, JAX-friendly schedule for the τ-ladder.
-
-    tau_seq:        (S+1,) τ_0..τ_S (monotone, τ_0 ∈ [0,1), τ_S=1.0)
-    alpha_seq:      (S,)   per-step mixing coefficients α_s
-    signal_idx_seq: (S+1,) integer signal indices for each τ_s
-    step_idx:       scalar integer step index e (same for all steps here)
-    k_max:          scalar integer, copied from config for convenience
-    """
-
-    tau_seq: jnp.ndarray
-    alpha_seq: jnp.ndarray
-    signal_idx_seq: jnp.ndarray
-    step_idx: int
-    k_max: int
 
 
 def _build_static_schedule(cfg: ImaginationConfig) -> DenoiseSchedule:
