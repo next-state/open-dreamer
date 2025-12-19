@@ -1,4 +1,6 @@
 import math
+import einops
+from flax.typing import VariableDict
 import jax
 import jax.numpy as jnp
 from typing import Dict, Any, Tuple 
@@ -60,9 +62,8 @@ class DenoiseSchedule:
 # ---------------------------
 
 def next_latent(
-    *,
     dynamics: Dynamics,
-    dyn_vars: Dict[str, Any],
+    dyn_vars: VariableDict,
     schedule: DenoiseSchedule,
     action: jax.Array,                 # (B, 1)
     latent_shape: Tuple,                   # (B, 1, n_spatial, D_s)
@@ -161,9 +162,9 @@ def next_latent(
 
 def latent_rollout(
     dynamics: Dynamics,
-    dyn_vars: Dict[str, Any],
+    dyn_vars: VariableDict,
     policy: PolicyHeadMTP | jax.Array,
-    policy_vars: Dict[str, Any] | None,
+    policy_vars: VariableDict | None,
     schedule: DenoiseSchedule,
     initial_latents: jax.Array,
     initial_actions: jax.Array,
@@ -191,7 +192,7 @@ def latent_rollout(
         latents: (B, num_steps, n_spatial, D_s)
         actions: (B, num_steps, ...)
     """
-    B, T_ctx = initial_latents.shape[:2]
+    B, T_ctx, n_spatial, D_s = initial_latents.shape[:2]
     
     # 1. Initialize caches and process context
     # We need to compute the max window size needed: context + rollout
@@ -203,77 +204,40 @@ def latent_rollout(
     steps_ctx = jnp.zeros((B, T_ctx), dtype=jnp.int32)
     signals_ctx = jnp.full((B, T_ctx), dynamics.k_max - 1, dtype=jnp.int32)
     
-    _, (h_seq, caches) = dynamics.apply(
-        dyn_vars,
-        initial_actions,
-        steps_ctx,
-        signals_ctx,
-        initial_latents,
-        agent_tokens=initial_agent_tokens,
-        caches=caches,
-        deterministic=True
-    )
+    _, (h_seq, caches) = dynamics.apply(dyn_vars, initial_actions, steps_ctx, signals_ctx, initial_latents, agent_tokens=initial_agent_tokens, caches=caches, deterministic=True)
     # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
-    h_last = h_seq[:, -1] # (B, n_agent, D)
+    h_last = h_seq[:, -1] if isinstance(h_seq, jax.Array) else None # (B, n_agent, D)
     
     # 2. Scan loop for rollout
     def scan_step(carry, step_idx):
-        h_t, caches_t, rng_t = carry
+        h_t, caches_t, rng = carry
         
         # Sample action
-        rng_t, rng_action = jax.random.split(rng_t)
+        rng, rng_action = jax.random.split(rng)
         
         if isinstance(policy, jax.Array):
-            # Fixed actions provided
             action = policy[:, step_idx]
         else:
-            # Policy model
-            # policy returns logits (B, L, A)
+            assert policy_vars is not None
             logits = policy.apply(policy_vars, h_t, deterministic=False) # Use False to enable sampling logic if any
-            # Sample discrete action
-            action = jax.random.categorical(rng_action, logits) # (B, L)
-        
-        # Ensure action shape is (B, 1) if L=1
-        if action.ndim == 2 and action.shape[1] == 1:
-            pass # (B, 1) is good
-        elif action.ndim == 1:
-             action = action[:, None] # (B) -> (B, 1)
+            action = jax.random.categorical(rng_action, logits) # (B, L) # Sample discrete action
         
         # Predict next latent (denoising)
         # We need latent shape for a single frame
-        latent_shape = (B, 1) + initial_latents.shape[2:]
+        latent_shape = (B, 1, n_spatial, D_s)
         
-        z_next, h_next, caches_next, rng_t = next_latent(
-            dynamics=dynamics,
-            dyn_vars=dyn_vars,
-            schedule=schedule,
-            action=action,
-            latent_shape=latent_shape,
-            rng=rng_t,
-            caches=caches_t,
-        )
+        z_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, rng, caches_t)
         
-        # z_next is (B, 1, n_spatial, D_s)
-        # h_next is (B, n_agent, D)
-        
-        return (h_next, caches_next, rng_t), (z_next, action)
+        return (h_next, caches_next, rng), z_next[:,0] # z_next is (B, 1, n_spatial, D_s) 
 
     # Run scan
-    _, (rollout_latents, rollout_actions) = jax.lax.scan(
+    _, rollout_latents = jax.lax.scan(
         scan_step,
         (h_last, caches, rng),
         jnp.arange(num_steps)
     )
     
     # Unpack results
-    # rollout_latents: (num_steps, B, 1, n_spatial, D_s) -> (B, num_steps, n_spatial, D_s)
-    rollout_latents = jnp.swapaxes(rollout_latents, 0, 1)[:, :, 0]
+    rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
     
-    # rollout_actions: (num_steps, B, 1) -> (B, num_steps)
-    # Assuming actions are (B, 1)
-    if rollout_actions.shape[2] == 1:
-        rollout_actions = jnp.swapaxes(rollout_actions, 0, 1)[:, :, 0]
-    else:
-        rollout_actions = jnp.swapaxes(rollout_actions, 0, 1)
-
-    return rollout_latents, rollout_actions
+    return rollout_latents 
