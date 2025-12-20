@@ -2,6 +2,11 @@
 # given the pretrained world model, train the agent tokens with bc and rew prediction.
 # while still applying the diffusion / shortcut loss.
 from __future__ import annotations
+
+import logging
+# Suppress absl info logs
+logging.getLogger('absl').setLevel(logging.WARNING)
+
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Any

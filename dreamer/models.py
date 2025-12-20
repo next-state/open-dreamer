@@ -564,7 +564,7 @@ class Encoder(nn.Module):
         proj_tokens = nn.tanh(self.bottleneck_proj(latent_tokens))
         
         if packing_factor is not None:
-            latents = rearrange(latents, "b t (n p) d -> b t n (p d)", p=packing_factor)
+            proj_tokens = rearrange(proj_tokens, "b t (n p) d -> b t n (p d)", p=packing_factor)
 
         return proj_tokens, (frame_mask, keep_prob)  # keep mask if you want diagnostics
 

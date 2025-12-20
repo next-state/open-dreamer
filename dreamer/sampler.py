@@ -54,9 +54,8 @@ def sample_video(
     rng, mae_key = jax.random.split(rng)
 
     # 1) encode once via tokenizer.encode (handles normalization internally? No - we normalize)
-    frames_norm = normalize_with_dataset_stats(frames, mean=config.dataset_mean, std=config.dataset_std)
     z_btLd, _ = tokenizer.apply(
-        tokenizer_vars, frames_norm, 
+        tokenizer_vars, frames, 
         method=tokenizer.encode, 
         rngs={"mae": mae_key}, 
         deterministic=True

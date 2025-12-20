@@ -278,7 +278,9 @@ def init_dynamics(rng, dynamics, tokenizer_cfg):
     n_spatial = enc_cfg.n_latents // packing_factor
     d_spatial = enc_cfg.d_bottleneck * packing_factor
     
+    shape = (B, T, n_spatial, d_spatial)
     packed_enc_tokens = jax.random.normal(key, (B, T, n_spatial, d_spatial))
+    
     actions = jnp.zeros((B, T), dtype=jnp.int32)
     step_idxs = jnp.zeros((B, T), dtype=jnp.int32)
     signal_idxs = jnp.zeros((B, T), dtype=jnp.int32)

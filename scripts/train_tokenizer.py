@@ -1,3 +1,7 @@
+import logging
+# Suppress absl info logs
+logging.getLogger('absl').setLevel(logging.WARNING)
+
 from functools import partial
 import einops
 import numpy as np

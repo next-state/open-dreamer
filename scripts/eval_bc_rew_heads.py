@@ -1,6 +1,11 @@
 # eval_bc_rew_heads.py
 # Evaluate dynamics + policy/reward heads in teacher-forced and autoregressive modes.
 from __future__ import annotations
+
+import logging
+# Suppress absl info logs
+logging.getLogger('absl').setLevel(logging.WARNING)
+
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Any, Tuple

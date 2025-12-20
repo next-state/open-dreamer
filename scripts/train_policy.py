@@ -18,6 +18,11 @@ High-level outline (from the docstring plan):
     - Train policy head on (s0…s{T-1}, a1…aT, G0…G{T-1}, V0…V{T-1}) using PMPO.
 """
 from __future__ import annotations
+
+import logging
+# Suppress absl info logs
+logging.getLogger('absl').setLevel(logging.WARNING)
+
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Any

@@ -9,6 +9,10 @@ Architecture:
 """
 from __future__ import annotations
 
+import logging
+# Suppress absl info logs
+logging.getLogger('absl').setLevel(logging.WARNING)
+
 import json
 import time
 from dataclasses import asdict
