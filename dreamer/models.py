@@ -800,7 +800,8 @@ class Dynamics(nn.Module):
 
         # Signal level τ ∈ {0, 1/d, 2/d, ..., 1 - 1/d} (grid length = 1/d)
         # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
-        self.signal_embed = nn.Embed(self.k_max, self.d_model, name="signal_embed")
+        # I'm not sure if i should have self.kmax+1
+        self.signal_embed = nn.Embed(self.k_max + 1, self.d_model, name="signal_embed")
         self.flow_x_head = nn.Dense(self.d_bottleneck * self.packing_factor, name="flow_x_head", kernel_init=nn.initializers.zeros,
                             bias_init=nn.initializers.zeros)  # zero-init
 

@@ -1,15 +1,10 @@
 import math
-from dreamer import data
 import einops
 import jax
 import jax.numpy as jnp
 from typing import Tuple 
 
 from .models import Dynamics, KVCache, PolicyHeadMTP, Tokenizer
-from .utils import (
-    pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck,
-    normalize_with_dataset_stats, unnormalize_with_dataset_stats
-)
 
 
 from flax.struct import dataclass
@@ -60,7 +55,7 @@ class DenoiseSchedule:
         
         # Compute noise level for context during autoregressive rollout
         step_idx_ctx = int(jnp.round(-math.log2(1 - tau_ctx)))
-        tau_idx_ctx = k_max - k_max // step_idx_ctx
+        tau_idx_ctx = k_max - k_max // 2**step_idx_ctx
         
         return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, step_idx_ctx, tau_idx_ctx)
     
@@ -204,7 +199,6 @@ def latent_rollout(
     """
     B, T_ctx, n_spatial, D_s = initial_latents.shape
     latent_shape = (B, 1, n_spatial, D_s)
-    
     # 1. Initialize caches and process context
     # We need to compute the max window size needed: context + rollout
     window_size = T_ctx + num_steps

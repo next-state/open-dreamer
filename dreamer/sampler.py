@@ -35,14 +35,14 @@ def sample_video(
         tokenizer_vars: Combined variables dict with 'params' and 'constants'
         dynamics: Dynamics model
         dyn_vars: Dynamics variables dict
-        frames: Input video frames (B, T, H, W, C) normalized to [0,1]
+        frames: Input video frames (B, T, H, W, C) in [0, 255]
         actions: Action sequence (B, T)
         schedule_config: DenoiseSchedule with rollout parameters
     
     Returns:
-        pred_frames: (B, ctx+horizon, H, W, C) predicted frames
-        tokenized_frames: (B, ctx+horizon, H, W, C) tokenizer reconstruction (GT latents decoded)
-        frames: (B, ctx+horizon, H, W, C) ground truth frames
+        pred_frames: (B, ctx+horizon, H, W, C) predicted frames (uint8)
+        tokenized_frames: (B, ctx+horizon, H, W, C) tokenizer reconstruction (GT latents decoded) (uint8)
+        frames: (B, ctx+horizon, H, W, C) ground truth frames (uint8)
     """
     B, T, H, W, C = frames.shape
 
@@ -95,4 +95,5 @@ def sample_video(
                                 rng=rng,
                                 initial_agent_tokens=None)
 
+    frames = jnp.clip(frames, 0, 255).astype(jnp.uint8)
     return pred_frames, tokenized_frames, frames

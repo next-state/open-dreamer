@@ -13,10 +13,7 @@ import logging
 
 from dreamer.generation import DenoiseSchedule
 from dreamer.sampler import sample_video
-# Suppress absl info logs
-logging.getLogger('absl').setLevel(logging.WARNING)
 
-import json
 import time
 from dataclasses import asdict
 from functools import partial
@@ -50,7 +47,9 @@ from dreamer.utils import (
     maybe_save,
     try_restore,
 )
-
+# jax.config.update("jax_debug_nans", True)
+# Suppress absl info logs
+logging.getLogger('absl').setLevel(logging.WARNING)
 
 # ---------------------------
 # Training step helpers (don't nest to improve JIT caching speed)
@@ -223,17 +222,16 @@ def run_evaluation(
     Uses unified Tokenizer with encode/decode methods.
     """
 
-    schedule_shortcut = DenoiseSchedule.init(4, 256)
-    schedule_diffusion = DenoiseSchedule.init(256, 256)
+    k_max = cfg.dynamics.k_max
+    schedule_shortcut = DenoiseSchedule.init(4, k_max)
+    schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
 
-    evaluation_schedules = {"shortcut": schedule_shortcut, 
-                            "diffusion": schedule_diffusion}
+    evaluation_schedules = {"shortcut": schedule_shortcut, "diffusion": schedule_diffusion}
 
     dyn_vars = {"params": dynamics_params, "constants": dynamics_constants}
 
     for tag, schedule_config in evaluation_schedules.items():
         t0 = time.time()
-
         # FIXME: only temporary for debugging
         assert val_videos.shape[1] > 5
         ctx_length = 4
@@ -385,7 +383,7 @@ def run(cfg: DynamicsConfig):
         # Periodic lightweight AR eval
         if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
             # Use current batch as validation data (simplest approach)
-            val_videos = batch["videos"].astype(jnp.float32) / 255.0
+            val_videos = batch["videos"]
             run_evaluation(
                 cfg=cfg,
                 tokenizer_cfg=tokenizer_cfg,

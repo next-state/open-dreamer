@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from dreamer.generation import DenoiseSchedule
 
 
-scheduler = DenoiseSchedule.create(32, 256, 0.9)
+scheduler = DenoiseSchedule.init(4, 256, 0.9)
 
 print(scheduler)
 
