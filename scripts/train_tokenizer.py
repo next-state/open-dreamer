@@ -74,21 +74,27 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
 
 @partial(
     jax.jit,
-    static_argnames=("apply_fn", "tx", "lpips_weight", "lpips_frac"),
+    static_argnames=("apply_fn", "tx", "lpips_weight", "lpips_frac", "dataset_mean", "dataset_std"),
 )
-def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key, step, lpips_weight, lpips_frac, dataset_std):
+def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key, step, lpips_weight, lpips_frac, dataset_mean, dataset_std):
+     
     step_key = jax.random.fold_in(master_key, step)
     mae_key, drop_key = jax.random.split(step_key)
 
     def loss_fn(p):
         pred, (mae_mask, keep_prob) = forward_apply(apply_fn, variables, p, videos, mae_key=mae_key, drop_key=drop_key, train=True)    
 
-        mse = recon_loss_from_mae(pred, videos, mae_mask)
-        lp = lpips_on_mae_recon(pred, videos, lpips_frac)
+        # For MSE: use standardized values (matches old gradient dynamics)
+        pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
+        target_norm = normalize_with_dataset_stats(videos, mean=dataset_mean, std=dataset_std)
+        mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
+        
+        # For LPIPS: use [0, 1] range
+        lp = lpips_on_mae_recon(pred / 255, videos / 255, lpips_frac)
+        
         total = mse + lpips_weight * lp
-
-        var = jnp.mean(dataset_std ** 2)
-        psnr = 10 * jnp.log10((1.0 / jnp.maximum(mse, 1e-10)) / var)
+        mse_01 = mse * (dataset_std[0] ** 2)
+        psnr = 10 * jnp.log10((1 / jnp.maximum(mse_01, 1e-10)))
 
         aux = {"loss_total": total, "loss_mse": mse, "loss_lpips": lp, "keep_prob": keep_prob, "psnr": psnr}
         return total, aux
@@ -104,31 +110,21 @@ def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key
 # ------------------------
 
 @partial(jax.jit, static_argnames=("apply_fn",))
-def viz_step_jit(apply_fn, variables, params, videos, *, mae_key, drop_key, mean, std):
+def viz_step_jit(apply_fn, variables, params, videos, *, mae_key, drop_key):
     recon, (mask, _) = forward_apply(apply_fn, variables, params, videos, mae_key=mae_key, drop_key=drop_key, train=False)
 
-    # Unnormalize to [0, 1]
-    videos_unnorm = unnormalize_with_dataset_stats(videos, mean=mean, std=std)
-    recon_unnorm = unnormalize_with_dataset_stats(recon, mean=mean, std=std)
+    masked = videos * (1.0 - mask)
+    recon_masked = masked + recon * mask
 
-    # Convert to [0, 255]
-    videos_255 = videos_unnorm * 255.0
-    recon_255 = recon_unnorm * 255.0
-
-    masked = videos_255 * (1.0 - mask)
-    recon_masked = masked + recon_255 * mask
-
-    grid = jnp.concatenate(
-        [videos_255, masked, recon_masked, recon_255], axis=2
-    )
+    grid = jnp.concatenate([videos, masked, recon_masked, recon], axis=2)
     grid = einops.rearrange(grid[:, 0], "b h w c -> h (b w) c")
     return grid.clip(0, 255).astype(jnp.uint8)
 
-def viz_step(apply_fn, variables, params, videos, rng, step, run_dir, mean, std, use_wandb=False):
+def viz_step(apply_fn, variables, params, videos, rng, step, run_dir, use_wandb=False):
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
-    grid = viz_step_jit(apply_fn, variables, params, videos[:8,:1], mae_key=mae_key, drop_key=drop_key, mean=jnp.array(mean), std=jnp.array(std))
+    grid = viz_step_jit(apply_fn, variables, params, videos[:8,:1], mae_key=mae_key, drop_key=drop_key)
 
     out = run_dir / "viz"
     out.mkdir(exist_ok=True, parents=True)
@@ -199,14 +195,8 @@ def run(cfg: TokenizerConfig):
         rng, master_key = jax.random.split(rng)
         
         # Normalize videos
-        videos = batch["videos"].astype(jnp.float32) / 255.0
-        videos = normalize_with_dataset_stats(
-            videos, 
-            mean=cfg.dataset.dataset_mean, 
-            std=cfg.dataset.dataset_std
-        )
-
-        params, opt_state, aux = train_step(apply_fn, tx, variables, params, opt_state, videos, master_key=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac, dataset_std=jnp.array(cfg.dataset.dataset_std))
+        videos = batch["videos"]
+        params, opt_state, aux = train_step(apply_fn, tx, variables, params, opt_state, videos, master_key=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac, dataset_mean=tuple(cfg.dataset.dataset_mean), dataset_std=tuple(cfg.dataset.dataset_std))
 
         if logger.should_log(step):
             mse = aux["loss_mse"]
@@ -226,7 +216,7 @@ def run(cfg: TokenizerConfig):
         maybe_save(mngr, step, state, meta)
 
         if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
-            viz_step(apply_fn, variables, params, videos, rng, step, run_dir, mean=cfg.dataset.dataset_mean, std=cfg.dataset.dataset_std, use_wandb=cfg.use_wandb)
+            viz_step(apply_fn, variables, params, videos, rng, step, run_dir, use_wandb=cfg.use_wandb)
 
     mngr.wait_until_finished()
 

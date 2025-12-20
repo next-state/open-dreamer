@@ -141,6 +141,7 @@ def normalize_with_dataset_stats(videos, *, mean, std):
     Returns:
         normalized videos
     """
+    videos = videos.astype(jnp.float32)/255
     mean_arr = jnp.asarray(mean, dtype=videos.dtype)
     std_arr = jnp.asarray(std, dtype=videos.dtype)
     
@@ -169,7 +170,7 @@ def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
     mean_c = jnp.expand_dims(mean_arr, axis=(0, 1, 2, 3)) 
     std_c =  jnp.expand_dims(std_arr, axis=(0, 1, 2, 3)) 
     
-    return normalized_videos * std_c + mean_c
+    return (normalized_videos * std_c + mean_c)*255
 
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     """
@@ -214,7 +215,7 @@ def make_state(params, opt_state, rng, step):
         "step": jnp.int32(step),
     }
 
-def make_manager(ckpt_dir: str, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("state","meta")):
+def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("state","meta")):
     path = Path(ckpt_dir).expanduser().resolve()
     path.mkdir(parents=True, exist_ok=True)
     options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep,

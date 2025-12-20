@@ -49,6 +49,9 @@ class EncoderConfig:
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
+    
+    dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
+    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 @dataclass(frozen=False)
 class DecoderConfig:
@@ -63,6 +66,11 @@ class DecoderConfig:
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
+    H: int = 64
+    W: int = 64
+    
+    dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
+    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 @dataclass(frozen=False)
 class TokenizerConfig:

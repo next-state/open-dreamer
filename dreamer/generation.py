@@ -112,7 +112,7 @@ def next_latent(
         alpha = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
         
         step_idx = schedule.step_idx
-        tau_idx_val = schedule.tau_idx[s+1] # Condition on target/next step, matching imagination.py
+        tau_idx_val = schedule.tau_idx[s+1] 
 
         step_idx_ctx, tau_idx_ctx = schedule.step_idx_ctx, schedule.tau_idx_ctx
 
@@ -206,10 +206,11 @@ def latent_rollout(
     
     # Run dynamics on context to warm up caches and get last hidden state
     # Use signal=Clean (max-1) and step=0 for context
-    steps_ctx = jnp.zeros((B, T_ctx), dtype=jnp.int32)
-    signals_ctx = jnp.full((B, T_ctx), dynamics.k_max - 1, dtype=jnp.int32)
     
-    _, (h_seq, caches) = dynamics.apply(dyn_vars, initial_actions, steps_ctx, signals_ctx, initial_latents, agent_tokens=initial_agent_tokens, caches=caches, deterministic=True)
+    step_idx_ctx= jnp.full((B, T_ctx), schedule.step_idx_ctx, dtype=jnp.int32)
+    tau_idx_ctx = jnp.full((B, T_ctx), schedule.tau_idx_ctx,  dtype=jnp.int32)
+    
+    _, (h_seq, caches) = dynamics.apply(dyn_vars, initial_actions, step_idx_ctx, tau_idx_ctx, initial_latents, agent_tokens=initial_agent_tokens, caches=caches, deterministic=True)
     # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
     h_last = h_seq[:, -1] if isinstance(h_seq, jax.Array) else None # (B, n_agent, D)
     
@@ -260,7 +261,6 @@ def video_rollout(
     num_steps: int,
     rng: jax.Array,
     initial_agent_tokens: jax.Array | None = None,
-    n_spatial: int = 8,
     packing_factor: int = 2,
     dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5),
     dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675),
@@ -280,7 +280,6 @@ def video_rollout(
         num_steps: Number of steps to unroll.
         rng: Random number generator key.
         initial_agent_tokens: Optional agent tokens.
-        n_spatial: Number of spatial tokens.
         packing_factor: Packing factor for tokens.
         dataset_mean: Mean for normalization.
         dataset_std: Std for normalization.

@@ -11,7 +11,7 @@ from typing import Optional, Tuple, Any, Dict
 from einops import rearrange, repeat
 import math
 import orbax.checkpoint as ocp
-from .utils import Modality, TokenLayout, make_manager, from_dict, recursive_list_to_tuple
+from .utils import Modality, TokenLayout, make_manager, from_dict, normalize_with_dataset_stats, recursive_list_to_tuple, unnormalize_with_dataset_stats
 from .data import patchify, unpatchify
 from .configs import TokenizerConfig, DynamicsModelConfig
 
@@ -167,7 +167,7 @@ class MAEReplacer(nn.Module):
     p_max: float = 0.9
 
     @nn.compact
-    def __call__(self, patches_btnd: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, patches_btnd: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         # patches_btnd: (B,T,Np,D)
         B, T, Np, D = patches_btnd.shape
         mask_token = self.param("mask_token", nn.initializers.normal(0.02), (D,))
@@ -507,6 +507,9 @@ class Encoder(nn.Module):
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
     rope_theta: float = 10000.0
+    
+    dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
+    dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675)
 
     def setup(self):
         self.patch_proj = nn.Dense(self.d_model, name="patch_proj")
@@ -528,9 +531,11 @@ class Encoder(nn.Module):
 
     @nn.compact
     def __call__(self, videos, *, deterministic: bool = True) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
-        # 1) Make patches and project to D_model
+        # 1) takes videos in the [0,255] range
         B, T, H, W, C = videos.shape
-        patch_tokens = patchify(videos, patch=self.patch_size)
+        
+        normalized_videos = normalize_with_dataset_stats(videos, mean=self.dataset_mean, std=self.dataset_std)
+        patch_tokens = patchify(normalized_videos, patch=self.patch_size)
         proj_patches = self.patch_proj(patch_tokens)  # (B,T,Np,D)
 
         # 2) MAE mask-and-replace on patch tokens (encoder input only)
@@ -552,10 +557,7 @@ class Encoder(nn.Module):
         mask = layout.make_mask("encoder", B, T)
 
         # 5) Feed tokens into transformer
-
         encoded_tokens, _ = self.transformer(tokens, mask=mask, deterministic=deterministic)
-        # print(f"encoded_tokens_btSd.shape: {encoded_tokens_btSd.shape}")
-
 
         # 6) Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
@@ -592,6 +594,9 @@ class Decoder(nn.Module):
     time_every: int = 4
     rope_theta: float = 10000.0
 
+    dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
+    dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675)
+    
     def setup(self):
         self.n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
         self.up_proj = nn.Dense(self.d_model, name="up_proj")
@@ -635,7 +640,8 @@ class Decoder(nn.Module):
 
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
         pred_btnd = self.patch_head(x_patches)  # (B, T, Np, D_patch)
-        out_frames = unpatchify(pred_btnd, patch=self.patch_size, H=self.H, W=self.W)
+        out_normalized_frames = unpatchify(pred_btnd, patch=self.patch_size, H=self.H, W=self.W)
+        out_frames = unnormalize_with_dataset_stats(out_normalized_frames, mean=self.dataset_mean, std=self.dataset_std)
         return out_frames
 
 class Tokenizer(nn.Module):
@@ -645,8 +651,6 @@ class Tokenizer(nn.Module):
         # Encoder configuration
         enc_kwargs = asdict(self.config.encoder)
         dec_kwargs = asdict(self.config.decoder)
-        dec_kwargs["H"] = self.config.dataset.H
-        dec_kwargs["W"] = self.config.dataset.W
 
         self.encoder = Encoder(**enc_kwargs)
         self.decoder = Decoder(**dec_kwargs)

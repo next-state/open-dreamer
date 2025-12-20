@@ -11,7 +11,7 @@ patch_size: 4
 dataset:
   source: "custom"
   array_record_path: "datasets/coinrun_episodes/train"
-  B: 2
+  B: 16
   T: 16
   H: 64
   W: 64
@@ -30,6 +30,9 @@ encoder:
   time_every: 4
   mae_p_min: 0.0
   mae_p_max: 0.9
+  
+  dataset_mean: ${dataset.dataset_mean}
+  dataset_std: ${dataset.dataset_std}
 
 decoder:
   d_model: ${encoder.d_model}
@@ -41,6 +44,11 @@ decoder:
   qk_norm_type: ${encoder.qk_norm_type}
   rope_theta: ${encoder.rope_theta}
   time_every: ${encoder.time_every}
+  H: ${dataset.H}
+  W: ${dataset.W}
+  
+  dataset_mean: ${dataset.dataset_mean}
+  dataset_std: ${dataset.dataset_std}
 
 lr: 3e-4
 max_steps: 1_000_000_000
