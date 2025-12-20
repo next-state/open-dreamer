@@ -96,7 +96,7 @@ def sample_video(
     preds: list[jnp.ndarray] = []
     n_spatial, D_s = int(z_all.shape[2]), int(z_all.shape[3])
 
-    pred_frames = video_rollout(tokenizer, tokenzier_vars, dynamics, dyn_vars, future_actions, policy_vars = None, schedule=schedule, initial_frames, initial_actions, num_steps=4, rng=rollout_rng)
+    pred_frames = video_rollout(tokenizer, tokenzier_vars, dynamics, dyn_vars, future_actions, policy_vars = None, schedule=schedule, initial_frames=initial_frames, initial_actions=initial_actions, horizon=horizon, num_steps=4, rng=rollout_rng)
     # 6) decode predictions (prepend context for viz)
     pred_latents = jnp.concatenate(preds, axis=1)
     pred_btLd = jnp.concatenate([

@@ -530,7 +530,7 @@ class Encoder(nn.Module):
         self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
 
     @nn.compact
-    def __call__(self, videos, *, deterministic: bool = True) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+    def __call__(self, videos, *, deterministic: bool = True, packing_factor = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
         # 1) takes videos in the [0,255] range
         B, T, H, W, C = videos.shape
         
@@ -562,6 +562,9 @@ class Encoder(nn.Module):
         # 6) Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
         proj_tokens = nn.tanh(self.bottleneck_proj(latent_tokens))
+        
+        if packing_factor is not None:
+            latents = rearrange(latents, "b t (n p) d -> b t n (p d)", p=packing_factor)
 
         return proj_tokens, (frame_mask, keep_prob)  # keep mask if you want diagnostics
 
@@ -616,9 +619,11 @@ class Decoder(nn.Module):
         self.patch_queries = self.param("patch_queries", nn.initializers.normal(0.02),(self.n_patches, self.d_model)) # (Np, D)
 
     @nn.compact
-    def __call__(self, z: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
+    def __call__(self, z: jnp.ndarray, *, deterministic: bool = True, packing_factor = None) -> jnp.ndarray:
         B, T, N_l, d_bottleneck = z.shape
 
+        if packing_factor is not None:
+            z = rearrange(z, "b t (n p) d -> b t n (p d)", p=packing_factor)
         # 1) Up-project latent bottleneck to d_model (per latent token)
         latents = self.up_proj(z)  # (B, T, N_l, D)
 
@@ -661,12 +666,12 @@ class Tokenizer(nn.Module):
         recon = self.decoder(z, deterministic=deterministic)
         return recon, aux
 
-    def encode(self, videos, deterministic: bool = True):
-        return self.encoder(videos, deterministic=deterministic)
+    def encode(self, videos, deterministic: bool = True, packing_factor = None):
+        return self.encoder(videos, deterministic=deterministic, packing_factor=packing_factor)
 
-    def decode(self, z, deterministic: bool = True, cache=None):
+    def decode(self, z, deterministic: bool = True, cache=None, packing_factor = None):
         # TODO: Implement caching mechanism for decoding
-        return self.decoder(z, deterministic=deterministic)
+        return self.decoder(z, deterministic=deterministic, packing_factor=packing_factor)
 
     @classmethod
     def from_pretrained(cls, path, *, load_for_training: bool = False):
