@@ -620,10 +620,10 @@ class Decoder(nn.Module):
 
     @nn.compact
     def __call__(self, z: jnp.ndarray, *, deterministic: bool = True, packing_factor = None) -> jnp.ndarray:
-        B, T, N_l, d_bottleneck = z.shape
-
         if packing_factor is not None:
-            z = rearrange(z, "b t (n p) d -> b t n (p d)", p=packing_factor)
+            z = rearrange(z, "b t n (p d) -> b t (n p) d", p=packing_factor)
+            
+        B, T, N_l, d_bottleneck = z.shape
         # 1) Up-project latent bottleneck to d_model (per latent token)
         latents = self.up_proj(z)  # (B, T, N_l, D)
 
@@ -674,7 +674,7 @@ class Tokenizer(nn.Module):
         return self.decoder(z, deterministic=deterministic, packing_factor=packing_factor)
 
     @classmethod
-    def from_pretrained(cls, path, *, load_for_training: bool = False):
+    def from_pretrained(cls, path, *, load_for_training: bool = False) -> Tuple["Tokenizer", Dict[Any, Any], TokenizerConfig]:
         mngr = make_manager(path, item_names=("meta","state"))
 
         # 1. Restore metadata to get config
@@ -743,7 +743,7 @@ class ActionEncoder(nn.Module):
 
         if as_tokens:
             # expand a token axis (S_a = 1)
-            out = out[:, :, None, :]
+            out = out[..., None, :]
 
         return out
 
@@ -806,8 +806,10 @@ class Dynamics(nn.Module):
 
     def create_static_caches(self,
                              batch_size: int,
+                             n_spatial: int,
                              window_size: int = 1024,
-                             dtype=jnp.float32) -> Dict[int, KVCache]:
+                             dtype=jnp.float32,
+                             ) -> Dict[int, KVCache]:
         """
         Creates concrete, zero-filled buffers for JIT compilation.
 
@@ -816,19 +818,19 @@ class Dynamics(nn.Module):
             window_size: Maximum sequence length (T) to support.
         """
         # Time attention sees (B*S) independent sequences. S includes all tokens (action, signal, step, spatial, register, agent)
-        S_total = 1 + 1 + 1 + self.n_spatial + self.n_register + (self.n_agent if self.n_agent > 0 else 0)
+        S_total = 1 + 1 + 1 + n_spatial + self.config.n_register + (self.config.n_agent if self.config.n_agent > 0 else 0)
 
         flattened_batch_size = batch_size * S_total
-        head_dim = self.d_model // self.n_heads
+        head_dim = self.config.d_model // self.config.n_heads
 
         caches = {}
-        for i in range(self.depth):
-            time_index, time_offset = divmod(i, self.time_every)
+        for i in range(self.config.depth):
+            time_index, time_offset = divmod(i, self.config.time_every)
             if time_offset == 0:
                 caches[time_index] = KVCache.init(
                     batch_size=flattened_batch_size,
                     window_size=window_size,
-                    num_kv_heads=self.n_kv_heads,
+                    num_kv_heads=self.config.n_kv_heads,
                     head_dim=head_dim,
                     dtype=dtype
                 )

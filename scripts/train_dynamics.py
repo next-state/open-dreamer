@@ -223,15 +223,15 @@ def run_evaluation(
     Uses unified Tokenizer with encode/decode methods.
     """
 
-    schedule_shortcut = DenoiseSchedule(4, 256)
-    schedule_diffusion = DenoiseSchedule(256, 256)
+    schedule_shortcut = DenoiseSchedule.init(4, 256)
+    schedule_diffusion = DenoiseSchedule.init(256, 256)
 
     evaluation_schedules = {"shortcut": schedule_shortcut, 
                             "diffusion": schedule_diffusion}
 
     dyn_vars = {"params": dynamics_params, "constants": dynamics_constants}
 
-    for tag, schedule_config in evaluation_schedules:
+    for tag, schedule_config in evaluation_schedules.items():
         t0 = time.time()
 
         # FIXME: only temporary for debugging
@@ -260,7 +260,8 @@ def run_evaluation(
 
         # Build visualization
         num_videos = min(4, pred_frames.shape[0])
-        stacked_frames = jnp.stack([pred_frames, floor_frames, gt_frames])[:, :num_videos]
+        frames = [pred_frames, floor_frames, gt_frames]
+        stacked_frames = jnp.stack(frames)[:, :num_videos]
         videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
 
         # Save artifacts
@@ -344,7 +345,7 @@ def run(cfg: DynamicsConfig):
         start_step = int(r.state["step"])
         # Preserve runtime flags before restoring checkpoint config
         use_wandb_override = cfg.use_wandb
-        cfg = from_dict(DynamicsConfig, r.meta["cfg"])
+        # cfg = from_dict(DynamicsConfig, r.meta["cfg"])
         cfg.use_wandb = use_wandb_override  # Keep CLI/YAML wandb setting
         print(f"[ckpt] Restored step {latest_step}")
 

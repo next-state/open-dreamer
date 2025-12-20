@@ -42,7 +42,7 @@ class DenoiseSchedule:
     tau_idx_ctx: int
 
     @classmethod
-    def create(cls, num_steps: int, k_max: int = 256, tau_ctx=0.9) -> "DenoiseSchedule":
+    def init(cls, num_steps: int, k_max: int = 256, tau_ctx=0.9) -> "DenoiseSchedule":
         """
         Create a DenoiseSchedule object.
         Args:
@@ -109,6 +109,9 @@ def next_latent(
     rng, rng_latent = jax.random.split(rng, 2)
     noisy_latent = jax.random.normal(rng_latent, latent_shape)
     B = latent_shape[0]
+
+    action = action[:, None] if action.ndim == 1 else action
+    
     
     def refinement_step(latent_t, s):
         tau_prev, tau_curr = schedule.tau_values[s], schedule.tau_values[s+1]
@@ -160,7 +163,7 @@ def next_latent(
         jnp.arange(schedule.num_steps),
     )
 
-    h_last = h_history[-1]  # (B, n_agent, d_model)
+    h_last = h_history[-1] if h_history is not None else None  # (B, n_agent, d_model)
     assert isinstance(h_last, jax.Array) or h_last is None
     caches_last = jax.tree.map(lambda x: x[-1], caches_history)
 
@@ -199,13 +202,13 @@ def latent_rollout(
         latents: (B, num_steps, n_spatial, D_s)
         actions: (B, num_steps, ...)
     """
-    B, T_ctx, n_spatial, D_s = initial_latents.shape[:2]
+    B, T_ctx, n_spatial, D_s = initial_latents.shape
     latent_shape = (B, 1, n_spatial, D_s)
     
     # 1. Initialize caches and process context
     # We need to compute the max window size needed: context + rollout
     window_size = T_ctx + num_steps
-    caches = dynamics.create_static_caches(batch_size=B, window_size=window_size)
+    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size)
     
     # Run dynamics on context to warm up caches and get last hidden state
     # Use signal=Clean (max-1) and step=0 for context
@@ -233,7 +236,7 @@ def latent_rollout(
             action = jax.random.categorical(rng_action, logits) # (B, L) # Sample discrete action
         
         # Predict next latent (denoising)
-        z_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, rng, caches_t)
+        z_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, rng, caches=caches_t)
         
         return (h_next, caches_next, rng), z_next[:,0] # z_next is (B, 1, n_spatial, D_s) 
 
@@ -291,7 +294,7 @@ def video_rollout(
     rng, mae_key = jax.random.split(rng)
     latents_ctx, _ = tokenizer.apply(tokenizer_vars,
                                 frames_ctx, 
-                                packing_factor=dynamics.packing_factor, 
+                                packing_factor=dynamics.config.packing_factor, 
                                 method=tokenizer.encode, 
                                 rngs={"mae": mae_key}, 
                                 deterministic=True) # Encode returns (B, T, L, D)
@@ -309,13 +312,10 @@ def video_rollout(
                                      rng,
                                      initial_agent_tokens)
     
-    # Concatenate context and rollout
-    full_latents = jnp.concatenate([frames_ctx, rollout_latents], axis=1)
-        
     # Decode
     pred_frames = tokenizer.apply(tokenizer_vars,
-                                       full_latents,
-                                       packing_factor=dynamics.packing_factor,
+                                       rollout_latents,
+                                       packing_factor=dynamics.config.packing_factor,
                                        method=tokenizer.decode,
                                        deterministic=True)
         

@@ -51,15 +51,13 @@ def sample_video(
     # encode frames to clean latents
     latents, _ = tokenizer.apply(
         tokenizer_vars, frames,
-        packing_factor=dynamics.packing_factor,
+        packing_factor=dynamics.config.packing_factor,
         method=tokenizer.encode, 
         rngs={"mae": mae_key},
         deterministic=True
     )
-
-    # Split context vs future
-    horizon = horizon // dynamics.packing_factor
     
+    # Split context vs future
     frames_ctx = frames[:, :-horizon, :, :, :]
     latents_ctx_clean = latents[:, :-horizon, :, :]
     latents_future = latents[:, -horizon:, :, :]
@@ -68,16 +66,16 @@ def sample_video(
 
     # Single-shot context corruption for visualization "floor" only
     latents_ctx = latents_ctx_clean
-    if schedule_config.tau_ctx < 1.0:  # FIXME: this is NOT taken from the evaluation config
-        rng, nkey = jax.random.split(rng)
-        noise = jax.random.normal(nkey, latents_ctx_clean.shape, latents_ctx_clean.dtype)
-        tau = jnp.asarray(schedule_config.tau_ctx, latents_ctx_clean.dtype)
-        latents_ctx = tau * latents_ctx_clean + (1.0 - tau) * noise
+    # if schedule_config.tau_ctx < 1.0:  # FIXME: this is NOT taken from the evaluation config
+    #     rng, nkey = jax.random.split(rng)
+    #     noise = jax.random.normal(nkey, latents_ctx_clean.shape, latents_ctx_clean.dtype)
+    #     tau = jnp.asarray(schedule_config.tau_ctx, latents_ctx_clean.dtype)
+    #     latents_ctx = tau * latents_ctx_clean + (1.0 - tau) * noise
 
     # Tokenized frames for visualization
     latents_for_tokenized_frames = jnp.concatenate([latents_ctx, latents_future], axis=1)
-    tokenized_frames, _ = tokenizer.apply(
-        tokenizer_vars, latents_for_tokenized_frames, 
+    tokenized_frames = tokenizer.apply(
+        tokenizer_vars, latents_for_tokenized_frames, packing_factor=dynamics.config.packing_factor,
         method=tokenizer.decode, 
         deterministic=True
     )
@@ -93,8 +91,7 @@ def sample_video(
                                 schedule=schedule_config,
                                 frames_ctx=frames_ctx,
                                 actions_ctx=actions_ctx,
-                                horizon=horizon,
-                                num_steps=4,
+                                num_steps=horizon,
                                 rng=rng,
                                 initial_agent_tokens=None)
 
