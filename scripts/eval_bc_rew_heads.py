@@ -509,7 +509,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
         d=(cfg.d if cfg.schedule=="shortcut" else None),
         start_mode="pure", rollout="teacher_forced",
         horizon=cfg.horizon, ctx_length=cfg.ctx_length,
-        ctx_signal_tau=cfg.ctx_signal_tau,
+        tau_ctx=cfg.tau_ctx,
         rng_key=jax.random.PRNGKey(4242), mae_eval_key=env["mae_eval_key"],
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=n_spatial, packing_factor=cfg.packing_factor,
@@ -518,7 +518,7 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
     pred_frames, floor_frames, gt_frames = sample_video(
         encoder=enc, decoder=dec, dynamics=dyn,
         enc_vars=enc_vars, dec_vars=dec_vars, dyn_vars=dyn_vars,
-        frames=frames, actions=actions, config=sampler_conf,
+        frames=frames, actions=actions, schedule_config=sampler_conf,
     )
 
     # Save a grid video (GT|Floor|Pred)
@@ -605,7 +605,7 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
         d=(cfg.d if cfg.schedule=="shortcut" else None),
         start_mode="pure", rollout="autoregressive",
         horizon=cfg.horizon, ctx_length=cfg.ctx_length,
-        ctx_signal_tau=cfg.ctx_signal_tau,
+        tau_ctx=cfg.tau_ctx,
         rng_key=jax.random.PRNGKey(101010), mae_eval_key=env["mae_eval_key"],
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=n_spatial, packing_factor=cfg.packing_factor,
@@ -614,7 +614,7 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
     pred_frames, floor_frames, gt_frames = sample_video(
         encoder=enc, decoder=dec, dynamics=dyn,
         enc_vars=enc_vars, dec_vars=dec_vars, dyn_vars=dyn_vars,
-        frames=frames, actions=actions, config=sampler_conf,
+        frames=frames, actions=actions, schedule_config=sampler_conf,
     )
 
     # We want heads' predictions per generated step. We'll compute h on the final τ for each future step.

@@ -10,6 +10,9 @@ Architecture:
 from __future__ import annotations
 
 import logging
+
+from dreamer.generation import DenoiseSchedule
+from dreamer.sampler import sample_video
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
 
@@ -40,9 +43,6 @@ from dreamer.models import Dynamics, Tokenizer
 # from dreamer.sampler import SamplerConfig, sample_video, plan_from_sampler_conf
 from dreamer.utils import (
     _ensure_dir,
-    _stack_wide,
-    _tile_videos,
-    _to_uint8,
     from_dict,
     init_dynamics,
     make_manager,
@@ -82,7 +82,7 @@ def _sample_step_excluding_dmin(rng, shape_bt, k_max: int):
 # ---------------------------
 
 @partial(jax.jit, static_argnames=("dynamics", "tx", "k_max", "B_self"))
-def train_step_efficient(
+def train_step(
     dynamics, tx, params, opt_state, constants, latents, actions,
     *, B_self: int, k_max: int, master_key: jnp.ndarray, step: int, bootstrap_start: int
 ):
@@ -202,150 +202,89 @@ def train_step_efficient(
 # Evaluation helpers
 # ---------------------------
 
-# def _eval_regimes_for_dynamics(
-#     cfg: DynamicsConfig,
-#     tokenizer_cfg: TokenizerConfig,
-#     *,
-#     ctx_length: int,
-# ) -> list[tuple[str, SamplerConfig]]:
-#     """Build eval regimes using nested config structure."""
-#     n_spatial = tokenizer_cfg.encoder.n_latents // cfg.dynamics.packing_factor
-#     common = dict(
-#         k_max=cfg.dynamics.k_max,
-#         horizon=min(32, tokenizer_cfg.dataset.T - ctx_length),
-#         ctx_length=ctx_length,
-#         ctx_signal_tau=1.0,  # clean context for fair PSNR
-#         H=tokenizer_cfg.dataset.H,
-#         W=tokenizer_cfg.dataset.W,
-#         C=tokenizer_cfg.dataset.C,
-#         patch=tokenizer_cfg.encoder.patch_size,
-#         n_spatial=n_spatial,
-#         packing_factor=cfg.dynamics.packing_factor,
-#         dataset_mean=tokenizer_cfg.dataset.dataset_mean,
-#         dataset_std=tokenizer_cfg.dataset.dataset_std,
-#         start_mode="pure",
-#         rollout="autoregressive",
-#     )
-#     regs = []
-#     regs.append(("finest_pure_AR", SamplerConfig(schedule="finest", **common)))
-#     regs.append(("shortcut_d4_pure_AR", SamplerConfig(schedule="shortcut", d=1/4, **common)))
-#     return regs
-
-
-# def build_tiled_video_frames(
-#     gt_frames: jnp.ndarray,
-#     floor_frames: jnp.ndarray,
-#     pred_frames: jnp.ndarray,
-#     batch_size: int,
-# ) -> list[np.ndarray]:
-#     """
-#     Build tiled video frames: (GT | Floor | Pred) per batch item, tiled in a grid.
-#     """
-#     gt_np_all = _to_uint8(gt_frames)
-#     floor_np_all = _to_uint8(floor_frames)
-#     pred_np_all = _to_uint8(pred_frames)
-
-#     T_total = gt_np_all.shape[1]
-#     ncols = 1 if batch_size <= 2 else min(8, batch_size)
-#     grid_frames = []
-
-#     for t_idx in range(T_total):
-#         trip_list = [
-#             _stack_wide(gt_np_all[b, t_idx], floor_np_all[b, t_idx], pred_np_all[b, t_idx])
-#             for b in range(batch_size)
-#         ]
-#         grid_img = _tile_videos(trip_list, ncols=4, pad_color=0)
-#         grid_frames.append(grid_img)
-
-#     return grid_frames
-
-
-# def run_evaluation(
-#     *,
-#     cfg: DynamicsConfig,
-#     tokenizer_cfg: TokenizerConfig,
-#     step: int,
-#     tokenizer: Tokenizer,
-#     tokenizer_vars: Dict[str, Any],
-#     dynamics: Dynamics,
-#     dynamics_params: Dict[str, Any],
-#     dynamics_constants: Dict[str, Any],
-#     val_videos: jnp.ndarray,
-#     val_actions: jnp.ndarray,
-#     vis_dir: Path,
-# ):
-#     """
-#     Run periodic evaluation: sample videos, compute metrics, and save visualization.
+def run_evaluation(
+    *,
+    cfg: DynamicsConfig,
+    tokenizer_cfg: TokenizerConfig,
+    step: int,
+    tokenizer: Tokenizer,
+    tokenizer_vars: Dict[str, Any],
+    dynamics: Dynamics,
+    dynamics_params: Dict[str, Any],
+    dynamics_constants: Dict[str, Any],
+    val_videos: jnp.ndarray,
+    val_actions: jnp.ndarray,
+    vis_dir: Path,
+    rng: jax.Array,
+):
+    """
+    Run periodic evaluation: sample videos, compute metrics, and save visualization.
     
-#     Uses unified Tokenizer with encode/decode methods.
-#     """
-#     dyn_vars = {"params": dynamics_params, "constants": dynamics_constants}
-#     ctx_length = min(32, tokenizer_cfg.dataset.T - 1)
-#     regimes = _eval_regimes_for_dynamics(cfg, tokenizer_cfg, ctx_length=ctx_length)
-    
-#     mae_eval_key = jax.random.PRNGKey(777)
-#     sampler_key = jax.random.PRNGKey(4242)
+    Uses unified Tokenizer with encode/decode methods.
+    """
 
-#     for tag, sampler_conf in regimes:
-#         sampler_conf.mae_eval_key = mae_eval_key
-#         sampler_conf.rng_key = sampler_key
-#         t0 = time.time()
+    schedule_shortcut = DenoiseSchedule(4, 256)
+    schedule_diffusion = DenoiseSchedule(256, 256)
 
-#         pred_frames, floor_frames, gt_frames = sample_video(
-#             tokenizer=tokenizer,
-#             tokenizer_vars=tokenizer_vars,
-#             dynamics=dynamics,
-#             dyn_vars=dyn_vars,
-#             frames=val_videos,
-#             actions=val_actions,
-#             horizon=sampler_conf.horizon,
-#             config=sampler_conf,
-#             rng=sampler_conf.rng_key,
-#         )
+    evaluation_schedules = {"shortcut": schedule_shortcut, 
+                            "diffusion": schedule_diffusion}
 
-#         # Compute metrics
-#         dt = time.time() - t0
-#         horizon = sampler_conf.horizon
-#         mse = float(jnp.mean((pred_frames[:, -horizon:] - gt_frames[:, -horizon:]) ** 2))
-#         psnr = float(10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12)))
-#         print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
+    dyn_vars = {"params": dynamics_params, "constants": dynamics_constants}
 
-#         # Build visualization
-#         batch_size = val_videos.shape[0]
-#         grid_frames = build_tiled_video_frames(gt_frames, floor_frames, pred_frames, batch_size)
+    for tag, schedule_config in evaluation_schedules:
+        t0 = time.time()
 
-#         # Save artifacts
-#         tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
-#         mp4_path = tag_dir / f"{tag}_grid.mp4"
-#         plan_path = tag_dir / f"{tag}_plan.json"
+        # FIXME: only temporary for debugging
+        assert val_videos.shape[1] > 5
+        ctx_length = 4
+        horizon = val_videos.shape[1] - ctx_length
 
-#         # Save video
-#         try:
-#             video_array = np.stack(grid_frames, axis=0)
-#             iio.imwrite(str(mp4_path), video_array, fps=25, plugin='pyav', codec='libx264')
-#         except Exception as e:
-#             print(f"[eval:{tag}] MP4 write failed: {e}")
+        pred_frames, floor_frames, gt_frames = sample_video(
+            tokenizer=tokenizer,
+            tokenizer_vars=tokenizer_vars,
+            dynamics=dynamics,
+            dyn_vars=dyn_vars,
+            frames=val_videos,
+            actions=val_actions,
+            horizon=horizon,
+            schedule_config=schedule_config,
+            rng=rng,
+        )
 
-#         # Save plan JSON
-#         plan = plan_from_sampler_conf(sampler_conf)
-#         plan["step"] = int(step)
-#         plan["mse"] = float(mse)
-#         plan["psnr_db"] = float(psnr)
-#         with open(plan_path, "w") as f:
-#             json.dump(plan, f, indent=2)
+        # Compute metrics
+        dt = time.time() - t0
+        # FIXME: this PSNR is wrong, see commit 73f7922a63cb3f88ca7b6435a5b3b14566281c8e
+        mse = float(jnp.mean((pred_frames[:, -horizon:] - gt_frames[:, -horizon:]) ** 2))
+        psnr = float(10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12)))
+        print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
 
-#         # Log to wandb
-#         if cfg.use_wandb and wandb.run is not None:
-#             wandb.log({
-#                 f"eval/{tag}/mse": mse,
-#                 f"eval/{tag}/psnr": psnr,
-#                 f"eval/{tag}/horizon": horizon,
-#                 f"eval/{tag}/eval_time": dt,
-#             }, step=step)
-#             if grid_frames:
-#                 wandb.log({
-#                     f"eval/{tag}/video": wandb.Video(mp4_path, format="mp4"),
-#                 }, step=step)
+        # Build visualization
+        num_videos = min(4, pred_frames.shape[0])
+        stacked_frames = jnp.stack([pred_frames, floor_frames, gt_frames])[:, :num_videos]
+        videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
+
+        # Save artifacts
+        tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+        mp4_path = tag_dir / f"{tag}_grid.mp4"
+
+        # Save video
+        try:
+            iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
+        except Exception as e:
+            print(f"[eval:{tag}] MP4 write failed: {e}")
+
+        # Log to wandb
+        if cfg.use_wandb and wandb.run is not None:
+            wandb.log({
+                f"eval/{tag}/mse": mse,
+                f"eval/{tag}/psnr": psnr,
+                f"eval/{tag}/horizon": horizon,
+                f"eval/{tag}/eval_time": dt,
+            }, step=step)
+            if videos:
+                wandb.log({
+                    f"eval/{tag}/video": wandb.Video(mp4_path, format="mp4"),
+                }, step=step)
 
 # ---------------------------
 # Main
@@ -422,7 +361,7 @@ def run(cfg: DynamicsConfig):
         actions = jnp.concatenate((jnp.full_like(actions[:,0:1], fill_value = 15), actions[:,:-1]), axis=1)
         latents, _ = tokenizer.apply(tokenizer_vars, videos, packing_factor=cfg.dynamics.packing_factor, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
 
-        dynamics_params, opt_state, aux = train_step_efficient(dynamics, tx, 
+        dynamics_params, opt_state, aux = train_step(dynamics, tx, 
             dynamics_params, opt_state, dynamics_constants, latents, actions, 
             B_self=videos.shape[0] // 2, k_max=cfg.dynamics.k_max, master_key=master_key,
             step=step, bootstrap_start=cfg.bootstrap_start)
@@ -443,22 +382,23 @@ def run(cfg: DynamicsConfig):
         maybe_save(mngr, step, state, meta)
 
         # Periodic lightweight AR eval
-        # if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
-        #     # Use current batch as validation data (simplest approach)
-        #     val_videos = batch["videos"].astype(jnp.float32) / 255.0
-        #     run_evaluation(
-        #         cfg=cfg,
-        #         tokenizer_cfg=tokenizer_cfg,
-        #         step=step,
-        #         tokenizer=tokenizer,
-        #         tokenizer_vars=tokenizer_vars,
-        #         dynamics=dynamics,
-        #         dynamics_params=dynamics_params,
-        #         dynamics_constants=dynamics_constants,
-        #         val_videos=val_videos,
-        #         val_actions=actions,
-        #         vis_dir=vis_dir,
-        #     )
+        if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
+            # Use current batch as validation data (simplest approach)
+            val_videos = batch["videos"].astype(jnp.float32) / 255.0
+            run_evaluation(
+                cfg=cfg,
+                tokenizer_cfg=tokenizer_cfg,
+                step=step,
+                tokenizer=tokenizer,
+                tokenizer_vars=tokenizer_vars,
+                dynamics=dynamics,
+                dynamics_params=dynamics_params,
+                dynamics_constants=dynamics_constants,
+                val_videos=val_videos,
+                val_actions=actions,
+                vis_dir=vis_dir,
+                rng=rng,
+            )
 
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:

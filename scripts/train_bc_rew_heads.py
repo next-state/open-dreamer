@@ -334,7 +334,7 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
         k_max=cfg.k_max,
         horizon=min(32, cfg.dataset.T - ctx_length),
         ctx_length=ctx_length,
-        ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
+        tau_ctx=1.0,
         H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, patch=cfg.patch,
         n_spatial=cfg.enc_n_latents // cfg.packing_factor,
         packing_factor=cfg.packing_factor,
@@ -686,7 +686,7 @@ def run_evaluation(
             enc_vars=train_state.enc_vars,
             dec_vars=train_state.dec_vars,
             dyn_vars=dyn_vars_eval,
-            frames=val_frames, actions=val_actions, config=sampler_conf,
+            frames=val_frames, actions=val_actions, schedule_config=sampler_conf,
         )
 
         dt = time.time() - t0

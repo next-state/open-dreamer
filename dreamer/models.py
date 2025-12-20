@@ -757,7 +757,7 @@ class Dynamics(nn.Module):
         self.depth = self.config.depth
         self.n_heads = self.config.n_heads
         self.n_kv_heads = self.config.n_kv_heads
-        packing_factor = self.config.packing_factor
+        self.packing_factor = self.config.packing_factor
         self.n_register = self.config.n_register
         self.n_agent = self.config.n_agent
         self.k_max = self.config.k_max
@@ -801,7 +801,7 @@ class Dynamics(nn.Module):
         # Signal level τ ∈ {0, 1/d, 2/d, ..., 1 - 1/d} (grid length = 1/d)
         # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
         self.signal_embed = nn.Embed(self.k_max, self.d_model, name="signal_embed")
-        self.flow_x_head = nn.Dense(self.d_bottleneck * packing_factor, name="flow_x_head", kernel_init=nn.initializers.zeros,
+        self.flow_x_head = nn.Dense(self.d_bottleneck * self.packing_factor, name="flow_x_head", kernel_init=nn.initializers.zeros,
                             bias_init=nn.initializers.zeros)  # zero-init
 
     def create_static_caches(self,

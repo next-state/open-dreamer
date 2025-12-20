@@ -326,7 +326,7 @@ class EvalConfig:
     horizon: int = 16
     schedule: str = "finest"  # "finest" or "shortcut"
     d: float | None = None    # e.g., 0.25 for shortcut
-    ctx_signal_tau: float = 1.0
+    tau_ctx: float = 1.0
     match_ctx_tau: bool = False
 
     # Visualization

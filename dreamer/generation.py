@@ -1,4 +1,5 @@
 import math
+from dreamer import data
 import einops
 import jax
 import jax.numpy as jnp
@@ -21,12 +22,14 @@ class DenoiseSchedule:
     Precomputed, JAX-friendly schedule for the τ-ladder.
 
     Attributes:
-        num_steps: Number of steps in the schedule, also a power of two.
-        k_max: A power of two, it represents the maximum number of denoising steps possible.
-        d: Step size d=1/num_steps ∈ {1, 1/2, 1/4, ..., 1/K_max}.
-        step_idx: log2(1/d) ∈ {0, 1, 2, ..., log2(K_max)}.
-        tau_values: Signal levels used during the denoising τ = [0, 1/d, 2/d, ..., 1 - 1/d, 1].
-        tau_indices: Indices of the signal levels used during the denoising τ_idx = [0, d, 2d, ..., K_max].
+        num_steps: a power of two, number of sampling steps (k) that you take during inference. In the paper, it's 4.
+        k_max: a power of two, maximum noise resolution used during diffusion training. In the paper, it's 256.
+        d: Step size d=1/k ∈ {1, 1/2, 1/4, ..., 1/k_max}, where k is {1, 2, 4, ..., k_max}.
+        step_idx: log2(k) ∈ {0, 1, 2, ..., log2(K_max)}.
+        tau_values: signal levels used during the denoising τ = [0, d, 2d, ..., 1 - d, 1].
+        tau_indices: indices of the signal levels used during the denoising τ_idx = [0, k, 2k, ..., k_max].
+        tau_idx_ctx: we pass slightly noised context frames, the index of that noise level (0.1 in the paper) is tau_idx_ctx.
+        step_idx_ctx: the index of the noise level that starting from tau_idx_ctx brings you to 1.
     """
 
     num_steps: int
@@ -35,11 +38,11 @@ class DenoiseSchedule:
     step_idx: int
     tau_values: jax.Array
     tau_idx: jax.Array
+    step_idx_ctx: int
     tau_idx_ctx: int
-    step_idx_ctx: int = 3
 
     @classmethod
-    def create(cls, num_steps: int, k_max: int = 256) -> "DenoiseSchedule":
+    def create(cls, num_steps: int, k_max: int = 256, tau_ctx=0.9) -> "DenoiseSchedule":
         """
         Create a DenoiseSchedule object.
         Args:
@@ -50,16 +53,16 @@ class DenoiseSchedule:
         """
         assert k_max % num_steps == 0, f"k_max={k_max} must be divisible by num_steps={num_steps}"
         
-        d = 1/num_steps
+        d = 1 / num_steps
         step_idx = int(math.log2(num_steps))
         tau_values = jnp.linspace(0.0, 1.0, num_steps + 1)
-        tau_indices = jnp.arange(num_steps+1)*(k_max//num_steps)
+        tau_indices = jnp.arange(num_steps + 1) * (k_max // num_steps)
         
-        # assuming the context has τ=0.9
-        step_idx_ctx = 3 # this is because the steps size d=0.1 and so the idx = log2(1/d) = 3.32
-        tau_idx_ctx = k_max - 2**step_idx_ctx # this is a bit more precise than just doing τ=0.9
+        # Compute noise level for context during autoregressive rollout
+        step_idx_ctx = int(jnp.round(-math.log2(1 - tau_ctx)))
+        tau_idx_ctx = k_max - k_max // step_idx_ctx
         
-        return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, tau_idx_ctx)
+        return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, step_idx_ctx, tau_idx_ctx)
     
 # ---------------------------
 # Single-step τ-ladder denoiser
@@ -256,14 +259,11 @@ def video_rollout(
     policy: PolicyHeadMTP | jax.Array,
     policy_vars: VariableDict | None,
     schedule: DenoiseSchedule,
-    initial_frames: jax.Array,
-    initial_actions: jax.Array,
+    frames_ctx: jax.Array,
+    actions_ctx: jax.Array,
     num_steps: int,
     rng: jax.Array,
     initial_agent_tokens: jax.Array | None = None,
-    packing_factor: int = 2,
-    dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5),
-    dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675),
 ):
     """
     End-to-end video generation rollout.
@@ -275,8 +275,8 @@ def video_rollout(
         policy: Policy model or array of fixed actions.
         policy_vars: Variables for policy.
         schedule: DenoiseSchedule.
-        initial_frames: (B, T_ctx, H, W, C) Context frames (0-1 range, unnormalized).
-        initial_actions: (B, T_ctx, ...) Context actions.
+        frames_ctx: (B, T_ctx, H, W, C) context frames (0-1 range, unnormalized).
+        actions_ctx: (B, T_ctx, ...) Context actions.
         num_steps: Number of steps to unroll.
         rng: Random number generator key.
         initial_agent_tokens: Optional agent tokens.
@@ -287,30 +287,36 @@ def video_rollout(
         pred_frames: (B, T_ctx + num_steps, H, W, C)
     """
     
-    # 1. Normalize frames
-    frames_norm = normalize_with_dataset_stats(initial_frames, mean=dataset_mean, std=dataset_std)
-    
-    # 2. Tokenize
+    # Tokenize
     rng, mae_key = jax.random.split(rng)
-    z_btLd, _ = tokenizer.apply(tokenizer_vars, frames_norm, method=tokenizer.encode, rngs={"mae": mae_key}, deterministic=True) # Encode returns (B, T, L, D)
-    
-    # 3. Pack to spatial format (B, T, n_spatial, D_s)
-    initial_latents = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=packing_factor)
-    
-    # 4. Latent Rollout
+    latents_ctx, _ = tokenizer.apply(tokenizer_vars,
+                                frames_ctx, 
+                                packing_factor=dynamics.packing_factor, 
+                                method=tokenizer.encode, 
+                                rngs={"mae": mae_key}, 
+                                deterministic=True) # Encode returns (B, T, L, D)
+        
+    # Latent Rollout
     # Returns (B, num_steps, n_spatial, D_s)
-    rollout_latents = latent_rollout(dynamics, dyn_vars, policy, policy_vars, schedule, initial_latents, initial_actions, num_steps, rng, initial_agent_tokens)
+    rollout_latents = latent_rollout(dynamics,
+                                     dyn_vars,
+                                     policy,
+                                     policy_vars,
+                                     schedule,
+                                     latents_ctx,
+                                     actions_ctx,
+                                     num_steps,
+                                     rng,
+                                     initial_agent_tokens)
     
-    # 5. Concatenate context and rollout
-    full_latents = jnp.concatenate([initial_latents, rollout_latents], axis=1)
-    
-    # 6. Unpack to bottleneck format
-    full_btLd = unpack_spatial_to_bottleneck(full_latents, n_spatial=n_spatial, k=packing_factor)
-    
-    # 7. Decode
-    pred_frames_norm = tokenizer.apply(tokenizer_vars, full_btLd, method=tokenizer.decode, deterministic=True)
-    
-    # 8. Unnormalize
-    pred_frames = unnormalize_with_dataset_stats(pred_frames_norm, mean=dataset_mean, std=dataset_std)
-    
-    return jnp.clip(pred_frames, 0.0, 1.0)
+    # Concatenate context and rollout
+    full_latents = jnp.concatenate([frames_ctx, rollout_latents], axis=1)
+        
+    # Decode
+    pred_frames = tokenizer.apply(tokenizer_vars,
+                                       full_latents,
+                                       packing_factor=dynamics.packing_factor,
+                                       method=tokenizer.decode,
+                                       deterministic=True)
+        
+    return jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)

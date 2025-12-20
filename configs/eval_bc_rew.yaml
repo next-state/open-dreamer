@@ -40,6 +40,6 @@ ctx_length: 32
 horizon: 16
 schedule: shortcut
 d: 0.25
-ctx_signal_tau: 0.9
+tau_ctx: 0.9
 max_examples_to_plot: 4
 paranoid_no_leak: false
