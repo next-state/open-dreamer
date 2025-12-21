@@ -104,7 +104,6 @@ def next_latent(
     noisy_latent = jax.random.normal(rng_latent, latent_shape)
     B = latent_shape[0]
 
-    noise_ctx = None
     latents_ctx_noised = None
     if latents_ctx is not None:
         noise_prefill= jnp.zeros(latents_ctx[:, :prefill_length].shape)
