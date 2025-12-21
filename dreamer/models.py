@@ -99,6 +99,43 @@ class KVCache:
         return k_ordered, v_ordered, final_mask
 
 
+def create_transformer_caches(
+    depth: int,
+    time_every: int,
+    flattened_batch_size: int,
+    window_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype=jnp.float32,
+) -> Dict[int, KVCache]:
+    """
+    Creates KV cache dictionary for transformer layers.
+    
+    Args:
+        depth: Total number of transformer layers
+        time_every: Create cache every N layers (for time attention)
+        flattened_batch_size: Batch size after spatial flattening (B * S)
+        window_size: Maximum temporal sequence length
+        num_kv_heads: Number of key/value heads
+        head_dim: Dimension per attention head
+        dtype: Data type for cache buffers
+    
+    Returns:
+        Dictionary mapping time layer indices to KVCache objects
+    """
+    caches = {}
+    for i in range(depth):
+        time_index, time_offset = divmod(i, time_every)
+        if time_offset == 0:
+            caches[time_index] = KVCache.init(
+                batch_size=flattened_batch_size,
+                window_size=window_size,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype=dtype
+            )
+    return caches
+
 
 class RotaryEmbedding1D(nn.Module):
     dim: int
@@ -619,7 +656,7 @@ class Decoder(nn.Module):
         self.patch_queries = self.param("patch_queries", nn.initializers.normal(0.02),(self.n_patches, self.d_model)) # (Np, D)
 
     @nn.compact
-    def __call__(self, z: jnp.ndarray, *, deterministic: bool = True, packing_factor = None) -> jnp.ndarray:
+    def __call__(self, z: jnp.ndarray, *, deterministic: bool = True, packing_factor = None, caches: Optional[Dict[int, KVCache]] = None):
         if packing_factor is not None:
             z = rearrange(z, "b t n (p d) -> b t (n p) d", p=packing_factor)
             
@@ -640,14 +677,14 @@ class Decoder(nn.Module):
             ))
         mask = layout.make_mask("decoder", B, T)
 
-        x, _ = self.transformer(tokens, mask=mask, deterministic=deterministic)
+        x, new_caches = self.transformer(tokens, mask=mask, deterministic=deterministic, caches=caches)
         # 6) Prediction head over the patch-query slice
 
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
         pred_btnd = self.patch_head(x_patches)  # (B, T, Np, D_patch)
         out_normalized_frames = unpatchify(pred_btnd, patch=self.patch_size, H=self.H, W=self.W)
         out_frames = unnormalize_with_dataset_stats(out_normalized_frames, mean=self.dataset_mean, std=self.dataset_std)
-        return out_frames
+        return out_frames, new_caches
 
 class Tokenizer(nn.Module):
     config: TokenizerConfig
@@ -663,15 +700,46 @@ class Tokenizer(nn.Module):
     @nn.compact
     def __call__(self, videos, deterministic: bool = True):
         z, aux = self.encoder(videos, deterministic=deterministic)
-        recon = self.decoder(z, deterministic=deterministic)
+        recon, _ = self.decoder(z, deterministic=deterministic)
         return recon, aux
 
     def encode(self, videos, deterministic: bool = True, packing_factor = None):
         return self.encoder(videos, deterministic=deterministic, packing_factor=packing_factor)
 
-    def decode(self, z, deterministic: bool = True, cache=None, packing_factor = None):
-        # TODO: Implement caching mechanism for decoding
-        return self.decoder(z, deterministic=deterministic, packing_factor=packing_factor)
+    def decode(self, z, deterministic: bool = True, caches=None, packing_factor = None):
+        return self.decoder(z, deterministic=deterministic, packing_factor=packing_factor, caches=caches)
+
+    def create_static_caches(self,
+                             batch_size: int,
+                             window_size: int = 1024,
+                             dtype=jnp.float32,
+                             ) -> Dict[int, KVCache]:
+        """
+        Creates concrete, zero-filled KV cache buffers for JIT compilation.
+
+        Args:
+            batch_size: Global batch size (B)
+            window_size: Maximum sequence length (T) to support.
+            dtype: Data type for cache buffers.
+            
+        Returns:
+            Dictionary mapping time layer indices to KVCache objects.
+        """
+        # In the decoder, time attention sees (B * S) independent sequences
+        # where S = N_latents + N_patches (total number of spatial tokens)
+        n_patches = (self.config.decoder.H // self.config.decoder.patch_size) * \
+                    (self.config.decoder.W // self.config.decoder.patch_size)
+        S_total = self.config.decoder.n_latents + n_patches
+        
+        return create_transformer_caches(
+            depth=self.config.decoder.depth,
+            time_every=self.config.decoder.time_every,
+            flattened_batch_size=batch_size * S_total,
+            window_size=window_size,
+            num_kv_heads=self.config.decoder.n_kv_heads,
+            head_dim=self.config.decoder.d_model // self.config.decoder.n_heads,
+            dtype=dtype
+        )
 
     @classmethod
     def from_pretrained(cls, path, *, load_for_training: bool = False) -> Tuple["Tokenizer", Dict[Any, Any], TokenizerConfig]:
@@ -816,26 +884,22 @@ class Dynamics(nn.Module):
 
         Args:
             batch_size: Global batch size (B)
+            n_spatial: Number of spatial tokens
             window_size: Maximum sequence length (T) to support.
+            dtype: Data type for cache buffers.
         """
         # Time attention sees (B*S) independent sequences. S includes all tokens (action, signal, step, spatial, register, agent)
         S_total = 1 + 1 + 1 + n_spatial + self.config.n_register + (self.config.n_agent if self.config.n_agent > 0 else 0)
 
-        flattened_batch_size = batch_size * S_total
-        head_dim = self.config.d_model // self.config.n_heads
-
-        caches = {}
-        for i in range(self.config.depth):
-            time_index, time_offset = divmod(i, self.config.time_every)
-            if time_offset == 0:
-                caches[time_index] = KVCache.init(
-                    batch_size=flattened_batch_size,
-                    window_size=window_size,
-                    num_kv_heads=self.config.n_kv_heads,
-                    head_dim=head_dim,
-                    dtype=dtype
-                )
-        return caches
+        return create_transformer_caches(
+            depth=self.config.depth,
+            time_every=self.config.time_every,
+            flattened_batch_size=batch_size * S_total,
+            window_size=window_size,
+            num_kv_heads=self.config.n_kv_heads,
+            head_dim=self.config.d_model // self.config.n_heads,
+            dtype=dtype
+        )
 
     @nn.compact
     def __call__(
