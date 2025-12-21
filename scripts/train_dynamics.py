@@ -101,7 +101,6 @@ def train_step(
 # ---------------------------
 
 def run_evaluation(
-    *,
     cfg: DynamicsConfig,
     tokenizer_cfg: TokenizerConfig,
     step: int,
@@ -136,17 +135,7 @@ def run_evaluation(
         ctx_length = 4
         horizon = val_videos.shape[1] - ctx_length
 
-        pred_frames, floor_frames, gt_frames = sample_video(
-            tokenizer=tokenizer,
-            tokenizer_vars=tokenizer_vars,
-            dynamics=dynamics,
-            dyn_vars=dyn_vars,
-            frames=val_videos,
-            actions=val_actions,
-            horizon=horizon,
-            schedule_config=schedule_config,
-            rng=rng,
-        )
+        pred_frames, floor_frames, gt_frames = sample_video(tokenizer, tokenizer_vars, dynamics, dyn_vars, val_videos, val_actions, horizon, schedule_config, rng)
 
         # Compute metrics
         dt = time.time() - t0
@@ -202,13 +191,7 @@ def run(cfg: DynamicsConfig):
 
     # Wandb
     if cfg.use_wandb:
-        wandb.init(
-            entity=cfg.wandb_entity,
-            project=cfg.wandb_project or cfg.run_name,
-            name=cfg.run_name,
-            config=asdict(cfg),
-            dir=str(run_dir),
-        )
+        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project or cfg.run_name, name=cfg.run_name, config=asdict(cfg), dir=str(run_dir))
 
     # Load frozen tokenizer
     rng = jax.random.PRNGKey(0)
@@ -225,12 +208,7 @@ def run(cfg: DynamicsConfig):
     opt_state = tx.init(dynamics_params)
 
     # Logging & checkpointing
-    logger = MetricLogger(
-        use_wandb=cfg.use_wandb,
-        log_every=cfg.log_every,
-        max_steps=cfg.max_steps,
-        wandb_obj=wandb,
-    )
+    logger = MetricLogger( use_wandb=cfg.use_wandb, log_every=cfg.log_every, max_steps=cfg.max_steps, wandb_obj=wandb)
     mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
 
     state_example = make_state(dynamics_params, opt_state, rng, step=0)
@@ -287,20 +265,7 @@ def run(cfg: DynamicsConfig):
         if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
             # Use current batch as validation data (simplest approach)
             val_videos = batch["videos"]
-            run_evaluation(
-                cfg=cfg,
-                tokenizer_cfg=tokenizer_cfg,
-                step=step,
-                tokenizer=tokenizer,
-                tokenizer_vars=tokenizer_vars,
-                dynamics=dynamics,
-                dynamics_params=dynamics_params,
-                dynamics_constants=dynamics_constants,
-                val_videos=val_videos,
-                val_actions=actions,
-                vis_dir=vis_dir,
-                rng=rng,
-            )
+            run_evaluation(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, dynamics_params, dynamics_constants, val_videos, actions, vis_dir, rng)
 
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:

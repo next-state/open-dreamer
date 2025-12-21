@@ -90,27 +90,8 @@ def sample_step_excluding_dmin(
     return d, step_idx
 
 
-# ---------------------------
 # Loss weighting
-# ---------------------------
-
 def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float = 1.0) -> jnp.ndarray:
-    """
-    Ramp loss weight that increases linearly with signal level.
-    
-    Lower signal levels (more noise) have less learning signal, so we downweight them.
-    This focuses model capacity on denoising steps with clearer targets.
-    
-    Args:
-        sigma: (B, T) or any shape - signal levels in [0, 1]
-        min_weight: Weight at sigma=0 (pure noise)
-        max_weight: Weight at sigma=1 (clean data)
-        
-    Returns:
-        weights: Same shape as sigma, values in [min_weight, max_weight]
-        
-    Default: w(sigma) = 0.9 * sigma + 0.1
-    """
     return (max_weight - min_weight) * sigma + min_weight
 
 
@@ -262,16 +243,7 @@ def shortcut_forcing_step(
     
     # --- Forward pass (full batch) ---
     drop_main, drop_h1, drop_h2 = jax.random.split(key_drop, 3)
-    z_pred_full, (h_states, _) = dynamics_apply_fn(
-        dynamics_vars,
-        actions,
-        step_idx_full,
-        sigma_idx_full,
-        z_tilde,
-        agent_tokens=agent_tokens,
-        rngs={"dropout": drop_main},
-        deterministic=False
-    )
+    z_pred_full, (h_states, _) = dynamics_apply_fn(dynamics_vars, actions, step_idx_full, sigma_idx_full, z_tilde, agent_tokens=agent_tokens, rngs={"dropout": drop_main}, deterministic=False)
     
     # --- Flow loss (empirical rows) ---
     z_pred_emp = z_pred_full[:B_emp]
@@ -295,32 +267,14 @@ def shortcut_forcing_step(
         sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
     
         # First half-step
-        z1_half1, *_ = dynamics_apply_fn(
-            dynamics_vars,
-            actions_self,
-            step_idx_half,
-            sigma_idx_self,
-            z_tilde_self,
-            agent_tokens=agent_tokens_self,
-            rngs={"dropout": drop_h1},
-            deterministic=False
-        )
+        z1_half1, *_ = dynamics_apply_fn(dynamics_vars, actions_self, step_idx_half, sigma_idx_self, z_tilde_self, agent_tokens=agent_tokens_self, rngs={"dropout": drop_h1}, deterministic=False)
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(
             1.0 - sigma_self[..., None, None], 1e-8
         )
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
     
         # Second half-step
-        z1_half2, *_ = dynamics_apply_fn(
-            dynamics_vars,
-            actions_self,
-            step_idx_half,
-            sigma_idx_plus,
-            z_prime,
-            agent_tokens=agent_tokens_self,
-            rngs={"dropout": drop_h2},
-            deterministic=False
-        )
+        z1_half2, *_ = dynamics_apply_fn(dynamics_vars, actions_self, step_idx_half, sigma_idx_plus, z_prime, agent_tokens=agent_tokens_self, rngs={"dropout": drop_h2}, deterministic=False)
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(
             1.0 - sigma_plus[..., None, None], 1e-8
         )
@@ -329,14 +283,7 @@ def shortcut_forcing_step(
         loss_boot = compute_bootstrap_loss(
             z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self
         )
-        boot_mse_unweighted = compute_bootstrap_loss(
-            z_pred_self,
-            z_tilde_self,
-            b_prime,
-            b_doubleprime,
-            sigma_self,
-            per_example=True,
-        ).mean()
+        boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self, per_example=True).mean()
     
         # Dynamic gating. TODO: isn't it better to simply do a weighted sum?
         bootstrap_mask = bootstrap_active.astype(latents.dtype)
@@ -347,20 +294,9 @@ def shortcut_forcing_step(
     # Weight by batch composition to keep scale constant
     loss_total = ((loss_flow * (B - B_self)) + (loss_boot * B_self)) / B
     
-    losses = {
-        'total': loss_total,
-        'flow': loss_flow,
-        'bootstrap': loss_boot,
-    }
+    losses = { 'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
+    aux = {'flow_mse': flow_mse_unweighted, 'bootstrap_mse': boot_mse_unweighted, 'h_states': h_states}
     
-    aux = {
-        'flow_mse': flow_mse_unweighted,
-        'bootstrap_mse': boot_mse_unweighted,
-    }
-    
-    # Optionally return hidden states for BC/reward training
-    if agent_tokens is not None:
-        aux['h_states'] = h_states
     
     return losses, aux
 
@@ -487,59 +423,3 @@ def compute_reward_loss(
     reward_loss = jnp.sum(reward_loss_per * rewards_valid) / jnp.maximum(rewards_valid.sum(), 1.0)
     
     return reward_loss
-
-
-# ---------------------------
-# Training step wrapper
-# ---------------------------
-
-def make_shortcut_forcing_update(
-    dynamics,
-    tx,
-    k_max: int,
-    B_self: int = 0,
-    bootstrap_start: int = 0,
-):
-    """
-    Create a JIT-compiled training step function for shortcut forcing.
-    
-    This factory function returns a training step that can be reused across
-    different training phases (dynamics pretraining, imagination training, etc.).
-    
-    Args:
-        dynamics: Dynamics model instance
-        tx: Optax optimizer
-        k_max: Maximum noise resolution
-        B_self: Number of bootstrap examples per batch
-        bootstrap_start: Step at which to activate bootstrap loss
-        
-    Returns:
-        train_step: JIT-compiled function that takes (params, opt_state, constants,
-                    latents, actions, rng, step) and returns (new_params, new_opt_state, metrics)
-    """
-    @partial(jax.jit, static_argnames=())
-    def train_step(params, opt_state, constants, latents, actions, rng, step, agent_tokens=None):
-        bootstrap_active = step >= bootstrap_start
-        
-        def loss_fn(p):
-            vars_dict = {"params": p, "constants": constants}
-            losses, aux = shortcut_forcing_step(
-                dynamics.apply,
-                vars_dict,
-                actions,
-                latents,
-                rng,
-                k_max,
-                B_self=B_self,
-                bootstrap_active=bootstrap_active,
-                agent_tokens=agent_tokens,
-            )
-            return losses['total'], {**losses, **aux}
-        
-        (loss_val, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-        updates, new_opt_state = tx.update(grads, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
-        
-        return new_params, new_opt_state, metrics
-    
-    return train_step
