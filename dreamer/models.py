@@ -966,8 +966,85 @@ class Dynamics(nn.Module):
     
     
     @classmethod
-    def from_pretrained(cls, path):
-        pass
+    @classmethod
+    def from_pretrained(cls, path, *, load_for_training: bool = False) -> Tuple["Dynamics", Dict[Any, Any], "DynamicsModelConfig", "TokenizerConfig"]:
+        """
+        Load a pretrained Dynamics model from a checkpoint directory.
+        
+        Args:
+            path: Path to checkpoint directory
+            load_for_training: If True, load optimizer state as well (not implemented yet)
+            
+        Returns:
+            Tuple of (dynamics_module, variables_dict, dynamics_config, tokenizer_config)
+            where variables_dict contains both 'params' and 'constants'
+        """
+        mngr = make_manager(path, item_names=("meta", "state"))
+
+        # 1. Restore metadata to get config
+        latest = mngr.latest_step()
+        if latest is None:
+            raise ValueError(f"No checkpoint found in {path}")
+
+        # Restore metadata first
+        restored_meta = mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
+        cfg_dict = restored_meta.meta["cfg"]
+        cfg_dict = recursive_list_to_tuple(cfg_dict)
+        
+        # Extract the dynamics config from the full training config
+        # The checkpoint saves the entire DynamicsConfig which contains a 'dynamics' field
+        from .configs import DynamicsConfig
+        full_cfg = from_dict(DynamicsConfig, cfg_dict)
+        dyn_model_cfg = full_cfg.dynamics
+        
+        # Load tokenizer config to get spatial dimensions
+        # We need this to properly initialize the dynamics model
+        tokenizer_cfg = None
+        if hasattr(full_cfg, 'tokenizer_ckpt'):
+            # Load tokenizer config from the referenced checkpoint
+            _, _, tokenizer_cfg = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt)
+        
+        if tokenizer_cfg is None:
+            raise ValueError("Cannot determine spatial dimensions - tokenizer config not found. "
+                           "Make sure tokenizer_ckpt is set in the dynamics config.")
+        
+        # 2. Initialize model to get structure
+        dynamics = cls(dyn_model_cfg)
+        rng = jax.random.PRNGKey(0)
+        rng_params, rng_drop, key = jax.random.split(rng, 3)
+        
+        # Create dummy inputs matching expected shapes
+        B, T = 2, 4  # dummy batch/time dimensions
+        packing_factor = dyn_model_cfg.packing_factor
+        enc_cfg = tokenizer_cfg.encoder
+        n_spatial = enc_cfg.n_latents // packing_factor
+        d_spatial = enc_cfg.d_bottleneck * packing_factor
+        
+        # Create dummy inputs
+        dummy_actions = jnp.zeros((B, T), dtype=jnp.int32)
+        dummy_step_idxs = jnp.zeros((B, T), dtype=jnp.int32)
+        dummy_signal_idxs = jnp.zeros((B, T), dtype=jnp.int32)
+        dummy_latents = jax.random.normal(key, (B, T, n_spatial, d_spatial))
+        
+        variables = dynamics.init(
+            {"params": rng_params, "dropout": rng_drop},
+            dummy_actions, dummy_step_idxs, dummy_signal_idxs, dummy_latents,
+            deterministic=True,
+        )
+
+        # 3. Restore parameters from checkpoint
+        restored = mngr.restore(latest, args=ocp.args.Composite(
+            state=ocp.args.StandardRestore(None)
+        ))
+        
+        loaded_params = restored.state["params"]
+        
+        # 4. Merge loaded params into variables (keeping constants from init)
+        variables = unfreeze(variables)
+        variables["params"] = loaded_params
+        variables = freeze(variables)
+        
+        return dynamics, variables, dyn_model_cfg, tokenizer_cfg
 
 class TaskEmbedder(nn.Module):
     d_model: int
