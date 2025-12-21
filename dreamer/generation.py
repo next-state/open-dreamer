@@ -51,7 +51,7 @@ class DenoiseSchedule:
         d = 1 / num_steps
         step_idx = int(math.log2(num_steps))
         tau_values = jnp.linspace(0.0, 1.0, num_steps + 1)
-        tau_indices = jnp.arange(num_steps + 1) * (k_max // num_steps)
+        tau_indices = jnp.arange(num_steps) * (k_max // num_steps)
         
         # Compute noise level for context during autoregressive rollout
         step_idx_ctx = int(jnp.round(-math.log2(1 - tau_ctx)))
@@ -113,7 +113,7 @@ def next_latent(
         alpha = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
         
         step_idx = schedule.step_idx
-        tau_idx_val = schedule.tau_idx[s+1] 
+        tau_idx_val = schedule.tau_idx[s] 
 
         step_idx_ctx, tau_idx_ctx = schedule.step_idx_ctx, schedule.tau_idx_ctx
 
