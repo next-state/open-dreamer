@@ -17,9 +17,9 @@ class DenoiseSchedule:
     Precomputed, JAX-friendly schedule for the τ-ladder.
 
     Attributes:
-        num_steps: a power of two, number of sampling steps (k) that you take during inference. In the paper, it's 4.
+        num_steps: number of sampling steps (k ∈ {1, 2, 4, ..., k_max}) that you take during inference. In the paper, it's 4.
         k_max: a power of two, maximum noise resolution used during diffusion training. In the paper, it's 256.
-        d: Step size d=1/k ∈ {1, 1/2, 1/4, ..., 1/k_max}, where k is {1, 2, 4, ..., k_max}.
+        d: Step size d=1/k ∈ {1, 1/2, 1/4, ..., 1/k_max} during inference, where k is num_steps.
         step_idx: log2(k) ∈ {0, 1, 2, ..., log2(K_max)}.
         tau_values: signal levels used during the denoising τ = [0, d, 2d, ..., 1 - d, 1].
         tau_indices: indices of the signal levels used during the denoising τ_idx = [0, k, 2k, ..., k_max].
@@ -32,7 +32,7 @@ class DenoiseSchedule:
     d: float
     step_idx: int
     tau_values: jax.Array
-    tau_idx: jax.Array
+    tau_indices: jax.Array
     step_idx_ctx: int
     tau_idx_ctx: int
 
@@ -78,10 +78,6 @@ def next_latent(
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
 
-    - Uses a precomputed schedule (τ_seq, α_seq, signal_idx_seq, step_idx).
-    - Contains only JAX ops in the inner loop (no Python branching on traced values).
-    - Returns the denoised latent, the final hidden state h_t from dynamics, and the updated KV cache.
-
     Args:
         dynamics: Dynamics model (Flax Module)
         dyn_vars: Variables for dynamics (params + collections)
@@ -96,10 +92,9 @@ def next_latent(
 
     Returns:
         Tuple containing:
-        - z_t_final: The denoised latent (B, 1, n_spatial, D_s)
+        - latent_t_new: The denoised latent (B, 1, n_spatial, D_s)
         - h_last: The final hidden state from dynamics (B, n_agent, d_model)
         - caches_last: The updated KV cache
-        - rng: Updated random number generator key
     """
     rng, rng_latent = jax.random.split(rng, 2)
     noisy_latent = jax.random.normal(rng_latent, latent_shape)
@@ -113,7 +108,7 @@ def next_latent(
         alpha = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
         
         step_idx = schedule.step_idx
-        tau_idx_val = schedule.tau_idx[s] 
+        tau_idx_val = schedule.tau_indices[s] 
 
         step_idx_ctx, tau_idx_ctx = schedule.step_idx_ctx, schedule.tau_idx_ctx
 
@@ -139,17 +134,16 @@ def next_latent(
             tau_idx_curr = jnp.full((B, 1),     tau_idx_val, dtype=jnp.int32)
             tau_idx = jnp.concatenate([tau_idx_ctx, tau_idx_curr], axis=1) # (B, T_ctx+1)
 
-
         # Dynamics call
-        z_clean_pred_seq, (h_seq, caches_updated) = dynamics.apply(dyn_vars, actions_input, step_idx, tau_idx, latent_input, agent_tokens=agent_tokens, deterministic=True, caches=caches)
+        latent_clean_pred_seq, (h_seq, caches_updated) = dynamics.apply(dyn_vars, actions_input, step_idx, tau_idx, latent_input, agent_tokens=agent_tokens, deterministic=True, caches=caches)
 
-        z_clean_pred = z_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
+        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
         h_last = h_seq[:, -1, :, :] if isinstance(h_seq, jax.Array) else h_seq # (B, n_agent, d_model)
 
         # Per-step mixing toward clean latent
-        z_t_new = (1.0 - alpha) * latent_t + alpha * z_clean_pred
+        latent_t_new = (1.0 - alpha) * latent_t + alpha * latent_clean_pred
 
-        return z_t_new, (h_last, caches_updated)
+        return latent_t_new, (h_last, caches_updated)
 
     # Run τ-ladder with JAX control flow using scan to keep carry/output structure consistent.
     z_t_final, (h_history, caches_history) = jax.lax.scan(
@@ -171,8 +165,8 @@ def latent_rollout(
     policy: PolicyHeadMTP | jax.Array,
     policy_vars: VariableDict | None,
     schedule: DenoiseSchedule,
-    initial_latents: jax.Array,
-    initial_actions: jax.Array,
+    latents_ctx: jax.Array,
+    actions_ctx: jax.Array,
     num_steps: int,
     rng: jax.Array,
     initial_agent_tokens: jax.Array | None = None,
@@ -187,8 +181,8 @@ def latent_rollout(
         policy: Policy model or array of fixed actions (B, num_steps, ...).
         policy_vars: Variables for policy.
         schedule: DenoiseSchedule.
-        initial_latents: (B, T_ctx, n_spatial, D_s) Context latents.
-        initial_actions: (B, T_ctx, ...) Context actions.
+        latents_ctx: (B, T_ctx, n_spatial, D_s) Context latents.
+        actions_ctx: (B, T_ctx, ...) Context actions.
         num_steps: Number of steps to unroll.
         rng: Random number generator key.
         initial_agent_tokens: Optional (B, T_ctx, n_agent, D) agent tokens for context.
@@ -197,7 +191,7 @@ def latent_rollout(
         latents: (B, num_steps, n_spatial, D_s)
         actions: (B, num_steps, ...)
     """
-    B, T_ctx, n_spatial, D_s = initial_latents.shape
+    B, T_ctx, n_spatial, D_s = latents_ctx.shape
     latent_shape = (B, 1, n_spatial, D_s)
     # 1. Initialize caches and process context
     # We need to compute the max window size needed: context + rollout
@@ -210,7 +204,8 @@ def latent_rollout(
     step_idx_ctx= jnp.full((B, T_ctx), schedule.step_idx_ctx, dtype=jnp.int32)
     tau_idx_ctx = jnp.full((B, T_ctx), schedule.tau_idx_ctx,  dtype=jnp.int32)
     
-    _, (h_seq, caches) = dynamics.apply(dyn_vars, initial_actions, step_idx_ctx, tau_idx_ctx, initial_latents, agent_tokens=initial_agent_tokens, caches=caches, deterministic=True)
+    _, (h_seq, caches) = dynamics.apply(dyn_vars, actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx, agent_tokens=initial_agent_tokens, caches=caches, deterministic=True)
+
     # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
     h_last = h_seq[:, -1] if isinstance(h_seq, jax.Array) else None # (B, n_agent, D)
     
@@ -225,14 +220,14 @@ def latent_rollout(
             action = policy[:, step_idx]
         else:
             assert policy_vars is not None
-            logits = policy.apply(policy_vars, h_t, deterministic=False) # Use False to enable sampling logic if any
+            logits = policy.apply(policy_vars, h_t, deterministic=False)
             assert isinstance(logits, jax.Array), "Logits should be a JAX array"
-            action = jax.random.categorical(rng_action, logits) # (B, L) # Sample discrete action
+            action = jax.random.categorical(rng_action, logits) # (B, L)
         
         # Predict next latent (denoising)
-        z_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, rng, caches=caches_t)
+        latent_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, rng, caches=caches_t)
         
-        return (h_next, caches_next, rng), z_next[:,0] # z_next is (B, 1, n_spatial, D_s) 
+        return (h_next, caches_next, rng), latent_next[:,0] # latent_next is (B, 1, n_spatial, D_s) 
 
     # Run scan
     _, rollout_latents = jax.lax.scan(
@@ -243,7 +238,7 @@ def latent_rollout(
     
     # Unpack results
     rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
-    out_latents = jnp.concatenate((initial_latents, rollout_latents), axis=1)
+    out_latents = jnp.concatenate((latents_ctx, rollout_latents), axis=1)
     return out_latents 
 
 
