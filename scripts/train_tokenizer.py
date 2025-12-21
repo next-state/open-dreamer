@@ -1,6 +1,4 @@
 import logging
-# Suppress absl info logs
-logging.getLogger('absl').setLevel(logging.WARNING)
 
 from functools import partial
 import einops
@@ -19,12 +17,14 @@ from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
 
-from dreamer.utils import make_state, make_manager, try_restore, maybe_save, normalize_with_dataset_stats, unnormalize_with_dataset_stats, with_params, init_tokenizer, from_dict
+from dreamer.utils import make_state, make_manager, try_restore, maybe_save, normalize_with_dataset_stats, with_params, init_tokenizer, from_dict
 from dreamer.logging import MetricLogger
 from dreamer.models import Tokenizer
 from dreamer.data import make_iterator
 from dreamer.configs import TokenizerConfig
 
+# Suppress absl info logs
+logging.getLogger('absl').setLevel(logging.WARNING)
     
 # ------------------------
 # Forward (no module in jit)
@@ -92,13 +92,12 @@ def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key
         pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
         target_norm = normalize_with_dataset_stats(videos, mean=dataset_mean, std=dataset_std)
         mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
+        psnr = 10 * jnp.log10((1 / jnp.maximum(mse * (dataset_std[0] ** 2), 1e-10)))
         
         # For LPIPS: use [0, 1] range
         lp = lpips_on_mae_recon(pred / 255, videos / 255, lpips_frac)
         
         total = mse + lpips_weight * lp
-        mse_01 = mse * (dataset_std[0] ** 2)
-        psnr = 10 * jnp.log10((1 / jnp.maximum(mse_01, 1e-10)))
 
         aux = {"loss_total": total, "loss_mse": mse, "loss_lpips": lp, "keep_prob": keep_prob, "psnr": psnr}
         return total, aux
@@ -205,16 +204,7 @@ def run(cfg: TokenizerConfig):
         if logger.should_log(step):
             mse = aux["loss_mse"]
             psnr = aux["psnr"]
-            logger.log(
-                step,
-                {
-                    "loss": aux["loss_total"],
-                    "rmse": jnp.sqrt(mse),
-                    "lpips": aux["loss_lpips"],
-                    "psnr": psnr,
-                },
-                pbar=pbar,
-            )
+            logger.log(step, {"loss": aux["loss_total"], "rmse": jnp.sqrt(mse), "lpips": aux["loss_lpips"], "psnr": psnr,}, pbar=pbar)
 
         state = make_state(params, opt_state, rng, step)
         maybe_save(mngr, step, state, meta)

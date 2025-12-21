@@ -45,7 +45,9 @@ from dreamer.utils import (
     make_manager,
     make_state,
     maybe_save,
+    normalize_with_dataset_stats,
     try_restore,
+    unnormalize_with_dataset_stats,
 )
 # jax.config.update("jax_debug_nans", True)
 # Suppress absl info logs
@@ -251,14 +253,18 @@ def run_evaluation(
 
         # Compute metrics
         dt = time.time() - t0
-        # FIXME: this PSNR is wrong, see commit 73f7922a63cb3f88ca7b6435a5b3b14566281c8e
-        mse = float(jnp.mean((pred_frames[:, -horizon:] - gt_frames[:, -horizon:]) ** 2))
-        psnr = float(10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12)))
+        dataset_std = tokenizer_cfg.dataset.dataset_std[0]
+        normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
+        normalized_gt = normalize_with_dataset_stats(gt_frames[:, -horizon:], mean=0, std=dataset_std)
+        mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
+        
+        psnr = 10 * jnp.log10((1 / jnp.maximum(mse * (dataset_std ** 2), 1e-10)))
+        # psnr = float(10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12)))
         print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
 
         # Build visualization
         num_videos = min(4, pred_frames.shape[0])
-        frames = [pred_frames, floor_frames, gt_frames]
+        frames = [floor_frames, gt_frames, pred_frames]
         stacked_frames = jnp.stack(frames)[:, :num_videos]
         videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
 
