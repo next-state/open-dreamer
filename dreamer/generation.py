@@ -126,11 +126,11 @@ def next_latent(
             actions_input = jnp.concatenate([actions_ctx, action],   axis=1)  # (B, T_ctx+1)
 
             T_ctx = latent_input.shape[1]
-            step_idx_ctx  = jnp.full((B, T_ctx), step_idx_ctx, dtype=jnp.int32)
+            step_idx_ctx  = jnp.full((B, T_ctx), step_idx_ctx, dtype=jnp.int32)  # FIXME: should be schedule.step_idx for gt ctx
             step_idx_curr = jnp.full((B, 1),     step_idx,     dtype=jnp.int32)
             step_idx = jnp.concatenate([step_idx_ctx, step_idx_curr], axis=1)
             
-            tau_idx_ctx  = jnp.full((B, T_ctx), tau_idx_ctx, dtype=jnp.int32)
+            tau_idx_ctx  = jnp.full((B, T_ctx), tau_idx_ctx, dtype=jnp.int32)  # FIXME: should be schedule.k_max for gt ctx
             tau_idx_curr = jnp.full((B, 1),     tau_idx_val, dtype=jnp.int32)
             tau_idx = jnp.concatenate([tau_idx_ctx, tau_idx_curr], axis=1) # (B, T_ctx+1)
 
@@ -198,11 +198,10 @@ def latent_rollout(
     window_size = T_ctx + num_steps
     caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size)
     
-    # Run dynamics on context to warm up caches and get last hidden state
-    # Use signal=Clean (max-1) and step=0 for context
-    
-    step_idx_ctx= jnp.full((B, T_ctx), schedule.step_idx_ctx, dtype=jnp.int32)
-    tau_idx_ctx = jnp.full((B, T_ctx), schedule.tau_idx_ctx,  dtype=jnp.int32)
+    # Run dynamics on context to prefill caches and get last hidden state
+    # Use clean signal for context 
+    step_idx_ctx= jnp.full((B, T_ctx), schedule.step_idx, dtype=jnp.int32)
+    tau_idx_ctx = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)
     
     _, (h_seq, caches) = dynamics.apply(dyn_vars, actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx, agent_tokens=initial_agent_tokens, caches=caches, deterministic=True)
 
