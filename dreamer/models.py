@@ -707,7 +707,8 @@ class Tokenizer(nn.Module):
         return self.encoder(videos, deterministic=deterministic, packing_factor=packing_factor)
 
     def decode(self, z, deterministic: bool = True, caches=None, packing_factor = None):
-        return self.decoder(z, deterministic=deterministic, packing_factor=packing_factor, caches=caches)
+        frames, caches = self.decoder(z, deterministic=deterministic, packing_factor=packing_factor, caches=caches)
+        return frames, caches
 
     def create_static_caches(self,
                              batch_size: int,

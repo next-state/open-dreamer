@@ -307,7 +307,7 @@ def video_rollout(
                                      initial_agent_tokens)
     
     # Decode
-    pred_frames = tokenizer.apply(tokenizer_vars,
+    pred_frames, _ = tokenizer.apply(tokenizer_vars,
                                        rollout_latents,
                                        packing_factor=dynamics.config.packing_factor,
                                        method=tokenizer.decode,

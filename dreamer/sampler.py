@@ -74,7 +74,7 @@ def sample_video(
 
     # Tokenized frames for visualization
     latents_for_tokenized_frames = jnp.concatenate([latents_ctx, latents_future], axis=1)
-    tokenized_frames = tokenizer.apply(
+    tokenized_frames, _ = tokenizer.apply(
         tokenizer_vars, latents_for_tokenized_frames, packing_factor=dynamics.config.packing_factor,
         method=tokenizer.decode, 
         deterministic=True
