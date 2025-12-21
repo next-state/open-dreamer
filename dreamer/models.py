@@ -966,7 +966,6 @@ class Dynamics(nn.Module):
     
     
     @classmethod
-    @classmethod
     def from_pretrained(cls, path, *, load_for_training: bool = False) -> Tuple["Dynamics", Dict[Any, Any], "DynamicsModelConfig", "TokenizerConfig"]:
         """
         Load a pretrained Dynamics model from a checkpoint directory.
