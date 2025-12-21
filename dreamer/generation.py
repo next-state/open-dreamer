@@ -123,8 +123,8 @@ def next_latent(
         if caches is not None:
             latent_input, actions_input = latent_t, action
 
-            step_idx= jnp.full((B, 1), step_idx,    dtype=jnp.int32)
-            tau_idx = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
+            step_indices= jnp.full((B, 1), step_idx,    dtype=jnp.int32)
+            tau_indices = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
 
             assert agent_tokens is None or agent_tokens.shape[1] == noisy_latent.shape[1] 
         
@@ -134,18 +134,18 @@ def next_latent(
             actions_input = jnp.concatenate([actions_ctx, action],   axis=1)  # (B, T_ctx+1)
 
             decode_length = latents_ctx_noised.shape[1] - prefill_length
-            step_idx_prefill= jnp.full((B, prefill_length), schedule.step_idx, dtype=jnp.int32)
+            step_idx_prefill= jnp.full((B, prefill_length), step_idx, dtype=jnp.int32)
             step_idx_decode = jnp.full((B, decode_length),  schedule.step_idx_ctx, dtype=jnp.int32)
             step_idx_curr   = jnp.full((B, 1), step_idx, dtype=jnp.int32)
-            step_idx = jnp.concatenate([step_idx_prefill, step_idx_decode, step_idx_curr], axis=1)
+            step_indices    = jnp.concatenate([step_idx_prefill, step_idx_decode, step_idx_curr], axis=1)
             
             tau_idx_prefill= jnp.full((B, prefill_length), schedule.k_max, dtype=jnp.int32)
             tau_idx_decode = jnp.full((B, decode_length), schedule.tau_idx_ctx, dtype=jnp.int32)
             tau_idx_curr   = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
-            tau_idx = jnp.concatenate([tau_idx_prefill, tau_idx_decode, tau_idx_curr], axis=1) # (B, T_ctx+1)
+            tau_indices    = jnp.concatenate([tau_idx_prefill, tau_idx_decode, tau_idx_curr], axis=1) # (B, T_ctx+1)
 
         # Dynamics call
-        latent_clean_pred_seq, (h_seq, _) = dynamics.apply(dyn_vars, actions_input, step_idx, tau_idx, latent_input, agent_tokens=agent_tokens, deterministic=True, caches=caches)
+        latent_clean_pred_seq, (h_seq, _) = dynamics.apply(dyn_vars, actions_input, step_indices, tau_indices, latent_input, agent_tokens=agent_tokens, deterministic=True, caches=caches)
 
         latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
         h_last = h_seq[:, -1, :, :] if isinstance(h_seq, jax.Array) else h_seq # (B, n_agent, d_model)
@@ -164,10 +164,10 @@ def next_latent(
     
     if caches is not None:
         # update caches by doing one more refinement step with tau_ctx
-        step_idx= jnp.full((B, 1), schedule.step_idx_ctx, dtype=jnp.int32)
-        tau_idx = jnp.full((B, 1), schedule.tau_idx_ctx,  dtype=jnp.int32)
+        step_indices= jnp.full((B, 1), schedule.step_idx_ctx, dtype=jnp.int32)
+        tau_indices = jnp.full((B, 1), schedule.tau_idx_ctx,  dtype=jnp.int32)
 
-        _, (h_seq_final, caches_new) = dynamics.apply(dyn_vars, action, step_idx, tau_idx, latent_t_final, agent_tokens=agent_tokens, deterministic=True, caches=caches)
+        _, (h_seq_final, caches_new) = dynamics.apply(dyn_vars, action, step_indices, tau_indices, latent_t_final, agent_tokens=agent_tokens, deterministic=True, caches=caches)
         h_last = h_seq_final[:, -1, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
     else:
         h_last = h_history[-1] if h_history is not None else None  # (B, n_agent, d_model)
