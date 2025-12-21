@@ -37,7 +37,7 @@ from dreamer.configs import DynamicsConfig, TokenizerConfig
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Dynamics, Tokenizer
-# from dreamer.sampler import SamplerConfig, sample_video, plan_from_sampler_conf
+from dreamer.training import shortcut_forcing_step  # NEW: Reusable training components
 from dreamer.utils import (
     _ensure_dir,
     from_dict,
@@ -54,41 +54,18 @@ from dreamer.utils import (
 logging.getLogger('absl').setLevel(logging.WARNING)
 
 # ---------------------------
-# Training step helpers (don't nest to improve JIT caching speed)
+# Training step (now using reusable components from dreamer.training)
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("shape_bt", "k_max"))
-def _sample_tau_for_step(rng, shape_bt, k_max: int, step_idx: jnp.ndarray, *, dtype=jnp.float32):
-    """Sample tau values aligned to step_idx grid."""
-    B_, T_ = shape_bt
-    K = 1 << step_idx
-    u = jax.random.uniform(rng, (B_, T_), dtype=dtype)
-    j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)
-    tau = j_idx.astype(dtype) / K.astype(dtype)
-    tau_idx = j_idx * (k_max // K)
-    return tau, tau_idx
-
-
-@partial(jax.jit, static_argnames=("shape_bt", "k_max"))
-def _sample_step_excluding_dmin(rng, shape_bt, k_max: int):
-    """Sample step indices excluding the finest level (for bootstrap)."""
-    B_, T_ = shape_bt
-    emax = jnp.log2(k_max).astype(jnp.int32)
-    step_idx = jax.random.randint(rng, (B_, T_), 0, emax, dtype=jnp.int32)
-    d = 1.0 / (1 << step_idx).astype(jnp.float32)
-    return d, step_idx
-
-# ---------------------------
-# Training step
-# ---------------------------
-
-@partial(jax.jit, static_argnames=("dynamics", "tx", "k_max", "B_self"))
+@partial(jax.jit, static_argnames=("dynamics", "tx", "k_max", "B_self", "bootstrap_start"))
 def train_step(
     dynamics, tx, params, opt_state, constants, latents, actions,
     *, B_self: int, k_max: int, master_key: jnp.ndarray, step: int, bootstrap_start: int
 ):
     """
-    Two-branch training step with fused forward pass.
+    Training step using shortcut forcing (flow matching + bootstrap self-consistency).
+    
+    Now uses reusable components from dreamer.training for maintainability and code reuse.
     
     Branches:
       - Empirical flow (first B_emp rows): standard flow matching at d_min = 1/k_max
@@ -96,108 +73,28 @@ def train_step(
     
     Bootstrap contribution is masked to 0 when step < bootstrap_start.
     """
-    # RNGs
     step_key = jax.random.fold_in(master_key, step)
-    key_sigma_full, key_step_self, key_noise_full, drop_key = jax.random.split(
-        step_key, 4
-    )
-
-    # Deterministic batch split
-    B, T, S, D = latents.shape
-    B_emp = B - B_self
-    actions_full = actions
-    emax = jnp.log2(k_max).astype(jnp.int32)
-
-    # --- Step indices (encode d) ---
-    step_idx_emp = jnp.full((B_emp, T), emax, dtype=jnp.int32)  # d = d_min
-    # If B_self == 0, create a dummy 0xT array – slicing below handles it.
-    d_self, step_idx_self = _sample_step_excluding_dmin(
-        key_step_self, (B_self, T), k_max
-    )
-    step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)  # (B,T)
-
-    # --- Signal levels on each row's grid (one call for whole batch) ---
-    sigma_full, sigma_idx_full = _sample_tau_for_step(
-        key_sigma_full, (B, T), k_max, step_idx_full
-    )
-    sigma_emp = sigma_full[:B_emp]
-    sigma_self = sigma_full[B_emp:]
-    sigma_idx_self = sigma_idx_full[B_emp:]
-
-    # --- Corrupt inputs: z_tilde = (1 - sigma) z0 + sigma z1 ---
-    z0_full = jax.random.normal(key_noise_full, latents.shape, dtype=latents.dtype)
-    z_tilde_full = (1.0 - sigma_full)[..., None, None] * z0_full + sigma_full[
-        ..., None, None
-    ] * latents
-    z_tilde_self = z_tilde_full[B_emp:]
-
-    # --- Ramp weights ---
-    w_emp = 0.9 * sigma_emp + 0.1
-    w_self = 0.9 * sigma_self + 0.1
-
-    # --- Half-step metadata for self rows ---
-    d_half = d_self / 2.0
-    step_idx_half = step_idx_self + 1
-    sigma_plus = sigma_self + d_half
-    sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
-
+    
     def loss_and_aux(p):
-        local_dyn = {"params": p, "constants": constants}
-        drop_main, drop_h1, drop_h2 = jax.random.split(drop_key, 3)
-
-        # Main forward (emp + self)
-        z1_hat_full, *_ = dynamics.apply(local_dyn, actions_full, step_idx_full, 
-            sigma_idx_full, z_tilde_full, rngs={"dropout": drop_main}, deterministic=False)  # (B,T,Sz,Dz)
-
-        z1_hat_emp = z1_hat_full[:B_emp]
-        z1_hat_self = z1_hat_full[B_emp:]
-
-        # Flow loss on empirical rows (to z1)
-        flow_per = jnp.mean(
-            (z1_hat_emp - latents[:B_emp]) ** 2, axis=(2, 3)
-        )  # (B_emp,T)
-        loss_emp = jnp.mean(flow_per * w_emp)
-
-        # Self-consistency (bootstrap) on self rows
-        # If B_self == 0, shapes are 0-sized and reductions become NaN; guard with mask.
-        do_boot = (B_self > 0) & (step >= bootstrap_start)
-
-        def _boot_loss():
-            z1_hat_half1, *_ = dynamics.apply(local_dyn, actions_full[B_emp:], step_idx_half, 
-                sigma_idx_self, z_tilde_self, rngs={"dropout": drop_h1}, deterministic=False)
-            b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[..., None, None]
-            z_prime = z_tilde_self + b_prime * d_half[..., None, None]
-            z1_hat_half2, *_ = dynamics.apply(local_dyn, actions_full[B_emp:], step_idx_half,
-                sigma_idx_plus, z_prime, rngs={"dropout": drop_h2}, deterministic=False)
-            b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[..., None, None] # (B_self, T, n_spatial, D_s)
-            vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[..., None, None] # (B_self, T, n_spatial, D_s)
-            vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-            boot_per = (1.0 - sigma_self) ** 2 * jnp.mean((vhat_sigma - vbar_target) ** 2, axis=(2, 3))  # (B_self,T)
-            loss_self = jnp.mean(boot_per * w_self)
-            return loss_self, jnp.mean(boot_per)
-
-        loss_self, boot_mse = jax.lax.cond(
-            do_boot,
-            _boot_loss,
-            lambda: (
-                jnp.array(0.0, dtype=latents.dtype),
-                jnp.array(0.0, dtype=latents.dtype),
-            ),
+        vars_dict = {"params": p, "constants": constants}
+        losses, aux = shortcut_forcing_step(
+            dynamics_apply_fn=dynamics.apply,
+            dynamics_vars=vars_dict,
+            actions=actions,
+            latents=latents,
+            rng=step_key,
+            k_max=k_max,
+            B_self=B_self,
+            bootstrap_active=(step >= bootstrap_start),
+            agent_tokens=None,  # Not used in dynamics pretraining
         )
-
-        # Combine (row-weighted by nominal B parts; denominator B keeps scale constant)
-        loss = ((loss_emp * (B - B_self)) + (loss_self * B_self)) / B
-
-        aux = {
-            "flow_mse": jnp.mean(flow_per),
-            "bootstrap_mse": boot_mse,
-        }
-        return loss, aux
-
-    (loss_val, aux), grads = jax.value_and_grad(loss_and_aux, has_aux=True)(params)
-    updates, opt_state = tx.update(grads, opt_state, params)
+        return losses['total'], aux
+    
+    (loss_val, metrics), grads = jax.value_and_grad(loss_and_aux, has_aux=True)(params)
+    updates, new_opt_state = tx.update(grads, opt_state, params)
     new_params = optax.apply_updates(params, updates)
-    return new_params, opt_state, aux
+    
+    return new_params, new_opt_state, metrics
 
 # ---------------------------
 # Evaluation helpers

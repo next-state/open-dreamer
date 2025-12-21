@@ -267,6 +267,11 @@ class BCRewConfig:
     max_steps: int = 1_000_000_000
     log_every: int = 5_000
     lr: float = 3e-4
+    lr_policy: float = 3e-4
+    lr_reward: float = 3e-4
+    lr_dynamics: float = 1e-4
+    continue_dynamics_loss: bool = True
+    dynamics_loss_weight: float = 0.1
 
     # eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
