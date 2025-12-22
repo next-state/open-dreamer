@@ -3,15 +3,15 @@ defaults:
   - _self_
 
 run_name: tokenizer
-ckpt_max_to_keep: 5
-ckpt_save_every: 500
+ckpt_max_to_keep: 1
+ckpt_save_every: 10_000
 
-patch_size: 4
+patch_size: 16
 
 dataset:
   source: "custom"
   array_record_path: "datasets/coinrun_episodes/train"
-  B: 32
+  B: 48
   T: 16
   H: 64
   W: 64
@@ -30,6 +30,7 @@ encoder:
   time_every: 4
   mae_p_min: 0.0
   mae_p_max: 0.9
+  patch_size: ${patch_size}
   
   dataset_mean: ${dataset.dataset_mean}
   dataset_std: ${dataset.dataset_std}
@@ -46,13 +47,26 @@ decoder:
   time_every: ${encoder.time_every}
   H: ${dataset.H}
   W: ${dataset.W}
+  patch_size: ${patch_size}
+  d_patch: ${mul:${patch_size},${patch_size},${dataset.C}}
   
   dataset_mean: ${dataset.dataset_mean}
   dataset_std: ${dataset.dataset_std}
 
-lr: 3e-4
-max_steps: 1_000_000_000
+max_steps: 300_000
 log_every: 100
+lr: 3e-4
+tokenizer_loss_type: "mae" # "mse" | "mae"
+
+# learning rate schedule
+lr_schedule: wsd  # constant | wsd | cos
+init_lr: 0.0
+max_lr: 3e-4
+lr_end: 0
+warmup_steps: 10000
+wsd_decay_steps: 30000
+log_gradients: false
+
 lpips_weight: 0.2
 lpips_frac: 0.5
 visualize_every: 1000

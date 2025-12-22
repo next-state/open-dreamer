@@ -3,7 +3,8 @@ import jax.numpy as jnp
 from dreamer.data import patchify, unpatchify
 import orbax.checkpoint as ocp
 from pathlib import Path
-import flax
+import optax
+import operator
 from flax.struct import dataclass
 from flax.core import freeze, unfreeze, FrozenDict
 from einops import rearrange, repeat
@@ -392,3 +393,82 @@ def recursive_list_to_tuple(d):
     if isinstance(d, dict):
         return {k: recursive_list_to_tuple(v) for k, v in d.items()}
     return d
+
+def _count_component(component_params):
+    """Count total parameters in a component."""
+    params_sizes = jax.tree.map(jax.numpy.size, component_params)
+    total_parameters = jax.tree.reduce(operator.add, params_sizes)
+    return total_parameters
+
+
+def count_parameters_by_component(params):
+    """Count parameters for each component of the model.
+
+    Args:
+        params: Model parameters from nnx.split(model, nnx.Param, ...)
+
+    Returns:
+        Dictionary with parameter counts for each component
+    """
+    component_names = list(params.keys())
+    print(f"Counting all components: {component_names}")
+
+    counts = {}
+    total_params = 0
+
+    for name in component_names:
+        component_params = params[name]
+        count = _count_component(component_params)
+        counts[name] = count
+        total_params += count
+
+    counts["total"] = total_params
+    return counts
+
+
+def get_lr_schedule(
+    lr_schedule: str,
+    init_lr: float,
+    max_lr: float,
+    decay_end: float,
+    total_steps: int,
+    warmup_steps: int,
+    wsd_decay_steps: int,
+) -> optax.Schedule:
+    """
+    Learning-rate schedule helper, mirrored from Jasmine.
+
+    Supported schedules:
+      - "cos": warmup cosine decay
+      - "wsd": warmup -> hold -> decay (linear warmup, constant hold, linear decay)
+    """
+    supported_schedules = ["wsd", "cos"]
+    if lr_schedule == "cos":
+        assert warmup_steps <= total_steps, "Warmup steps can't be greater than total steps."
+        return optax.warmup_cosine_decay_schedule(
+            init_value=init_lr,
+            peak_value=max_lr,
+            warmup_steps=warmup_steps,
+            # Note: decay_steps includes the warmup steps, so pass the total value.
+            decay_steps=total_steps,
+            end_value=decay_end,
+        )
+    elif lr_schedule == "wsd":
+        assert (
+            warmup_steps + wsd_decay_steps <= total_steps
+        ), "Warmup and decay period is longer than total steps."
+        schedules = [
+            optax.linear_schedule(
+                init_value=init_lr, end_value=max_lr, transition_steps=warmup_steps
+            ),
+            optax.constant_schedule(value=max_lr),
+            optax.linear_schedule(
+                init_value=max_lr, end_value=decay_end, transition_steps=wsd_decay_steps
+            ),
+        ]
+        boundaries = [warmup_steps, total_steps - wsd_decay_steps]
+        return optax.join_schedules(schedules, boundaries)
+    else:
+        raise ValueError(
+            f"Learning rate schedule not supported. Please use one of {supported_schedules}"
+        )
