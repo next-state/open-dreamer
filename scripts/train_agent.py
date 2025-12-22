@@ -15,16 +15,15 @@ Architecture:
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict
+from typing import Dict
 
+from flax.typing import VariableDict
 import hydra
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 import wandb
 from flax.core import FrozenDict
@@ -40,12 +39,9 @@ from dreamer.training import (
     compute_policy_loss,
     compute_reward_loss,
     shortcut_forcing_step,
-    symlog,
-    twohot_symlog_targets,
 )
 from dreamer.utils import (
     _ensure_dir,
-    from_dict,
     make_manager,
     make_state,
     maybe_save,
@@ -119,24 +115,23 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
 # Training step
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("tokenizer", "dynamics", "task_embedder", "policy_head", "reward_head", "tx_dict", "k_max", "L_mtp"))
+@partial(jax.jit, static_argnames=("dynamics", "task_embedder", "policy_head", "reward_head", "tx_dict", "k_max", "L_mtp"))
 def train_step(
-    tokenizer,
-    dynamics,
-    task_embedder,
-    policy_head,
-    reward_head,
-    tx_dict,
+    dynamics: Dynamics,
+    task_embedder: TaskEmbedder,
+    policy_head: PolicyHeadMTP,
+    reward_head: RewardHeadMTP,
+    tx_dict: Dict[str, optax.GradientTransformationExtraArgs],
     # State
-    tokenizer_vars,
-    dynamics_params,
-    dynamics_constants,
-    policy_params,
-    reward_params,
+    dynamics_params: VariableDict,
+    dynamics_constants: VariableDict,
+    policy_params: VariableDict,
+    reward_params: VariableDict,
     opt_states,
     # Data
+    latents: jax.Array,
     batch,
-    rng,
+    rng: jax.Array,
     step: int,
     # Config
     k_max: int,
@@ -148,10 +143,11 @@ def train_step(
     Agent finetuning step with BC + reward prediction + optional dynamics loss.
     
     Args:
-        Models: tokenizer, dynamics, task_embedder, policy_head, reward_head
+        Models: dynamics, task_embedder, policy_head, reward_head
         tx_dict: Dict of optimizers for each component
         State: parameters and optimizer states
-        batch: Data batch with videos, actions, tasks, rewards
+        latents: Precomputed latents from tokenizer
+        batch: Data batch with actions, tasks, rewards
         rng: Random key
         step: Training step number
         Config: hyperparameters
@@ -159,31 +155,13 @@ def train_step(
     Returns:
         new_params, new_opt_states, metrics
     """
-    B = batch["videos"].shape[0]
+    B, T_video, _, _ = latents.shape
     
     # Split RNG
-    rng, enc_key, dyn_key = jax.random.split(rng, 3)
+    rng, dyn_key = jax.random.split(rng, 2)
     
-    # 1. Encode videos to latents (frozen tokenizer)
-    latents, _ = jax.lax.stop_gradient(
-        tokenizer.apply(
-            tokenizer_vars,
-            batch["videos"],
-            packing_factor=dynamics.config.packing_factor,
-            method=tokenizer.encode,
-            rngs={"mae": enc_key},
-            deterministic=True,
-        )
-    )
-    
-    # 2. Create task-conditioned agent tokens
-    _, T_video, _, _ = latents.shape
-    agent_tokens_bt = task_embedder.apply(
-        {"params": {}},  # Task embedder has no learnable params (just lookup)
-        task=batch["tasks"],
-        B=B,
-        T=T_video,
-    )
+    # 1. Create task-conditioned agent tokens
+    agent_tokens_bt = task_embedder.apply( {"params": {}},   task=batch["tasks"], B=B, T=T_video)
     
     # 3. Gather future actions and rewards for MTP
     actions_btL, actions_valid = gather_future_actions(batch["actions"], L_mtp)
@@ -194,39 +172,16 @@ def train_step(
         # Dynamics loss (also returns hidden states for BC/reward training)
         dyn_vars = {"params": dyn_p, "constants": dynamics_constants}
         
-        dyn_losses, dyn_aux = shortcut_forcing_step(
-            dynamics_apply_fn=dynamics.apply,
-            dynamics_vars=dyn_vars,
-            actions=batch["actions"],
-            latents=latents,
-            rng=dyn_key,
-            k_max=k_max,
-            B_self=B // 2,
-            bootstrap_active=(step >= bootstrap_start),
-            agent_tokens=agent_tokens_bt,
-        )
-        dynamics_loss = dyn_losses['total']
-        h_states = dyn_aux['h_states']  # (B, T, n_agent, d_model)
+        dyn_losses, dyn_aux = shortcut_forcing_step(dynamics.apply, dyn_vars, batch["actions"], latents, dyn_key, k_max, B_self=B // 2, bootstrap_active=(step >= bootstrap_start), agent_tokens=agent_tokens_bt)
+        dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
         
-        # Policy loss (BC with MTP)
-        policy_loss = compute_policy_loss(
-            policy_head, pol_p, h_states, actions_btL, actions_valid
-        )
-        
-        # Reward loss (symexp twohot with MTP)
-        reward_loss = compute_reward_loss(
-            reward_head, rew_p, h_states, rewards_btL, rewards_valid
-        )
+        policy_loss = compute_policy_loss(policy_head, pol_p, h_states, actions_btL, actions_valid)
+        reward_loss = compute_reward_loss(reward_head, rew_p, h_states, rewards_btL, rewards_valid)
         
         # Combine losses
         total_loss = policy_loss + reward_loss + dynamics_loss_weight * dynamics_loss
         
-        aux = {
-            "policy_loss": policy_loss,
-            "reward_loss": reward_loss,
-            "dynamics_loss": dynamics_loss,
-            **dyn_aux,
-        }
+        aux = {"policy_loss": policy_loss, "reward_loss": reward_loss, "dynamics_loss": dynamics_loss, **dyn_aux}
         
         return total_loss, aux
     
@@ -252,17 +207,8 @@ def train_step(
         new_dynamics_params = dynamics_params
         new_dyn_opt = opt_states["dynamics"]
     
-    new_params = {
-        "dynamics": new_dynamics_params,
-        "policy": new_policy_params,
-        "reward": new_reward_params,
-    }
-    
-    new_opt_states = {
-        "dynamics": new_dyn_opt,
-        "policy": new_pol_opt,
-        "reward": new_rew_opt,
-    }
+    new_params = {"dynamics": new_dynamics_params, "policy": new_policy_params, "reward": new_reward_params}
+    new_opt_states = {"dynamics": new_dyn_opt, "policy": new_pol_opt, "reward": new_rew_opt}
     
     return new_params, new_opt_states, metrics
 
@@ -290,46 +236,22 @@ def run(cfg: BCRewConfig):
     
     # Load pretrained tokenizer and dynamics
     rng = jax.random.PRNGKey(0)
-    print(f"[setup] Loading pretrained tokenizer from {cfg.tokenizer_ckpt}")
-    tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(cfg.tokenizer_ckpt)
-    
-    print(f"[setup] Loading pretrained dynamics from {cfg.dynamics_ckpt}")
-    dynamics, dynamics_vars = Dynamics.from_pretrained(cfg.dynamics_ckpt)
+    print(f"[setup] Loading pretrained dynamics and tokenizer from {cfg.dynamics_ckpt}")
+    dynamics, dynamics_vars, dynamics_cfg, tokenizer, tokenizer_vars, tokenizer_cfg = Dynamics.from_pretrained(cfg.dynamics_ckpt)
     dynamics_params = dynamics_vars["params"]
     dynamics_constants = dynamics_vars.get("constants", FrozenDict())
     
     # Initialize task embedder, policy, and reward heads
     print("[setup] Initializing agent components")
-    task_embedder = TaskEmbedder(
-        n_tasks=10,  # TODO: Get from config
-        n_agent=dynamics.config.n_agent,
-        d_model=dynamics.config.d_model,
-        use_ids=True,
-    )
-    
-    policy_head = PolicyHeadMTP(
-        d_model=dynamics.config.d_model,
-        d_hidden=dynamics.config.d_model,
-        n_actions=cfg.action_dim,
-        L=8,  # MTP length
-        kind="categorical",
-    )
-    
-    reward_head = RewardHeadMTP(
-        d_model=dynamics.config.d_model,
-        d_hidden=dynamics.config.d_model,
-        L=8,  # MTP length
-        K=255,  # Number of bins
-        min_val=-20.0,
-        max_val=20.0,
-    )
+    task_embedder = TaskEmbedder(d_model=dynamics.config.d_model, n_agent=cfg.n_agent, use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks)
+    policy_head = PolicyHeadMTP(d_model=dynamics.config.d_model, action_dim=dynamics.config.action_dim, L=cfg.L)
+    reward_head = RewardHeadMTP(d_model=dynamics.config.d_model, L=cfg.L, num_bins=cfg.num_reward_bins, log_low=cfg.reward_log_low, log_high=cfg.reward_log_high)
     
     # Initialize parameters
     rng, pol_key, rew_key = jax.random.split(rng, 3)
     
     # Dummy inputs for initialization
-    dummy_h = jnp.zeros((1, 4, dynamics.config.n_agent, dynamics.config.d_model))
-    
+    dummy_h = jnp.zeros((1, 4, cfg.n_agent, dynamics.config.d_model))
     policy_params = policy_head.init(pol_key, dummy_h, deterministic=True)["params"]
     reward_vars = reward_head.init(rew_key, dummy_h, deterministic=True)
     reward_params = reward_vars["params"]
@@ -340,7 +262,6 @@ def run(cfg: BCRewConfig):
         "reward": optax.adamw(cfg.lr_reward),
         "dynamics": optax.adamw(cfg.lr_dynamics) if cfg.continue_dynamics_loss else optax.set_to_zero(),
     }
-    
     opt_states = {
         "policy": tx_dict["policy"].init(policy_params),
         "reward": tx_dict["reward"].init(reward_params),
@@ -386,22 +307,30 @@ def run(cfg: BCRewConfig):
         if step >= cfg.max_steps:
             break
         
-        rng, step_key = jax.random.split(rng)
+        rng, enc_key, step_key = jax.random.split(rng, 3)
+        
+        # Encode videos to latents (frozen tokenizer - outside train_step)
+        # Inline JIT using a lambda
+        latents, _ = jax.jit(lambda videos, rng: 
+            tokenizer.apply(
+            tokenizer_vars, videos, packing_factor=dynamics.config.packing_factor,
+            method=tokenizer.encode, rngs={"mae": rng}, deterministic=True
+            )
+        )(batch["videos"], enc_key)
         
         # Training step
         new_params, opt_states, metrics = train_step(
-            tokenizer=tokenizer,
             dynamics=dynamics,
             task_embedder=task_embedder,
             policy_head=policy_head,
             reward_head=reward_head,
             tx_dict=tx_dict,
-            tokenizer_vars=tokenizer_vars,
             dynamics_params=new_params.get("dynamics", dynamics_params) if step > start_step else dynamics_params,
             dynamics_constants=dynamics_constants,
             policy_params=new_params.get("policy", policy_params) if step > start_step else policy_params,
             reward_params=new_params.get("reward", reward_params) if step > start_step else reward_params,
             opt_states=opt_states,
+            latents=latents,
             batch=batch,
             rng=step_key,
             step=step,
