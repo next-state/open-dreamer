@@ -167,8 +167,11 @@ def next_latent(
         # update caches by doing one more refinement step with tau_ctx
         step_indices= jnp.full((B, 1), schedule.step_idx_ctx, dtype=jnp.int32)
         tau_indices = jnp.full((B, 1), schedule.tau_idx_ctx,  dtype=jnp.int32)
+        
+        rng, new_random_key = jax.random.split(rng)
+        latent_noised_caching = latent_t_final*(1-schedule.tau_ctx) + jax.random.normal(new_random_key, shape=latent_t_final.shape, dtype=latent_t_final.dtype)
 
-        _, (h_seq_final, caches_new) = dynamics.apply(dyn_vars, action, step_indices, tau_indices, latent_t_final, agent_tokens=agent_tokens, deterministic=True, caches=caches)
+        _, (h_seq_final, caches_new) = dynamics.apply(dyn_vars, action, step_indices, tau_indices, latent_noised_caching, agent_tokens=agent_tokens, deterministic=True, caches=caches)
         h_last = h_seq_final[:, -1, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
     else:
         h_last = h_history[-1] if h_history is not None else None  # (B, n_agent, d_model)
