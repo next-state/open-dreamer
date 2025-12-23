@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, Tuple
 import jax
 import jax.numpy as jnp
 from flax.typing import VariableDict
+import optax
 
 
 # ---------------------------
@@ -350,7 +351,7 @@ def compute_policy_loss(
     policy_head,
     policy_params: Any,
     h_states: jnp.ndarray,
-    actions_btL: jnp.ndarray,
+    actions: jnp.ndarray,
     actions_valid: jnp.ndarray,
 ) -> jnp.ndarray:
     """
@@ -360,29 +361,20 @@ def compute_policy_loss(
         policy_head: Policy head model instance
         policy_params: Policy head parameters
         h_states: (B, T, n_agent, d_model) Hidden states from dynamics
-        actions_btL: (B, T, L) Future action labels
+        actions: (B, T, L) Future action labels
         actions_valid: (B, T, L) Validity mask
         
     Returns:
         policy_loss: Scalar categorical cross-entropy loss
     """
     # Forward pass
-    policy_logits = policy_head.apply(
-        {"params": policy_params},
-        h_states,
-        deterministic=True,
-    )  # (B, T, L, A)
+    policy_logits = policy_head.apply({"params": policy_params},h_states,deterministic=True)  # (B, T, L, A)
     
     # Categorical cross-entropy for each future action
-    log_probs = jax.nn.log_softmax(policy_logits, axis=-1)  # (B, T, L, A)
-    action_log_probs = jnp.take_along_axis(
-        log_probs,
-        actions_btL[..., None],  # (B, T, L, 1)
-        axis=-1
-    ).squeeze(-1)  # (B, T, L)
-    
-    # Average over valid positions
-    policy_loss = -jnp.sum(action_log_probs * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
+    assert actions.dtype == jnp.int32, "actions must be of type int32"
+    assert actions_valid.dtype == jnp.bool, "actions_valid must be of type bool"
+    per_token_loss = optax.softmax_cross_entropy_with_integer_labels(policy_logits, actions)
+    policy_loss = jnp.sum(per_token_loss * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
     
     return policy_loss
 
@@ -408,18 +400,12 @@ def compute_reward_loss(
         reward_loss: Scalar categorical cross-entropy loss
     """
     # Forward pass
-    reward_logits, centers_log = reward_head.apply(
-        reward_vars,
-        h_states,
-        deterministic=True,
-    )  # logits: (B, T, L, K), centers: (K,)
+    reward_logits, centers_log = reward_head.apply(reward_vars, h_states, deterministic=True) 
     
-    # Convert rewards to two-hot targets
+    assert rewards_valid.dtype == jnp.bool, "rewards_valid must be of type bool"
     reward_targets = twohot_symlog_targets(rewards_btL, centers_log)  # (B, T, L, K)
-    
-    # Cross-entropy loss
-    reward_log_probs = jax.nn.log_softmax(reward_logits, axis=-1)
-    reward_loss_per = -jnp.sum(reward_targets * reward_log_probs, axis=-1)  # (B, T, L)
+    reward_loss_per = optax.softmax_cross_entropy(logits=reward_logits, labels=reward_targets)  # (B, T, L)
     reward_loss = jnp.sum(reward_loss_per * rewards_valid) / jnp.maximum(rewards_valid.sum(), 1.0)
     
     return reward_loss
+

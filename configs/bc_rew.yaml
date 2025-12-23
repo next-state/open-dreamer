@@ -26,7 +26,6 @@ log_every: 10
 lr_policy: 1e-4
 lr_reward: 1e-4
 lr_dynamics: 1e-5
-continue_dynamics_loss: true
 dynamics_loss_weight: 0.1
 
 write_video_every: 100_000

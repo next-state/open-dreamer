@@ -250,7 +250,6 @@ class BCRewConfig:
     lr_policy: float = 1e-4
     lr_reward: float = 1e-4
     lr_dynamics: float = 1e-5
-    continue_dynamics_loss: bool = True
     dynamics_loss_weight: float = 0.1
 
     # Eval media toggle

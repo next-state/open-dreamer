@@ -128,7 +128,7 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
 # Training step
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("dynamics", "task_embedder", "policy_head", "reward_head", "optimizers", "k_max", "L_mtp", "continue_dynamics_loss"))
+@partial(jax.jit, static_argnames=("dynamics", "task_embedder", "policy_head", "reward_head", "optimizers", "k_max", "L_mtp"))
 def train_step(
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
@@ -153,7 +153,6 @@ def train_step(
     L_mtp: int,
     bootstrap_start: int,
     dynamics_loss_weight: float,
-    continue_dynamics_loss: bool,
 ):
     """
     Agent finetuning step with BC + reward prediction + optional dynamics loss.
@@ -280,7 +279,7 @@ def run(cfg: BCRewConfig):
         task_embedder=optax.adamw(cfg.lr_policy),  # Use same LR as policy
         policy=optax.adamw(cfg.lr_policy),
         reward=optax.adamw(cfg.lr_reward),
-        dynamics=optax.adamw(cfg.lr_dynamics) if cfg.continue_dynamics_loss else optax.set_to_zero(),
+        dynamics=optax.adamw(cfg.lr_dynamics)
     )
     opt_states = {
         "task_embedder": optimizers.task_embedder.init(task_embedder_params),
@@ -360,7 +359,6 @@ def run(cfg: BCRewConfig):
             k_max=dynamics.config.k_max,
             L_mtp=cfg.L,
             bootstrap_start=cfg.bootstrap_start,
-            continue_dynamics_loss=cfg.continue_dynamics_loss,
             dynamics_loss_weight=cfg.dynamics_loss_weight,
         )
         
