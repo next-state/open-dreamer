@@ -347,6 +347,38 @@ def twohot_symlog_targets(values: jnp.ndarray, centers_log: jnp.ndarray) -> jnp.
 # Agent training losses (BC + Reward)
 # ---------------------------
 
+def compute_reward_loss(
+    reward_head,
+    reward_vars: Any,
+    h_states: jnp.ndarray,
+    rewards_btL: jnp.ndarray,
+    rewards_valid: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Compute reward prediction loss with symexp twohot encoding.
+    
+    Args:
+        reward_head: Reward head model instance
+        reward_vars: Reward head variables dict (params + constants)
+        h_states: (B, T, n_agent, d_model) Hidden states from dynamics
+        rewards_btL: (B, T, L) Future reward values
+        rewards_valid: (B, T, L) Validity mask
+        
+    Returns:
+        reward_loss: Scalar categorical cross-entropy loss
+    """
+    # Forward pass
+    reward_logits, centers_log = reward_head.apply(reward_vars, h_states, deterministic=True) 
+    
+    assert rewards_valid.dtype == jnp.bool, "rewards_valid must be of type bool"
+    reward_targets = twohot_symlog_targets(rewards_btL, centers_log)  # (B, T, L, K)
+    reward_loss_per = optax.safe_softmax_cross_entropy(logits=reward_logits, labels=reward_targets)  # (B, T, L)
+    reward_loss = jnp.sum(reward_loss_per * rewards_valid) / jnp.maximum(rewards_valid.sum(), 1.0)
+    
+    return reward_loss
+
+
+
 def compute_policy_loss(
     policy_head,
     policy_params: Any,
@@ -377,35 +409,3 @@ def compute_policy_loss(
     policy_loss = jnp.sum(per_token_loss * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
     
     return policy_loss
-
-
-def compute_reward_loss(
-    reward_head,
-    reward_vars: Any,
-    h_states: jnp.ndarray,
-    rewards_btL: jnp.ndarray,
-    rewards_valid: jnp.ndarray,
-) -> jnp.ndarray:
-    """
-    Compute reward prediction loss with symexp twohot encoding.
-    
-    Args:
-        reward_head: Reward head model instance
-        reward_vars: Reward head variables dict (params + constants)
-        h_states: (B, T, n_agent, d_model) Hidden states from dynamics
-        rewards_btL: (B, T, L) Future reward values
-        rewards_valid: (B, T, L) Validity mask
-        
-    Returns:
-        reward_loss: Scalar categorical cross-entropy loss
-    """
-    # Forward pass
-    reward_logits, centers_log = reward_head.apply(reward_vars, h_states, deterministic=True) 
-    
-    assert rewards_valid.dtype == jnp.bool, "rewards_valid must be of type bool"
-    reward_targets = twohot_symlog_targets(rewards_btL, centers_log)  # (B, T, L, K)
-    reward_loss_per = optax.softmax_cross_entropy(logits=reward_logits, labels=reward_targets)  # (B, T, L)
-    reward_loss = jnp.sum(reward_loss_per * rewards_valid) / jnp.maximum(rewards_valid.sum(), 1.0)
-    
-    return reward_loss
-
