@@ -58,6 +58,7 @@ class DenoiseSchedule:
         # Compute noise level for context during autoregressive rollout
         step_idx_ctx = int(jnp.round(-math.log2(1 - tau_ctx)))
         tau_idx_ctx = k_max - k_max // 2**step_idx_ctx
+        tau_ctx = 1.0 - 2.0**(-step_idx_ctx) # setting tau_ctx to the exact value such that tau_ctx + step_ctx = 1
         
         return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, step_idx_ctx, tau_idx_ctx, tau_ctx)
     
