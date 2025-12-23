@@ -15,7 +15,7 @@ Architecture:
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import Dict
@@ -50,6 +50,19 @@ from dreamer.utils import (
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
+
+# ---------------------------
+# Hashable optimizer container
+# ---------------------------
+
+@dataclass(frozen=True)
+class OptimizerContainer:
+    """Hashable container for optimizers to pass as static argument to JIT."""
+    task_embedder: optax.GradientTransformationExtraArgs
+    policy: optax.GradientTransformationExtraArgs
+    reward: optax.GradientTransformationExtraArgs
+    dynamics: optax.GradientTransformationExtraArgs
+    
 
 # ---------------------------
 # Multi-token prediction (MTP) helpers
@@ -115,18 +128,20 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
 # Training step
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("dynamics", "task_embedder", "policy_head", "reward_head", "tx_dict", "k_max", "L_mtp"))
+@partial(jax.jit, static_argnames=("dynamics", "task_embedder", "policy_head", "reward_head", "optimizers", "k_max", "L_mtp", "continue_dynamics_loss"))
 def train_step(
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
     policy_head: PolicyHeadMTP,
     reward_head: RewardHeadMTP,
-    tx_dict: Dict[str, optax.GradientTransformationExtraArgs],
+    optimizers: OptimizerContainer,
     # State
     dynamics_params: VariableDict,
     dynamics_constants: VariableDict,
+    task_embedder_params: VariableDict,
     policy_params: VariableDict,
     reward_params: VariableDict,
+    reward_constants: VariableDict,
     opt_states,
     # Data
     latents: jax.Array,
@@ -138,6 +153,7 @@ def train_step(
     L_mtp: int,
     bootstrap_start: int,
     dynamics_loss_weight: float,
+    continue_dynamics_loss: bool,
 ):
     """
     Agent finetuning step with BC + reward prediction + optional dynamics loss.
@@ -161,7 +177,9 @@ def train_step(
     rng, dyn_key = jax.random.split(rng, 2)
     
     # 1. Create task-conditioned agent tokens
-    agent_tokens_bt = task_embedder.apply( {"params": {}},   task=batch["tasks"], B=B, T=T_video)
+    # For now, pass task ID 0 for all samples in batch
+    task = jnp.zeros((B,), dtype=jnp.int32)
+    agent_tokens_bt = task_embedder.apply({"params": task_embedder_params}, task=task, B=B, T=T_video)
     
     # 3. Gather future actions and rewards for MTP
     actions_btL, actions_valid = gather_future_actions(batch["actions"], L_mtp)
@@ -175,13 +193,15 @@ def train_step(
         dyn_losses, dyn_aux = shortcut_forcing_step(dynamics.apply, dyn_vars, batch["actions"], latents, dyn_key, k_max, B_self=B // 2, bootstrap_active=(step >= bootstrap_start), agent_tokens=agent_tokens_bt)
         dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
         
-        policy_loss = compute_policy_loss(policy_head, pol_p, h_states, actions_btL, actions_valid)
-        reward_loss = compute_reward_loss(reward_head, rew_p, h_states, rewards_btL, rewards_valid)
+        policy_loss = compute_policy_loss(policy_head, pol_p, h_states[:,:,0], actions_btL, actions_valid)
+        reward_loss = compute_reward_loss(reward_head, {"params": rew_p, "constants": reward_constants}, h_states[:,:,0], rewards_btL, rewards_valid)
         
         # Combine losses
         total_loss = policy_loss + reward_loss + dynamics_loss_weight * dynamics_loss
         
-        aux = {"policy_loss": policy_loss, "reward_loss": reward_loss, "dynamics_loss": dynamics_loss, **dyn_aux}
+        # Filter out non-scalar metrics (h_states is used above but shouldn't be logged)
+        aux = {"policy_loss": policy_loss, "reward_loss": reward_loss, "dynamics_loss": dynamics_loss, 
+               "flow_mse": dyn_aux["flow_mse"], "bootstrap_mse": dyn_aux["bootstrap_mse"]}
         
         return total_loss, aux
     
@@ -193,22 +213,18 @@ def train_step(
     )
     
     # 6. Apply updates
-    pol_updates, new_pol_opt = tx_dict["policy"].update(pol_grads, opt_states["policy"], policy_params)
+    pol_updates, new_pol_opt = optimizers.policy.update(pol_grads, opt_states["policy"], policy_params)
     new_policy_params = optax.apply_updates(policy_params, pol_updates)
     
-    rew_updates, new_rew_opt = tx_dict["reward"].update(rew_grads, opt_states["reward"], reward_params)
+    rew_updates, new_rew_opt = optimizers.reward.update(rew_grads, opt_states["reward"], reward_params)
     new_reward_params = optax.apply_updates(reward_params, rew_updates)
     
-    # Dynamics update (optional)
-    if continue_dynamics_loss and dynamics_loss_weight > 0:
-        dyn_updates, new_dyn_opt = tx_dict["dynamics"].update(dyn_grads, opt_states["dynamics"], dynamics_params)
-        new_dynamics_params = optax.apply_updates(dynamics_params, dyn_updates)
-    else:
-        new_dynamics_params = dynamics_params
-        new_dyn_opt = opt_states["dynamics"]
+    # Dynamics update (always compute, but optimizer is set_to_zero if not continuing)
+    dyn_updates, new_dyn_opt = optimizers.dynamics.update(dyn_grads, opt_states["dynamics"], dynamics_params)
+    new_dynamics_params = optax.apply_updates(dynamics_params, dyn_updates)
     
-    new_params = {"dynamics": new_dynamics_params, "policy": new_policy_params, "reward": new_reward_params}
-    new_opt_states = {"dynamics": new_dyn_opt, "policy": new_pol_opt, "reward": new_rew_opt}
+    new_params = {"task_embedder": task_embedder_params, "dynamics": new_dynamics_params, "policy": new_policy_params, "reward": new_reward_params}
+    new_opt_states = {"task_embedder": opt_states["task_embedder"], "dynamics": new_dyn_opt, "policy": new_pol_opt, "reward": new_rew_opt}
     
     return new_params, new_opt_states, metrics
 
@@ -248,24 +264,29 @@ def run(cfg: BCRewConfig):
     reward_head = RewardHeadMTP(d_model=dynamics.config.d_model, L=cfg.L, num_bins=cfg.num_reward_bins, log_low=cfg.reward_log_low, log_high=cfg.reward_log_high)
     
     # Initialize parameters
-    rng, pol_key, rew_key = jax.random.split(rng, 3)
+    rng, task_key, pol_key, rew_key = jax.random.split(rng, 4)
     
     # Dummy inputs for initialization
-    dummy_h = jnp.zeros((1, 4, cfg.n_agent, dynamics.config.d_model))
+    dummy_h = jnp.zeros((1, 4, dynamics.config.d_model))  # (B, T, D) for heads (agent dim already pooled)
+    dummy_task = jnp.zeros((1,), dtype=jnp.int32) if cfg.use_task_ids else jnp.zeros((1, cfg.n_tasks))
+    task_embedder_params = task_embedder.init(task_key, task=dummy_task, B=1, T=4)["params"]
     policy_params = policy_head.init(pol_key, dummy_h, deterministic=True)["params"]
     reward_vars = reward_head.init(rew_key, dummy_h, deterministic=True)
     reward_params = reward_vars["params"]
+    reward_constants = reward_vars.get("constants", FrozenDict())
     
     # Optimizers
-    tx_dict = {
-        "policy": optax.adamw(cfg.lr_policy),
-        "reward": optax.adamw(cfg.lr_reward),
-        "dynamics": optax.adamw(cfg.lr_dynamics) if cfg.continue_dynamics_loss else optax.set_to_zero(),
-    }
+    optimizers = OptimizerContainer(
+        task_embedder=optax.adamw(cfg.lr_policy),  # Use same LR as policy
+        policy=optax.adamw(cfg.lr_policy),
+        reward=optax.adamw(cfg.lr_reward),
+        dynamics=optax.adamw(cfg.lr_dynamics) if cfg.continue_dynamics_loss else optax.set_to_zero(),
+    )
     opt_states = {
-        "policy": tx_dict["policy"].init(policy_params),
-        "reward": tx_dict["reward"].init(reward_params),
-        "dynamics": tx_dict["dynamics"].init(dynamics_params),
+        "task_embedder": optimizers.task_embedder.init(task_embedder_params),
+        "policy": optimizers.policy.init(policy_params),
+        "reward": optimizers.reward.init(reward_params),
+        "dynamics": optimizers.dynamics.init(dynamics_params),
     }
     
     # Logging & checkpointing
@@ -279,8 +300,8 @@ def run(cfg: BCRewConfig):
     
     # Try to restore checkpoint
     state_example = make_state(
-        {"policy": policy_params, "reward": reward_params, "dynamics": dynamics_params},
-        {"policy": opt_states["policy"], "reward": opt_states["reward"], "dynamics": opt_states["dynamics"]},
+        {"task_embedder": task_embedder_params, "policy": policy_params, "reward": reward_params, "dynamics": dynamics_params},
+        {"task_embedder": opt_states["task_embedder"], "policy": opt_states["policy"], "reward": opt_states["reward"], "dynamics": opt_states["dynamics"]},
         rng,
         step=0
     )
@@ -290,6 +311,7 @@ def run(cfg: BCRewConfig):
     start_step = 0
     if restored is not None:
         latest_step, r = restored
+        task_embedder_params = r.state["params"]["task_embedder"]
         policy_params = r.state["params"]["policy"]
         reward_params = r.state["params"]["reward"]
         dynamics_params = r.state["params"]["dynamics"]
@@ -307,16 +329,15 @@ def run(cfg: BCRewConfig):
         if step >= cfg.max_steps:
             break
         
-        rng, enc_key, step_key = jax.random.split(rng, 3)
+        rng, tokenizer_key, step_key = jax.random.split(rng, 3)
         
         # Encode videos to latents (frozen tokenizer - outside train_step)
         # Inline JIT using a lambda
-        latents, _ = jax.jit(lambda videos, rng: 
-            tokenizer.apply(
-            tokenizer_vars, videos, packing_factor=dynamics.config.packing_factor,
-            method=tokenizer.encode, rngs={"mae": rng}, deterministic=True
-            )
-        )(batch["videos"], enc_key)
+        videos = batch["videos"]
+        actions = batch["actions"]
+        # shift the actions by one and put the "first action token" = 15 at the beginning 
+        actions = jnp.concatenate((jnp.full_like(actions[:,0:1], fill_value = 15), actions[:,:-1]), axis=1) # TODO: pass this to the train step!
+        latents, _ = tokenizer.apply(tokenizer_vars, videos, packing_factor=dynamics_cfg.packing_factor, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
         
         # Training step
         new_params, opt_states, metrics = train_step(
@@ -324,18 +345,20 @@ def run(cfg: BCRewConfig):
             task_embedder=task_embedder,
             policy_head=policy_head,
             reward_head=reward_head,
-            tx_dict=tx_dict,
+            optimizers=optimizers,
             dynamics_params=new_params.get("dynamics", dynamics_params) if step > start_step else dynamics_params,
             dynamics_constants=dynamics_constants,
+            task_embedder_params=new_params.get("task_embedder", task_embedder_params) if step > start_step else task_embedder_params,
             policy_params=new_params.get("policy", policy_params) if step > start_step else policy_params,
             reward_params=new_params.get("reward", reward_params) if step > start_step else reward_params,
+            reward_constants=reward_constants,
             opt_states=opt_states,
             latents=latents,
             batch=batch,
             rng=step_key,
             step=step,
             k_max=dynamics.config.k_max,
-            L_mtp=8,
+            L_mtp=cfg.L,
             bootstrap_start=cfg.bootstrap_start,
             continue_dynamics_loss=cfg.continue_dynamics_loss,
             dynamics_loss_weight=cfg.dynamics_loss_weight,

@@ -9,37 +9,29 @@ ckpt_save_every: 100_000
 
 dataset:
   B: 64
+  T: 32
   diversify_data: true
 
-action_dim: 4
-
-patch: 4
-enc_n_latents: 16
-enc_d_bottleneck: 32
-d_model_enc: 64
-d_model_dyn: 128
-enc_depth: 8
-dec_depth: 8
-dyn_depth: 8
-n_heads: 4
-n_kv_heads: 2
-qk_norm_type: null  # options: qknorm, quest, null
-rope_theta: 10000.0
-packing_factor: 2
-n_register: 4
+action_dim: 16
 n_agent: 1
-agent_space_mode: wm_agent
 
-k_max: 8
+# Training hyperparameters
 bootstrap_start: 5000
 self_fraction: 0.25
 
 max_steps: 1_000_000_000
-log_every: 500
-lr: 1e-4
+log_every: 10
+
+# Learning rates
+lr_policy: 1e-4
+lr_reward: 1e-4
+lr_dynamics: 1e-5
+continue_dynamics_loss: true
+dynamics_loss_weight: 0.1
 
 write_video_every: 100_000
 
+# Multi-token prediction settings
 L: 2
 num_reward_bins: 101
 reward_log_low: -3.0
@@ -47,6 +39,7 @@ reward_log_high: 3.0
 n_tasks: 128
 use_task_ids: true
 
+# Loss weighting
 loss_weight_shortcut: 1.0
 loss_weight_policy: 0.3
 loss_weight_reward: 0.3

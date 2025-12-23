@@ -389,7 +389,7 @@ def compute_policy_loss(
 
 def compute_reward_loss(
     reward_head,
-    reward_params: Any,
+    reward_vars: Any,
     h_states: jnp.ndarray,
     rewards_btL: jnp.ndarray,
     rewards_valid: jnp.ndarray,
@@ -399,7 +399,7 @@ def compute_reward_loss(
     
     Args:
         reward_head: Reward head model instance
-        reward_params: Reward head parameters
+        reward_vars: Reward head variables dict (params + constants)
         h_states: (B, T, n_agent, d_model) Hidden states from dynamics
         rewards_btL: (B, T, L) Future reward values
         rewards_valid: (B, T, L) Validity mask
@@ -409,7 +409,7 @@ def compute_reward_loss(
     """
     # Forward pass
     reward_logits, centers_log = reward_head.apply(
-        {"params": reward_params},
+        reward_vars,
         h_states,
         deterministic=True,
     )  # logits: (B, T, L, K), centers: (K,)

@@ -993,6 +993,9 @@ class TaskEmbedder(nn.Module):
     n_tasks: int = 128       # only used if use_ids=True
     d_task: int = 64         # only used if use_ids=False
 
+    def setup(self):
+        self.emb = nn.Embed(self.n_tasks, self.d_model, name="task_table") if self.use_ids else nn.Dense(self.d_model, name="task_proj")
+
     @nn.compact
     def __call__(self, task, B: int, T: int):
         """
@@ -1003,11 +1006,7 @@ class TaskEmbedder(nn.Module):
 
         Returns agent tokens: (B, T, n_agent, d_model)
         """
-        if self.use_ids:
-            emb = nn.Embed(self.n_tasks, self.d_model, name="task_table")(task)  # (B, D)
-        else:
-            emb = nn.Dense(self.d_model, name="task_proj")(task)                 # (B, D)
-
+        emb = self.emb(task)
         # Learned base + optional small MLP to decouple from raw table
         base = self.param("agent_base", nn.initializers.normal(0.02), (self.d_model,))
         x = emb + base[None, :]
