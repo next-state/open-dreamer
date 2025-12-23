@@ -132,7 +132,7 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
 # Training step
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("dynamics", "task_embedder", "policy_head", "reward_head", "optimizers", "k_max", "L_mtp"))
+@partial(jax.jit, static_argnames=("dynamics", "task_embedder", "policy_head", "reward_head", "optimizers", "k_max", "L_mtp", "B_self"))
 def train_step(
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
@@ -155,7 +155,7 @@ def train_step(
     # Config
     k_max: int,
     L_mtp: int,
-    bootstrap_start: int,
+    B_self: int,
     dynamics_loss_weight: float,
 ):
     """
@@ -193,7 +193,7 @@ def train_step(
         # Dynamics loss (also returns hidden states for BC/reward training)
         dyn_vars = {"params": dyn_p, "constants": dynamics_constants}
         
-        dyn_losses, dyn_aux = shortcut_forcing_step(dynamics.apply, dyn_vars, batch["actions"], latents, dyn_key, k_max, B_self=B // 2, bootstrap_active=(step >= bootstrap_start), agent_tokens=agent_tokens_bt)
+        dyn_losses, dyn_aux = shortcut_forcing_step(dynamics.apply, dyn_vars, batch["actions"], latents, dyn_key, k_max, B_self=B_self, agent_tokens=agent_tokens_bt)
         dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
         
         policy_loss = compute_policy_loss(policy_head, pol_p, h_states, actions_btL, actions_valid)
@@ -339,6 +339,7 @@ def run(cfg: BCRewConfig):
         # Inline JIT using a lambda
         videos = batch["videos"]
         actions = batch["actions"]
+        B, T, H, W, C = videos.shape
         # shift the actions by one and put the "first action token" = 15 at the beginning 
         actions = jnp.concatenate((jnp.full_like(actions[:,0:1], fill_value = 15), actions[:,:-1]), axis=1) # TODO: pass this to the train step!
         latents, _ = tokenizer.apply(tokenizer_vars, videos, packing_factor=dynamics_cfg.packing_factor, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
@@ -363,7 +364,7 @@ def run(cfg: BCRewConfig):
             step=step,
             k_max=dynamics.config.k_max,
             L_mtp=cfg.L,
-            bootstrap_start=cfg.bootstrap_start,
+            B_self=(B // 2)*(step >= cfg.bootstrap_start), # This will make the function compile twice. TODO: see if it's worth fixing this
             dynamics_loss_weight=cfg.dynamics_loss_weight,
         )
         

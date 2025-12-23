@@ -194,7 +194,6 @@ def shortcut_forcing_step(
     k_max: int,
     *,
     B_self: int = 0,
-    bootstrap_active: jnp.ndarray = jnp.array(True),
     agent_tokens: jnp.ndarray | None = None,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
@@ -221,7 +220,6 @@ def shortcut_forcing_step(
              from the main forward pass (computed with noisy inputs)
     """
     B, T, S, D = latents.shape
-    if bootstrap_active: B_self = 0
     B_emp = B - B_self
     emax = jnp.log2(k_max).astype(jnp.int32)
     

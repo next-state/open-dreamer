@@ -46,11 +46,10 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Training step (now using reusable components from dreamer.training)
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("dynamics", "tx", "k_max", "B_self", "bootstrap_start"))
+@partial(jax.jit, static_argnames=("dynamics", "tx", "k_max", "B_self"))
 def train_step(
     dynamics, tx, params, opt_state, constants, latents, actions,
-    *, B_self: int, k_max: int, master_key: jnp.ndarray, step: int, bootstrap_start: int
-):
+    *, B_self: int, k_max: int, master_key: jnp.ndarray, step: int):
     """
     Training step using shortcut forcing (flow matching + bootstrap self-consistency).
     
@@ -74,7 +73,6 @@ def train_step(
             rng=step_key,
             k_max=k_max,
             B_self=B_self,
-            bootstrap_active=(step >= bootstrap_start),
             agent_tokens=None,  # Not used in dynamics pretraining
         )
         return losses['total'], aux
@@ -151,8 +149,8 @@ def run(cfg: DynamicsConfig):
 
         dynamics_params, opt_state, aux = train_step(dynamics, tx, 
             dynamics_params, opt_state, dynamics_constants, latents, actions, 
-            B_self=videos.shape[0] // 2, k_max=cfg.dynamics.k_max, master_key=master_key,
-            step=step, bootstrap_start=cfg.bootstrap_start)
+            B_self=(videos.shape[0] // 2)*(step >= cfg.bootstrap_start), # This will make the function compile twice. TODO: see if it's worth fixing this
+            k_max=cfg.dynamics.k_max, master_key=master_key, step=step)
 
         # Logging
         if logger.should_log(step):
