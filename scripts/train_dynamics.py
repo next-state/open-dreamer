@@ -10,24 +10,15 @@ Architecture:
 from __future__ import annotations
 
 import logging
-
-from dreamer.generation import DenoiseSchedule
-from dreamer.sampler import sample_video
-
-import time
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict
 
 import hydra
-import imageio.v3 as iio
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 import wandb
-from einops import rearrange
 from flax.core import FrozenDict
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
@@ -37,7 +28,7 @@ from dreamer.configs import DynamicsConfig, TokenizerConfig
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.training import shortcut_forcing_step  # NEW: Reusable training components
+from dreamer.training import run_evaluation, shortcut_forcing_step  # NEW: Reusable training components
 from dreamer.utils import (
     _ensure_dir,
     from_dict,
@@ -45,9 +36,7 @@ from dreamer.utils import (
     make_manager,
     make_state,
     maybe_save,
-    normalize_with_dataset_stats,
     try_restore,
-    unnormalize_with_dataset_stats,
 )
 # jax.config.update("jax_debug_nans", True)
 # Suppress absl info logs
@@ -95,87 +84,6 @@ def train_step(
     new_params = optax.apply_updates(params, updates)
     
     return new_params, new_opt_state, metrics
-
-# ---------------------------
-# Evaluation helpers
-# ---------------------------
-
-def run_evaluation(
-    cfg: DynamicsConfig,
-    tokenizer_cfg: TokenizerConfig,
-    step: int,
-    tokenizer: Tokenizer,
-    tokenizer_vars: Dict[str, Any],
-    dynamics: Dynamics,
-    dynamics_params: Dict[str, Any],
-    dynamics_constants: Dict[str, Any],
-    val_videos: jnp.ndarray,
-    val_actions: jnp.ndarray,
-    vis_dir: Path,
-    rng: jax.Array,
-):
-    """
-    Run periodic evaluation: sample videos, compute metrics, and save visualization.
-    
-    Uses unified Tokenizer with encode/decode methods.
-    """
-
-    k_max = cfg.dynamics.k_max
-    schedule_shortcut = DenoiseSchedule.init(4, k_max)
-    schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
-
-    evaluation_schedules = {"shortcut": schedule_shortcut, "diffusion": schedule_diffusion}
-
-    dyn_vars = {"params": dynamics_params, "constants": dynamics_constants}
-
-    for tag, schedule_config in evaluation_schedules.items():
-        t0 = time.time()
-        # FIXME: only temporary for debugging
-        assert val_videos.shape[1] > 5
-        ctx_length = 4
-        horizon = val_videos.shape[1] - ctx_length
-
-        pred_frames, floor_frames, gt_frames = sample_video(tokenizer, tokenizer_vars, dynamics, dyn_vars, val_videos, val_actions, horizon, schedule_config, rng)
-
-        # Compute metrics
-        dt = time.time() - t0
-        dataset_std = tokenizer_cfg.dataset.dataset_std[0]
-        normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
-        normalized_gt = normalize_with_dataset_stats(gt_frames[:, -horizon:], mean=0, std=dataset_std)
-        mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
-        
-        psnr = 10 * jnp.log10((1 / jnp.maximum(mse * (dataset_std ** 2), 1e-10)))
-        # psnr = float(10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12)))
-        print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
-
-        # Build visualization
-        num_videos = min(4, pred_frames.shape[0])
-        frames = [floor_frames, gt_frames, pred_frames]
-        stacked_frames = jnp.stack(frames)[:, :num_videos]
-        videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
-
-        # Save artifacts
-        tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
-        mp4_path = tag_dir / f"{tag}_grid.mp4"
-
-        # Save video
-        try:
-            iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
-        except Exception as e:
-            print(f"[eval:{tag}] MP4 write failed: {e}")
-
-        # Log to wandb
-        if cfg.use_wandb and wandb.run is not None:
-            wandb.log({
-                f"eval/{tag}/mse": mse,
-                f"eval/{tag}/psnr": psnr,
-                f"eval/{tag}/horizon": horizon,
-                f"eval/{tag}/eval_time": dt,
-            }, step=step)
-            if videos:
-                wandb.log({
-                    f"eval/{tag}/video": wandb.Video(mp4_path, format="mp4"),
-                }, step=step)
 
 # ---------------------------
 # Main

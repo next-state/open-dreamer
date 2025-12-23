@@ -226,5 +226,4 @@ __marimo__/
 
 # Repo stuff
 datasets/
-migration_tests/
-docs/
+migration/

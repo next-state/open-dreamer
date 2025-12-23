@@ -13,7 +13,7 @@ dataset:
   diversify_data: true
 
 action_dim: 16
-n_agent: 1
+n_agent: 4
 
 # Training hyperparameters
 bootstrap_start: 5000
@@ -21,6 +21,7 @@ self_fraction: 0.25
 
 max_steps: 1_000_000_000
 log_every: 10
+write_video_every: 500
 
 # Learning rates
 lr_policy: 1e-4
@@ -28,10 +29,8 @@ lr_reward: 1e-4
 lr_dynamics: 1e-5
 dynamics_loss_weight: 0.1
 
-write_video_every: 100_000
-
 # Multi-token prediction settings
-L: 2
+L: ${n_agent}
 num_reward_bins: 101
 reward_log_low: -5.0  # Extended range to cover negative pixel distances (symlog(-45) ≈ -3.83)
 reward_log_high: 3.0

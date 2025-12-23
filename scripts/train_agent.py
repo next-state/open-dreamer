@@ -38,6 +38,7 @@ from dreamer.models import Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder,
 from dreamer.training import (
     compute_policy_loss,
     compute_reward_loss,
+    run_evaluation,
     shortcut_forcing_step,
 )
 from dreamer.utils import (
@@ -74,6 +75,9 @@ def gather_future_actions(actions_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
     
     At timestep t, predicts actions[t+1], actions[t+2], ..., actions[t+L]
     (Following Dreamer convention: action a_i happens before state s_i)
+    
+    Note: Paper equation uses n=0..L, but with Dreamer's convention where a_t is the 
+    action TO TAKE from state s_t, we predict L future actions starting from a_{t+1}.
     
     Args:
         actions_bt: (B, T) action labels
@@ -192,8 +196,8 @@ def train_step(
         dyn_losses, dyn_aux = shortcut_forcing_step(dynamics.apply, dyn_vars, batch["actions"], latents, dyn_key, k_max, B_self=B // 2, bootstrap_active=(step >= bootstrap_start), agent_tokens=agent_tokens_bt)
         dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
         
-        policy_loss = compute_policy_loss(policy_head, pol_p, h_states[:,:,0], actions_btL, actions_valid)
-        reward_loss = compute_reward_loss(reward_head, {"params": rew_p, "constants": reward_constants}, h_states[:,:,0], rewards_btL, rewards_valid)
+        policy_loss = compute_policy_loss(policy_head, pol_p, h_states, actions_btL, actions_valid)
+        reward_loss = compute_reward_loss(reward_head, {"params": rew_p, "constants": reward_constants}, h_states, rewards_btL, rewards_valid)
         
         # Combine losses
         total_loss = policy_loss + reward_loss + dynamics_loss_weight * dynamics_loss
@@ -237,6 +241,7 @@ def run(cfg: BCRewConfig):
     # Setup directories
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
+    vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] output dir: {run_dir.resolve()}")
     
     # Wandb
@@ -266,7 +271,7 @@ def run(cfg: BCRewConfig):
     rng, task_key, pol_key, rew_key = jax.random.split(rng, 4)
     
     # Dummy inputs for initialization
-    dummy_h = jnp.zeros((1, 4, dynamics.config.d_model))  # (B, T, D) for heads (agent dim already pooled)
+    dummy_h = jnp.zeros((1, 4, cfg.L, dynamics.config.d_model))  # (B, T, D) for heads (agent dim already pooled)
     dummy_task = jnp.zeros((1,), dtype=jnp.int32) if cfg.use_task_ids else jnp.zeros((1, cfg.n_tasks))
     task_embedder_params = task_embedder.init(task_key, task=dummy_task, B=1, T=4)["params"]
     policy_params = policy_head.init(pol_key, dummy_h, deterministic=True)["params"]
@@ -374,6 +379,12 @@ def run(cfg: BCRewConfig):
         # Save checkpoint
         state = make_state(new_params, opt_states, rng, step)
         maybe_save(mngr, step, state, meta)
+        
+        # Periodic lightweight AR eval
+        if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
+            # Use current batch as validation data (simplest approach)
+            val_videos = batch["videos"]
+            run_evaluation(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, dynamics_params, dynamics_constants, val_videos, actions, vis_dir, rng)
     
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:

@@ -1,6 +1,7 @@
 from functools import lru_cache
 from dataclasses import asdict
 
+import einops
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
@@ -1052,6 +1053,7 @@ class PolicyHeadMTP(nn.Module):
 
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
+        h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
         norm_ht=RMSNorm()(h_t)
         x = self.projector(norm_ht, deterministic=deterministic)  # (B, T, D)
         logits = self.out(x)                                  # (B, T, L, A)
@@ -1099,6 +1101,7 @@ class RewardHeadMTP(nn.Module):
 
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
+        h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
         norm_ht=RMSNorm()(h_t)
         x = self.projector(norm_ht, deterministic=deterministic)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L, K)
@@ -1146,6 +1149,7 @@ class ValueHead(nn.Module):
 
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
+        h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
         norm_ht=RMSNorm()(h_t)
         x = self.projector(norm_ht, deterministic=deterministic)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, K)
