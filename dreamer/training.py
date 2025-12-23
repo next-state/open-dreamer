@@ -115,7 +115,7 @@ def compute_flow_loss(
     z_target: jnp.ndarray,
     sigma: jnp.ndarray,
     per_example: bool = False
-) -> jnp.ndarray:
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Flow matching loss in x-space (direct prediction of clean latents).
     
@@ -126,17 +126,17 @@ def compute_flow_loss(
         per_example: If True, return (B, T) losses; else return scalar
         
     Returns:
-        loss: Scalar or (B, T) MSE loss
+        loss: tuple of scalar or (B, T) MSE loss
+            mse_per_step: tuple of scalar or (B, T) MSE loss per step weighted by ramp weight
+            mse_per_token: tuple of scalar or (B, T, S, D) MSE loss per token
     """
     mse_per_token = (z_pred - z_target) ** 2  # (B, T, S, D)
     mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
     
-    if per_example:
-        return mse_per_step
     
     # Apply ramp weighting and reduce
     weights = ramp_weight(sigma)
-    return jnp.mean(mse_per_step * weights)
+    return jnp.mean(mse_per_step * weights), jnp.mean(mse_per_step)
 
 
 def compute_bootstrap_loss(
@@ -145,8 +145,7 @@ def compute_bootstrap_loss(
     b_prime: jnp.ndarray,
     b_doubleprime: jnp.ndarray,
     sigma: jnp.ndarray,
-    per_example: bool = False
-) -> jnp.ndarray:
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Bootstrap self-consistency loss for shortcut forcing.
     
@@ -159,10 +158,11 @@ def compute_bootstrap_loss(
         b_prime: (B, T, S, D) Velocity from first half-step
         b_doubleprime: (B, T, S, D) Velocity from second half-step
         sigma: (B, T) Signal levels
-        per_example: If True, return (B, T) losses; else return scalar
         
     Returns:
-        loss: Scalar or (B, T) bootstrap loss
+        loss: tuple of scalar or (B, T) MSE loss
+            mse_per_step: tuple of scalar or (B, T) MSE loss per step weighted by ramp weight
+            mse_per_token: tuple of scalar or (B, T, S, D) MSE loss per token
     """
     # Convert full-step prediction to velocity
     v_hat = (z_pred - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
@@ -175,12 +175,10 @@ def compute_bootstrap_loss(
     boot_per_token = (1.0 - sigma[..., None, None]) ** 2 * v_diff
     boot_per_step = jnp.mean(boot_per_token, axis=(2, 3))  # (B, T)
     
-    if per_example:
-        return boot_per_step
     
     # Apply ramp weighting and reduce
     weights = ramp_weight(sigma)
-    return jnp.mean(boot_per_step * weights)
+    return jnp.mean(boot_per_step * weights), jnp.mean(boot_per_step)
 
 
 # ---------------------------
@@ -223,6 +221,7 @@ def shortcut_forcing_step(
              from the main forward pass (computed with noisy inputs)
     """
     B, T, S, D = latents.shape
+    if bootstrap_active: B_self = 0
     B_emp = B - B_self
     emax = jnp.log2(k_max).astype(jnp.int32)
     
@@ -258,8 +257,7 @@ def shortcut_forcing_step(
     
     # --- Flow loss (empirical rows) ---
     z_pred_emp = z_pred_full[:B_emp]
-    loss_flow = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
-    flow_mse_unweighted = jnp.mean((z_pred_emp - latents[:B_emp]) ** 2)
+    loss_flow, flow_mse_unweighted = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
     
     # --- Bootstrap loss (self-consistency rows) ---
     loss_boot = jnp.array(0.0, dtype=latents.dtype)
@@ -279,27 +277,15 @@ def shortcut_forcing_step(
     
         # First half-step
         z1_half1, *_ = dynamics_apply_fn(dynamics_vars, actions_self, step_idx_half, sigma_idx_self, z_tilde_self, agent_tokens=agent_tokens_self, rngs={"dropout": drop_h1}, deterministic=False)
-        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(
-            1.0 - sigma_self[..., None, None], 1e-8
-        )
+        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
     
         # Second half-step
         z1_half2, *_ = dynamics_apply_fn(dynamics_vars, actions_self, step_idx_half, sigma_idx_plus, z_prime, agent_tokens=agent_tokens_self, rngs={"dropout": drop_h2}, deterministic=False)
-        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(
-            1.0 - sigma_plus[..., None, None], 1e-8
-        )
+        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
     
         # Bootstrap loss (computed unconditionally)
-        loss_boot = compute_bootstrap_loss(
-            z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self
-        )
-        boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self, per_example=True).mean()
-    
-        # Dynamic gating. TODO: isn't it better to simply do a weighted sum?
-        bootstrap_mask = bootstrap_active.astype(latents.dtype)
-        loss_boot = loss_boot * bootstrap_mask
-        boot_mse_unweighted = boot_mse_unweighted * bootstrap_mask
+        loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
     
     # --- Combine losses ---
     # Weight by batch composition to keep scale constant
