@@ -32,7 +32,7 @@ dynamics_loss_weight: 0.1
 # Multi-token prediction settings
 L: ${n_agent}
 num_reward_bins: 101
-reward_log_low: -5.0  # Extended range to cover negative pixel distances (symlog(-45) ≈ -3.83)
+reward_log_low: -5.0  
 reward_log_high: 3.0
 n_tasks: 128
 use_task_ids: true
