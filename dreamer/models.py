@@ -1052,7 +1052,8 @@ class PolicyHeadMTP(nn.Module):
 
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
-        x = self.projector(h_t, deterministic=deterministic)  # (B, T, D)
+        norm_ht=RMSNorm()(h_t)
+        x = self.projector(norm_ht, deterministic=deterministic)  # (B, T, D)
         logits = self.out(x)                                  # (B, T, L, A)
         return logits  # softmax/sigmoid applied at loss-time based on `kind`
 
@@ -1098,7 +1099,8 @@ class RewardHeadMTP(nn.Module):
 
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
-        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
+        norm_ht=RMSNorm()(h_t)
+        x = self.projector(norm_ht, deterministic=deterministic)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L, K)
         centers_log = self.centers_var.value                   # (K,)
         return logits, centers_log
@@ -1144,7 +1146,8 @@ class ValueHead(nn.Module):
 
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
-        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
+        norm_ht=RMSNorm()(h_t)
+        x = self.projector(norm_ht, deterministic=deterministic)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, K)
         centers_log = self.centers_var.value                   # (K,)
         return logits, centers_log
