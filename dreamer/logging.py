@@ -1,5 +1,5 @@
 from typing import Any, Dict, Optional
-
+import re
 
 class MetricLogger:
     def __init__(
@@ -28,6 +28,7 @@ class MetricLogger:
         pbar: Any = None,
         prefix: str = "train/",
         float_fmt: str = ".4f",
+        pbar_filter: Optional[str] = None,
     ):
         """
         Log metrics to tqdm and wandb (if enabled).
@@ -38,6 +39,9 @@ class MetricLogger:
             pbar: tqdm progress bar instance to update postfix.
             prefix: Prefix for wandb keys (default: "train/").
             float_fmt: Format string for floats in tqdm postfix (default: ".4f").
+            pbar_filter: Optional regex string to filter which keys appear in progress bar.
+                        If provided, only keys matching the pattern will be shown in pbar.
+                        All metrics are still logged to wandb regardless of filter.
         """
         if not self.should_log(step):
             return
@@ -57,7 +61,14 @@ class MetricLogger:
 
         if pbar is not None:
             postfix_data = {}
-            for k, v in clean_metrics.items():
+            filtered_metrics = clean_metrics
+            
+            # Apply filter if provided
+            if pbar_filter is not None:
+                pattern = re.compile(pbar_filter)
+                filtered_metrics = {k: v for k, v in clean_metrics.items() if pattern.search(k)}
+            
+            for k, v in filtered_metrics.items():
                 if isinstance(v, float):
                     postfix_data[k] = f"{v:{float_fmt}}"
                 else:

@@ -869,8 +869,8 @@ class Dynamics(nn.Module):
     def __call__(
         self,
         actions,             # (B,T)
-        step_idxs,           # (B,T)
-        tau_idxs,         # (B,T)
+        step_indices,           # (B,T)
+        tau_indices,         # (B,T)
         packed_enc_tokens,   # (B,T,n_s,d_spatial)
         *,
         agent_tokens: Optional[jnp.ndarray] = None,  # (B,T,n_agent,D) or None
@@ -880,9 +880,9 @@ class Dynamics(nn.Module):
         """
         Args:
           packed_enc_tokens:      (B, T, n_spatial, d_spatial) packed encoder tokens
-          actions:    (B, T) int32 in [0, n_keyboard) raw action tokens
-          step_idxs:  (B, T) int32 — step indices for embedding lookup
-          tau_idxs:   (B, T) int32 - signal indices for embedding lookup
+          actions:       (B, T) int32 in [0, n_keyboard) raw action tokens
+          step_indices:  (B, T) int32 — step indices for embedding lookup
+          tau_indices:   (B, T) int32 - signal indices for embedding lookup
           caches:     optional dict of KVCache for each layer
 
         Shapes produced:
@@ -905,8 +905,8 @@ class Dynamics(nn.Module):
         )
 
         # --- 4) Shortcut embeddings (discrete lookup)
-        step_tok   = self.step_embed(step_idxs)[:, :, None, :]         # (B, T, 1, d_model)
-        signal_tok = self.signal_embed(tau_idxs)[:, :, None, :]     # (B, T, 1, d_model)
+        step_tok   = self.step_embed(step_indices)[:, :, None, :]         # (B, T, 1, d_model)
+        signal_tok = self.signal_embed(tau_indices)[:, :, None, :]     # (B, T, 1, d_model)
 
         # --- 5) Concatenate in your declared layout order
         if agent_tokens is not None:

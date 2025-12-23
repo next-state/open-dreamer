@@ -1,30 +1,47 @@
 import logging
-
-from functools import partial
-import einops
-import numpy as np
-from tqdm import tqdm
+import os
 from dataclasses import asdict
-import time
+from functools import partial
+from pathlib import Path
+
+import einops
 import hydra
-from omegaconf import DictConfig, OmegaConf
+import imageio
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
-import imageio
-from jaxlpips import LPIPS
-from pathlib import Path
 import wandb
 from hydra.core.hydra_config import HydraConfig
+from jaxlpips import LPIPS
+from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
-from dreamer.utils import make_state, make_manager, try_restore, maybe_save, normalize_with_dataset_stats, with_params, init_tokenizer, from_dict
+from dreamer.configs import TokenizerConfig
+from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Tokenizer
-from dreamer.data import make_iterator
-from dreamer.configs import TokenizerConfig
+from dreamer.utils import (
+    make_state,
+    make_manager,
+    try_restore,
+    maybe_save,
+    normalize_with_dataset_stats,
+    with_params,
+    init_tokenizer,
+    from_dict,
+    get_lr_schedule,
+    count_parameters_by_component,
+)
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
+
+# Register OmegaConf resolver for arithmetic expressions
+# Usage: ${mul:a,b,c,...} multiplies all arguments
+OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
+
     
 # ------------------------
 # Forward (no module in jit)
@@ -57,10 +74,32 @@ def recon_loss_from_mae(pred, target, mae_mask):
     count = jnp.maximum(mae_mask.sum(), 1.0)
     return total_sse / count
 
+def recon_loss_full_mse(pred, target):
+    sq_err = (pred - target) ** 2
+    return jnp.mean(sq_err)  # scalar
+
+def compute_psnr(pred, target):
+    """
+    Assumes pred and target are in the [0, 1] pixel range.
+    Computes PSNR per sample, then returns the mean PSNR. 
+    """
+    pred_clipped = jnp.clip(pred, 0.0, 1.0)
+    target_clipped = jnp.clip(target, 0.0, 1.0)
+    # Compute MSE per (B, T) sample: reduce over spatial and channel dims
+    mse_per_sample = einops.reduce(
+        (pred_clipped - target_clipped) ** 2,
+        "b t h w c -> b t",
+        reduction="mean"
+    )  
+    psnr_per_sample = -10.0 * jnp.log(mse_per_sample) / jnp.log(10.0)
+    return jnp.mean(psnr_per_sample)
+
 lpips_loss_fn = LPIPS(pretrained_network="alexnet")
 
 def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
-    # TODO: maybe unnormalize
+    # Lpips expects [-1, 1] pixel range. Normalize to [-1, 1]
+    pred = (pred - 0.5) * 2
+    target = (target - 0.5) * 2
     if subsample_frac < 1.0:
         B, T = pred.shape[:2]
         step = max(1, int(1.0 / subsample_frac))
@@ -78,9 +117,9 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
 
 @partial(
     jax.jit,
-    static_argnames=("apply_fn", "tx", "lpips_weight", "lpips_frac", "dataset_mean", "dataset_std"),
+    static_argnames=("apply_fn", "tx", "lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"),
 )
-def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key, step, lpips_weight, lpips_frac, dataset_mean, dataset_std):
+def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key, step, lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
      
     step_key = jax.random.fold_in(master_key, step)
     mae_key, drop_key = jax.random.split(step_key)
@@ -91,11 +130,20 @@ def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key
         # For MSE: use standardized values (matches old gradient dynamics)
         pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
         target_norm = normalize_with_dataset_stats(videos, mean=dataset_mean, std=dataset_std)
-        mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
-        psnr = 10 * jnp.log10((1 / jnp.maximum(mse * (dataset_std[0] ** 2), 1e-10)))
+        if tokenizer_loss_type == "mae":
+            mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
+        elif tokenizer_loss_type == "mse":
+            mse = recon_loss_full_mse(pred_norm, target_norm)
+        else:
+            raise ValueError(f"Invalid loss type: {tokenizer_loss_type}")
+
+        # for psnr: use [0, 1] normalized pixel range.
+        psnr = compute_psnr(pred / 255, videos / 255)
         
         # For LPIPS: use [0, 1] range
-        lp = lpips_on_mae_recon(pred / 255, videos / 255, lpips_frac)
+        lp = 0
+        if lpips_weight > 0:
+            lp = lpips_on_mae_recon(pred / 255, videos / 255, lpips_frac)
         
         total = mse + lpips_weight * lp
 
@@ -103,6 +151,21 @@ def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key
         return total, aux
 
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+
+    if log_gradients:
+        def _tree_std_mean(tree):
+            std_tree = jax.tree_util.tree_map(lambda x: jnp.std(x), tree)
+            leaves = jax.tree_util.tree_leaves(std_tree)
+            if len(leaves) == 0:
+                return jnp.array(0.0, dtype=jnp.float32)
+            return jnp.mean(jnp.stack([jnp.asarray(x, dtype=jnp.float32) for x in leaves]))
+
+        aux["grad/global_norm"] = optax.global_norm(grads)
+        aux["grad/encoder_norm"] = optax.global_norm(grads["encoder"])
+        aux["grad/decoder_norm"] = optax.global_norm(grads["decoder"])
+        aux["grad/encoder_std_mean"] = _tree_std_mean(grads["encoder"])
+        aux["grad/decoder_std_mean"] = _tree_std_mean(grads["decoder"])
+
     updates, opt_state = tx.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
 
@@ -160,8 +223,25 @@ def run(cfg: TokenizerConfig):
     apply_fn = tokenizer.apply
     rng, variables = init_tokenizer(rng, tokenizer, cfg)
     params = variables["params"]
+    param_counts = count_parameters_by_component(params)
+    print(f"Parameter counts: {param_counts}")
 
-    tx = optax.adamw(cfg.lr)
+    if cfg.lr_schedule == "constant":
+        lr = cfg.lr
+        lr_schedule = None
+    else:
+        lr_schedule = get_lr_schedule(
+            cfg.lr_schedule,
+            cfg.init_lr,
+            cfg.max_lr,
+            cfg.lr_end,
+            cfg.max_steps,
+            cfg.warmup_steps,
+            cfg.wsd_decay_steps,
+        )
+        lr = lr_schedule
+    # Adamw params from Genie paper.
+    tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
     opt_state = tx.init(params)
 
     # ---------- Checkpointing ----------
@@ -199,13 +279,35 @@ def run(cfg: TokenizerConfig):
         
         # Normalize videos
         videos = batch["videos"]
-        params, opt_state, aux = train_step(apply_fn, tx, variables, params, opt_state, videos, master_key=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac, dataset_mean=tuple(cfg.dataset.dataset_mean), dataset_std=tuple(cfg.dataset.dataset_std))
+        params, opt_state, aux = train_step(apply_fn, tx, variables, params, opt_state, videos, master_key=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac, dataset_mean=tuple(cfg.dataset.dataset_mean), dataset_std=tuple(cfg.dataset.dataset_std), log_gradients=cfg.log_gradients, tokenizer_loss_type=cfg.tokenizer_loss_type)
 
         if logger.should_log(step):
+            if lr_schedule is None:
+                lr_value = cfg.lr
+            else:
+                lr_value = lr_schedule(step)
             mse = aux["loss_mse"]
             psnr = aux["psnr"]
-            logger.log(step, {"loss": aux["loss_total"], "rmse": jnp.sqrt(mse), "lpips": aux["loss_lpips"], "psnr": psnr,}, pbar=pbar)
-
+            logger.log(
+                step,
+                {
+                    "loss": aux["loss_total"],
+                    "mse": mse,
+                    "rmse": jnp.sqrt(mse),
+                    "lpips": aux["loss_lpips"],
+                    "psnr": psnr,
+                    "lr": lr_value,
+                    **({} if not cfg.log_gradients else {
+                        "grad/global_norm": aux["grad/global_norm"],
+                        "grad/encoder_norm": aux["grad/encoder_norm"],
+                        "grad/decoder_norm": aux["grad/decoder_norm"],
+                        "grad/encoder_std_mean": aux["grad/encoder_std_mean"],
+                        "grad/decoder_std_mean": aux["grad/decoder_std_mean"],
+                    }),
+                },
+                pbar=pbar,
+                pbar_filter=r"^(loss|mse|lpips|psnr|lr)$",
+            )
         state = make_state(params, opt_state, rng, step)
         maybe_save(mngr, step, state, meta)
 

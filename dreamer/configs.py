@@ -99,6 +99,21 @@ class TokenizerConfig:
     lpips_weight: float = 0.2
     lpips_frac: float = 0.5
     visualize_every: int = 10_000
+    tokenizer_loss_type: str = "mae" # "mse" | "mae"
+
+    # learning rate schedule
+    # - "constant": use lr
+    # - "wsd": warmup -> hold -> decay
+    # - "cos": warmup cosine decay
+    lr_schedule: str = "constant"
+    init_lr: float = 0.0
+    max_lr: float = 3e-4
+    lr_end: float = 0.0
+    warmup_steps: int = 10_000
+    wsd_decay_steps: int = 30_000
+
+    # logging
+    log_gradients: bool = False
 
 @dataclass(frozen=True)
 class RLConfig:
