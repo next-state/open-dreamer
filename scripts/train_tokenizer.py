@@ -18,6 +18,7 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import TokenizerConfig
+from dreamer.training import compute_psnr
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Tokenizer
@@ -78,21 +79,7 @@ def recon_loss_full_mse(pred, target):
     sq_err = (pred - target) ** 2
     return jnp.mean(sq_err)  # scalar
 
-def compute_psnr(pred, target):
-    """
-    Assumes pred and target are in the [0, 1] pixel range.
-    Computes PSNR per sample, then returns the mean PSNR. 
-    """
-    pred_clipped = jnp.clip(pred, 0.0, 1.0)
-    target_clipped = jnp.clip(target, 0.0, 1.0)
-    # Compute MSE per (B, T) sample: reduce over spatial and channel dims
-    mse_per_sample = einops.reduce(
-        (pred_clipped - target_clipped) ** 2,
-        "b t h w c -> b t",
-        reduction="mean"
-    )  
-    psnr_per_sample = -10.0 * jnp.log(mse_per_sample) / jnp.log(10.0)
-    return jnp.mean(psnr_per_sample)
+
 
 lpips_loss_fn = LPIPS(pretrained_network="alexnet")
 

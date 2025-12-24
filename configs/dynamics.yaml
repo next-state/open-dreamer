@@ -10,12 +10,12 @@ ckpt_save_every: 1000
 dynamics:
     d_model: 128
     d_bottleneck: 32
+    action_dim: 16
     depth: 8
     n_heads: 4
     n_kv_heads: 2
     packing_factor: 2
     n_register: 4
-    n_agent: 0
     qk_norm_type: Null
     rope_theta: 10000.0
     time_every: 4

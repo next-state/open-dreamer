@@ -16,7 +16,6 @@ from .generation import DenoiseSchedule, video_rollout
 # ---------------------------
 
 def sample_video(
-    *,
     tokenizer: Tokenizer,
     tokenizer_vars: Dict[str, Any],
     dynamics: Dynamics,
