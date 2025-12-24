@@ -191,12 +191,12 @@ class RLConfig:
 class DynamicsModelConfig:
     d_model: int = 128
     d_bottleneck: int = 32
+    action_dim: int = 16
     depth: int = 8
     n_heads: int = 4
     n_kv_heads: int = 2
     packing_factor: int = 2
     n_register: int = 4 # number of register tokens for dynamics
-    n_agent: int = 1 # number of agent tokens for dynamics
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
@@ -250,42 +250,27 @@ class BCRewConfig:
 
     # dataset config
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    action_dim: int = 4 # number of categorical actions
+    action_dim: int = 4  # number of categorical actions
+    n_agent: int = 1  # number of agent tokens for dynamics
 
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4 # number of register tokens for dynamics
-    n_agent: int = 1 # number of agent tokens for dynamics
-
-    # UPDATED: default to wm_agent (fine-tuning with agent readouts)
-    agent_space_mode: str = "wm_agent"
-
-    # schedule
-    k_max: int = 8
+    # Training hyperparameters
     bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
     self_fraction: float = 0.25   # used once we pass bootstrap_start
 
-    # train
+    # Train
     max_steps: int = 1_000_000_000
     log_every: int = 5_000
-    lr: float = 3e-4
+    
+    # Learning rates
+    lr_policy: float = 1e-4
+    lr_reward: float = 1e-4
+    lr_dynamics: float = 1e-5
+    dynamics_loss_weight: float = 0.1
 
-    # eval media toggle
+    # Eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
-    # NEW: multi-token prediction (MTP) settings
+    # Multi-token prediction (MTP) settings
     L: int = 2                      # predict next L actions/rewards
     num_reward_bins: int = 101      # twohot bins for symexp rewards
     reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
@@ -295,8 +280,8 @@ class BCRewConfig:
     
     # Loss weighting (to balance scales across different loss components)
     loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
-    loss_weight_policy: float = 1.0      # weight for policy CE loss (nats)
-    loss_weight_reward: float = 1.0      # weight for reward CE loss (nats)
+    loss_weight_policy: float = 0.3      # weight for policy CE loss (nats)
+    loss_weight_reward: float = 0.3      # weight for reward CE loss (nats)
 
 @dataclass(frozen=True)
 class EvalConfig:

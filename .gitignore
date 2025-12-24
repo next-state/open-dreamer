@@ -223,4 +223,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Repo stuff
 datasets/
+migration/

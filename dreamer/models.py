@@ -1,6 +1,7 @@
 from functools import lru_cache
 from dataclasses import asdict
 
+import einops
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
@@ -11,9 +12,9 @@ from typing import Optional, Tuple, Any, Dict
 from einops import rearrange, repeat
 import math
 import orbax.checkpoint as ocp
-from .utils import Modality, TokenLayout, make_manager, from_dict, normalize_with_dataset_stats, recursive_list_to_tuple, unnormalize_with_dataset_stats
+from .utils import Modality, TokenLayout, make_manager, from_dict, normalize_with_dataset_stats, recursive_list_to_tuple, unnormalize_with_dataset_stats, init_dynamics, init_tokenizer
 from .data import patchify, unpatchify
-from .configs import TokenizerConfig, DynamicsModelConfig
+from .configs import DynamicsConfig, TokenizerConfig, DynamicsModelConfig
 
 
 
@@ -761,13 +762,7 @@ class Tokenizer(nn.Module):
         # 2. Init to get structure (params + constants)
         tokenizer = cls(cfg)
         rng = jax.random.PRNGKey(0)
-        rng_params, rng_mae, rng_drop = jax.random.split(rng, 3)
-        dummy = jax.random.uniform(rng, (1, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C))
-        variables = tokenizer.init(
-            {"params": rng_params, "mae": rng_mae, "dropout": rng_drop},
-            dummy,
-            deterministic=True
-        )
+        rng, variables = init_tokenizer(rng, tokenizer, cfg)
 
         # 3. Restore parameters using keys from initialized variables (so shapes/types match)
         # Note: We only restore 'params', keeping 'constants' from init
@@ -784,37 +779,6 @@ class Tokenizer(nn.Module):
 
         return tokenizer, variables, cfg
 
-class ActionEncoder(nn.Module):
-    d_model: int
-    n_keyboard: int = 16  # up, down, left, right, null (categorical actions)
-
-    @nn.compact
-    def __call__(
-        self,
-        actions: Optional[jnp.ndarray],           # (B, T) int32 in [0, n_keyboard)
-        batch_time_shape: Optional[Tuple[int,int]] = None,
-        as_tokens: bool = True,
-    ):
-        # Base "action token" embedding (used always)
-        base_emb = self.param(
-            'base_action_emb', nn.initializers.normal(0.02), (self.d_model,)
-        )
-
-        if actions is None:
-            # unlabeled videos: just broadcast base embedding
-            assert batch_time_shape is not None
-            B, T = batch_time_shape
-            out = jnp.broadcast_to(base_emb, (B, T, self.d_model))
-        else:
-            # embed categorical actions
-            emb_key = nn.Embed(self.n_keyboard, self.d_model, name="emb_key")(actions)
-            out = emb_key + base_emb  # broadcast add
-
-        if as_tokens:
-            # expand a token axis (S_a = 1)
-            out = out[..., None, :]
-
-        return out
 
 class Dynamics(nn.Module):
     config: DynamicsModelConfig
@@ -828,7 +792,6 @@ class Dynamics(nn.Module):
         self.n_kv_heads = self.config.n_kv_heads
         self.packing_factor = self.config.packing_factor
         self.n_register = self.config.n_register
-        self.n_agent = self.config.n_agent
         self.k_max = self.config.k_max
 
         # Defaults
@@ -846,7 +809,7 @@ class Dynamics(nn.Module):
             nn.initializers.normal(0.02),
             (self.n_register, self.d_model),
         )
-        self.action_encoder = ActionEncoder(d_model=self.d_model)
+        self.action_encoder = ActionEncoder(d_model=self.d_model, action_dim = self.config.action_dim)
 
 
         self.transformer = BlockCausalTransformer(
@@ -878,6 +841,7 @@ class Dynamics(nn.Module):
                              batch_size: int,
                              n_spatial: int,
                              window_size: int = 1024,
+                             n_agent: int = 0,
                              dtype=jnp.float32,
                              ) -> Dict[int, KVCache]:
         """
@@ -890,7 +854,7 @@ class Dynamics(nn.Module):
             dtype: Data type for cache buffers.
         """
         # Time attention sees (B*S) independent sequences. S includes all tokens (action, signal, step, spatial, register, agent)
-        S_total = 1 + 1 + 1 + n_spatial + self.config.n_register + (self.config.n_agent if self.config.n_agent > 0 else 0)
+        S_total = 1 + 1 + 1 + n_spatial + n_agent + self.config.n_register 
 
         return create_transformer_caches(
             depth=self.config.depth,
@@ -946,7 +910,7 @@ class Dynamics(nn.Module):
         signal_tok = self.signal_embed(tau_indices)[:, :, None, :]     # (B, T, 1, d_model)
 
         # --- 5) Concatenate in your declared layout order
-        if self.n_agent > 0 and agent_tokens is not None:
+        if agent_tokens is not None:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, agent_tokens]
         else:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
@@ -962,12 +926,12 @@ class Dynamics(nn.Module):
 
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
         x1_hat = self.flow_x_head(spatial_tokens)
-        h_t = x[:, :, layout.slices()[Modality.AGENT], :] if self.n_agent > 0 else None  # (B,T,n_agent,D) or None
+        h_t = x[:, :, layout.slices()[Modality.AGENT], :] if agent_tokens is not None else None  # (B,T,n_agent,D) or None
         return x1_hat, (h_t, new_caches)
     
     
     @classmethod
-    def from_pretrained(cls, path, *, load_for_training: bool = False) -> Tuple["Dynamics", Dict[Any, Any], "DynamicsModelConfig", "TokenizerConfig"]:
+    def from_pretrained(cls, path) -> Tuple["Dynamics", Dict[Any, Any], "DynamicsModelConfig", "Tokenizer", Dict[Any, Any], "TokenizerConfig"]:
         """
         Load a pretrained Dynamics model from a checkpoint directory.
         
@@ -993,16 +957,12 @@ class Dynamics(nn.Module):
         
         # Extract the dynamics config from the full training config
         # The checkpoint saves the entire DynamicsConfig which contains a 'dynamics' field
-        from .configs import DynamicsConfig
         full_cfg = from_dict(DynamicsConfig, cfg_dict)
         dyn_model_cfg = full_cfg.dynamics
         
         # Load tokenizer config to get spatial dimensions
         # We need this to properly initialize the dynamics model
-        tokenizer_cfg = None
-        if hasattr(full_cfg, 'tokenizer_ckpt'):
-            # Load tokenizer config from the referenced checkpoint
-            _, _, tokenizer_cfg = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt)
+        tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt)
         
         if tokenizer_cfg is None:
             raise ValueError("Cannot determine spatial dimensions - tokenizer config not found. "
@@ -1011,26 +971,7 @@ class Dynamics(nn.Module):
         # 2. Initialize model to get structure
         dynamics = cls(dyn_model_cfg)
         rng = jax.random.PRNGKey(0)
-        rng_params, rng_drop, key = jax.random.split(rng, 3)
-        
-        # Create dummy inputs matching expected shapes
-        B, T = 2, 4  # dummy batch/time dimensions
-        packing_factor = dyn_model_cfg.packing_factor
-        enc_cfg = tokenizer_cfg.encoder
-        n_spatial = enc_cfg.n_latents // packing_factor
-        d_spatial = enc_cfg.d_bottleneck * packing_factor
-        
-        # Create dummy inputs
-        dummy_actions = jnp.zeros((B, T), dtype=jnp.int32)
-        dummy_step_indices = jnp.zeros((B, T), dtype=jnp.int32)
-        dummy_signal_indices = jnp.zeros((B, T), dtype=jnp.int32)
-        dummy_latents = jax.random.normal(key, (B, T, n_spatial, d_spatial))
-        
-        variables = dynamics.init(
-            {"params": rng_params, "dropout": rng_drop},
-            dummy_actions, dummy_step_indices, dummy_signal_indices, dummy_latents,
-            deterministic=True,
-        )
+        rng, dynamics_vars = init_dynamics(rng, dynamics, tokenizer_cfg)
 
         # 3. Restore parameters from checkpoint
         restored = mngr.restore(latest, args=ocp.args.Composite(
@@ -1040,11 +981,11 @@ class Dynamics(nn.Module):
         loaded_params = restored.state["params"]
         
         # 4. Merge loaded params into variables (keeping constants from init)
-        variables = unfreeze(variables)
-        variables["params"] = loaded_params
-        variables = freeze(variables)
+        dynamics_vars = unfreeze(dynamics_vars)
+        dynamics_vars["params"] = loaded_params
+        dynamics_vars = freeze(dynamics_vars)
         
-        return dynamics, variables, dyn_model_cfg, tokenizer_cfg
+        return dynamics, dynamics_vars, dyn_model_cfg, tokenizer, tokenizer_vars, tokenizer_cfg
 
 class TaskEmbedder(nn.Module):
     d_model: int
@@ -1052,6 +993,9 @@ class TaskEmbedder(nn.Module):
     use_ids: bool = True     # True: task is int ids; False: task is vector
     n_tasks: int = 128       # only used if use_ids=True
     d_task: int = 64         # only used if use_ids=False
+
+    def setup(self):
+        self.emb = nn.Embed(self.n_tasks, self.d_model, name="task_table") if self.use_ids else nn.Dense(self.d_model, name="task_proj")
 
     @nn.compact
     def __call__(self, task, B: int, T: int):
@@ -1063,11 +1007,7 @@ class TaskEmbedder(nn.Module):
 
         Returns agent tokens: (B, T, n_agent, d_model)
         """
-        if self.use_ids:
-            emb = nn.Embed(self.n_tasks, self.d_model, name="task_table")(task)  # (B, D)
-        else:
-            emb = nn.Dense(self.d_model, name="task_proj")(task)                 # (B, D)
-
+        emb = self.emb(task)
         # Learned base + optional small MLP to decouple from raw table
         base = self.param("agent_base", nn.initializers.normal(0.02), (self.d_model,))
         x = emb + base[None, :]
@@ -1113,7 +1053,9 @@ class PolicyHeadMTP(nn.Module):
 
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
-        x = self.projector(h_t, deterministic=deterministic)  # (B, T, D)
+        h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
+        norm_ht=RMSNorm()(h_t)
+        x = self.projector(norm_ht, deterministic=deterministic)  # (B, T, D)
         logits = self.out(x)                                  # (B, T, L, A)
         return logits  # softmax/sigmoid applied at loss-time based on `kind`
 
@@ -1159,7 +1101,9 @@ class RewardHeadMTP(nn.Module):
 
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
-        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
+        h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
+        norm_ht=RMSNorm()(h_t)
+        x = self.projector(norm_ht, deterministic=deterministic)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L, K)
         centers_log = self.centers_var.value                   # (K,)
         return logits, centers_log
@@ -1205,7 +1149,41 @@ class ValueHead(nn.Module):
 
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
-        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
+        h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
+        norm_ht=RMSNorm()(h_t)
+        x = self.projector(norm_ht, deterministic=deterministic)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, K)
         centers_log = self.centers_var.value                   # (K,)
         return logits, centers_log
+
+class ActionEncoder(nn.Module):
+    d_model: int
+    action_dim: int = 16  # up, down, left, right, null (categorical actions)
+
+    @nn.compact
+    def __call__(
+        self,
+        actions: Optional[jnp.ndarray],           # (B, T) int32 in [0, n_keyboard)
+        batch_time_shape: Optional[Tuple[int,int]] = None,
+        as_tokens: bool = True,
+    ):
+        # Base "action token" embedding (used always)
+        base_emb = self.param(
+            'base_action_emb', nn.initializers.normal(0.02), (self.d_model,)
+        )
+
+        if actions is None:
+            # unlabeled videos: just broadcast base embedding
+            assert batch_time_shape is not None
+            B, T = batch_time_shape
+            out = jnp.broadcast_to(base_emb, (B, T, self.d_model))
+        else:
+            # embed categorical actions
+            emb_key = nn.Embed(self.action_dim, self.d_model, name="emb_key")(actions)
+            out = emb_key + base_emb  # broadcast add
+
+        if as_tokens:
+            # expand a token axis (S_a = 1)
+            out = out[..., None, :]
+
+        return out
