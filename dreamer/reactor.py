@@ -117,7 +117,7 @@ def new_frame(
         dynamics: Dynamics model
         dynamics_vars: Dynamics parameters
         schedule: Denoising schedule
-        action: Action to condition on (B, 1) or (B,)
+        action: Action to condition on (B,) - categorical integer array
         latent_shape: Shape of latent (B, 1, n_spatial, D_s)
         dynamics_cache: KV cache for dynamics model from previous steps
         tokenizer_cache: KV cache for tokenizer decoder from previous steps
@@ -131,8 +131,9 @@ def new_frame(
         dynamics=dynamics,
         dyn_vars=dynamics_vars,
         schedule=schedule,
-        action=action,
+        action=action,  # Shape (B,) - categorical integer
         latent_shape=latent_shape,
+        prefill_length=0,  # No prefill for interactive generation
         rng=rng,
         agent_tokens=None,
         caches=dynamics_cache,
@@ -176,6 +177,21 @@ class DreamerVideoModel(VideoModel):
         self.current_mouse_pos = (mouse_x, mouse_y)
         action = input_to_action(self.current_mouse_pos, self.controller_state, self.cfg.action_dim)
         self.current_action = action
+        
+    @command("send_keyboard_action", description="Send keyboard action for coinrun (0=up, 1=down, 2=left, 3=right, 4=null)")
+    def send_keyboard_action(self, action: int):
+        """
+        Accept a categorical keyboard action for coinrun.
+        
+        Args:
+            action: Integer in [0, 4] representing the action
+                   0 = up, 1 = down, 2 = left, 3 = right, 4 = null
+        """
+        if action < 0 or action > 4:
+            logger.warning(f"Invalid action {action}, clamping to [0, 4]")
+            action = max(0, min(4, action))
+        self.current_action = jnp.array(action, dtype=jnp.int32)
+        self.use_agent = False  # User input overrides agent mode
         
     @command("use_agent", description="Switch to policy-based action selection")
     def switch_to_policy(self, use_agent: bool):
@@ -241,7 +257,7 @@ class DreamerVideoModel(VideoModel):
         self.dynamics_cache = None
         self.tokenizer_cache = None
         self.current_mouse_pos = (0, 0)
-        self.current_action = None
+        self.current_action = jnp.array(4, dtype=jnp.int32)  # Default to null action (4)
         self.controller_state = {}
         self.use_agent = False
         
@@ -267,7 +283,7 @@ class DreamerVideoModel(VideoModel):
         
         # Initialize session state
         self.current_mouse_pos = (0, 0)
-        self.current_action = jnp.zeros(self.cfg.action_dim)  # Default action
+        self.current_action = jnp.array(4, dtype=jnp.int32)  # Default to null action (4)
         self.controller_state = {}
         self.use_agent = False
         
@@ -330,9 +346,14 @@ class DreamerVideoModel(VideoModel):
                     # Use current action from user input
                     current_action = self.current_action
                 
-                # Ensure action has correct shape (B,) or (B, 1)
-                if current_action.ndim == 1:
-                    current_action = current_action[None, :]  # Add batch dimension if needed
+                # Ensure action has correct shape (B,) for dynamics model
+                # Actions are categorical integers, shape should be (B,) or (B, 1)
+                if current_action.ndim == 0:
+                    # Scalar action, expand to (1,)
+                    current_action = current_action[None]
+                elif current_action.ndim == 2:
+                    # (B, 1) -> (B,)
+                    current_action = current_action.squeeze(axis=1)
                 
                 # Generate next frame
                 frame, self.dynamics_cache, self.tokenizer_cache, self.rng = new_frame(
