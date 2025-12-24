@@ -12,12 +12,21 @@ class EpisodeLengthFilter(grain.transforms.Filter):
     A Grain Filter that keeps only episodes with sufficient length.
     """
 
-    def __init__(self, seq_len: int, image_h: int, image_w: int, image_c: int):
+    def __init__(
+        self,
+        seq_len: int,
+        image_h: int,
+        image_w: int,
+        image_c: int,
+        *,
+        print_filter_warnings: bool = True,
+    ):
         """Initializes the filter with sequence length requirements."""
         self.seq_len = seq_len
         self.image_h = image_h
         self.image_w = image_w
         self.image_c = image_c
+        self.print_filter_warnings = print_filter_warnings
 
     def filter(self, element: Any) -> bool:
         """
@@ -35,10 +44,11 @@ class EpisodeLengthFilter(grain.transforms.Filter):
 
         current_episode_len = element["sequence_length"]
         if current_episode_len < self.seq_len:
-            print(
-                f"Filtering out episode with length {current_episode_len}, which is "
-                f"shorter than the requested sequence length {self.seq_len}."
-            )
+            if self.print_filter_warnings:
+                print(
+                    f"Filtering out episode with length {current_episode_len}, which is "
+                    f"shorter than the requested sequence length {self.seq_len}."
+                )
             return False
 
         return True
@@ -119,6 +129,8 @@ def get_dataloader(
     num_workers: int = 1,
     prefetch_buffer_size: int = 1,
     seed: int = 42,
+    *,
+    print_filter_warnings: bool = True,
 ):
     """
     Creates a data loading pipeline using Grain.
@@ -155,7 +167,11 @@ def get_dataloader(
 
     operations = [
         EpisodeLengthFilter(
-            seq_len=seq_len, image_h=image_h, image_w=image_w, image_c=image_c
+            seq_len=seq_len,
+            image_h=image_h,
+            image_w=image_w,
+            image_c=image_c,
+            print_filter_warnings=print_filter_warnings,
         ),
         ProcessEpisodeAndSlice(
             seq_len=seq_len, image_h=image_h, image_w=image_w, image_c=image_c

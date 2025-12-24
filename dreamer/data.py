@@ -422,7 +422,8 @@ def make_iterator(cfg: DatasetConfig):
             image_h=cfg.H,
             image_w=cfg.W,
             image_c=cfg.C, 
-            num_workers=1 # Use 1 worker to avoid multiprocessing complexity issues if any
+            num_workers=8,
+            print_filter_warnings=False,
         )
     else:
         raise ValueError(f"Unknown dataset source: {cfg.source}")
