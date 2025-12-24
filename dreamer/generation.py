@@ -72,8 +72,8 @@ def next_latent(
     schedule: DenoiseSchedule,
     action: jax.Array,                 # (B, 1)
     latent_shape: Tuple,                   # (B, 1, n_spatial, D_s)
-    prefill_length: int,
     rng: jax.Array,
+    prefill_length: int | None = None,
     agent_tokens: jax.Array | None = None,  # (B, T_ctx+1, n_agent, d_model)
     caches: KVCache | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
@@ -106,7 +106,7 @@ def next_latent(
     B = latent_shape[0]
 
     latents_ctx_noised = None
-    if latents_ctx is not None:
+    if latents_ctx is not None and caches is None:
         noise_prefill= jnp.zeros(latents_ctx[:, :prefill_length].shape)
         noise_decode = jax.random.normal(rng_ctx, latents_ctx[:, prefill_length:].shape)
         noise_ctx    = jnp.concatenate([noise_prefill, noise_decode], axis=1)
@@ -130,7 +130,7 @@ def next_latent(
             assert agent_tokens is None or agent_tokens.shape[1] == noisy_latent.shape[1] 
         
         else: # Used only for debugging.
-            assert latents_ctx_noised is not None and actions_ctx is not None
+            assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None
             latent_input  = jnp.concatenate([latents_ctx_noised, latent_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
             actions_input = jnp.concatenate([actions_ctx, action],   axis=1)  # (B, T_ctx+1)
 
@@ -247,7 +247,7 @@ def latent_rollout(
             action = jax.random.categorical(rng_action, logits) # (B, L)
         
         # Predict next latent (denoising)
-        latent_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, T_ctx, rng, caches=caches_t)
+        latent_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, rng, caches=caches_t)
         
         return (h_next, caches_next, rng), latent_next[:,0] # latent_next is (B, 1, n_spatial, D_s) 
 

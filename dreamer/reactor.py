@@ -26,7 +26,6 @@ User Input → input_to_action() → Action Array
 @dataclass
 class ReactorConfig:
     """Configuration for Dreamer reactor runtime."""
-    tokenizer_ckpt: str
     dynamics_ckpt: str
     policy_ckpt: Optional[str] = None
     
@@ -47,31 +46,46 @@ class ReactorConfig:
     batch_size: int = 1
 
 
-def input_to_action(mouse_pos: Tuple[int, int], controller_state: Dict[str, Any], action_dim: int = 121) -> jax.Array:
+def input_to_action(mouse_pos: Tuple[int, int], controller_state: Dict[str, Any], action_dim: int = 7) -> jax.Array:
     """
-    Convert mouse position and controller state to action representation.
+    Convert keyboard input to CoinRun action.
+    Used https://github.com/openai/coinrun/blob/master/coinrun/coinrun.cpp for reference 
+
+    CoinRun Action Space (NUM_ACTIONS = 7):
+        Action 0: No movement (dx=0, dy=0)
+        Action 1: Right → (dx=+1, dy=0) - mapped to D key
+        Action 2: Left ← (dx=-1, dy=0) - mapped to A key
+        Action 3: Jump/Up ↑ (dx=0, dy=+1) - mapped to W key
+        Action 4: Right-Jump ↗ (dx=+1, dy=+1) - mapped to E key
+        Action 5: Left-Jump ↖ (dx=-1, dy=+1) - mapped to Q key
+        Action 6: Down ↓ (dx=0, dy=-1) - mapped to S key
     
     Args:
-        mouse_pos: (mouse_x, mouse_y) position
+        mouse_pos: (mouse_x, mouse_y) position (unused for CoinRun)
         controller_state: Dictionary with keyboard button states
-        action_dim: Dimension of discretized mouse action space
+        action_dim: Dimension of action space (7 for CoinRun)
         
     Returns:
-        JAX array with shape (action_dim,) for mouse action
+        JAX array - categorical integer action index
     """
-    # For now, simple implementation: map mouse position to discrete action
-    # In practice, you'd use foveated discretization like VPT
-    # This is a placeholder - you should implement proper mouse action encoding
-    mouse_x, mouse_y = mouse_pos
+    # Key to action mapping (priority order: diagonals first, then cardinals)
+    key_map = [
+        ('q', 5),  # Left-Jump
+        ('e', 4),  # Right-Jump
+        ('w', 3),  # Jump/Up
+        ('s', 6),  # Down
+        ('d', 1),  # Right
+        ('a', 2),  # Left
+    ]
     
-    # Simple discretization: map to action_dim bins
-    # This is a simplified version - VPT uses more sophisticated foveated encoding
-    action_idx = (mouse_x % action_dim)  # Placeholder logic
+    action_idx = 0  # Default: no movement
+    for key, action in key_map:
+        if controller_state.get(key, False):
+            action_idx = action
+            break
     
-    action = jnp.zeros(action_dim)
-    action = action.at[action_idx].set(1.0)
-    
-    return action
+    # Return categorical integer (not one-hot)
+    return jnp.array(action_idx, dtype=jnp.int32)
 
 
 def policy(policy_model: PolicyHeadMTP, policy_vars: Dict, agent_tokens: jax.Array, rng: jax.Array) -> jax.Array:
@@ -107,7 +121,8 @@ def new_frame(
     dynamics_cache: Any,
     tokenizer_cache: Any,
     rng: jax.Array,
-) -> Tuple[np.ndarray, Any, Any, jax.Array]:
+    task: jax.Array | None,
+) -> Tuple[np.ndarray, Any, Any, Any, jax.Array]:
     """
     Generate next frame using dynamics model and decode to pixels.
     
@@ -131,14 +146,12 @@ def new_frame(
         dynamics=dynamics,
         dyn_vars=dynamics_vars,
         schedule=schedule,
-        action=action,  # Shape (B,) - categorical integer
+        action=action,  # Shape (1,) - categorical integer
         latent_shape=latent_shape,
-        prefill_length=0,  # No prefill for interactive generation
         rng=rng,
-        agent_tokens=None,
+        prefill_length=None,  # No prefill for interactive generation
+        agent_tokens=None,  # Not using agent tokens in reactor mode
         caches=dynamics_cache,
-        latents_ctx=None,
-        actions_ctx=None,
     )
     
     # Decode latent to frame
@@ -157,7 +170,7 @@ def new_frame(
     frame = jnp.clip(frame, 0, 255).astype(jnp.uint8)
     frame_np = np.array(frame[0, 0])  # Extract (H, W, C) from batch
     
-    return frame_np, dynamics_cache_updated, tokenizer_cache_updated, rng
+    return frame_np, h_last, dynamics_cache_updated, tokenizer_cache_updated, rng
 
 class DreamerVideoModel(VideoModel):
     """
@@ -172,25 +185,23 @@ class DreamerVideoModel(VideoModel):
 
     name: str = "template-video"
 
-    @command("send_mouse_control", description="Send mouse control inputs")
-    def get_inputs(self, mouse_x: int, mouse_y: int):
-        self.current_mouse_pos = (mouse_x, mouse_y)
-        action = input_to_action(self.current_mouse_pos, self.controller_state, self.cfg.action_dim)
-        self.current_action = action
-        
-    @command("send_keyboard_action", description="Send keyboard action for coinrun (0=up, 1=down, 2=left, 3=right, 4=null)")
-    def send_keyboard_action(self, action: int):
+    @command("send_keyboard_state", description="Update keyboard state (WASD+QE keys)")
+    def send_keyboard_state(self, w: bool = False, a: bool = False, s: bool = False, 
+                           d: bool = False, q: bool = False, e: bool = False):
         """
-        Accept a categorical keyboard action for coinrun.
+        Update keyboard state and compute action from current key presses.
         
         Args:
-            action: Integer in [0, 4] representing the action
-                   0 = up, 1 = down, 2 = left, 3 = right, 4 = null
+            w: W key pressed (Jump/Up)
+            a: A key pressed (Left)
+            s: S key pressed (Down)
+            d: D key pressed (Right)
+            q: Q key pressed (Left-Jump)
+            e: E key pressed (Right-Jump)
         """
-        if action < 0 or action > 4:
-            logger.warning(f"Invalid action {action}, clamping to [0, 4]")
-            action = max(0, min(4, action))
-        self.current_action = jnp.array(action, dtype=jnp.int32)
+        self.controller_state = {'w': w, 'a': a, 's': s, 'd': d, 'q': q, 'e': e}
+        action = input_to_action((0, 0), self.controller_state, self.cfg.action_dim)
+        self.current_action = action
         self.use_agent = False  # User input overrides agent mode
         
     @command("use_agent", description="Switch to policy-based action selection")
@@ -216,23 +227,17 @@ class DreamerVideoModel(VideoModel):
             # Try to construct from kwargs
             if 'tokenizer_ckpt' in kwargs and 'dynamics_ckpt' in kwargs:
                 cfg = ReactorConfig(
-                    tokenizer_ckpt=kwargs['tokenizer_ckpt'],
                     dynamics_ckpt=kwargs['dynamics_ckpt'],
                     policy_ckpt=kwargs.get('policy_ckpt', None),
                 )
             else:
                 raise ValueError("Must provide either cfg or tokenizer_ckpt/dynamics_ckpt in kwargs")
         
-        self.cfg = cfg
-        self.fps = fps
-        self.size = size  # (H, W)
+        self.cfg, self.fps, self.size = cfg, fps, size
         
         # Load models from checkpoints
-        logger.debug(f"Loading tokenizer from {cfg.tokenizer_ckpt}")
-        self.tokenizer, self.tokenizer_vars, self.tokenizer_cfg = Tokenizer.from_pretrained(cfg.tokenizer_ckpt)
-        
-        logger.debug(f"Loading dynamics from {cfg.dynamics_ckpt}")
-        self.dynamics, self.dynamics_vars, self.dynamics_cfg, _ = Dynamics.from_pretrained(cfg.dynamics_ckpt)
+        logger.debug(f"Loading dynamics model and tokenizer from {cfg.dynamics_ckpt}")
+        self.dynamics, self.dynamics_vars, self.dynamics_cfg, self.tokenizer, self.tokenizer_vars, self.tokenizer_cfg  = Dynamics.from_pretrained(cfg.dynamics_ckpt)
         
         # Load policy if checkpoint provided
         self.policy = None
@@ -243,23 +248,31 @@ class DreamerVideoModel(VideoModel):
             self.policy, self.policy_vars, self.policy_cfg = PolicyHeadMTP.from_pretrained(cfg.policy_ckpt)
         
         # Initialize denoising schedule
-        self.schedule = DenoiseSchedule.init(
-            num_steps=cfg.num_steps,
-            k_max=cfg.k_max,
-            tau_ctx=cfg.tau_ctx,
-        )
+        self.schedule = DenoiseSchedule.init(num_steps=cfg.num_steps, k_max=cfg.k_max, tau_ctx=cfg.tau_ctx)
         
         # Compute latent shape from dynamics config
-        # This will be properly set when we know n_spatial from the actual image size
-        self.latent_shape = None  # Will be set in start_session
+        H, W = self.size
+        patch_size = self.tokenizer_cfg.patch_size
+        packing_factor = self.dynamics.config.packing_factor
+        
+        # Calculate number of spatial tokens
+        patches_h = H // patch_size
+        patches_w = W // patch_size
+        n_patches = patches_h * patches_w
+        self.n_spatial = n_patches // packing_factor
+        
+        # Get bottleneck dimension from encoder config
+        D_s = self.tokenizer_cfg.encoder.d_bottleneck
+        
+        # Set latent shape: (1, 1, n_spatial, D_s)
+        self.latent_shape = (1, 1, self.n_spatial, D_s*packing_factor)
         
         # State variables (will be initialized per session)
         self.dynamics_cache = None
         self.tokenizer_cache = None
-        self.current_mouse_pos = (0, 0)
-        self.current_action = jnp.array(4, dtype=jnp.int32)  # Default to null action (4)
+        self.current_action = jnp.array(0, dtype=jnp.int32)  # Default to no movement (action 0)
         self.controller_state = {}
-        self.use_agent = False
+        self.use_agent = self.policy is not None
         
         # Random key
         self.rng = jax.random.PRNGKey(0)
@@ -282,38 +295,19 @@ class DreamerVideoModel(VideoModel):
         logger.debug("Starting user session...")
         
         # Initialize session state
-        self.current_mouse_pos = (0, 0)
-        self.current_action = jnp.array(4, dtype=jnp.int32)  # Default to null action (4)
+        self.current_action = jnp.array(0, dtype=jnp.int32)  # Default to no movement (action 0)
         self.controller_state = {}
-        self.use_agent = False
         
         # Determine latent dimensions from the tokenizer and dynamics config
-        H, W = self.size
-        patch_size = self.tokenizer_cfg.patch_size
-        packing_factor = self.dynamics.config.packing_factor
-        
-        # Calculate number of spatial tokens
-        # After patching: (H/patch_size) * (W/patch_size) patches
-        # After packing: patches // (packing_factor^2)
-        patches_h = H // patch_size
-        patches_w = W // patch_size
-        n_patches = patches_h * patches_w
-        n_spatial = n_patches // packing_factor ** 2
-        
-        # Get bottleneck dimension from encoder config
-        D_s = self.tokenizer_cfg.encoder.d_bottleneck
-        
-        # Set latent shape: (batch_size, 1, n_spatial, D_s)
-        self.latent_shape = (self.cfg.batch_size, 1, n_spatial, D_s)
         
         logger.debug(f"Latent shape: {self.latent_shape}")
         
         # Initialize KV caches for both dynamics and tokenizer
-        # We need a large enough window for interactive generation
-        window_size = 1024  # Large enough for continuous interactive use
+        # Window size: 1024 frames = ~34 seconds at 30 FPS. Cache will wrap after this period.
+        window_size = 1024
         self.dynamics_cache = self.dynamics.create_static_caches(
             batch_size=self.cfg.batch_size,
-            n_spatial=n_spatial,
+            n_spatial=self.n_spatial,
             window_size=window_size,
         )
         
@@ -338,10 +332,7 @@ class DreamerVideoModel(VideoModel):
                 # Determine action: either from policy or from user input
                 if self.use_agent and self.policy is not None:
                     # Use policy to generate action
-                    # Note: This requires agent_tokens from the last dynamics forward pass
-                    # For simplicity, we'll use the current action if policy is enabled
-                    # A full implementation would extract agent_tokens from dynamics
-                    current_action = self.current_action
+                    raise NotImplementedError("Policy-based action generation not implemented")
                 else:
                     # Use current action from user input
                     current_action = self.current_action
@@ -356,7 +347,7 @@ class DreamerVideoModel(VideoModel):
                     current_action = current_action.squeeze(axis=1)
                 
                 # Generate next frame
-                frame, self.dynamics_cache, self.tokenizer_cache, self.rng = new_frame(
+                frame, h, self.dynamics_cache, self.tokenizer_cache, self.rng = new_frame(
                     tokenizer=self.tokenizer,
                     tokenizer_vars=self.tokenizer_vars,
                     dynamics=self.dynamics,
@@ -367,6 +358,7 @@ class DreamerVideoModel(VideoModel):
                     dynamics_cache=self.dynamics_cache,
                     tokenizer_cache=self.tokenizer_cache,
                     rng=key,
+                    task=None,  # Not using task conditioning in reactor mode
                 )
                 
                 # Emit frame to reactor runtime
