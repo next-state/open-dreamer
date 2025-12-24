@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Tuple
 import time
 
+import einops
 import imageio.v3 as iio
 import jax
 import jax.numpy as jnp
@@ -109,12 +110,26 @@ def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float =
 # ---------------------------
 # Loss computation
 # ---------------------------
-
+def compute_psnr(pred, target):
+    """
+    Assumes pred and target are in the [0, 1] pixel range.
+    Computes PSNR per sample, then returns the mean PSNR. 
+    """
+    pred_clipped = jnp.clip(pred, 0.0, 1.0)
+    target_clipped = jnp.clip(target, 0.0, 1.0)
+    # Compute MSE per (B, T) sample: reduce over spatial and channel dims
+    mse_per_sample = einops.reduce(
+        (pred_clipped - target_clipped) ** 2,
+        "b t h w c -> b t",
+        reduction="mean"
+    )  
+    psnr_per_sample = -10.0 * jnp.log(mse_per_sample) / jnp.log(10.0)
+    return jnp.mean(psnr_per_sample)
+    
 def compute_flow_loss(
     z_pred: jnp.ndarray,
     z_target: jnp.ndarray,
     sigma: jnp.ndarray,
-    per_example: bool = False
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Flow matching loss in x-space (direct prediction of clean latents).
@@ -126,9 +141,9 @@ def compute_flow_loss(
         per_example: If True, return (B, T) losses; else return scalar
         
     Returns:
-        loss: tuple of scalar or (B, T) MSE loss
-            mse_per_step: tuple of scalar or (B, T) MSE loss per step weighted by ramp weight
-            mse_per_token: tuple of scalar or (B, T, S, D) MSE loss per token
+        loss: Tuple[jnp.float32, jnp.float32]
+            mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
+            mse_per_token: tuple of scalars. MSE loss 
     """
     mse_per_token = (z_pred - z_target) ** 2  # (B, T, S, D)
     mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
@@ -160,9 +175,9 @@ def compute_bootstrap_loss(
         sigma: (B, T) Signal levels
         
     Returns:
-        loss: tuple of scalar or (B, T) MSE loss
-            mse_per_step: tuple of scalar or (B, T) MSE loss per step weighted by ramp weight
-            mse_per_token: tuple of scalar or (B, T, S, D) MSE loss per token
+        loss: Tuple[jnp.float32, jnp.float32]
+            mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
+            mse_per_token: tuple of scalars. MSE loss 
     """
     # Convert full-step prediction to velocity
     v_hat = (z_pred - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
@@ -469,7 +484,7 @@ def run_evaluation(
         normalized_gt = normalize_with_dataset_stats(gt_frames[:, -horizon:], mean=0, std=dataset_std)
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
         
-        psnr = 10 * jnp.log10((1 / jnp.maximum(mse * (dataset_std ** 2), 1e-10)))
+        psnr = compute_psnr(pred_frames/255, gt_frames/255)
         print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
 
         # Build visualization
