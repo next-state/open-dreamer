@@ -24,9 +24,9 @@ log_every: 10
 write_video_every: 500
 
 # Learning rates
-lr_policy: 1e-4
-lr_reward: 1e-4
-lr_dynamics: 1e-5
+lr_policy: ${lr_dynamics}
+lr_reward: ${lr_dynamics}
+lr_dynamics: 1e-4
 dynamics_loss_weight: 0.1
 
 # Multi-token prediction settings
