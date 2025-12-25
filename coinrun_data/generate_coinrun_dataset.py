@@ -1,4 +1,4 @@
-"""
+"""generate_coinrun_dataset.py
 Generates a dataset of random-action CoinRun episodes.
 Episodes are saved individually as memory-mapped files for efficient loading.
 """
