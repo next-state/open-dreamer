@@ -143,8 +143,6 @@ def run(cfg: DynamicsConfig):
         # Normalize videos
         videos = batch["videos"]
         actions = batch["actions"]
-        # shift the actions by one and put the "first action token" = 15 at the beginning 
-        actions = jnp.concatenate((jnp.full_like(actions[:,0:1], fill_value = 15), actions[:,:-1]), axis=1)
         latents, _ = tokenizer.apply(tokenizer_vars, videos, packing_factor=cfg.dynamics.packing_factor, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
 
         dynamics_params, opt_state, aux = train_step(dynamics, tx, 
