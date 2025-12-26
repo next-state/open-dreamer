@@ -22,6 +22,11 @@ from dataclasses import dataclass
 from procgen import ProcgenEnv
 from reactor_runtime import VideoModel, command, get_ctx
 
+# Configure logging to show DEBUG level messages
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
@@ -136,7 +141,8 @@ class ProcgenVideoModel(VideoModel):
         """
         super().__init__()
         
-        logger.debug("Initializing Procgen CoinRun...")
+        logger.info("Initializing Procgen CoinRun...")
+        print("DEBUG: Initializing Procgen CoinRun...", flush=True)
         
         # Handle configuration
         if cfg is None:
@@ -162,79 +168,73 @@ class ProcgenVideoModel(VideoModel):
         self.controller_state = {}
         self.current_obs = None
         
-        logger.debug("Procgen CoinRun initialization complete")
+        logger.info("Procgen CoinRun initialization complete")
+        print("DEBUG: Procgen CoinRun initialization complete", flush=True)
 
-    def start_session(self):
-        # Emit a single frame
-        frame = np.random.rand(480, 640, 3)  # (H, W, 3) in RGB
-        get_ctx().emit_block(frame)
+    def start_session(self) -> None:
+        """
+        Start the environment's main processing loop.
         
-        # Emit multiple frames at once
-        frames = np.random.rand(10, 480, 640, 3)  # (N, H, W, 3)
-        get_ctx().emit_block(frames)
+        This method runs the CoinRun environment and emits frames to the Reactor runtime.
+        """
+        self._running = True
         
-        # Send a black frame
-        get_ctx().emit_block(None)
-
-    # def start_session(self) -> None:
-    #     """
-    #     Start the environment's main processing loop.
+        logger.info("Starting Procgen session...")
+        print("DEBUG: Starting Procgen session...", flush=True)
         
-    #     This method runs the CoinRun environment and emits frames to the Reactor runtime.
-    #     """
-    #     self._running = True
+        # Reset environment and initialize state
+        self.current_action = 0  # Default to no movement (action 0)
+        self.controller_state = {}
         
-    #     logger.debug("Starting Procgen session...")
+        # Reset environment to get initial observation
+        obs = self.env.reset()
+        # obs is a dict with key 'rgb', shape: (1, 64, 64, 3)
+        self.current_obs = obs['rgb'][0]  # Extract first batch element: (64, 64, 3)
         
-    #     # Reset environment and initialize state
-    #     self.current_action = 0  # Default to no movement (action 0)
-    #     self.controller_state = {}
+        logger.info(f"Environment initialized. Observation shape: {self.current_obs.shape}")
+        print(f"DEBUG: Environment initialized. Observation shape: {self.current_obs.shape}", flush=True)
+        logger.info("Session initialized, starting game loop...")
+        print("DEBUG: Session initialized, starting game loop...", flush=True)
         
-    #     # Reset environment to get initial observation
-    #     obs = self.env.reset()
-    #     # obs is a dict with key 'rgb', shape: (1, 64, 64, 3)
-    #     self.current_obs = obs['rgb'][0]  # Extract first batch element: (64, 64, 3)
-        
-    #     logger.debug(f"Environment initialized. Observation shape: {self.current_obs.shape}")
-    #     logger.debug("Session initialized, starting game loop...")
-        
-    #     try:
-    #         while get_ctx()._stop_evt.is_set() is False:
-    #             # Get current action from user input
-    #             current_action = self.current_action
+        try:
+            while get_ctx()._stop_evt.is_set() is False:
+                # Get current action from user input
+                current_action = self.current_action
                 
-    #             # Step the environment
-    #             obs, reward, done, info = self.env.step(np.array([current_action]))
+                # Step the environment
+                obs, reward, done, info = self.env.step(np.array([current_action]))
                 
-    #             # Extract frame from observation
-    #             # obs is a dict with key 'rgb', shape: (1, 64, 64, 3)
-    #             frame = obs['rgb'][0]  # Extract first batch element: (64, 64, 3)
+                # Extract frame from observation
+                # obs is a dict with key 'rgb', shape: (1, 64, 64, 3)
+                frame = obs['rgb'][0]  # Extract first batch element: (64, 64, 3)
                 
-    #             # Ensure frame is uint8
-    #             if frame.dtype != np.uint8:
-    #                 frame = np.clip(frame, 0, 255).astype(np.uint8)
+                # Ensure frame is uint8
+                if frame.dtype != np.uint8:
+                    frame = np.clip(frame, 0, 255).astype(np.uint8)
                 
-    #             # Check if episode ended
-    #             if done[0]:
-    #                 logger.debug(f"Episode ended. Reward: {reward[0]}")
-    #                 # Reset environment
-    #                 obs = self.env.reset()
-    #                 frame = obs['rgb'][0]
+                # Check if episode ended
+                if done[0]:
+                    logger.info(f"Episode ended. Reward: {reward[0]}")
+                    print(f"DEBUG: Episode ended. Reward: {reward[0]}", flush=True)
+                    # Reset environment
+                    obs = self.env.reset()
+                    frame = obs['rgb'][0]
                 
-    #             # Update current observation
-    #             self.current_obs = frame
+                # Update current observation
+                self.current_obs = frame
                 
-    #             # Emit frame to reactor runtime
-    #             self.emit_frame(frame)
+                # Emit frame to reactor runtime
+                get_ctx().emit_block(frame)
                 
-    #     except Exception as e:
-    #         logger.error(f"Error in session: {e}", exc_info=True)
-    #         self._running = False
-    #         time.sleep(2)  # Fake machine resetting time
-    #         raise e
-    #     finally:
-    #         time.sleep(2)  # Fake machine resetting time
-    #         self._running = False
-    #         if self.env is not None:
-    #             self.env.close()
-    #         logger.debug("Procgen session ended.")
+        except Exception as e:
+            logger.error(f"Error in session: {e}", exc_info=True)
+            self._running = False
+            time.sleep(2)  # Fake machine resetting time
+            raise e
+        finally:
+            time.sleep(2)  # Fake machine resetting time
+            self._running = False
+            if self.env is not None:
+                self.env.close()
+            logger.info("Procgen session ended.")
+            print("DEBUG: Procgen session ended.", flush=True)
