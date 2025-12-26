@@ -21,7 +21,7 @@ dynamics:
     time_every: 4
     mlp_ratio: 4
     dropout_rate: 0.0
-    k_max: 8
+    k_max: 256
 
 bootstrap_start: 5_000
 self_fraction: 0.25
@@ -30,4 +30,4 @@ max_steps: 1_000_000_000
 log_every: 100
 lr: 1e-3
 
-write_video_every: 500
+write_video_every: 3
