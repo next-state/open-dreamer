@@ -140,7 +140,7 @@ class ProcgenVideoModel(VideoModel):
 
     def __init__(
         self,
-        fps: int = 3,
+        fps: int = 5,
         size: Tuple[int, int] = (64, 64),
         cfg: Optional[ProcgenReactorConfig] = None,
         **kwargs,
@@ -216,7 +216,13 @@ class ProcgenVideoModel(VideoModel):
         logger.info("Session initialized, starting game loop...")
         print("DEBUG: Session initialized, starting game loop...", flush=True)
 
+        # Calculate frame time based on FPS
+        frame_time = 1.0 / self.fps
+        logger.info(f"Running at {self.fps} FPS (frame time: {frame_time:.3f}s)")
+        print(f"DEBUG: Running at {self.fps} FPS (frame time: {frame_time:.3f}s)", flush=True)
+
         try:
+            last_frame_time = time.time()
             while get_ctx()._stop_evt.is_set() is False:
                 # Get current action from user input
                 current_action = self.current_action
@@ -244,8 +250,15 @@ class ProcgenVideoModel(VideoModel):
                 self.current_obs = frame
 
                 # Emit frame to reactor runtime
-                time.sleep(0.2)
                 get_ctx().emit_block(frame)
+                
+                # Sleep to maintain target FPS
+                current_time = time.time()
+                elapsed = current_time - last_frame_time
+                sleep_time = max(0, frame_time - elapsed)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                last_frame_time = time.time()
 
         except Exception as e:
             logger.error(f"Error in session: {e}", exc_info=True)
