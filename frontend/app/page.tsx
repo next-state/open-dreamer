@@ -52,7 +52,11 @@ export default function Home() {
             </a>
           </div>
         </div>
-        <ReactorProvider modelName="dreamervideo" local>
+        <ReactorProvider 
+          modelName="procgen-coinrun" 
+          local
+          insecureApiKey="local-dev"
+        >
           <GameInterface />
         </ReactorProvider>
       </div>
