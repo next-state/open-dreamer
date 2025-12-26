@@ -52,7 +52,7 @@ class DenoiseSchedule:
         
         d = 1 / num_steps
         step_idx = int(math.log2(num_steps))
-        tau_values = jnp.linspace(0.0, 1.0, num_steps + 1)
+        tau_values = jnp.linspace(0.0, 1.0, num_steps)
         tau_indices = jnp.arange(num_steps) * (k_max // num_steps)
         
         # Compute noise level for context during autoregressive rollout
@@ -224,7 +224,7 @@ def latent_rollout(
     # Run dynamics on context to prefill caches and get last hidden state
     # Use clean signal for ground truth context 
     step_idx_ctx= jnp.full((B, T_ctx), schedule.step_idx, dtype=jnp.int32)
-    tau_idx_ctx = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)
+    tau_idx_ctx = jnp.full((B, T_ctx), schedule.k_max - 1, dtype=jnp.int32)
     
     _, (h_seq, caches) = dynamics.apply(dyn_vars, actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx, agent_tokens=initial_agent_tokens, caches=caches, deterministic=True)
 
