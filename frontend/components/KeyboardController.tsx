@@ -4,20 +4,19 @@ import { useEffect, useCallback, useRef, useState } from "react";
 import { useReactor } from "@reactor-team/js-sdk";
 
 /**
- * Maps keyboard keys to coinrun actions:
- * 0 = up, 1 = down, 2 = left, 3 = right, 4 = null
+ * Maps keyboard codes to key names for the backend
  */
-const KEY_TO_ACTION: Record<string, number> = {
-  // WASD keys
-  KeyW: 0, // up
-  KeyS: 1, // down
-  KeyA: 2, // left
-  KeyD: 3, // right
-  // Arrow keys
-  ArrowUp: 0,
-  ArrowDown: 1,
-  ArrowLeft: 2,
-  ArrowRight: 3,
+const KEY_CODE_TO_NAME: Record<string, string> = {
+  KeyW: "w",
+  KeyA: "a",
+  KeyS: "s",
+  KeyD: "d",
+  KeyQ: "q",
+  KeyE: "e",
+  ArrowUp: "w",
+  ArrowLeft: "a",
+  ArrowDown: "s",
+  ArrowRight: "d",
 };
 
 interface KeyboardControllerProps {
@@ -35,88 +34,68 @@ export function KeyboardController({
   }));
 
   const pressedKeys = useRef<Set<string>>(new Set());
-  const currentAction = useRef<number>(4); // Default to null action
   const [activeKeys, setActiveKeys] = useState<string[]>([]);
 
-  const updateAction = useCallback(() => {
-    // Priority: up > down > left > right
-    let action = 4; // null
+  const updateKeyboardState = useCallback(() => {
+    if (!enabled) return;
 
-    if (pressedKeys.current.has("KeyW") || pressedKeys.current.has("ArrowUp")) {
-      action = 0; // up
-    } else if (
-      pressedKeys.current.has("KeyS") ||
-      pressedKeys.current.has("ArrowDown")
-    ) {
-      action = 1; // down
-    } else if (
-      pressedKeys.current.has("KeyA") ||
-      pressedKeys.current.has("ArrowLeft")
-    ) {
-      action = 2; // left
-    } else if (
-      pressedKeys.current.has("KeyD") ||
-      pressedKeys.current.has("ArrowRight")
-    ) {
-      action = 3; // right
-    }
+    // Build keyboard state object
+    const keyState = {
+      w: pressedKeys.current.has("KeyW") || pressedKeys.current.has("ArrowUp"),
+      a: pressedKeys.current.has("KeyA") || pressedKeys.current.has("ArrowLeft"),
+      s: pressedKeys.current.has("KeyS") || pressedKeys.current.has("ArrowDown"),
+      d: pressedKeys.current.has("KeyD") || pressedKeys.current.has("ArrowRight"),
+      q: pressedKeys.current.has("KeyQ"),
+      e: pressedKeys.current.has("KeyE"),
+    };
 
-    // Only send if action changed
-    if (action !== currentAction.current && enabled) {
-      currentAction.current = action;
-      sendMessage({ type: "send_keyboard_action", data: { action } });
-    }
+    // Send keyboard state to backend
+    sendMessage({ type: "send_keyboard_state", data: keyState });
 
     // Update active keys display
     const active: string[] = [];
-    if (pressedKeys.current.has("KeyW") || pressedKeys.current.has("ArrowUp")) {
-      active.push("↑");
-    }
-    if (pressedKeys.current.has("KeyS") || pressedKeys.current.has("ArrowDown")) {
-      active.push("↓");
-    }
-    if (pressedKeys.current.has("KeyA") || pressedKeys.current.has("ArrowLeft")) {
-      active.push("←");
-    }
-    if (pressedKeys.current.has("KeyD") || pressedKeys.current.has("ArrowRight")) {
-      active.push("→");
-    }
+    if (keyState.w) active.push("↑");
+    if (keyState.s) active.push("↓");
+    if (keyState.a) active.push("←");
+    if (keyState.d) active.push("→");
+    if (keyState.q) active.push("Q");
+    if (keyState.e) active.push("E");
     setActiveKeys(active);
   }, [sendMessage, enabled]);
 
   const handleKeyDown = useCallback(
     (event: KeyboardEvent) => {
       const code = event.code;
-      if (KEY_TO_ACTION.hasOwnProperty(code)) {
+      if (KEY_CODE_TO_NAME.hasOwnProperty(code)) {
         event.preventDefault();
         pressedKeys.current.add(code);
-        updateAction();
+        updateKeyboardState();
       }
     },
-    [updateAction]
+    [updateKeyboardState]
   );
 
   const handleKeyUp = useCallback(
     (event: KeyboardEvent) => {
       const code = event.code;
-      if (KEY_TO_ACTION.hasOwnProperty(code)) {
+      if (KEY_CODE_TO_NAME.hasOwnProperty(code)) {
         event.preventDefault();
         pressedKeys.current.delete(code);
-        updateAction();
+        updateKeyboardState();
       }
     },
-    [updateAction]
+    [updateKeyboardState]
   );
 
   useEffect(() => {
     if (!enabled) {
-      // Reset to null action when disabled
-      if (currentAction.current !== 4) {
-        currentAction.current = 4;
-        sendMessage({ type: "send_keyboard_action", data: { action: 4 } });
-      }
+      // Reset to no keys pressed when disabled
       pressedKeys.current.clear();
       setActiveKeys([]);
+      sendMessage({ 
+        type: "send_keyboard_state", 
+        data: { w: false, a: false, s: false, d: false, q: false, e: false } 
+      });
       return;
     }
 

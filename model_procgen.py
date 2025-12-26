@@ -14,18 +14,18 @@ User Input → input_to_action() → Action Index
                             emit_frame() → User sees result
 """
 
-import numpy as np
 import logging
 import time
-from typing import Tuple, Optional, Dict, Any
 from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
 from procgen import ProcgenEnv
 from reactor_runtime import VideoModel, command, get_ctx
 
 # Configure logging to show DEBUG level messages
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -33,24 +33,26 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ProcgenReactorConfig:
     """Configuration for Procgen reactor runtime."""
-    
+
     # Environment configuration
     env_name: str = "coinrun"
     num_levels: int = 0  # 0 = infinite procedural levels
     start_level: int = 0
     distribution_mode: str = "easy"  # "easy", "hard", or "exploration"
-    
+
     # Rendering
     render_mode: str = "rgb_array"
-    
+
     # Action space configuration (CoinRun has 7 discrete actions)
     action_dim: int = 7
 
 
-def input_to_action(mouse_pos: Tuple[int, int], controller_state: Dict[str, Any], action_dim: int = 7) -> int:
+def input_to_action(
+    mouse_pos: Tuple[int, int], controller_state: Dict[str, Any], action_dim: int = 7
+) -> int:
     """
     Convert keyboard input to CoinRun action.
-    Used https://github.com/openai/coinrun/blob/master/coinrun/coinrun.cpp for reference 
+    Used https://github.com/openai/coinrun/blob/master/coinrun/coinrun.cpp for reference
 
     CoinRun Action Space (NUM_ACTIONS = 7):
         Action 0: No movement (dx=0, dy=0)
@@ -60,41 +62,41 @@ def input_to_action(mouse_pos: Tuple[int, int], controller_state: Dict[str, Any]
         Action 4: Right-Jump ↗ (dx=+1, dy=+1) - mapped to E key
         Action 5: Left-Jump ↖ (dx=-1, dy=+1) - mapped to Q key
         Action 6: Down ↓ (dx=0, dy=-1) - mapped to S key
-    
+
     Args:
         mouse_pos: (mouse_x, mouse_y) position (unused for CoinRun)
         controller_state: Dictionary with keyboard button states
         action_dim: Dimension of action space (7 for CoinRun)
-        
+
     Returns:
         Integer action index
     """
     # Key to action mapping (priority order: diagonals first, then cardinals)
     key_map = [
-        ('q', 5),  # Left-Jump
-        ('e', 4),  # Right-Jump
-        ('w', 3),  # Jump/Up
-        ('s', 6),  # Down
-        ('d', 1),  # Right
-        ('a', 2),  # Left
+        ("q", 2),  # Left-Jump # correct
+        ("e", 8),  # Right-Jump
+        ("w", 5),  # Jump/Up # correct
+        ("s", 3),  # Down
+        ("d", 7),  # Right # correct
+        ("a", 1),  # Left #correct
     ]
-    
-    action_idx = 0  # Default: no movement
+
+    action_idx = 4  # Default: no movement
     for key, action in key_map:
         if controller_state.get(key, False):
             action_idx = action
             break
-    
+
     return action_idx
 
 
 class ProcgenVideoModel(VideoModel):
     """
     Procgen environment integration with Reactor VideoModel interface.
-    
+
     This version uses the actual CoinRun environment for testing the Reactor integration
     before deploying the full Dreamer model.
-    
+
     Demonstrates:
     - Method-based command system with automatic schema generation
     - Environment integration pattern
@@ -105,11 +107,18 @@ class ProcgenVideoModel(VideoModel):
     name: str = "procgen-coinrun"
 
     @command("send_keyboard_state", description="Update keyboard state (WASD+QE keys)")
-    def send_keyboard_state(self, w: bool = False, a: bool = False, s: bool = False, 
-                           d: bool = False, q: bool = False, e: bool = False):
+    def send_keyboard_state(
+        self,
+        w: bool = False,
+        a: bool = False,
+        s: bool = False,
+        d: bool = False,
+        q: bool = False,
+        e: bool = False,
+    ):
         """
         Update keyboard state and compute action from current key presses.
-        
+
         Args:
             w: W key pressed (Jump/Up)
             a: A key pressed (Left)
@@ -118,10 +127,10 @@ class ProcgenVideoModel(VideoModel):
             q: Q key pressed (Left-Jump)
             e: E key pressed (Right-Jump)
         """
-        self.controller_state = {'w': w, 'a': a, 's': s, 'd': d, 'q': q, 'e': e}
+        self.controller_state = {"w": w, "a": a, "s": s, "d": d, "q": q, "e": e}
         action = input_to_action((0, 0), self.controller_state, self.cfg.action_dim)
         self.current_action = action
-        
+
     @command("reset_env", description="Reset the environment to a new level")
     def reset_environment(self):
         """Reset the environment to generate a new level."""
@@ -129,10 +138,16 @@ class ProcgenVideoModel(VideoModel):
             obs = self.env.reset()
             logger.debug("Environment reset to new level")
 
-    def __init__(self, fps: int = 15, size: Tuple[int, int] = (64, 64), cfg: Optional[ProcgenReactorConfig] = None, **kwargs):
+    def __init__(
+        self,
+        fps: int = 3,
+        size: Tuple[int, int] = (64, 64),
+        cfg: Optional[ProcgenReactorConfig] = None,
+        **kwargs,
+    ):
         """
         Initialize Procgen environment.
-        
+
         Args:
             fps: Target frames per second (CoinRun typically runs at 15 FPS)
             size: (height, width) of output video (CoinRun native is 64x64)
@@ -140,18 +155,18 @@ class ProcgenVideoModel(VideoModel):
             **kwargs: Additional arguments
         """
         super().__init__()
-        
+
         logger.info("Initializing Procgen CoinRun...")
         print("DEBUG: Initializing Procgen CoinRun...", flush=True)
-        
+
         # Handle configuration
         if cfg is None:
             cfg = ProcgenReactorConfig()
-        
+
         self.cfg = cfg
         self.fps = fps
         self.size = size
-        
+
         # Create Procgen environment
         # num_envs=1 for single environment
         self.env = ProcgenEnv(
@@ -162,70 +177,76 @@ class ProcgenVideoModel(VideoModel):
             distribution_mode=self.cfg.distribution_mode,
             render_mode=self.cfg.render_mode,
         )
-        
+
         # State variables
         self.current_action = 0  # Default to no movement (action 0)
         self.controller_state = {}
         self.current_obs = None
-        
+
         logger.info("Procgen CoinRun initialization complete")
         print("DEBUG: Procgen CoinRun initialization complete", flush=True)
 
     def start_session(self) -> None:
         """
         Start the environment's main processing loop.
-        
+
         This method runs the CoinRun environment and emits frames to the Reactor runtime.
         """
         self._running = True
-        
+
         logger.info("Starting Procgen session...")
         print("DEBUG: Starting Procgen session...", flush=True)
-        
+
         # Reset environment and initialize state
         self.current_action = 0  # Default to no movement (action 0)
         self.controller_state = {}
-        
+
         # Reset environment to get initial observation
         obs = self.env.reset()
         # obs is a dict with key 'rgb', shape: (1, 64, 64, 3)
-        self.current_obs = obs['rgb'][0]  # Extract first batch element: (64, 64, 3)
-        
-        logger.info(f"Environment initialized. Observation shape: {self.current_obs.shape}")
-        print(f"DEBUG: Environment initialized. Observation shape: {self.current_obs.shape}", flush=True)
+        self.current_obs = obs["rgb"][0]  # Extract first batch element: (64, 64, 3)
+
+        logger.info(
+            f"Environment initialized. Observation shape: {self.current_obs.shape}"
+        )
+        print(
+            f"DEBUG: Environment initialized. Observation shape: {self.current_obs.shape}",
+            flush=True,
+        )
         logger.info("Session initialized, starting game loop...")
         print("DEBUG: Session initialized, starting game loop...", flush=True)
-        
+
         try:
             while get_ctx()._stop_evt.is_set() is False:
                 # Get current action from user input
                 current_action = self.current_action
-                
+
                 # Step the environment
                 obs, reward, done, info = self.env.step(np.array([current_action]))
-                
+
                 # Extract frame from observation
                 # obs is a dict with key 'rgb', shape: (1, 64, 64, 3)
-                frame = obs['rgb'][0]  # Extract first batch element: (64, 64, 3)
-                
+                frame = obs["rgb"][0]  # Extract first batch element: (64, 64, 3)
+
                 # Ensure frame is uint8
                 if frame.dtype != np.uint8:
                     frame = np.clip(frame, 0, 255).astype(np.uint8)
-                
+
                 # Check if episode ended
                 if done[0]:
                     logger.info(f"Episode ended. Reward: {reward[0]}")
                     print(f"DEBUG: Episode ended. Reward: {reward[0]}", flush=True)
                     # Reset environment
                     obs = self.env.reset()
-                    frame = obs['rgb'][0]
-                
+                    frame = obs["rgb"][0]
+
                 # Update current observation
                 self.current_obs = frame
-                
+
                 # Emit frame to reactor runtime
+                time.sleep(0.2)
                 get_ctx().emit_block(frame)
-                
+
         except Exception as e:
             logger.error(f"Error in session: {e}", exc_info=True)
             self._running = False
