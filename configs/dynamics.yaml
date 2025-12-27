@@ -4,7 +4,7 @@ defaults:
 
 run_name: dynamics
 tokenizer_ckpt: "logs/tokenizer/checkpoints"
-ckpt_save_every: 1000
+ckpt_save_every: 10000
 
 # Dynamics specific
 dynamics:
@@ -26,7 +26,7 @@ dynamics:
 bootstrap_start: 5_000
 self_fraction: 0.25
 
-max_steps: 1_000_000_000
+max_steps: 200_000
 log_every: 100
 lr: 1e-3
 

@@ -31,7 +31,6 @@ from dreamer.models import Dynamics, Tokenizer
 from dreamer.training import run_evaluation, shortcut_forcing_step  # NEW: Reusable training components
 from dreamer.utils import (
     _ensure_dir,
-    from_dict,
     init_dynamics,
     make_manager,
     make_state,
@@ -169,7 +168,7 @@ def run(cfg: DynamicsConfig):
         if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
             # Use current batch as validation data (simplest approach)
             val_videos = batch["videos"]
-            run_evaluation(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, dynamics_params, dynamics_constants, val_videos, actions, vis_dir, rng)
+            run_evaluation(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, dynamics_params, dynamics_constants, val_videos, jnp.asarray(actions), vis_dir, rng)
 
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:
