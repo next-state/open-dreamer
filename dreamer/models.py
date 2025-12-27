@@ -138,7 +138,7 @@ def create_transformer_caches(
     return caches
 
 
-class RotaryEmbedding1D(nn.Module):
+class RotaryEmbeddingBase(nn.Module):
     dim: int
     theta: float = 10000.0
     dtype: Any = jnp.float32
@@ -147,6 +147,35 @@ class RotaryEmbedding1D(nn.Module):
         inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
         self.inv_freq = self.variable('constants', 'inv_freq', lambda: inv_freq)
 
+    def _rotate(self, x, fr):
+        """
+        Apply Rotary Positional Embeddings (RoPE) to a tensor x using pre-computed frequencies.
+        x: (..., D)
+        fr: (..., D/2)
+        """
+        # x: (..., D) -> (..., D/2, 2)
+        x_pairs = rearrange(x, '... (d two) -> ... d two', two=2)
+        x_r, x_i = x_pairs[..., 0], x_pairs[..., 1]
+
+        # Rotation math
+        c = jnp.cos(fr)
+        s = jnp.sin(fr)
+
+        # Apply rotation
+        out_r = x_r * c - x_i * s
+        out_i = x_r * s + x_i * c
+        
+        # Stack back and flatten
+        out = jnp.stack([out_r, out_i], axis=-1)
+        out = rearrange(out, '... d two -> ... (d two)')
+        return out
+
+    def _apply_twins(self, q, k, fr):
+        """Helper to rotate both q and k with same frequencies."""
+        return self._rotate(q, fr), self._rotate(k, fr)
+
+
+class RotaryEmbedding1D(RotaryEmbeddingBase):
     def __call__(self, q, k, start_pos=0):
         """
         q: (B, T, N, H)
@@ -155,49 +184,50 @@ class RotaryEmbedding1D(nn.Module):
         """
         T = q.shape[1]
         t_indices = jnp.arange(T, dtype=self.dtype) + start_pos
+
+        # inv_freq is (dim/2,)
         freqs = jnp.outer(t_indices, self.inv_freq.value) # (T, dim//2)
 
-        freqs_cos = jnp.cos(freqs)
-        freqs_sin = jnp.sin(freqs)
-
+        # Broadcast for heads and batch
         # (1, T, 1, Dim//2)
-        freqs_cos = freqs_cos[None, :, None, :]
-        freqs_sin = freqs_sin[None, :, None, :]
+        freqs = freqs[None, :, None, :]
+        return self._apply_twins(q, k, freqs)
 
-        return self._apply(q, k, freqs_cos, freqs_sin)
 
-    def _apply(self, xq, xk, freqs_cos, freqs_sin):
+class RotaryEmbedding2D(RotaryEmbeddingBase):
+    def __call__(self, q, k, coords):
         """
-        Apply Rotary Positional Embeddings (RoPE) to queries and keys using real sin/cos.
-        xq: (B, T, N, H)
-        xk: (B, T, K, H)
-        freqs_cos: (L, H/2)
-        freqs_sin: (L, H/2)
+        q: (B, T, N, H)
+        k: (B, T, K, H)
+        coords: (S, 2)
         """
-        # Rearrange to (..., H/2, 2)
-        xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
-        xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
+        H = q.shape[-1]
+        if H % 4 != 0:
+            raise ValueError(f"Head dim {H} must be divisible by 4 for 2D split.")
 
-        xq_r, xq_i = xq_pairs[..., 0], xq_pairs[..., 1]
-        xk_r, xk_i = xk_pairs[..., 0], xk_pairs[..., 1]
+        H_half = H // 2
+        
+        # inv_freq is (dim/2,) where dim is the head_dim. 
+        inv_f = self.inv_freq.value[:H_half//2]
 
-        # Rotation:
-        # x' = x cos - y sin
-        # y' = x sin + y cos
-        xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
-        xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
+        # coords: (..., S, 2) -> y: (..., S), x: (..., S)
+        y = coords[..., 0]
+        x = coords[..., 1]
 
-        xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
-        xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
-
-        # Stack back and flatten
-        xq_out = jnp.stack([xq_out_r, xq_out_i], axis=-1)
-        xk_out = jnp.stack([xk_out_r, xk_out_i], axis=-1)
-
-        xq_out = rearrange(xq_out, '... d two -> ... (d two)')
-        xk_out = rearrange(xk_out, '... d two -> ... (d two)')
-
-        return xq_out, xk_out
+        # Prepare freqs for Y and X
+        fr_y = jnp.einsum('...s,d->...sd', y, inv_f)
+        fr_x = jnp.einsum('...s,d->...sd', x, inv_f)
+        
+        # Split q, k into halves along head dim
+        q_y, q_x = q[..., :H_half], q[..., H_half:]
+        k_y, k_x = k[..., :H_half], k[..., H_half:]
+        
+        q_y_out, k_y_out = self._apply_twins(q_y, k_y, fr_y)
+        q_x_out, k_x_out = self._apply_twins(q_x, k_x, fr_x)
+        
+        q_out = jnp.concatenate([q_y_out, q_x_out], axis=-1)
+        k_out = jnp.concatenate([k_y_out, k_x_out], axis=-1)
+        return q_out, k_out
 
 
 class MAEReplacer(nn.Module):
@@ -297,6 +327,7 @@ class GroupedQueryAttention(nn.Module):
     qk_norm_type: str | None = None  # "qknorm", or "quest"
     is_causal: bool = False
     rope_theta: float = 10000.0
+    rope_type: str = "1d"  # "1d" or "2d"
 
     def setup(self):
         assert self.dim % self.num_heads == 0
@@ -314,12 +345,18 @@ class GroupedQueryAttention(nn.Module):
             self.q_ln = nn.RMSNorm(use_scale=True)
             self.k_ln = nn.RMSNorm(use_scale=True)
 
-        self.rope = RotaryEmbedding1D(
-            dim=head_dim,
-            theta=self.rope_theta
-        )
+        if self.rope_type == "1d":
+            self.rope = RotaryEmbedding1D(
+                dim=head_dim,
+                theta=self.rope_theta
+            )
+        else:
+            self.rope = RotaryEmbedding2D(
+                dim=head_dim,
+                theta=self.rope_theta
+            )
 
-    def __call__(self, x, mask, *args, cache: Optional[KVCache] = None):
+    def __call__(self, x, mask, *args, cache: Optional[KVCache] = None, coords: Optional[jnp.ndarray] = None):
         """
         https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html
         B = batch size
@@ -346,8 +383,13 @@ class GroupedQueryAttention(nn.Module):
             scale = 1.0
 
         # RoPE
-        start_pos = cache.index if cache is not None else 0
-        q, k = self.rope(q, k, start_pos=start_pos)
+        if self.rope_type == "1d":
+            start_pos = cache.index if cache is not None else 0
+            q, k = self.rope(q, k, start_pos=start_pos)
+        else:
+            if coords is None:
+                raise ValueError("coords required for 2D RoPE")
+            q, k = self.rope(q, k, coords=coords)
 
         # KV cache
         if self.is_causal and cache is not None:
@@ -393,7 +435,7 @@ class SpaceSelfAttention(nn.Module):
     rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None):
+    def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None, coords: Optional[jnp.ndarray] = None):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B T) S D")
@@ -408,7 +450,8 @@ class SpaceSelfAttention(nn.Module):
             rope_theta=self.rope_theta,
             deterministic=deterministic,
             is_causal=False,
-        )(x, mask=mask, cache=None)
+            rope_type="2d",
+        )(x, mask=mask, cache=None, coords=coords)
 
         out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
         return out, None  # Return None for cache consistency
@@ -423,7 +466,7 @@ class TimeSelfAttention(nn.Module):
     rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None):
+    def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None, coords: Optional[jnp.ndarray] = None):
         # mask does nothing, but is required for API consistency
         # x: (B, T, S, D) -> attention across T, causal
         B, T, S, D = x.shape
@@ -438,6 +481,7 @@ class TimeSelfAttention(nn.Module):
             rope_theta=self.rope_theta,
             deterministic=deterministic,
             is_causal=True,
+            rope_type="1d",
         )(x, mask=None, cache=cache)
 
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
@@ -475,10 +519,10 @@ class BlockCausalLayer(nn.Module):
         self.mlp = MLP(self.dim, self.mlp_ratio, self.dropout_rate)
 
     @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None):
+    def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None, coords: Optional[jnp.ndarray] = None):
         # --- Attention (time or space, depending on layer_index) ---
         y = self.norm(x)
-        y, new_cache = self.attn(y, mask=mask, deterministic=deterministic, cache=cache)
+        y, new_cache = self.attn(y, mask=mask, deterministic=deterministic, cache=cache, coords=coords)
         x = x + y
 
         # --- MLP ---
@@ -501,7 +545,7 @@ class BlockCausalTransformer(nn.Module):
     rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool, caches: Optional[Dict[int, KVCache]] = None):
+    def __call__(self, x, mask, *, deterministic: bool, caches: Optional[Dict[int, KVCache]] = None, coords: Optional[jnp.ndarray] = None):
         """
         Args:
             x: input tensor
@@ -523,7 +567,7 @@ class BlockCausalTransformer(nn.Module):
                 dropout_rate=self.dropout_rate, qk_norm_type=self.qk_norm_type,
                 mlp_ratio=self.mlp_ratio, layer_index=i, time_every=self.time_every,
                 rope_theta=self.rope_theta,
-            )(x, mask=mask, deterministic=deterministic, cache=cache_i)
+            )(x, mask=mask, deterministic=deterministic, cache=cache_i, coords=coords)
 
             if new_caches is not None and new_cache_i is not None:
                 new_caches[time_index] = new_cache_i
@@ -587,15 +631,31 @@ class Encoder(nn.Module):
         latents = repeat(self.latents, "... -> b t ...", b=B, t=T)
         tokens = jnp.concatenate([latents, proj_patches_masked], axis=2)  # (B,T,S=(Np+Nl),D)
 
+        # We need shapes for coordinates
+        n_h = H // self.patch_size
+        n_w = W // self.patch_size
+        
+        # Latents shape: assume square grid
+        lat_side = int(math.isqrt(self.n_latents))
+        assert lat_side * lat_side == self.n_latents, f"Latents must be a square grid for 2D RoPE, got {self.n_latents}"
+        lat_shape = (lat_side, lat_side)
+
+        layout = TokenLayout(
+            segments=(
+                (Modality.LATENT, self.n_latents),
+                (Modality.IMAGE, patch_tokens.shape[-2]),
+            ),
+            shapes=(
+                lat_shape,
+                (n_h, n_w)
+            )
+        )
         # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
-        layout = TokenLayout((
-            (Modality.LATENT, self.n_latents),
-            (Modality.IMAGE, patch_tokens.shape[-2]),
-            ))
-        mask = layout.make_mask("encoder", B, T)
+        mask = layout.make_mask("encoder")
+        coords = layout.make_coordinates()
 
         # 5) Feed tokens into transformer
-        encoded_tokens, _ = self.transformer(tokens, mask=mask, deterministic=deterministic)
+        encoded_tokens, _ = self.transformer(tokens, mask=mask, deterministic=deterministic, coords=coords)
 
         # 6) Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
@@ -672,13 +732,28 @@ class Decoder(nn.Module):
         tokens = jnp.concatenate([latents, patches], axis=-2)
 
         # 5) Make mask
-        layout = TokenLayout((
-            (Modality.LATENT, N_l),
-            (Modality.IMAGE, self.n_patches)
-            ))
-        mask = layout.make_mask("decoder", B, T)
+        # Shapes
+        n_h = self.H // self.patch_size
+        n_w = self.W // self.patch_size
+        
+        lat_side = int(math.isqrt(N_l))
+        assert lat_side * lat_side == N_l, f"Latents must be a square grid for 2D RoPE, got {N_l}"
+        lat_shape = (lat_side, lat_side)
 
-        x, new_caches = self.transformer(tokens, mask=mask, deterministic=deterministic, caches=caches)
+        layout = TokenLayout(
+            segments=(
+                (Modality.LATENT, N_l),
+                (Modality.IMAGE, self.n_patches)
+            ),
+            shapes=(
+                lat_shape,
+                (n_h, n_w)
+            )
+        )
+        mask = layout.make_mask("decoder")
+        coords = layout.make_coordinates()
+
+        x, new_caches = self.transformer(tokens, mask=mask, deterministic=deterministic, caches=caches, coords=coords)
         # 6) Prediction head over the patch-query slice
 
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
@@ -919,10 +994,34 @@ class Dynamics(nn.Module):
         # make the layout for masking
         modalities = [Modality.ACTION, Modality.SHORTCUT_SIGNAL, Modality.SHORTCUT_STEP, Modality.SPATIAL, Modality.REGISTER, Modality.AGENT]
         segments = tuple((modality, tok.shape[2]) for modality, tok in zip(modalities, toks))
-        layout = TokenLayout(segments)
-        mask = layout.make_mask("wm_agent", B, T)
+        
+        # Determine shapes for spatial token coord generation
+        # "spatial_tokens" is our packed latents
+        n_spatial = spatial_tokens.shape[2]
+        side = int(math.isqrt(n_spatial))
+        assert side * side == n_spatial, f"Dynamics spatial tokens must be a square grid for 2D RoPE, got {n_spatial}"
+        spatial_shape = (side, side)
+            
+        # Same for registers
+        n_reg = self.n_register
+        reg_side = int(math.isqrt(n_reg))
+        assert reg_side * reg_side == n_reg, f"Register tokens must be a square grid for 2D RoPE, got {n_reg}"
+        reg_shape = (reg_side, reg_side)
+            
+        shapes = []
+        for m, n in segments:
+            if m == Modality.SPATIAL:
+                shapes.append(spatial_shape)
+            elif m == Modality.REGISTER:
+                shapes.append(reg_shape)
+            else:
+                shapes.append((1, 1)) # Global modalities at (0,0)
 
-        x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches)
+        layout = TokenLayout(segments=segments, shapes=tuple(shapes))
+        mask = layout.make_mask("wm_agent")
+        coords = layout.make_coordinates()
+
+        x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches, coords=coords)
 
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
         x1_hat = self.flow_x_head(spatial_tokens)

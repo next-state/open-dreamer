@@ -51,6 +51,7 @@ class TokenLayout:
     Ordered token layout for a single timestep: segments define the order.
     """
     segments: Tuple[Tuple[Modality, int], ...]  # e.g., ((Modality.LATENT, n_latents), (Modality.IMAGE, n_patches), ...)
+    shapes: Tuple[Tuple[int, int], ...] | None = None  # Optional: (H, W) for each segment. None means (1, 1).
 
     def S(self) -> int:
         return sum(n for _, n in self.segments)
@@ -68,9 +69,9 @@ class TokenLayout:
             idx += n
         return out
 
-    def make_mask(self, mode: str, B: int, T: int):
+    def make_mask(self, mode: str):
         """
-        Returns a (B*T, 1, S, S) boolean mask indicating allowed key for each query index, per mode.
+        Returns a (1, 1, S, S) boolean mask indicating allowed key for each query index, per mode.
         S = number of tokens in a single frame.
 
         Modes:
@@ -122,10 +123,54 @@ class TokenLayout:
         else:
             raise ValueError(f"Unknown mode {mode}")
 
-        # Save (S,S)
-        mask = repeat(mask, "q k -> (b t) h q k", b=B, t=T, h=1)
+        # Save (1, 1, S, S)
+        mask = mask[None, None, :, :]
         mask = jax.lax.stop_gradient(mask)
         return mask
+
+    def make_coordinates(self) -> jnp.ndarray:
+        """
+        Returns spatial coordinates (S, 2) for 2D RoPE.
+        Values are float32 indices. Modalities like Latents/Registers are scaled to match Image resolution.
+        """
+        coords_list = []
+        
+        # If no shapes provided, assume defaults (everything at 0,0)
+        shapes = self.shapes if self.shapes is not None else [(1, 1)] * len(self.segments)
+        
+        # heuristic: find max image dimensions to use as the "physical space" limits
+        max_H, max_W = 1, 1
+        for (m, n), (h, w) in zip(self.segments, shapes):
+            if m == Modality.IMAGE:
+                max_H = max(max_H, h)
+                max_W = max(max_W, w)
+                
+        for (m, n), (h, w) in zip(self.segments, shapes):
+            if n == 0:
+                continue
+
+            if m == Modality.IMAGE:
+                ys, xs = jnp.meshgrid(jnp.arange(h), jnp.arange(w), indexing='ij')
+                c = jnp.stack([ys.flatten(), xs.flatten()], axis=-1)
+                
+            elif m in (Modality.LATENT, Modality.SPATIAL, Modality.REGISTER):
+                # latents/spatial/registers are treated as spatial grids.
+                # we want them to "cover" the same field of view.
+                assert n == h * w, f"Modality {m} tokens must be a square grid for 2D RoPE (n={n}, h={h}, w={w})"
+                
+                ys = jnp.linspace(0, max_H - 1, h)
+                xs = jnp.linspace(0, max_W - 1, w)
+                ys, xs = jnp.meshgrid(ys, xs, indexing='ij')
+                c = jnp.stack([ys.flatten(), xs.flatten()], axis=-1)
+            
+            else:
+                # All other modalities are "global" -> (0,0)
+                c = jnp.zeros((n, 2), dtype=jnp.float32)
+            
+            coords_list.append(c)
+            
+        coords = jnp.concatenate(coords_list, axis=0) # (S, 2)
+        return coords
 
 
 def normalize_with_dataset_stats(videos, *, mean, std):
