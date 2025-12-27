@@ -215,8 +215,8 @@ class RotaryEmbedding2D(RotaryEmbeddingBase):
         x = coords[..., 1]
 
         # Prepare freqs for Y and X
-        fr_y = jnp.einsum('...s,d->...sd', y, inv_f)
-        fr_x = jnp.einsum('...s,d->...sd', x, inv_f)
+        fr_y = jnp.einsum('...s,d->...sd', y, inv_f)[..., None, :]
+        fr_x = jnp.einsum('...s,d->...sd', x, inv_f)[..., None, :]
         
         # Split q, k into halves along head dim
         q_y, q_x = q[..., :H_half], q[..., H_half:]
