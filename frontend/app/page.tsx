@@ -1,13 +1,10 @@
 "use client";
 
-import {
-  ReactorProvider,
-} from "@reactor-team/js-sdk";
 import { ReactorStatus } from "@/components/ReactorStatus";
 import { GameView } from "@/components/GameView";
 import { KeyboardController } from "@/components/KeyboardController";
 import { AgentToggle } from "@/components/AgentToggle";
-import { useReactor } from "@reactor-team/js-sdk";
+import { useReactor, ReactorProvider } from "@reactor-team/js-sdk";
 
 function GameInterface() {
   const { status } = useReactor((state) => ({
@@ -55,7 +52,6 @@ export default function Home() {
         <ReactorProvider 
           modelName="procgen-coinrun" 
           local
-          insecureApiKey="local-dev"
         >
           <GameInterface />
         </ReactorProvider>
