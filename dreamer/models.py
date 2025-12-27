@@ -650,7 +650,6 @@ class Encoder(nn.Module):
                 (n_h, n_w)
             )
         )
-        # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
         mask = layout.make_mask("encoder")
         coords = layout.make_coordinates()
 
