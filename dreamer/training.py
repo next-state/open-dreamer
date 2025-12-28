@@ -23,7 +23,7 @@ import wandb
 
 from dreamer.generation import DenoiseSchedule
 from dreamer.sampler import sample_video
-from dreamer.utils import _ensure_dir, normalize_with_dataset_stats
+from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border
 
 
 # ---------------------------
@@ -489,6 +489,10 @@ def run_evaluation(
 
         # Build visualization
         num_videos = min(4, pred_frames.shape[0])
+        
+        # Add red border to context frames in prediction
+        pred_frames = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
+        
         frames = [floor_frames, gt_frames, pred_frames]
         stacked_frames = jnp.stack(frames)[:, :num_videos]
         videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
