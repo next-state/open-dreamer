@@ -52,6 +52,7 @@ class TokenLayout:
     """
     segments: Tuple[Tuple[Modality, int], ...]  # e.g., ((Modality.LATENT, n_latents), (Modality.IMAGE, n_patches), ...)
 
+    @property
     def S(self) -> int:
         return sum(n for _, n in self.segments)
 
@@ -86,14 +87,14 @@ class TokenLayout:
             - Agent tokens (query) can attend to ALL tokens (key).
         """
         modality_ids = self.modality_ids()
-        S = int(modality_ids.shape[0])
+        S = self.S
 
         # Broadcast helpers
-        q_idx = jnp.arange(S)[:, None]       # (S,1)
-        k_idx = jnp.arange(S)[None, :]       # (1,S)
+        q_idx = jnp.arange(S)[:, None]       # (S, 1)
+        k_idx = jnp.arange(S)[None, :]       # (1, S)
 
-        q_mod = modality_ids[q_idx]      # (S,1)
-        k_mod = modality_ids[k_idx]      # (1,S)
+        q_mod = modality_ids[q_idx]      # (S, 1)
+        k_mod = modality_ids[k_idx]      # (1, S)
 
         if mode == "encoder":
             # latents -> all; non-latents -> same modality only
