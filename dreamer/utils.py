@@ -305,7 +305,7 @@ def _to_uint8(img_f32):
     """Convert float32 image to uint8."""
     return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
 
-def apply_border(frames: jnp.ndarray, color: jnp.ndarray = jnp.array([255, 0, 0], dtype=jnp.uint8), width: int = 2) -> jnp.ndarray:
+def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jnp.ndarray:
     """
     Add a colored border to a batch of frames.
     """
