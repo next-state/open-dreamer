@@ -68,9 +68,9 @@ class TokenLayout:
             idx += n
         return out
 
-    def make_mask(self, mode: str, B: int, T: int):
+    def make_mask(self, mode: str):
         """
-        Returns a (B*T, 1, S, S) boolean mask indicating allowed key for each query index, per mode.
+        Returns a (1, 1, S, S) boolean mask indicating allowed key for each query index, per mode.
         S = number of tokens in a single frame.
 
         Modes:
@@ -122,8 +122,8 @@ class TokenLayout:
         else:
             raise ValueError(f"Unknown mode {mode}")
 
-        # Save (S,S)
-        mask = repeat(mask, "q k -> (b t) h q k", b=B, t=T, h=1)
+        # Save (1, 1, S, S)
+        mask = mask[None, None, :, :]
         mask = jax.lax.stop_gradient(mask)
         return mask
 
