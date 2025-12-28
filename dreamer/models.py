@@ -587,12 +587,11 @@ class Encoder(nn.Module):
         latents = repeat(self.latents, "... -> b t ...", b=B, t=T)
         tokens = jnp.concatenate([latents, proj_patches_masked], axis=2)  # (B,T,S=(Np+Nl),D)
 
-        # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
         layout = TokenLayout((
             (Modality.LATENT, self.n_latents),
             (Modality.IMAGE, patch_tokens.shape[-2]),
             ))
-        mask = layout.make_mask("encoder", B, T)
+        mask = layout.make_mask("encoder")  # (1, 1, q_len, k_len)
 
         # 5) Feed tokens into transformer
         encoded_tokens, _ = self.transformer(tokens, mask=mask, deterministic=deterministic)
@@ -676,7 +675,7 @@ class Decoder(nn.Module):
             (Modality.LATENT, N_l),
             (Modality.IMAGE, self.n_patches)
             ))
-        mask = layout.make_mask("decoder", B, T)
+        mask = layout.make_mask("decoder")
 
         x, new_caches = self.transformer(tokens, mask=mask, deterministic=deterministic, caches=caches)
         # 6) Prediction head over the patch-query slice
@@ -920,7 +919,7 @@ class Dynamics(nn.Module):
         modalities = [Modality.ACTION, Modality.SHORTCUT_SIGNAL, Modality.SHORTCUT_STEP, Modality.SPATIAL, Modality.REGISTER, Modality.AGENT]
         segments = tuple((modality, tok.shape[2]) for modality, tok in zip(modalities, toks))
         layout = TokenLayout(segments)
-        mask = layout.make_mask("wm_agent", B, T)
+        mask = layout.make_mask("wm_agent")
 
         x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches)
 
