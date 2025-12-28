@@ -141,7 +141,7 @@ def next_latent(
             step_idx_curr   = jnp.full((B, 1), step_idx, dtype=jnp.int32)
             step_indices    = jnp.concatenate([step_idx_prefill, step_idx_decode, step_idx_curr], axis=1)
             
-            tau_idx_prefill= jnp.full((B, prefill_length), schedule.k_max, dtype=jnp.int32)
+            tau_idx_prefill= jnp.full((B, prefill_length), schedule.k_max - 1, dtype=jnp.int32)
             tau_idx_decode = jnp.full((B, decode_length), schedule.tau_idx_ctx, dtype=jnp.int32)
             tau_idx_curr   = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
             tau_indices    = jnp.concatenate([tau_idx_prefill, tau_idx_decode, tau_idx_curr], axis=1) # (B, T_ctx+1)
@@ -237,12 +237,11 @@ def next_frame(
         deterministic=True,
     )
     
-    # Convert to numpy and clip to valid range
+    # Clip to valid range (keep as JAX array)
     # frame shape: (B, 1, H, W, C)
     frame = jnp.clip(frame, 0, 255).astype(jnp.uint8)
-    frame_np = np.array(frame[0, 0])  # Extract (H, W, C) from batch
     
-    return frame_np, h_last, dynamics_cache_updated, tokenizer_cache_updated, rng
+    return frame, h_last, dynamics_cache_updated, tokenizer_cache_updated, rng
 
 def latent_rollout(
     dynamics: Dynamics,

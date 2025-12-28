@@ -576,8 +576,14 @@ class Encoder(nn.Module):
         patch_tokens = patchify(normalized_videos, patch=self.patch_size)
         proj_patches = self.patch_proj(patch_tokens)  # (B,T,Np,D)
 
-        # 2) MAE mask-and-replace on patch tokens (encoder input only)
-        proj_patches_masked, patch_mask, keep_prob = self.mask_and_replace(proj_patches)
+        # 2) MAE mask-and-replace on patch tokens (encoder input only during training)
+        if deterministic:
+            # Skip MAE masking during inference
+            proj_patches_masked = proj_patches
+            patch_mask = jnp.zeros((B, T, proj_patches.shape[2], 1), dtype=jnp.bool_)
+            keep_prob = jnp.ones((B, T, 1))
+        else:
+            proj_patches_masked, patch_mask, keep_prob = self.mask_and_replace(proj_patches)
         # patch_mask is (B,T,Np,1), need to expand to pixels (B,T,Np, P*P)
         patch_mask_expanded = jnp.repeat(patch_mask, self.patch_size**2, axis=-1)
         frame_mask = unpatchify(patch_mask_expanded, self.patch_size, H, W)

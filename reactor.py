@@ -30,21 +30,12 @@ User Input → input_to_action() → Action Array
 @dataclass
 class ReactorConfig:
     """Configuration for Dreamer reactor runtime."""
-    dynamics_ckpt: str
+    dynamics_ckpt: str = 'logs/dynamics/checkpoints'
     policy_ckpt: Optional[str] = None
-    
-    # Action space configuration
-    action_dim: int = 121  # Discretized mouse actions (foveated)
-    keyboard_dim: int = 23  # Binary keyboard actions
     
     # Denoising schedule
     num_steps: int = 4  # Number of denoising steps per frame
-    k_max: int = 256
-    tau_ctx: float = 0.9
-    
-    # Initial context
-    context_length: int = 16  # Number of initial frames to use as context
-    use_noise_init: bool = True  # Start from noise if no context provided
+    tau_ctx: float = .9
     
     # Batch size (usually 1 for interactive)
     batch_size: int = 1
@@ -81,7 +72,7 @@ def input_to_action(controller_state: Dict[str, Any]) -> jax.Array:
             break
     
     # Return categorical integer (not one-hot)
-    return jnp.array(action_idx, dtype=jnp.int32)[None,None]
+    return jnp.full((1,1), action_idx, dtype=jnp.int32)
 
 
 def policy(policy_model: PolicyHeadMTP, policy_vars: Dict, agent_tokens: jax.Array, rng: jax.Array) -> jax.Array:
@@ -130,7 +121,7 @@ class DreamerVideoModel(VideoModel):
     def switch_to_policy(self, use_agent: bool):
         self.use_agent = use_agent
 
-    def __init__(self, fps: int = 30, size: Tuple[int, int] = (480, 640), cfg: Optional[ReactorConfig] = None):
+    def __init__(self, fps: int = 30, size: Tuple[int, int] = (480, 640), cfg: Optional[ReactorConfig] = ReactorConfig()):
         """
         Initialize model. Heavy weight loading happens here during container startup, before any user connects.
         
@@ -161,7 +152,7 @@ class DreamerVideoModel(VideoModel):
             self.policy, self.policy_vars, self.policy_cfg = PolicyHeadMTP.from_pretrained(cfg.policy_ckpt)
         
         # Initialize denoising schedule
-        self.schedule = DenoiseSchedule.init(num_steps=cfg.num_steps, k_max=cfg.k_max, tau_ctx=cfg.tau_ctx)
+        self.schedule = DenoiseSchedule.init(num_steps=cfg.num_steps, k_max=self.dynamics_cfg.k_max, tau_ctx=cfg.tau_ctx)
         
         # Compute latent shape from dynamics config
         H, W = self.size
@@ -202,11 +193,12 @@ class DreamerVideoModel(VideoModel):
         """
         self._running = True
         
+        rng_warmup, rng_encoder, self.rng = jax.random.split(self.rng, num = 3)
         logger.info("Starting Dreamer session...")
         print("DEBUG: Starting Dreamer session...", flush=True)
         
         # Initialize session state
-        self.current_action = jnp.array(4, dtype=jnp.int32)[None,None]  # Default to no movement (action 4)
+        self.current_action = jnp.full((1,1), 4, dtype=jnp.int32)  # Default to no movement (action 4)
         self.controller_state = {}
         
         logger.info(f"Latent shape: {self.latent_shape}")
@@ -227,11 +219,11 @@ class DreamerVideoModel(VideoModel):
         # Initialize with context from canonical starting frames
         logger.info("Loading canonical starting frames...")
         init_frames = np.load('assets/start_frames/level_000.npy')  # Shape: (16, 64, 64, 3)
-        init_frames_jax = jnp.array(init_frames)[None,:0]  # Add batch dim -> (1, 1, 64, 64, 3)
+        init_frames_jax = jnp.array(init_frames)[None, :1]  # Add batch dim, take first frame -> (1, 1, 64, 64, 3)
         
         # Encode frames to latents
         logger.info("Encoding frames to latents...")
-        init_latents = self.tokenizer.apply(
+        init_latents, _ = self.tokenizer.apply(
             self.tokenizer_vars,
             init_frames_jax,
             method=self.tokenizer.encode,
@@ -241,19 +233,16 @@ class DreamerVideoModel(VideoModel):
         
         # Warm up dynamics cache by processing context latents
         logger.info("Warming up dynamics cache...")
+        assert isinstance(init_latents, jax.Array)
+        B, T_ctx = init_latents.shape[0], init_latents.shape[1]
         
         # Create dummy actions for context (no-op actions)
-        actions_ctx = jnp.full((0, 0), 4, dtype=jnp.int32)  # Action 4 = no movement
-        
-        # Process context through dynamics to populate cache
-        step_indices = jnp.full((0, 0), self.schedule.step_idx_ctx, dtype=jnp.int32)
-        tau_indices = jnp.full((0, 0), self.schedule.tau_idx_ctx, dtype=jnp.int32)
+        actions_ctx = jnp.full((B, T_ctx), 4, dtype=jnp.int32)  # Action 4 = no movement
+        step_indices = jnp.full((B, T_ctx), self.schedule.step_idx_ctx, dtype=jnp.int32)
+        tau_indices = jnp.full((B, T_ctx), self.schedule.tau_idx_ctx, dtype=jnp.int32)
         
         # Add slight noise to context latents as per tau_ctx
-        rng_warmup, self.rng = jax.random.split(self.rng)
-        latents_noised = init_latents * self.schedule.tau_ctx + (1 - self.schedule.tau_ctx) * jax.random.normal(
-            rng_warmup, shape=init_latents.shape, dtype=init_latents.dtype
-        )
+        latents_noised = init_latents*self.schedule.tau_ctx + (1-self.schedule.tau_ctx)*jax.random.normal(rng_warmup, shape=init_latents.shape, dtype=init_latents.dtype)
         
         # Run through dynamics to warm up cache
         _, (_, self.dynamics_cache) = self.dynamics.apply(
@@ -286,6 +275,16 @@ class DreamerVideoModel(VideoModel):
         logger.info("Session initialized, starting generation loop...")
         print("DEBUG: Session initialized, starting generation loop...", flush=True)
         
+        # Create JIT-compiled version of next_frame with static arguments prebaked
+        import functools
+        self.next_frame_compiled = jax.jit(functools.partial(
+            next_frame,
+            tokenizer=self.tokenizer,
+            dynamics=self.dynamics,
+            schedule=self.schedule,
+            latent_shape=self.latent_shape,
+        ))
+        
         # Calculate frame time based on FPS
         frame_time = 1.0 / self.fps
         logger.info(f"Running at {self.fps} FPS (frame time: {frame_time:.3f}s)")
@@ -305,19 +304,18 @@ class DreamerVideoModel(VideoModel):
                     current_action = self.current_action
                 
                 # Generate next frame
-                frame, h, self.dynamics_cache, self.tokenizer_cache, self.rng = next_frame(
-                    tokenizer=self.tokenizer,
+                frame_jax, h, self.dynamics_cache, self.tokenizer_cache, self.rng = self.next_frame_compiled(
                     tokenizer_vars=self.tokenizer_vars,
-                    dynamics=self.dynamics,
                     dynamics_vars=self.dynamics_vars,
-                    schedule=self.schedule,
                     action=current_action,
-                    latent_shape=self.latent_shape,
                     dynamics_cache=self.dynamics_cache,
                     tokenizer_cache=self.tokenizer_cache,
                     rng=key,
                     task=None,  # Not using task conditioning in reactor mode
                 )
+                
+                # Convert to numpy outside JIT boundary
+                frame = np.array(frame_jax[0, 0])  # Extract (H, W, C) from batch
                 
                 # Emit frame to reactor runtime
                 get_ctx().emit_block(frame)
