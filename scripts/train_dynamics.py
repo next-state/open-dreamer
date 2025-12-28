@@ -31,12 +31,13 @@ from dreamer.models import Dynamics, Tokenizer
 from dreamer.training import run_evaluation, shortcut_forcing_step  # NEW: Reusable training components
 from dreamer.utils import (
     _ensure_dir,
-    from_dict,
     init_dynamics,
     make_manager,
     make_state,
     maybe_save,
     try_restore,
+    get_lr_schedule,
+    count_parameters_by_component,
 )
 # jax.config.update("jax_debug_nans", True)
 # Suppress absl info logs
@@ -108,9 +109,25 @@ def run(cfg: DynamicsConfig):
     rng, dynamics_variables = init_dynamics(rng, dynamics, tokenizer_cfg)
     dynamics_params = dynamics_variables["params"]
     dynamics_constants = dynamics_variables.get("constants", FrozenDict())
+    param_counts = count_parameters_by_component(dynamics_params)
+    print(f"Parameter counts: {param_counts}")
 
     # Optimizer
-    tx = optax.adamw(cfg.lr)
+    if cfg.lr_schedule == "constant":
+        lr = cfg.lr
+        lr_schedule = None
+    else:
+        lr_schedule = get_lr_schedule(
+            cfg.lr_schedule,
+            cfg.init_lr,
+            cfg.max_lr,
+            cfg.lr_end,
+            cfg.max_steps,
+            cfg.warmup_steps,
+            cfg.wsd_decay_steps,
+        )
+        lr = lr_schedule
+    tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
     opt_state = tx.init(dynamics_params)
 
     # Logging & checkpointing
@@ -137,6 +154,8 @@ def run(cfg: DynamicsConfig):
     dataset = make_iterator(tokenizer_cfg.dataset)
     pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
     for step, batch in pbar:
+        if step > cfg.max_steps:
+            break
         # Data
         rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
 
@@ -157,6 +176,7 @@ def run(cfg: DynamicsConfig):
                 metrics={
                     "flow_mse": aux["flow_mse"],
                     "boot_mse": aux["bootstrap_mse"],
+                    "lr": cfg.lr if lr_schedule is None else lr_schedule(step),
                 },
                 pbar=pbar,
             )
@@ -169,7 +189,7 @@ def run(cfg: DynamicsConfig):
         if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
             # Use current batch as validation data (simplest approach)
             val_videos = batch["videos"]
-            run_evaluation(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, dynamics_params, dynamics_constants, val_videos, actions, vis_dir, rng)
+            run_evaluation(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, dynamics_params, dynamics_constants, val_videos, jnp.asarray(actions), vis_dir, rng)
 
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:

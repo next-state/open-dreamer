@@ -262,6 +262,8 @@ def run(cfg: TokenizerConfig):
     for step, batch in pbar:
         if step < start_step:
             continue
+        if step >= cfg.max_steps:
+            break
 
         rng, master_key = jax.random.split(rng)
         

@@ -169,7 +169,7 @@ def next_latent(
         tau_indices = jnp.full((B, 1), schedule.tau_idx_ctx,  dtype=jnp.int32)
         
         rng, new_random_key = jax.random.split(rng)
-        latent_noised_caching = latent_t_final*(1-schedule.tau_ctx) + jax.random.normal(new_random_key, shape=latent_t_final.shape, dtype=latent_t_final.dtype)
+        latent_noised_caching = latent_t_final*schedule.tau_ctx + (1-schedule.tau_ctx)*jax.random.normal(new_random_key, shape=latent_t_final.shape, dtype=latent_t_final.dtype)
 
         _, (h_seq_final, caches_new) = dynamics.apply(dyn_vars, action, step_indices, tau_indices, latent_noised_caching, agent_tokens=agent_tokens, deterministic=True, caches=caches)
         h_last = h_seq_final[:, -1, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
