@@ -5,8 +5,7 @@ import einops
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
-import time
-from flax.core import FrozenDict, freeze, unfreeze
+from flax.core import freeze, unfreeze
 import flax
 from typing import Optional, Tuple, Any, Dict
 from einops import rearrange, repeat

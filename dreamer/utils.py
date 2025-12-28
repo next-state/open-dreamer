@@ -7,7 +7,7 @@ import optax
 import operator
 from flax.struct import dataclass
 from flax.core import freeze, unfreeze, FrozenDict
-from einops import rearrange, repeat
+from einops import rearrange
 from enum import IntEnum
 from typing import Tuple
 import numpy as np
@@ -45,7 +45,7 @@ class Modality(IntEnum):
     AGENT = 7
     # add more as needed
 
-@dataclass  # immutable, PyTree-friendly
+@dataclass
 class TokenLayout:
     """
     Ordered token layout for a single timestep: segments define the order.
