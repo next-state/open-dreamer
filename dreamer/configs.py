@@ -104,7 +104,6 @@ class TokenizerConfig:
     # learning rate schedule
     # - "constant": use lr
     # - "wsd": warmup -> hold -> decay
-    # - "cos": warmup cosine decay
     lr_schedule: str = "constant"
     init_lr: float = 0.0
     max_lr: float = 3e-4
@@ -224,9 +223,16 @@ class DynamicsConfig:
     wandb_project: str | None = None  # if None, uses run_name as project
 
     # train
-    max_steps: int = 1_000_000_000
+    max_steps: int = 50_000
     log_every: int = 5_000
-    lr: float = 3e-4
+    lr: float = 1e-4
+    lr_schedule: str = "constant"
+    init_lr: float = 0.0
+    max_lr: float = 1e-4
+    lr_end: float = 0.0
+    warmup_steps: int = 5_000
+    wsd_decay_steps: int = 20_000
+
     # schedule
     bootstrap_start: int = 5_000
     self_fraction: float = 0.25
