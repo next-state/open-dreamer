@@ -17,6 +17,9 @@ dataset:
   W: 64
   C: 3
 
+  dataset_mean: [0.5, 0.5, 0.5]
+  dataset_std: [0.288675, 0.288675, 0.288675]
+
 encoder:
   n_latents: 16
   d_bottleneck: 32
@@ -56,7 +59,7 @@ decoder:
 max_steps: 300_000
 log_every: 100
 lr: 3e-4
-tokenizer_loss_type: "mae" # "mse" | "mae"
+tokenizer_loss_type: "mse" # "mse" | "mae"
 
 # learning rate schedule
 lr_schedule: wsd  # constant | wsd | cos
