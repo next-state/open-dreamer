@@ -1,8 +1,9 @@
 import math
 import einops
 import jax
+import numpy as np
 import jax.numpy as jnp
-from typing import Tuple 
+from typing import Any, Dict, Tuple 
 
 from .models import Dynamics, KVCache, PolicyHeadMTP, Tokenizer
 
@@ -181,6 +182,67 @@ def next_latent(
 
     return latent_t_final, h_last, caches_new, rng  
 
+def next_frame(
+    tokenizer: Tokenizer,
+    tokenizer_vars: Dict,
+    dynamics: Dynamics,
+    dynamics_vars: Dict,
+    schedule: DenoiseSchedule,
+    action: jax.Array,
+    latent_shape: Tuple,
+    dynamics_cache: Any,
+    tokenizer_cache: Any,
+    rng: jax.Array,
+    task: jax.Array | None,
+) -> Tuple[np.ndarray, Any, Any, Any, jax.Array]:
+    """
+    Generate next frame using dynamics model and decode to pixels.
+    
+    Args:
+        tokenizer: Tokenizer model for decoding
+        tokenizer_vars: Tokenizer parameters
+        dynamics: Dynamics model
+        dynamics_vars: Dynamics parameters
+        schedule: Denoising schedule
+        action: Action to condition on (B,) - categorical integer array
+        latent_shape: Shape of latent (B, 1, n_spatial, D_s)
+        dynamics_cache: KV cache for dynamics model from previous steps
+        tokenizer_cache: KV cache for tokenizer decoder from previous steps
+        rng: Random key
+        
+    Returns:
+        Tuple of (frame as numpy array, updated dynamics cache, updated tokenizer cache, updated rng)
+    """
+    # Generate next latent using τ-ladder denoising
+    latent, h_last, dynamics_cache_updated, rng = next_latent(
+        dynamics=dynamics,
+        dyn_vars=dynamics_vars,
+        schedule=schedule,
+        action=action,  # Shape (1,) - categorical integer
+        latent_shape=latent_shape,
+        rng=rng,
+        prefill_length=None,  # No prefill for interactive generation
+        agent_tokens=None,  # Not using agent tokens in reactor mode
+        caches=dynamics_cache,
+    )
+    
+    # Decode latent to frame
+    # latent shape: (B, 1, n_spatial, D_s)
+    frame, tokenizer_cache_updated = tokenizer.apply(
+        tokenizer_vars,
+        latent,
+        packing_factor=dynamics.config.packing_factor,
+        caches=tokenizer_cache,
+        method=tokenizer.decode,
+        deterministic=True,
+    )
+    
+    # Convert to numpy and clip to valid range
+    # frame shape: (B, 1, H, W, C)
+    frame = jnp.clip(frame, 0, 255).astype(jnp.uint8)
+    frame_np = np.array(frame[0, 0])  # Extract (H, W, C) from batch
+    
+    return frame_np, h_last, dynamics_cache_updated, tokenizer_cache_updated, rng
 
 def latent_rollout(
     dynamics: Dynamics,
