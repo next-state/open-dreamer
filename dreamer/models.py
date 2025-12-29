@@ -633,7 +633,14 @@ class Decoder(nn.Module):
 
     dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675)
-    
+
+    def get_token_layout(self) -> TokenLayout:
+        n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
+        return TokenLayout((
+            (Modality.LATENT, self.n_latents),
+            (Modality.IMAGE, n_patches)
+        ))
+
     def setup(self):
         self.n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
         self.up_proj = nn.Dense(self.d_model, name="up_proj")
@@ -668,10 +675,7 @@ class Decoder(nn.Module):
         tokens = jnp.concatenate([latents, patches], axis=-2)
 
         # 5) Make mask
-        layout = TokenLayout((
-            (Modality.LATENT, N_l),
-            (Modality.IMAGE, self.n_patches)
-            ))
+        layout = self.get_token_layout()
         mask = layout.make_mask("decoder")
 
         x, new_caches = self.transformer(tokens, mask=mask, deterministic=deterministic, caches=caches)
@@ -723,16 +727,12 @@ class Tokenizer(nn.Module):
         Returns:
             Dictionary mapping time layer indices to KVCache objects.
         """
-        # In the decoder, time attention sees (B * S) independent sequences
-        # where S = N_latents + N_patches (total number of spatial tokens)
-        n_patches = (self.config.decoder.H // self.config.decoder.patch_size) * \
-                    (self.config.decoder.W // self.config.decoder.patch_size)
-        S_total = self.config.decoder.n_latents + n_patches
+        layout = self.decoder.get_token_layout()
         
         return create_transformer_caches(
             depth=self.config.decoder.depth,
             time_every=self.config.decoder.time_every,
-            flattened_batch_size=batch_size * S_total,
+            flattened_batch_size=batch_size * layout.S,
             window_size=window_size,
             num_kv_heads=self.config.decoder.n_kv_heads,
             head_dim=self.config.decoder.d_model // self.config.decoder.n_heads,
@@ -807,7 +807,6 @@ class Dynamics(nn.Module):
         )
         self.action_encoder = ActionEncoder(d_model=self.d_model, action_dim = self.config.action_dim)
 
-
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
@@ -833,6 +832,18 @@ class Dynamics(nn.Module):
         self.flow_x_head = nn.Dense(self.d_bottleneck * self.packing_factor, name="flow_x_head", kernel_init=nn.initializers.zeros,
                             bias_init=nn.initializers.zeros)  # zero-init
 
+    def get_token_layout(self, n_spatial: int, n_agent: int = 0) -> TokenLayout:
+        segments = [
+            (Modality.ACTION, 1),
+            (Modality.SHORTCUT_SIGNAL, 1),
+            (Modality.SHORTCUT_STEP, 1),
+            (Modality.SPATIAL, n_spatial),
+            (Modality.REGISTER, self.config.n_register),
+        ]
+        if n_agent > 0:
+            segments.append((Modality.AGENT, n_agent))
+        return TokenLayout(tuple(segments))
+
     def create_static_caches(self,
                              batch_size: int,
                              n_spatial: int,
@@ -849,13 +860,12 @@ class Dynamics(nn.Module):
             window_size: Maximum sequence length (T) to support.
             dtype: Data type for cache buffers.
         """
-        # Time attention sees (B*S) independent sequences. S includes all tokens (action, signal, step, spatial, register, agent)
-        S_total = 1 + 1 + 1 + n_spatial + n_agent + self.config.n_register 
+        layout = self.get_token_layout(n_spatial=n_spatial, n_agent=n_agent)
 
         return create_transformer_caches(
             depth=self.config.depth,
             time_every=self.config.time_every,
-            flattened_batch_size=batch_size * S_total,
+            flattened_batch_size=batch_size * layout.S,
             window_size=window_size,
             num_kv_heads=self.config.n_kv_heads,
             head_dim=self.config.d_model // self.config.n_heads,
@@ -913,9 +923,8 @@ class Dynamics(nn.Module):
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
         # make the layout for masking
-        modalities = [Modality.ACTION, Modality.SHORTCUT_SIGNAL, Modality.SHORTCUT_STEP, Modality.SPATIAL, Modality.REGISTER, Modality.AGENT]
-        segments = tuple((modality, tok.shape[2]) for modality, tok in zip(modalities, toks))
-        layout = TokenLayout(segments)
+        n_agent = agent_tokens.shape[2] if agent_tokens is not None else 0
+        layout = self.get_token_layout(n_spatial=spatial_tokens.shape[2], n_agent=n_agent)
         mask = layout.make_mask("wm_agent")
 
         x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches)
