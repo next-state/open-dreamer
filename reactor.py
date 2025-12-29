@@ -30,7 +30,7 @@ User Input → input_to_action() → Action Array
 @dataclass
 class ReactorConfig:
     """Configuration for Dreamer reactor runtime."""
-    dynamics_ckpt: str = 'logs/dynamics/checkpoints'
+    dynamics_ckpt: str = 'logs/ed/checkpoints'
     policy_ckpt: Optional[str] = None
     
     # Denoising schedule
@@ -169,13 +169,42 @@ class DreamerVideoModel(VideoModel):
         # Set latent shape: (1, 1, n_spatial, D_s)
         self.latent_shape = (1, 1, n_latents//packing_factor, D_s*packing_factor)
         
-        # State variables (will be initialized per session)
-        self.dynamics_cache = None
-        self.tokenizer_cache = None
+        # Initialize use_agent flag
         self.use_agent = self.policy is not None
         
         # Random key
         self.rng = jax.random.PRNGKey(0)
+        
+        # Initialize KV caches for both dynamics and tokenizer
+        logger.info("Initializing KV caches...")
+        self.initial_dynamics_cache = self.dynamics.create_static_caches(
+            batch_size=1,
+            n_spatial=self.n_spatial,
+            window_size=self.window_size,
+        )
+        
+        self.initial_tokenizer_cache = self.tokenizer.create_static_caches(
+            batch_size=1,
+            window_size=self.window_size,
+        )
+        
+        # Active caches (will be reset per session)
+        self.dynamics_cache = None
+        self.tokenizer_cache = None
+        
+        # Create JIT-compiled version of next_frame
+        # Use jax.tree_util.Partial to properly handle non-hashable objects like Flax modules
+        logger.info("Compiling next_frame function...")
+        from jax.tree_util import Partial
+        
+        next_frame_partial = Partial(
+            next_frame,
+            tokenizer=self.tokenizer,
+            dynamics=self.dynamics,
+            schedule=self.schedule,
+            latent_shape=self.latent_shape,
+        )
+        self.next_frame_compiled = jax.jit(next_frame_partial)
         
         logger.info("Dreamer initialization complete")
         print("DEBUG: Dreamer initialization complete", flush=True)
@@ -204,17 +233,9 @@ class DreamerVideoModel(VideoModel):
         logger.info(f"Latent shape: {self.latent_shape}")
         print(f"DEBUG: Latent shape: {self.latent_shape}", flush=True)
         
-        # Initialize KV caches for both dynamics and tokenizer
-        self.dynamics_cache = self.dynamics.create_static_caches(
-            batch_size=1,
-            n_spatial=self.n_spatial,
-            window_size=self.window_size,
-        )
-        
-        self.tokenizer_cache = self.tokenizer.create_static_caches(
-            batch_size=1,
-            window_size=self.window_size,
-        )
+        # Reset caches to initial empty state
+        self.dynamics_cache = self.initial_dynamics_cache
+        self.tokenizer_cache = self.initial_tokenizer_cache
         
         # Initialize with context from canonical starting frames
         logger.info("Loading canonical starting frames...")
@@ -274,16 +295,6 @@ class DreamerVideoModel(VideoModel):
         
         logger.info("Session initialized, starting generation loop...")
         print("DEBUG: Session initialized, starting generation loop...", flush=True)
-        
-        # Create JIT-compiled version of next_frame with static arguments prebaked
-        import functools
-        self.next_frame_compiled = jax.jit(functools.partial(
-            next_frame,
-            tokenizer=self.tokenizer,
-            dynamics=self.dynamics,
-            schedule=self.schedule,
-            latent_shape=self.latent_shape,
-        ))
         
         # Calculate frame time based on FPS
         frame_time = 1.0 / self.fps
