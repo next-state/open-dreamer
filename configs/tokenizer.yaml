@@ -6,7 +6,7 @@ run_name: tokenizer
 ckpt_max_to_keep: 1
 ckpt_save_every: 10_000
 
-patch_size: 16
+patch_size: 8
 
 dataset:
   source: "custom"

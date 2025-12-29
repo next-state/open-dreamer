@@ -1,11 +1,11 @@
 {
-  "reactor-runtime": "0.0.0",
-  "class": "dreamer.interactive:DreamerVideoModel",
-  "model_name": "dreamervideo",
-  "model_version": "1.0.0",
-  "args": {
-    "fps": 30,
-    "size": [480, 640]
-  },
-  "weights": [] 
+    "reactor-runtime": "0.0.4",
+    "class": "reactor:DreamerVideoModel",
+    "model_name": "dreamer-coinrun",
+    "model_version": "1.0.0",
+    "args": {
+        "fps": 15,
+        "size": [64, 64]
+    },
+    "weights": []
 }

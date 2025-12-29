@@ -21,7 +21,7 @@ dynamics:
     time_every: 4
     mlp_ratio: 4
     dropout_rate: 0.0
-    k_max: 256
+    k_max: 8
 
 bootstrap_start: 5_000
 self_fraction: 0.25

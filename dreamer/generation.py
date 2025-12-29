@@ -1,8 +1,9 @@
 import math
 import einops
 import jax
+import numpy as np
 import jax.numpy as jnp
-from typing import Tuple 
+from typing import Any, Dict, Tuple 
 
 from .models import Dynamics, KVCache, PolicyHeadMTP, Tokenizer
 
@@ -72,8 +73,8 @@ def next_latent(
     schedule: DenoiseSchedule,
     action: jax.Array,                 # (B, 1)
     latent_shape: Tuple,                   # (B, 1, n_spatial, D_s)
-    prefill_length: int,
     rng: jax.Array,
+    prefill_length: int | None = None,
     agent_tokens: jax.Array | None = None,  # (B, T_ctx+1, n_agent, d_model)
     caches: KVCache | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
@@ -106,7 +107,7 @@ def next_latent(
     B = latent_shape[0]
 
     latents_ctx_noised = None
-    if latents_ctx is not None:
+    if latents_ctx is not None and caches is None:
         noise_prefill= jnp.zeros(latents_ctx[:, :prefill_length].shape)
         noise_decode = jax.random.normal(rng_ctx, latents_ctx[:, prefill_length:].shape)
         noise_ctx    = jnp.concatenate([noise_prefill, noise_decode], axis=1)
@@ -130,7 +131,7 @@ def next_latent(
             assert agent_tokens is None or agent_tokens.shape[1] == noisy_latent.shape[1] 
         
         else: # Used only for debugging.
-            assert latents_ctx_noised is not None and actions_ctx is not None
+            assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None
             latent_input  = jnp.concatenate([latents_ctx_noised, latent_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
             actions_input = jnp.concatenate([actions_ctx, action],   axis=1)  # (B, T_ctx+1)
 
@@ -140,7 +141,7 @@ def next_latent(
             step_idx_curr   = jnp.full((B, 1), step_idx, dtype=jnp.int32)
             step_indices    = jnp.concatenate([step_idx_prefill, step_idx_decode, step_idx_curr], axis=1)
             
-            tau_idx_prefill= jnp.full((B, prefill_length), schedule.k_max, dtype=jnp.int32)
+            tau_idx_prefill= jnp.full((B, prefill_length), schedule.k_max - 1, dtype=jnp.int32)
             tau_idx_decode = jnp.full((B, decode_length), schedule.tau_idx_ctx, dtype=jnp.int32)
             tau_idx_curr   = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
             tau_indices    = jnp.concatenate([tau_idx_prefill, tau_idx_decode, tau_idx_curr], axis=1) # (B, T_ctx+1)
@@ -181,6 +182,66 @@ def next_latent(
 
     return latent_t_final, h_last, caches_new, rng  
 
+def next_frame(
+    tokenizer: Tokenizer,
+    tokenizer_vars: Dict,
+    dynamics: Dynamics,
+    dynamics_vars: Dict,
+    schedule: DenoiseSchedule,
+    action: jax.Array,
+    latent_shape: Tuple,
+    dynamics_cache: Any,
+    tokenizer_cache: Any,
+    rng: jax.Array,
+    task: jax.Array | None,
+) -> Tuple[np.ndarray, Any, Any, Any, jax.Array]:
+    """
+    Generate next frame using dynamics model and decode to pixels.
+    
+    Args:
+        tokenizer: Tokenizer model for decoding
+        tokenizer_vars: Tokenizer parameters
+        dynamics: Dynamics model
+        dynamics_vars: Dynamics parameters
+        schedule: Denoising schedule
+        action: Action to condition on (B,) - categorical integer array
+        latent_shape: Shape of latent (B, 1, n_spatial, D_s)
+        dynamics_cache: KV cache for dynamics model from previous steps
+        tokenizer_cache: KV cache for tokenizer decoder from previous steps
+        rng: Random key
+        
+    Returns:
+        Tuple of (frame as numpy array, updated dynamics cache, updated tokenizer cache, updated rng)
+    """
+    # Generate next latent using τ-ladder denoising
+    latent, h_last, dynamics_cache_updated, rng = next_latent(
+        dynamics=dynamics,
+        dyn_vars=dynamics_vars,
+        schedule=schedule,
+        action=action,  # Shape (1,) - categorical integer
+        latent_shape=latent_shape,
+        rng=rng,
+        prefill_length=None,  # No prefill for interactive generation
+        agent_tokens=None,  # Not using agent tokens in reactor mode
+        caches=dynamics_cache,
+    )
+    
+    # Decode latent to frame
+    # latent shape: (B, 1, n_spatial, D_s)
+    frame, tokenizer_cache_updated = tokenizer.apply(
+        tokenizer_vars,
+        latent,
+        packing_factor=dynamics.config.packing_factor,
+        caches=tokenizer_cache,
+        method=tokenizer.decode,
+        deterministic=True,
+    )
+    
+    # Clip to valid range (keep as JAX array)
+    # frame shape: (B, 1, H, W, C)
+    frame = jnp.clip(frame, 0, 255).astype(jnp.uint8)
+    
+    return frame, h_last, dynamics_cache_updated, tokenizer_cache_updated, rng
 
 def latent_rollout(
     dynamics: Dynamics,
@@ -247,7 +308,7 @@ def latent_rollout(
             action = jax.random.categorical(rng_action, logits) # (B, L)
         
         # Predict next latent (denoising)
-        latent_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, T_ctx, rng, caches=caches_t)
+        latent_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, rng, caches=caches_t)
         
         return (h_next, caches_next, rng), latent_next[:,0] # latent_next is (B, 1, n_spatial, D_s) 
 

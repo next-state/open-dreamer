@@ -81,6 +81,7 @@ def sample_video(
     tokenized_frames = jnp.clip(tokenized_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
+    actions_future = jnp.array(actions_future)
     pred_frames = video_rollout(tokenizer,
                                 tokenizer_vars,
                                 dynamics,
