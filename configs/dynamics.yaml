@@ -22,6 +22,8 @@ dynamics:
     mlp_ratio: 4
     dropout_rate: 0.0
     k_max: 8
+    dtype: ${dtype}
+    param_dtype: ${param_dtype}
 
 bootstrap_start: 5_000
 self_fraction: 0.25

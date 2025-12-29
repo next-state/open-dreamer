@@ -20,7 +20,7 @@ dataset:
 encoder:
   n_latents: 16
   d_bottleneck: 32
-  d_model: 256
+  d_model: 512
   n_heads: 8
   n_kv_heads: 4
   depth: 8
@@ -31,6 +31,8 @@ encoder:
   mae_p_min: 0.0
   mae_p_max: 0.9
   patch_size: ${patch_size}
+  dtype: ${dtype}
+  param_dtype: ${param_dtype}
   
   dataset_mean: ${dataset.dataset_mean}
   dataset_std: ${dataset.dataset_std}
@@ -49,6 +51,8 @@ decoder:
   W: ${dataset.W}
   patch_size: ${patch_size}
   d_patch: ${mul:${patch_size},${patch_size},${dataset.C}}
+  dtype: ${dtype}
+  param_dtype: ${param_dtype}
   
   dataset_mean: ${dataset.dataset_mean}
   dataset_std: ${dataset.dataset_std}

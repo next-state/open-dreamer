@@ -9,6 +9,10 @@ use_wandb: False
 wandb_entity: Null
 wandb_project: tiny_dreamer_4
 
+# Precision
+dtype: float32
+param_dtype: float32
+
 # Hydra
 hydra:
   run:
