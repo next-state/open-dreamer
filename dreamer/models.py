@@ -241,6 +241,7 @@ class MLP(nn.Module):
     dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
+    use_norm: bool = True
     dtype: Any = jnp.float32
 
     @nn.compact
@@ -254,6 +255,9 @@ class MLP(nn.Module):
         Returns:
           y:            (..., d_model) output activations, same shape as input.
         """
+        if self.use_norm:
+            x = nn.RMSNorm(name="norm")(x)
+
         # Choose hidden size
         mult = self.mlp_ratio
         if self.swiglu and self.parity_2over3:
@@ -462,7 +466,6 @@ class BlockCausalLayer(nn.Module):
         )
 
         # --- MLP ---
-        self.norm_mlp = nn.RMSNorm()
         self.mlp = MLP(self.dim, self.mlp_ratio, self.dropout_rate)
 
     @nn.compact
@@ -473,8 +476,7 @@ class BlockCausalLayer(nn.Module):
         x = x + y
 
         # --- MLP ---
-        y = self.norm_mlp(x)
-        y = self.mlp(y, deterministic=deterministic)
+        y = self.mlp(x, deterministic=deterministic)
         x = x + y
         return x, new_cache
 
@@ -1059,8 +1061,7 @@ class PolicyHeadMTP(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
-        norm_ht=nn.RMSNorm()(h_t)
-        x = self.projector(norm_ht, deterministic=deterministic)  # (B, T, D)
+        x = self.projector(h_t, deterministic=deterministic)  # (B, T, D)
         logits = self.out(x)                                  # (B, T, L, A)
         return logits  # softmax/sigmoid applied at loss-time based on `kind`
 
@@ -1107,8 +1108,7 @@ class RewardHeadMTP(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
-        norm_ht=nn.RMSNorm()(h_t)
-        x = self.projector(norm_ht, deterministic=deterministic)   # (B, T, D)
+        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L, K)
         centers_log = self.centers_var.value                   # (K,)
         return logits, centers_log
@@ -1155,8 +1155,7 @@ class ValueHead(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
-        norm_ht=nn.RMSNorm()(h_t)
-        x = self.projector(norm_ht, deterministic=deterministic)   # (B, T, D)
+        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, K)
         centers_log = self.centers_var.value                   # (K,)
         return logits, centers_log
