@@ -47,6 +47,39 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Training step (now using reusable components from dreamer.training)
 # ---------------------------
 
+def make_encode_and_train_step(tokenizer, dynamics, tx):
+    """
+    Factory function to create a JIT-compiled encode_and_train_step with models bound.
+
+    This avoids passing unhashable model objects as static arguments to jax.jit.
+    Instead, we bind them using functools.partial at creation time.
+    """
+    @partial(jax.jit, static_argnames=("k_max", "B_self", "packing_factor"))
+    def encode_and_train_step(
+        tokenizer_vars, params, opt_state, constants,
+        videos, actions,
+        *, tokenizer_key: jnp.ndarray, master_key: jnp.ndarray, step: int,
+        B_self: int, k_max: int, packing_factor: int):
+        # Phase 1: Encode videos to latents (parallelized when videos are sharded)
+        latents, _ = tokenizer.apply(
+            tokenizer_vars,
+            videos,
+            packing_factor=packing_factor,
+            rngs={"mae": tokenizer_key},
+            method=tokenizer.encode
+        )
+
+        # Phase 2: Training step (parallelized when latents are sharded)
+        new_params, new_opt_state, metrics = train_step(
+            dynamics, tx, params, opt_state, constants, latents, actions,
+            B_self=B_self, k_max=k_max, master_key=master_key, step=step
+        )
+
+        return new_params, new_opt_state, metrics
+
+    return encode_and_train_step
+
+
 @partial(jax.jit, static_argnames=("dynamics", "tx", "k_max", "B_self"))
 def train_step(
     dynamics, tx, params, opt_state, constants, latents, actions,
@@ -130,6 +163,9 @@ def run(cfg: DynamicsConfig):
     tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
     opt_state = tx.init(dynamics_params)
 
+    # Create JIT-compiled training step with models bound
+    encode_and_train_step = make_encode_and_train_step(tokenizer, dynamics, tx)
+
     # Logging & checkpointing
     logger = MetricLogger( use_wandb=cfg.use_wandb, log_every=cfg.log_every, max_steps=cfg.max_steps, wandb_obj=wandb)
     mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
@@ -159,15 +195,19 @@ def run(cfg: DynamicsConfig):
         # Data
         rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
 
-        # Normalize videos
+        # Get batch data
         videos = batch["videos"]
         actions = batch["actions"]
-        latents, _ = tokenizer.apply(tokenizer_vars, videos, packing_factor=cfg.dynamics.packing_factor, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
 
-        dynamics_params, opt_state, aux = train_step(dynamics, tx, 
-            dynamics_params, opt_state, dynamics_constants, latents, actions, 
-            B_self=(videos.shape[0] // 2)*(step >= cfg.bootstrap_start), # This will make the function compile twice. TODO: see if it's worth fixing this
-            k_max=cfg.dynamics.k_max, master_key=master_key, step=step)
+        # Combined encoding + training step (both phases parallelized)
+        dynamics_params, opt_state, aux = encode_and_train_step(
+            tokenizer_vars, dynamics_params, opt_state, dynamics_constants,
+            videos, actions,
+            tokenizer_key=tokenizer_key, master_key=master_key, step=step,
+            B_self=(videos.shape[0] // 2)*(step >= cfg.bootstrap_start),
+            k_max=cfg.dynamics.k_max,
+            packing_factor=cfg.dynamics.packing_factor
+        )
 
         # Logging
         if logger.should_log(step):
