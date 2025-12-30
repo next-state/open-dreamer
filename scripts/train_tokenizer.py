@@ -165,7 +165,7 @@ def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key
 
 @partial(jax.jit, static_argnames=("apply_fn",))
 def viz_step_jit(apply_fn, variables, params, videos, *, mae_key, drop_key):
-    recon, (mask, _) = forward_apply(apply_fn, variables, params, videos, mae_key=mae_key, drop_key=drop_key, train=False)
+    recon, (mask, _) = forward_apply(apply_fn, variables, params, videos, mae_key=mae_key, drop_key=drop_key, train=True)
 
     masked = videos * (1.0 - mask)
     recon_masked = masked + recon * mask

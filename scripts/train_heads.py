@@ -47,6 +47,7 @@ from dreamer.utils import (
     make_state,
     maybe_save,
     try_restore,
+    to_jnp_dtype,
 )
 
 # Suppress absl info logs
@@ -264,15 +265,15 @@ def run(cfg: BCRewConfig):
     
     # Initialize task embedder, policy, and reward heads
     print("[setup] Initializing agent components")
-    task_embedder = TaskEmbedder(d_model=dynamics.config.d_model, n_agent=cfg.n_agent, use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks)
-    policy_head = PolicyHeadMTP(d_model=dynamics.config.d_model, action_dim=dynamics.config.action_dim, L=cfg.L)
-    reward_head = RewardHeadMTP(d_model=dynamics.config.d_model, L=cfg.L, num_bins=cfg.num_reward_bins, log_low=cfg.reward_log_low, log_high=cfg.reward_log_high)
+    task_embedder = TaskEmbedder(d_model=dynamics.config.d_model, n_agent=cfg.n_agent, use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks, dtype=cfg.dtype, param_dtype=cfg.param_dtype)
+    policy_head = PolicyHeadMTP(d_model=dynamics.config.d_model, action_dim=dynamics.config.action_dim, L=cfg.L, dtype=cfg.dtype, param_dtype=cfg.param_dtype)
+    reward_head = RewardHeadMTP(d_model=dynamics.config.d_model, L=cfg.L, num_bins=cfg.num_reward_bins, log_low=cfg.reward_log_low, log_high=cfg.reward_log_high, dtype=cfg.dtype, param_dtype=cfg.param_dtype)
     
     # Initialize parameters
     rng, task_key, pol_key, rew_key = jax.random.split(rng, 4)
     
     # Dummy inputs for initialization
-    dummy_h = jnp.zeros((1, 4, cfg.L, dynamics.config.d_model))  # (B, T, D) for heads (agent dim already pooled)
+    dummy_h = jnp.zeros((1, 4, cfg.L, dynamics.config.d_model), dtype=to_jnp_dtype(cfg.dtype))  # (B, T, D) for heads (agent dim already pooled)
     dummy_task = jnp.zeros((1,), dtype=jnp.int32) if cfg.use_task_ids else jnp.zeros((1, cfg.n_tasks))
     task_embedder_params = task_embedder.init(task_key, task=dummy_task, B=1, T=4)["params"]
     policy_params = policy_head.init(pol_key, dummy_h, deterministic=True)["params"]

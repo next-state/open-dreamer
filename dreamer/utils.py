@@ -13,6 +13,22 @@ from typing import Tuple
 import numpy as np
 import math
 
+
+# --- dtype helpers ---
+
+def to_jnp_dtype(dtype: str | jnp.dtype) -> jnp.dtype:
+    """Convert string or jnp.dtype to jnp.dtype."""
+    if isinstance(dtype, jnp.dtype):
+        return dtype
+    if dtype == "float32":
+        return jnp.float32
+    if dtype == "float16":
+        return jnp.float16
+    if dtype == "bfloat16":
+        return jnp.bfloat16
+    return jnp.dtype(dtype)
+
+
 # --- math helpers ---
 
 def is_pow2_frac(x: float) -> bool:
@@ -255,15 +271,17 @@ def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict |
 
 
 def init_tokenizer(rng, tokenizer, tokenizer_cfg):
+    dtype = to_jnp_dtype(tokenizer_cfg.encoder.dtype)
     rng, params_rng, mae_rng, dropout_rng, key = jax.random.split(rng, 5)
     dummy = jax.random.uniform(
         key,
         (tokenizer_cfg.dataset.B, tokenizer_cfg.dataset.T, tokenizer_cfg.dataset.H, tokenizer_cfg.dataset.W, tokenizer_cfg.dataset.C),
+        dtype=dtype,
     )
     variables = tokenizer.init(
         {"params": params_rng, "mae": mae_rng, "dropout": dropout_rng},
         dummy,
-        deterministic=True,
+        deterministic=False,
     )
     return rng, variables
 
@@ -280,8 +298,9 @@ def init_dynamics(rng, dynamics, tokenizer_cfg):
     n_spatial = enc_cfg.n_latents // packing_factor
     d_spatial = enc_cfg.d_bottleneck * packing_factor
     
+    dtype = to_jnp_dtype(dyn_cfg.dtype)
     shape = (B, T, n_spatial, d_spatial)
-    packed_enc_tokens = jax.random.normal(key, (B, T, n_spatial, d_spatial))
+    packed_enc_tokens = jax.random.normal(key, shape, dtype=dtype)
     
     actions = jnp.zeros((B, T), dtype=jnp.int32)
     step_idxs = jnp.zeros((B, T), dtype=jnp.int32)

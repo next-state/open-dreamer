@@ -5,6 +5,9 @@ defaults:
 run_ckpt_dir: null
 tokenizer_ckpt: null
 
+dtype: ${dtype}
+param_dtype: ${param_dtype}
+
 dataset:
   B: 8
   diversify_data: true

@@ -11,7 +11,12 @@ from typing import Optional, Tuple, Any, Dict
 from einops import rearrange, repeat
 import math
 import orbax.checkpoint as ocp
-from .utils import Modality, TokenLayout, make_manager, from_dict, normalize_with_dataset_stats, recursive_list_to_tuple, unnormalize_with_dataset_stats, init_dynamics, init_tokenizer
+from .utils import (
+    Modality, TokenLayout, make_manager, from_dict, 
+    normalize_with_dataset_stats, recursive_list_to_tuple, 
+    unnormalize_with_dataset_stats, init_dynamics, init_tokenizer,
+    to_jnp_dtype
+)
 from .data import patchify, unpatchify
 from .configs import DynamicsConfig, TokenizerConfig, DynamicsModelConfig
 
@@ -29,6 +34,7 @@ class KVCache:
 
     @classmethod
     def init(cls, batch_size, window_size, num_kv_heads, head_dim, dtype=jnp.float32):
+        dtype = to_jnp_dtype(dtype)
         return cls(
             k=jnp.zeros((batch_size, window_size, num_kv_heads, head_dim), dtype=dtype),
             v=jnp.zeros((batch_size, window_size, num_kv_heads, head_dim), dtype=dtype),
@@ -141,8 +147,11 @@ class RotaryEmbedding1D(nn.Module):
     dim: int
     theta: float = 10000.0
     dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     def setup(self):
+        dtype = to_jnp_dtype(self.dtype)
+        param_dtype = to_jnp_dtype(self.param_dtype)
         inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
         self.inv_freq = self.variable('constants', 'inv_freq', lambda: inv_freq)
 
@@ -156,8 +165,8 @@ class RotaryEmbedding1D(nn.Module):
         t_indices = jnp.arange(T, dtype=self.dtype) + start_pos
         freqs = jnp.outer(t_indices, self.inv_freq.value) # (T, dim//2)
 
-        freqs_cos = jnp.cos(freqs)
-        freqs_sin = jnp.sin(freqs)
+        freqs_cos = jnp.cos(freqs).astype(self.dtype)
+        freqs_sin = jnp.sin(freqs).astype(self.dtype)
 
         # (1, T, 1, Dim//2)
         freqs_cos = freqs_cos[None, :, None, :]
@@ -202,12 +211,17 @@ class RotaryEmbedding1D(nn.Module):
 class MAEReplacer(nn.Module):
     p_min: float = 0.0
     p_max: float = 0.9
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, patches_btnd: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         # patches_btnd: (B,T,Np,D)
+        dtype = to_jnp_dtype(self.dtype)
+        param_dtype = to_jnp_dtype(self.param_dtype)
         B, T, Np, D = patches_btnd.shape
-        mask_token = self.param("mask_token", nn.initializers.normal(0.02), (D,))
+        mask_token = self.param("mask_token", nn.initializers.normal(0.02), (D,), param_dtype)
+        mask_token = mask_token.astype(dtype)
         # draw RNGs from a named stream
         rng = self.make_rng("mae")
         p_rng, m_rng = jax.random.split(rng)
@@ -243,9 +257,12 @@ class MLP(nn.Module):
     parity_2over3: bool = False
     use_norm: bool = True
     dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
+        dtype = to_jnp_dtype(self.dtype)
+        param_dtype = to_jnp_dtype(self.param_dtype)
         """
         Args:
           x:            (..., d_model) input activations.
@@ -256,7 +273,7 @@ class MLP(nn.Module):
           y:            (..., d_model) output activations, same shape as input.
         """
         if self.use_norm:
-            x = nn.RMSNorm(name="norm")(x)
+            x = nn.RMSNorm(name="norm", dtype=jnp.float32, param_dtype=param_dtype)(x)
 
         # Choose hidden size
         mult = self.mlp_ratio
@@ -268,17 +285,17 @@ class MLP(nn.Module):
         if self.swiglu:
             # SwiGLU: Dense -> split -> u * silu(v)
             pre = nn.Dense(
-                2 * hidden, dtype=self.dtype, name="fc_in"
+                2 * hidden, dtype=self.dtype, param_dtype=self.param_dtype, name="fc_in"
             )(x)  # (..., 2H)
             u, v = jnp.split(pre, 2, axis=-1)     # (..., H), (..., H)
             h = u * jax.nn.silu(v)                # (..., H)
         else:
             # Standard GELU MLP
-            h = nn.Dense(hidden, dtype=self.dtype, name="fc_in")(x)
+            h = nn.Dense(hidden, dtype=self.dtype, param_dtype=self.param_dtype, name="fc_in")(x)
             h = nn.gelu(h)
 
         h = nn.Dropout(self.dropout_rate)(h, deterministic=deterministic)
-        y = nn.Dense(self.d_model, dtype=self.dtype, name="fc_out")(h)
+        y = nn.Dense(self.d_model, dtype=self.dtype, param_dtype=self.param_dtype, name="fc_out")(h)
         y = nn.Dropout(self.dropout_rate)(y, deterministic=deterministic)
         return y
 
@@ -292,26 +309,32 @@ class GroupedQueryAttention(nn.Module):
     qk_norm_type: str | None = None  # "qknorm", or "quest"
     is_causal: bool = False
     rope_theta: float = 10000.0
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     def setup(self):
+        dtype = to_jnp_dtype(self.dtype)
+        param_dtype = to_jnp_dtype(self.param_dtype)
         assert self.dim % self.num_heads == 0
         assert self.num_heads % self.num_kv_heads == 0
 
         head_dim = self.dim // self.num_heads
         kv_dim = self.num_kv_heads * head_dim
 
-        self.to_q = nn.Dense(self.dim, use_bias=False)
-        self.to_kv = nn.Dense(2 * kv_dim, use_bias=False)
-        self.to_out = nn.Dense(self.dim, use_bias=False)
+        self.to_q = nn.Dense(self.dim, use_bias=False, dtype=dtype, param_dtype=param_dtype)
+        self.to_kv = nn.Dense(2 * kv_dim, use_bias=False, dtype=dtype, param_dtype=param_dtype)
+        self.to_out = nn.Dense(self.dim, use_bias=False, dtype=dtype, param_dtype=param_dtype)
         self.dropout = nn.Dropout(self.dropout_rate)
 
         if self.qk_norm_type == 'qknorm':
-            self.q_ln = nn.RMSNorm(use_scale=True)
-            self.k_ln = nn.RMSNorm(use_scale=True)
+            self.q_ln = nn.RMSNorm(use_scale=True, dtype=jnp.float32, param_dtype=param_dtype)
+            self.k_ln = nn.RMSNorm(use_scale=True, dtype=jnp.float32, param_dtype=param_dtype)
 
         self.rope = RotaryEmbedding1D(
             dim=head_dim,
-            theta=self.rope_theta
+            theta=self.rope_theta,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
 
     def __call__(self, x, mask, *args, cache: Optional[KVCache] = None):
@@ -386,6 +409,8 @@ class SpaceSelfAttention(nn.Module):
     dropout_rate: float = 0.0
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None):
@@ -403,6 +428,8 @@ class SpaceSelfAttention(nn.Module):
             rope_theta=self.rope_theta,
             deterministic=deterministic,
             is_causal=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )(x, mask=mask, cache=None)
 
         out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
@@ -416,6 +443,8 @@ class TimeSelfAttention(nn.Module):
     dropout_rate: float = 0.0
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None):
@@ -433,6 +462,8 @@ class TimeSelfAttention(nn.Module):
             rope_theta=self.rope_theta,
             deterministic=deterministic,
             is_causal=True,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )(x, mask=None, cache=cache)
 
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
@@ -449,9 +480,12 @@ class BlockCausalLayer(nn.Module):
     layer_index: int = 0
     time_every: int = 4
     rope_theta: float = 10000.0
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     def setup(self):
-        self.norm = nn.RMSNorm()
+        param_dtype = to_jnp_dtype(self.param_dtype)
+        self.norm = nn.RMSNorm(dtype=jnp.float32, param_dtype=param_dtype)
 
         # --- Time or space attention ---
         self.use_time = (self.layer_index + 1) % self.time_every == 0
@@ -463,10 +497,12 @@ class BlockCausalLayer(nn.Module):
             dropout_rate=self.dropout_rate,
             qk_norm_type=self.qk_norm_type,
             rope_theta=self.rope_theta,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
 
         # --- MLP ---
-        self.mlp = MLP(self.dim, self.mlp_ratio, self.dropout_rate)
+        self.mlp = MLP(self.dim, self.mlp_ratio, self.dropout_rate, dtype=self.dtype, param_dtype=self.param_dtype)
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool, cache: Optional[KVCache] = None):
@@ -492,6 +528,8 @@ class BlockCausalTransformer(nn.Module):
     mlp_ratio: float = 4.0
     time_every: int = 4
     rope_theta: float = 10000.0
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x, mask, *, deterministic: bool, caches: Optional[Dict[int, KVCache]] = None):
@@ -515,7 +553,7 @@ class BlockCausalTransformer(nn.Module):
                 self.d_model, self.n_heads, self.n_kv_heads,
                 dropout_rate=self.dropout_rate, qk_norm_type=self.qk_norm_type,
                 mlp_ratio=self.mlp_ratio, layer_index=i, time_every=self.time_every,
-                rope_theta=self.rope_theta,
+                rope_theta=self.rope_theta, dtype=self.dtype, param_dtype=self.param_dtype,
             )(x, mask=mask, deterministic=deterministic, cache=cache_i)
 
             if new_caches is not None and new_cache_i is not None:
@@ -538,13 +576,17 @@ class Encoder(nn.Module):
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
     rope_theta: float = 10000.0
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
     
     dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675)
 
     def setup(self):
-        self.patch_proj = nn.Dense(self.d_model, name="patch_proj")
-        self.bottleneck_proj = nn.Dense(self.d_bottleneck, name="bottleneck_proj")
+        dtype = to_jnp_dtype(self.dtype)
+        param_dtype = to_jnp_dtype(self.param_dtype)
+        self.patch_proj = nn.Dense(self.d_model, name="patch_proj", dtype=dtype, param_dtype=param_dtype)
+        self.bottleneck_proj = nn.Dense(self.d_bottleneck, name="bottleneck_proj", dtype=dtype, param_dtype=param_dtype)
 
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
@@ -556,9 +598,11 @@ class Encoder(nn.Module):
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
             rope_theta=self.rope_theta,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
-        self.mask_and_replace = MAEReplacer(name="mae", p_min=self.mae_p_min, p_max=self.mae_p_max)
-        self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
+        self.mask_and_replace = MAEReplacer(name="mae", p_min=self.mae_p_min, p_max=self.mae_p_max, dtype=dtype, param_dtype=param_dtype)
+        self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model), param_dtype)
 
     @nn.compact
     def __call__(self, videos, *, deterministic: bool = True, packing_factor = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
@@ -583,7 +627,7 @@ class Encoder(nn.Module):
 
         # 3) Prepend learned latents (owned here)
         B, T = proj_patches_masked.shape[:2]
-        latents = repeat(self.latents, "... -> b t ...", b=B, t=T)
+        latents = repeat(self.latents.astype(self.dtype), "... -> b t ...", b=B, t=T)
         tokens = jnp.concatenate([latents, proj_patches_masked], axis=2)  # (B,T,S=(Np+Nl),D)
 
         layout = TokenLayout((
@@ -632,6 +676,8 @@ class Decoder(nn.Module):
     mlp_ratio: float = 4.0
     time_every: int = 4
     rope_theta: float = 10000.0
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675)
@@ -644,9 +690,11 @@ class Decoder(nn.Module):
         ))
 
     def setup(self):
+        dtype = to_jnp_dtype(self.dtype)
+        param_dtype = to_jnp_dtype(self.param_dtype)
         self.n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
-        self.up_proj = nn.Dense(self.d_model, name="up_proj")
-        self.patch_head = nn.Dense(self.d_patch, name="patch_head") # (Np, D_patch)
+        self.up_proj = nn.Dense(self.d_model, name="up_proj", dtype=dtype, param_dtype=param_dtype)
+        self.patch_head = nn.Dense(self.d_patch, name="patch_head", dtype=dtype, param_dtype=param_dtype) # (Np, D_patch)
 
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
@@ -658,8 +706,10 @@ class Decoder(nn.Module):
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
             rope_theta=self.rope_theta,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
-        self.patch_queries = self.param("patch_queries", nn.initializers.normal(0.02),(self.n_patches, self.d_model)) # (Np, D)
+        self.patch_queries = self.param("patch_queries", nn.initializers.normal(0.02),(self.n_patches, self.d_model), param_dtype) # (Np, D)
 
     @nn.compact
     def __call__(self, z: jnp.ndarray, *, deterministic: bool = True, packing_factor = None, caches: Optional[Dict[int, KVCache]] = None):
@@ -671,7 +721,7 @@ class Decoder(nn.Module):
         latents = self.up_proj(z)  # (B, T, N_l, D)
 
         # 2) Learned per-patch query tokens (owned by the decoder)
-        patches = repeat(self.patch_queries, " ... -> b t ...", b=B, t=T)  # (B, T, Np, D)
+        patches = repeat(self.patch_queries.astype(self.dtype), " ... -> b t ...", b=B, t=T)  # (B, T, Np, D)
 
         # 3) Concat: [latents, patch queries]  ->  (B, T, S=N_l+N_p, D)
         tokens = jnp.concatenate([latents, patches], axis=-2)
@@ -783,6 +833,8 @@ class Dynamics(nn.Module):
 
     def setup(self):
         # Extract params from configs
+        self.dtype = to_jnp_dtype(self.config.dtype)
+        self.param_dtype = to_jnp_dtype(self.config.param_dtype)
         self.d_model = self.config.d_model
         self.d_bottleneck = self.config.d_bottleneck
         self.depth = self.config.depth
@@ -800,14 +852,15 @@ class Dynamics(nn.Module):
         rope_theta = self.config.rope_theta
 
         # Want to transform bottleneck inputs (B, T, N_b, D_b) to (B, T, N_b/packing_factor, D_b*packing_factor)
-        self.spatial_proj = nn.Dense(self.d_model, name="proj_spatial") # converts spatial tokens, of dim d_spatial to d_model
+        self.spatial_proj = nn.Dense(self.d_model, name="proj_spatial", dtype=self.dtype, param_dtype=self.param_dtype) # converts spatial tokens, of dim d_spatial to d_model
 
         self.register_tokens = self.param(
             "register_tokens",
             nn.initializers.normal(0.02),
             (self.n_register, self.d_model),
+            self.param_dtype
         )
-        self.action_encoder = ActionEncoder(d_model=self.d_model, action_dim = self.config.action_dim)
+        self.action_encoder = ActionEncoder(d_model=self.d_model, action_dim = self.config.action_dim, dtype=self.dtype, param_dtype=self.param_dtype)
 
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
@@ -819,20 +872,22 @@ class Dynamics(nn.Module):
             mlp_ratio=mlp_ratio,
             time_every=time_every,
             rope_theta=rope_theta,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
 
         # -------- Discrete embeddings for shortcut conditioning --------
         # Step size d ∈ {1, 1/2, 1/4, ..., 1/256}
         # We index steps by: step_idx = log2(1/d) ∈ {0, 1, 2, ...,7, 8}
         self.num_step_bins = int(math.log2(self.k_max)) + 1
-        self.step_embed = nn.Embed(self.num_step_bins, self.d_model, name="step_embed")
+        self.step_embed = nn.Embed(self.num_step_bins, self.d_model, name="step_embed", dtype=self.dtype, param_dtype=self.param_dtype)
 
         # Signal level τ ∈ {0, 1/d, 2/d, ..., 1 - 1/d} (grid length = 1/d)
         # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
         # I'm not sure if i should have self.kmax+1
-        self.signal_embed = nn.Embed(self.k_max, self.d_model, name="signal_embed")
+        self.signal_embed = nn.Embed(self.k_max, self.d_model, name="signal_embed", dtype=self.dtype, param_dtype=self.param_dtype)
         self.flow_x_head = nn.Dense(self.d_bottleneck * self.packing_factor, name="flow_x_head", kernel_init=nn.initializers.zeros,
-                            bias_init=nn.initializers.zeros)  # zero-init
+                            bias_init=nn.initializers.zeros, dtype=self.dtype, param_dtype=self.param_dtype)  # zero-init
 
     def get_token_layout(self, n_spatial: int, n_agent: int = 0) -> TokenLayout:
         segments = [
@@ -909,7 +964,7 @@ class Dynamics(nn.Module):
         # --- 3) Prepare learned register tokens
         B, T = spatial_tokens.shape[:2]
         register_tokens = jnp.broadcast_to(
-            self.register_tokens[None, None, ...],  # (1,1,n_register,d_model)
+            self.register_tokens.astype(self.dtype)[None, None, ...],  # (1,1,n_register,d_model)
             (B, T, self.n_register, self.d_model),
         )
 
@@ -1000,9 +1055,13 @@ class TaskEmbedder(nn.Module):
     use_ids: bool = True     # True: task is int ids; False: task is vector
     n_tasks: int = 128       # only used if use_ids=True
     d_task: int = 64         # only used if use_ids=False
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     def setup(self):
-        self.emb = nn.Embed(self.n_tasks, self.d_model, name="task_table") if self.use_ids else nn.Dense(self.d_model, name="task_proj")
+        dtype = to_jnp_dtype(self.dtype)
+        param_dtype = to_jnp_dtype(self.param_dtype)
+        self.emb = nn.Embed(self.n_tasks, self.d_model, name="task_table", dtype=dtype, param_dtype=param_dtype) if self.use_ids else nn.Dense(self.d_model, name="task_proj", dtype=dtype, param_dtype=param_dtype)
 
     @nn.compact
     def __call__(self, task, B: int, T: int):
@@ -1016,8 +1075,10 @@ class TaskEmbedder(nn.Module):
         """
         emb = self.emb(task)
         # Learned base + optional small MLP to decouple from raw table
-        base = self.param("agent_base", nn.initializers.normal(0.02), (self.d_model,))
-        x = emb + base[None, :]
+        param_dtype = to_jnp_dtype(self.param_dtype)
+        dtype = to_jnp_dtype(self.dtype)
+        base = self.param("agent_base", nn.initializers.normal(0.02), (self.d_model,), param_dtype)
+        x = emb + base.astype(dtype)[None, :]
 
         # Replicate across time and agent slots
         x = jnp.broadcast_to(x[:, None, None, :], (B, T, self.n_agent, self.d_model))
@@ -1039,8 +1100,11 @@ class PolicyHeadMTP(nn.Module):
     swiglu: bool = True
     parity_2over3: bool = False
     dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     def setup(self):
+        dtype = to_jnp_dtype(self.dtype)
+        param_dtype = to_jnp_dtype(self.param_dtype)
         # Feature projector (D -> D) using your MLP
         self.projector = MLP(
             d_model=self.d_model,
@@ -1048,13 +1112,15 @@ class PolicyHeadMTP(nn.Module):
             dropout_rate=self.dropout_rate,
             swiglu=self.swiglu,
             parity_2over3=self.parity_2over3,
-            dtype=self.dtype,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         # Single matmul that produces all L offsets at once: (… , D) -> (…, L, A)
         self.out = nn.DenseGeneral(
             features=(self.L, self.action_dim),
             axis=-1,
-            dtype=self.dtype,
+            dtype=dtype,
+            param_dtype=param_dtype,
             name="out",
         )
 
@@ -1079,23 +1145,28 @@ class RewardHeadMTP(nn.Module):
     swiglu: bool = True
     parity_2over3: bool = False
     dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
     # log-space bounds for symexp bins (tune per dataset)
     log_low: float = -8.0
     log_high: float = 8.0
 
     def setup(self):
+        dtype = to_jnp_dtype(self.dtype)
+        param_dtype = to_jnp_dtype(self.param_dtype)
         self.projector = MLP(
             d_model=self.d_model,
             mlp_ratio=self.mlp_ratio,
             dropout_rate=self.dropout_rate,
             swiglu=self.swiglu,
             parity_2over3=self.parity_2over3,
-            dtype=self.dtype,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.out = nn.DenseGeneral(
             features=(self.L, self.num_bins),
             axis=-1,
-            dtype=self.dtype,
+            dtype=dtype,
+            param_dtype=param_dtype,
             name="out",
         )
         # Precompute bin centers as a constant (share across calls/checkpoints)
@@ -1126,23 +1197,28 @@ class ValueHead(nn.Module):
     swiglu: bool = True
     parity_2over3: bool = False
     dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
     # log-space bounds for symexp bins (tune per dataset)
     log_low: float = -8.0
     log_high: float = 8.0
 
     def setup(self):
+        dtype = to_jnp_dtype(self.dtype)
+        param_dtype = to_jnp_dtype(self.param_dtype)
         self.projector = MLP(
             d_model=self.d_model,
             mlp_ratio=self.mlp_ratio,
             dropout_rate=self.dropout_rate,
             swiglu=self.swiglu,
             parity_2over3=self.parity_2over3,
-            dtype=self.dtype,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.out = nn.DenseGeneral(
             features=self.num_bins,
             axis=-1,
-            dtype=self.dtype,
+            dtype=dtype,
+            param_dtype=param_dtype,
             name="out",
         )
         # Precompute bin centers as a constant (share across calls/checkpoints)
@@ -1163,6 +1239,8 @@ class ValueHead(nn.Module):
 class ActionEncoder(nn.Module):
     d_model: int
     action_dim: int = 16  # up, down, left, right, null (categorical actions)
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(
@@ -1171,10 +1249,14 @@ class ActionEncoder(nn.Module):
         batch_time_shape: Optional[Tuple[int,int]] = None,
         as_tokens: bool = True,
     ):
+        dtype = to_jnp_dtype(self.dtype)
+        param_dtype = to_jnp_dtype(self.param_dtype)
+
         # Base "action token" embedding (used always)
         base_emb = self.param(
-            'base_action_emb', nn.initializers.normal(0.02), (self.d_model,)
+            'base_action_emb', nn.initializers.normal(0.02), (self.d_model,), param_dtype
         )
+        base_emb = base_emb.astype(dtype)
 
         if actions is None:
             # unlabeled videos: just broadcast base embedding
@@ -1183,7 +1265,7 @@ class ActionEncoder(nn.Module):
             out = jnp.broadcast_to(base_emb, (B, T, self.d_model))
         else:
             # embed categorical actions
-            emb_key = nn.Embed(self.action_dim, self.d_model, name="emb_key")(actions)
+            emb_key = nn.Embed(self.action_dim, self.d_model, name="emb_key", dtype=self.dtype, param_dtype=self.param_dtype)(actions)
             out = emb_key + base_emb  # broadcast add
 
         if as_tokens:

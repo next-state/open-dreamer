@@ -67,6 +67,7 @@ from dreamer.utils import (
     maybe_save,
     pack_mae_params,
     _ensure_dir, _to_uint8,
+    to_jnp_dtype,
 )
 from dreamer.imagination import (
     ImaginationConfig,
@@ -474,6 +475,8 @@ def initialize_models(
         mae_p_min=0.0,
         mae_p_max=0.0,
         time_every=4,
+        dtype=cfg.dtype,
+        param_dtype=cfg.param_dtype,
     )
     dec_kwargs = dict(
         d_model=cfg.d_model_enc,
@@ -488,6 +491,8 @@ def initialize_models(
         rope_theta=cfg.rope_theta,
         mlp_ratio=4.0,
         time_every=4,
+        dtype=cfg.dtype,
+        param_dtype=cfg.param_dtype,
     )
     n_spatial = cfg.enc_n_latents // cfg.packing_factor
     dyn_kwargs = dict(
@@ -505,6 +510,8 @@ def initialize_models(
         k_max=k_max,
         time_every=4,
         n_agent=cfg.n_agent,
+        dtype=cfg.dtype,
+        param_dtype=cfg.param_dtype,
     )
 
     encoder = Encoder(**enc_kwargs)
@@ -514,11 +521,15 @@ def initialize_models(
         d_model=cfg.d_model_dyn,
         use_ids=cfg.use_task_ids,
         n_tasks=cfg.n_tasks,
+        dtype=cfg.dtype,
+        param_dtype=cfg.param_dtype,
     )
     policy_head_bc = PolicyHeadMTP(
         d_model=cfg.d_model_dyn,
         action_dim=cfg.action_dim,
         L=cfg.L,
+        dtype=cfg.dtype,
+        param_dtype=cfg.param_dtype,
     )
     reward_head = RewardHeadMTP(
         d_model=cfg.d_model_dyn,
@@ -526,16 +537,22 @@ def initialize_models(
         num_bins=cfg.num_reward_bins,
         log_low=cfg.reward_log_low,
         log_high=cfg.reward_log_high,
+        dtype=cfg.dtype,
+        param_dtype=cfg.param_dtype,
     )
 
     policy_head = PolicyHeadMTP(
         d_model=cfg.d_model_dyn,
         action_dim=cfg.action_dim,
         L=cfg.L,
+        dtype=cfg.dtype,
+        param_dtype=cfg.param_dtype,
     )
     value_head = ValueHead(
         d_model=cfg.d_model_dyn,
         num_bins=cfg.num_value_bins,
+        dtype=cfg.dtype,
+        param_dtype=cfg.param_dtype,
     )
 
     rng = jax.random.PRNGKey(0)
@@ -547,7 +564,7 @@ def initialize_models(
     )
     fake_z = jnp.zeros(
         (cfg.dataset.B, cfg.dataset.T, cfg.enc_n_latents, cfg.enc_d_bottleneck),
-        dtype=jnp.float32,
+        dtype=to_jnp_dtype(cfg.dtype),
     )
     dec_vars = decoder.init(
         {"params": rng, "dropout": rng},
@@ -618,7 +635,7 @@ def initialize_models(
 
     fake_h = jnp.zeros(
         (cfg.dataset.B, cfg.dataset.T, cfg.d_model_dyn),
-        dtype=jnp.float32,
+        dtype=to_jnp_dtype(cfg.dtype),
     )
     pi_bc_vars = policy_head_bc.init(
         {"params": rng_pi_bc, "dropout": rng_pi_bc},

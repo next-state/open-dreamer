@@ -6,6 +6,9 @@ run_name: policy
 bc_rew_ckpt: logs/bc_rew/checkpoints 
 ckpt_save_every: 10_000
 
+dtype: ${dtype}
+param_dtype: ${param_dtype}
+
 dataset:
   B: 64
   diversify_data: true
