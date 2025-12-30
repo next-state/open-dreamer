@@ -255,6 +255,7 @@ class DynamicsConfig:
     # schedule
     bootstrap_start: int = 5_000
     self_fraction: float = 0.25
+    batch_size: int = 16
 
     # eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
