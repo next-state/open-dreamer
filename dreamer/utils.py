@@ -226,10 +226,10 @@ def unpack_mae_params(packed_params, enc_vars, dec_vars):
 
 def make_state(params, opt_state, rng, step, unreplicate=False):
     # Pack training state as a PyTree; JAX/Orbax-friendly types only.
-    # If unreplicate=True, extract data from device 0 (for multi-GPU checkpointing).
+    # If unreplicate=True, extract data from first device (for multi-GPU checkpointing).
     if unreplicate:
-        params = jax.tree.map(lambda x: x[0] if hasattr(x, '__getitem__') and len(x.shape) > 0 else x, params)
-        opt_state = jax.tree.map(lambda x: x[0] if hasattr(x, '__getitem__') and len(x.shape) > 0 else x, opt_state)
+        params = jax.tree.map(lambda x: x[0] if isinstance(x, jax.Array) else x, params)
+        opt_state = jax.tree.map(lambda x: x[0] if isinstance(x, jax.Array) else x, opt_state)
 
     return {
         "params": params,
