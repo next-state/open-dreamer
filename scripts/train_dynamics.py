@@ -165,7 +165,7 @@ def run(cfg: DynamicsConfig):
     dynamics_params = dynamics_variables["params"]
     dynamics_constants = dynamics_variables.get("constants", FrozenDict())
     param_counts = count_parameters_by_component(dynamics_params)
-    print(f"Parameter counts: {param_counts}")
+    print(f"Parameter counts: {param_counts['transformer']/1e6}M")
 
     # Optimizer
     if cfg.lr_schedule == "constant":
