@@ -19,7 +19,7 @@ dataset:
 
 encoder:
   n_latents: 32
-  d_bottleneck: 64
+  d_bottleneck: 32
   d_model: 512
   n_heads: 8
   n_kv_heads: 2
