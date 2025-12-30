@@ -181,11 +181,13 @@ class DreamerVideoModel(VideoModel):
             batch_size=1,
             n_spatial=self.n_spatial,
             window_size=self.window_size,
+            dtype=self.dynamics_cfg.dtype,
         )
         
         self.initial_tokenizer_cache = self.tokenizer.create_static_caches(
             batch_size=1,
             window_size=self.window_size,
+            dtype=self.tokenizer_cfg.decoder.dtype,
         )
         
         # Active caches (will be reset per session)

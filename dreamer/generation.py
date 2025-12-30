@@ -280,7 +280,7 @@ def latent_rollout(
     # 1. Initialize caches and process context
     # We need to compute the max window size needed: context + rollout
     window_size = T_ctx + num_steps
-    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size)
+    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size, dtype=latents_ctx.dtype)
     
     # Run dynamics on context to prefill caches and get last hidden state
     # Use clean signal for ground truth context 
