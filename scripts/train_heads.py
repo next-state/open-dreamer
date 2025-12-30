@@ -18,7 +18,6 @@ import logging
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from typing import Dict
 
 from flax.typing import VariableDict
 import hydra
@@ -47,11 +46,16 @@ from dreamer.utils import (
     make_state,
     maybe_save,
     try_restore,
+    count_parameters_by_component,
+    get_lr_schedule
 )
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
 
+# disable preallocation completely
+import os
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 # ---------------------------
 # Hashable optimizer container
 # ---------------------------
@@ -64,6 +68,33 @@ class OptimizerContainer:
     reward: optax.GradientTransformationExtraArgs
     dynamics: optax.GradientTransformationExtraArgs
     
+
+# ---------------------------
+# Tokenizer forward apply (no module in jit)
+# ---------------------------
+
+def tokenizer_encode_apply(tokenizer_encode_fn, tokenizer_vars, videos, *, mae_key, packing_factor):
+    """
+    Wrapper for tokenizer encoding to avoid passing unhashable Tokenizer module to JIT.
+    
+    Args:
+        tokenizer_encode_fn: Partial function of tokenizer.apply with method=tokenizer.encode bound
+        tokenizer_vars: Tokenizer variables dict
+        videos: Video data to encode
+        mae_key: RNG key for MAE masking
+        packing_factor: Packing factor for latent tokens
+        
+    Returns:
+        latents: Encoded latent tokens
+        aux: Auxiliary outputs (frame_mask, keep_prob)
+    """
+    latents, aux = tokenizer_encode_fn(
+        tokenizer_vars,
+        videos,
+        packing_factor=packing_factor,
+        rngs={"mae": mae_key},
+    )
+    return latents, aux
 
 # ---------------------------
 # Multi-token prediction (MTP) helpers
@@ -132,8 +163,9 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
 # Training step
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("dynamics", "task_embedder", "policy_head", "reward_head", "optimizers", "k_max", "L_mtp", "B_self"))
+@partial(jax.jit, static_argnames=("tokenizer_encode_fn", "dynamics", "task_embedder", "policy_head", "reward_head", "optimizers", "k_max", "L_mtp", "B_self", "packing_factor"))
 def train_step(
+    tokenizer_encode_fn,
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
     policy_head: PolicyHeadMTP,
@@ -146,38 +178,44 @@ def train_step(
     policy_params: VariableDict,
     reward_params: VariableDict,
     reward_constants: VariableDict,
+    tokenizer_vars: VariableDict,
     opt_states,
     # Data
-    latents: jax.Array,
+    videos: jax.Array,
     batch,
     rng: jax.Array,
-    step: int,
     # Config
     k_max: int,
     L_mtp: int,
     B_self: int,
-    dynamics_loss_weight: float,
+    packing_factor: int,
+    loss_weight_shortcut: float,
+    loss_weight_policy: float,
+    loss_weight_reward: float,
 ):
     """
     Agent finetuning step with BC + reward prediction + optional dynamics loss.
     
     Args:
+        tokenizer_encode_fn: Partial function of tokenizer.apply with method=tokenizer.encode bound
         Models: dynamics, task_embedder, policy_head, reward_head
         tx_dict: Dict of optimizers for each component
         State: parameters and optimizer states
-        latents: Precomputed latents from tokenizer
+        videos: Video data to encode
         batch: Data batch with actions, tasks, rewards
         rng: Random key
-        step: Training step number
         Config: hyperparameters
         
     Returns:
         new_params, new_opt_states, metrics
     """
-    B, T_video, _, _ = latents.shape
+    # Split RNG for tokenizer and dynamics
+    rng, tokenizer_key, dyn_key = jax.random.split(rng, 3)
     
-    # Split RNG
-    rng, dyn_key = jax.random.split(rng, 2)
+    # Encode videos to latents (frozen tokenizer - now inside train_step for JIT)
+    latents, _ = tokenizer_encode_apply(tokenizer_encode_fn, tokenizer_vars, videos, mae_key=tokenizer_key, packing_factor=packing_factor)
+    
+    B, T_video, _, _ = latents.shape
     
     # 1. Create task-conditioned agent tokens
     # For now, pass task ID 0 for all samples in batch
@@ -200,12 +238,26 @@ def train_step(
         policy_loss = compute_policy_loss(policy_head, pol_p, h_states, actions_btL, actions_valid)
         reward_loss = compute_reward_loss(reward_head, {"params": rew_p, "constants": reward_constants}, h_states, rewards_btL, rewards_valid)
         
-        # Combine losses
-        total_loss = policy_loss + reward_loss + dynamics_loss_weight * dynamics_loss
+        # Combine losses with weights
+        w_policy_loss = loss_weight_policy * policy_loss
+        w_reward_loss = loss_weight_reward * reward_loss
+        w_dynamics_loss = loss_weight_shortcut * dynamics_loss
+        total_loss = w_policy_loss + w_reward_loss + w_dynamics_loss
         
         # Filter out non-scalar metrics (h_states is used above but shouldn't be logged)
-        aux = {"policy_loss": policy_loss, "reward_loss": reward_loss, "dynamics_loss": dynamics_loss, 
-               "flow_mse": dyn_aux["flow_mse"], "bootstrap_mse": dyn_aux["bootstrap_mse"]}
+        aux = {
+            # Unweighted losses
+            "policy_loss": policy_loss,
+            "reward_loss": reward_loss,
+            "dynamics_loss": dynamics_loss,
+            # Weighted losses
+            "w_policy_loss": w_policy_loss,
+            "w_reward_loss": w_reward_loss,
+            "w_dynamics_loss": w_dynamics_loss,
+            # Other metrics
+            "flow_mse": dyn_aux["flow_mse"],
+            "bootstrap_mse": dyn_aux["bootstrap_mse"]
+        }
         
         return total_loss, aux
     
@@ -257,7 +309,8 @@ def run(cfg: BCRewConfig):
     
     # Load pretrained tokenizer and dynamics
     rng = jax.random.PRNGKey(0)
-    print(f"[setup] Loading pretrained dynamics and tokenizer from {cfg.dynamics_ckpt}")
+    print(f"[setup] Loading pretrained dynamics from {cfg.dynamics_ckpt}")
+    print(f"[setup] Loading pretrained tokenizer from {cfg.tokenizer_ckpt}")
     dynamics, dynamics_vars, dynamics_cfg, tokenizer, tokenizer_vars, tokenizer_cfg = Dynamics.from_pretrained(cfg.dynamics_ckpt)
     dynamics_params = dynamics_vars["params"]
     dynamics_constants = dynamics_vars.get("constants", FrozenDict())
@@ -281,11 +334,12 @@ def run(cfg: BCRewConfig):
     reward_constants = reward_vars.get("constants", FrozenDict())
     
     # Optimizers
+    adamw = partial(optax.adamw, b1=0.9, b2=0.9, weight_decay=1e-4)
     optimizers = OptimizerContainer(
-        task_embedder=optax.adamw(cfg.lr_policy),  # Use same LR as policy
-        policy=optax.adamw(cfg.lr_policy),
-        reward=optax.adamw(cfg.lr_reward),
-        dynamics=optax.adamw(cfg.lr_dynamics)
+        task_embedder=adamw(cfg.lr_policy),  # Use same LR as policy
+        policy=adamw(cfg.lr_policy),
+        reward=adamw(cfg.lr_reward),
+        dynamics=adamw(cfg.lr_dynamics)
     )
     opt_states = {
         "task_embedder": optimizers.task_embedder.init(task_embedder_params),
@@ -316,77 +370,81 @@ def run(cfg: BCRewConfig):
     start_step = 0
     if restored is not None:
         latest_step, r = restored
-        task_embedder_params = r.state["params"]["task_embedder"]
-        policy_params = r.state["params"]["policy"]
-        reward_params = r.state["params"]["reward"]
-        dynamics_params = r.state["params"]["dynamics"]
+        params = r.state["params"]
         opt_states = r.state["opt_state"]
         rng = r.state["rng"]
         start_step = int(r.state["step"])
         print(f"[ckpt] Restored step {latest_step}")
-    
+    else:
+        # Initialize params dict as single source of truth
+        params = {
+            "task_embedder": task_embedder_params,
+            "policy": policy_params,
+            "reward": reward_params,
+            "dynamics": dynamics_params,
+        }
+    param_counts = count_parameters_by_component(params)
+    print(f"Parameter counts: {param_counts}")
+
     # Dataset
-    dataset = make_iterator(cfg.dataset)
+    dataset = make_iterator(tokenizer_cfg.dataset)
     
     # Training loop
     pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
+    tokenizer_encode_fn = partial(tokenizer.apply, method=tokenizer.encode)
     for step, batch in pbar:
         if step >= cfg.max_steps:
             break
         
-        rng, tokenizer_key, step_key = jax.random.split(rng, 3)
+        rng, step_key = jax.random.split(rng, 2)
         
-        # Encode videos to latents (frozen tokenizer - outside train_step)
-        # Inline JIT using a lambda
+        # Get videos and compute batch size
         videos = batch["videos"]
         actions = batch["actions"]
         B, T, H, W, C = videos.shape
-        # shift the actions by one and put the "first action token" = 15 at the beginning 
-        actions = jnp.concatenate((jnp.full_like(actions[:,0:1], fill_value = 15), actions[:,:-1]), axis=1) # TODO: pass this to the train step!
-        latents, _ = tokenizer.apply(tokenizer_vars, videos, packing_factor=dynamics_cfg.packing_factor, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
+        B_self = int(videos.shape[0] * cfg.self_fraction) * (step >= cfg.bootstrap_start)
         
-        # Training step
-        new_params, opt_states, metrics = train_step(
+        # Training step (tokenizer encoding now happens inside train_step for JIT)
+        params, opt_states, metrics = train_step(
+            tokenizer_encode_fn=tokenizer_encode_fn,
             dynamics=dynamics,
             task_embedder=task_embedder,
             policy_head=policy_head,
             reward_head=reward_head,
             optimizers=optimizers,
-            dynamics_params=new_params.get("dynamics", dynamics_params) if step > start_step else dynamics_params,
+            dynamics_params=params["dynamics"],
             dynamics_constants=dynamics_constants,
-            task_embedder_params=new_params.get("task_embedder", task_embedder_params) if step > start_step else task_embedder_params,
-            policy_params=new_params.get("policy", policy_params) if step > start_step else policy_params,
-            reward_params=new_params.get("reward", reward_params) if step > start_step else reward_params,
+            task_embedder_params=params["task_embedder"],
+            policy_params=params["policy"],
+            reward_params=params["reward"],
             reward_constants=reward_constants,
+            tokenizer_vars=tokenizer_vars,
             opt_states=opt_states,
-            latents=latents,
+            videos=videos,
             batch=batch,
             rng=step_key,
-            step=step,
             k_max=dynamics.config.k_max,
             L_mtp=cfg.L,
-            B_self=(B // 2)*(step >= cfg.bootstrap_start), # This will make the function compile twice. TODO: see if it's worth fixing this
-            dynamics_loss_weight=cfg.dynamics_loss_weight,
+            B_self=B_self,
+            packing_factor=dynamics_cfg.packing_factor,
+            loss_weight_shortcut=cfg.loss_weight_shortcut,
+            loss_weight_policy=cfg.loss_weight_policy,
+            loss_weight_reward=cfg.loss_weight_reward,
         )
-        
-        # Update params
-        dynamics_params = new_params["dynamics"]
-        policy_params = new_params["policy"]
-        reward_params = new_params["reward"]
         
         # Logging
         if logger.should_log(step):
             logger.log(step, metrics=metrics, pbar=pbar)
         
         # Save checkpoint
-        state = make_state(new_params, opt_states, rng, step)
+        state = make_state(params, opt_states, rng, step)
         maybe_save(mngr, step, state, meta)
         
         # Periodic lightweight AR eval
         if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
             # Use current batch as validation data (simplest approach)
             val_videos = batch["videos"]
-            run_evaluation(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, dynamics_params, dynamics_constants, val_videos, actions, vis_dir, rng)
+            run_evaluation(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, params["dynamics"], dynamics_constants, val_videos, jnp.asarray(actions), vis_dir, rng)
     
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:
@@ -395,7 +453,7 @@ def run(cfg: BCRewConfig):
     print("[done] Agent finetuning complete!")
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="bc_rew")
+@hydra.main(version_base=None, config_path="../configs", config_name="heads")
 def main(cfg: DictConfig):
     schema = OmegaConf.structured(BCRewConfig)
     cfg = OmegaConf.merge(schema, cfg)

@@ -271,7 +271,6 @@ class BCRewConfig:
     lr_policy: float = 1e-4
     lr_reward: float = 1e-4
     lr_dynamics: float = 1e-5
-    dynamics_loss_weight: float = 0.1
 
     # Eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely

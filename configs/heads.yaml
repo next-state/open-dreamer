@@ -3,13 +3,13 @@ defaults:
   - _self_
 
 run_name: bc_rew
-tokenizer_ckpt: "logs/tokenizer/checkpoints"
-dynamics_ckpt: "logs/dynamics/checkpoints"
+tokenizer_ckpt: "logs/coinrun_hard_besttk/checkpoints"
+dynamics_ckpt: "logs/fixed_d_model512_n_register32_depth6_k_max64_dropout0.05_qk_normquest_rope_theta10000_n_heads8_n_kv_heads2/checkpoints"
 ckpt_save_every: 100_000
 
 dataset:
-  B: 64
-  T: 32
+  B: 48
+  T: 16
   diversify_data: true
 
 action_dim: 16
@@ -19,15 +19,14 @@ n_agent: 4
 bootstrap_start: 5000
 self_fraction: 0.25
 
-max_steps: 1_000_000_000
-log_every: 10
-write_video_every: 500
+max_steps: 50_000
+log_every: 100
+write_video_every: 5000
 
 # Learning rates
 lr_policy: ${lr_dynamics}
 lr_reward: ${lr_dynamics}
 lr_dynamics: 1e-4
-dynamics_loss_weight: 0.1
 
 # Multi-token prediction settings
 L: ${n_agent}
