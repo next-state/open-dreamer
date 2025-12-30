@@ -17,6 +17,7 @@ from pathlib import Path
 import hydra
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
 import optax
 import wandb
 from flax.core import FrozenDict
@@ -133,9 +134,30 @@ def run(cfg: DynamicsConfig):
     if cfg.use_wandb:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project or cfg.run_name, name=cfg.run_name, config=asdict(cfg), dir=str(run_dir))
 
+    # Validate batch size divisibility for data parallelism
+    device_count = jax.local_device_count()
+    if cfg.batch_size % device_count != 0:
+        raise ValueError(
+            f"Batch size ({cfg.batch_size}) must be divisible by "
+            f"device count ({device_count}) for data parallelism."
+        )
+
+    per_device_batch_size = cfg.batch_size // device_count
+    print(f"[data_parallel] Found {device_count} devices: {jax.local_devices()}")
+    print(f"[data_parallel] Global batch size: {cfg.batch_size}")
+    print(f"[data_parallel] Per-device batch size: {per_device_batch_size}")
+
     # Load frozen tokenizer
     rng = jax.random.PRNGKey(0)
     tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(cfg.tokenizer_ckpt)
+
+    # Create device mesh for data parallelism
+    mesh = jax.make_mesh((device_count,), ('batch',))
+    print(f"[data_parallel] Created mesh: {mesh}")
+
+    # Define sharding strategies
+    batch_sharding = NamedSharding(mesh, P('batch'))      # Shard batch dimension
+    replicated_sharding = NamedSharding(mesh, P())         # Replicate across devices
 
     # Initialize dynamics
     dynamics = Dynamics(cfg.dynamics)
@@ -187,6 +209,19 @@ def run(cfg: DynamicsConfig):
         cfg.use_wandb = use_wandb_override  # Keep CLI/YAML wandb setting
         print(f"[ckpt] Restored step {latest_step}")
 
+    # Helper to replicate pytrees across devices
+    def replicate_across_devices(tree, sharding):
+        """Place a pytree on all devices with given sharding."""
+        return jax.tree.map(lambda x: jax.device_put(x, sharding), tree)
+
+    # Replicate all model state across devices
+    dynamics_params = replicate_across_devices(dynamics_params, replicated_sharding)
+    dynamics_constants = replicate_across_devices(dynamics_constants, replicated_sharding)
+    opt_state = replicate_across_devices(opt_state, replicated_sharding)
+    tokenizer_vars = replicate_across_devices(tokenizer_vars, replicated_sharding)
+
+    print(f"[data_parallel] Replicated params, constants, opt_state, and tokenizer_vars")
+
     dataset = make_iterator(tokenizer_cfg.dataset)
     pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
     for step, batch in pbar:
@@ -195,9 +230,9 @@ def run(cfg: DynamicsConfig):
         # Data
         rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
 
-        # Get batch data
-        videos = batch["videos"]
-        actions = batch["actions"]
+        # Get batch data and shard across devices
+        videos = jax.device_put(batch["videos"], batch_sharding)
+        actions = jax.device_put(batch["actions"], batch_sharding)
 
         # Combined encoding + training step (both phases parallelized)
         dynamics_params, opt_state, aux = encode_and_train_step(
@@ -227,9 +262,18 @@ def run(cfg: DynamicsConfig):
 
         # Periodic lightweight AR eval
         if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
-            # Use current batch as validation data (simplest approach)
-            val_videos = batch["videos"]
-            run_evaluation(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, dynamics_params, dynamics_constants, val_videos, jnp.asarray(actions), vis_dir, rng)
+            # Use subset of batch for visualization (move to host)
+            val_videos = jax.device_get(batch["videos"][:4])
+            val_actions = jax.device_get(batch["actions"][:4])
+
+            run_evaluation(
+                cfg, tokenizer_cfg, step, tokenizer,
+                jax.device_get(tokenizer_vars),
+                dynamics,
+                jax.device_get(dynamics_params),
+                jax.device_get(dynamics_constants),
+                val_videos, jnp.asarray(val_actions), vis_dir, rng
+            )
 
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:
