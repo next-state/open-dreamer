@@ -229,10 +229,12 @@ def run(cfg: DynamicsConfig):
             break
         # Data
         rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
-        
-        # Replicate random keys across devices
-        tokenizer_key = jax.device_put(tokenizer_key, replicated_sharding)
-        master_key = jax.device_put(master_key, replicated_sharding)
+
+        # Split keys for each device
+        tokenizer_key = jax.random.split(tokenizer_key, num=device_count) # 
+        master_key = jax.random.split(master_key, num=device_count)
+        tokenizer_key = jax.device_put(tokenizer_key, batch_sharding)
+        master_key = jax.device_put(master_key, batch_sharding)
 
         # Get batch data and shard across devices
         videos = jax.device_put(batch["videos"], batch_sharding)
@@ -261,7 +263,7 @@ def run(cfg: DynamicsConfig):
             )
 
         # Save (async) when policy says we should
-        state = make_state(dynamics_params, opt_state, rng, step)
+        state = make_state(dynamics_params, opt_state, rng, step, unreplicate=True)
         maybe_save(mngr, step, state, meta)
 
         # Periodic lightweight AR eval
