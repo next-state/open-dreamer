@@ -5,8 +5,7 @@ import einops
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
-import time
-from flax.core import FrozenDict, freeze, unfreeze
+from flax.core import freeze, unfreeze
 import flax
 from typing import Optional, Tuple, Any, Dict
 from einops import rearrange, repeat
@@ -223,14 +222,6 @@ class MAEReplacer(nn.Module):
 
 # ---------- small building blocks ----------
 
-class RMSNorm(nn.Module):
-    eps: float = 1e-6
-    @nn.compact
-    def __call__(self, x):
-        scale = self.param("scale", nn.initializers.ones, (x.shape[-1],))
-        var = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
-        return x * (scale / jnp.sqrt(var + self.eps))
-
 class MLP(nn.Module):
     """
     Transformer MLP with optional SwiGLU gating.
@@ -250,6 +241,7 @@ class MLP(nn.Module):
     dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
+    use_norm: bool = True
     dtype: Any = jnp.float32
 
     @nn.compact
@@ -263,6 +255,9 @@ class MLP(nn.Module):
         Returns:
           y:            (..., d_model) output activations, same shape as input.
         """
+        if self.use_norm:
+            x = nn.RMSNorm(name="norm")(x)
+
         # Choose hidden size
         mult = self.mlp_ratio
         if self.swiglu and self.parity_2over3:
@@ -456,7 +451,7 @@ class BlockCausalLayer(nn.Module):
     rope_theta: float = 10000.0
 
     def setup(self):
-        self.norm = RMSNorm()
+        self.norm = nn.RMSNorm()
 
         # --- Time or space attention ---
         self.use_time = (self.layer_index + 1) % self.time_every == 0
@@ -471,7 +466,6 @@ class BlockCausalLayer(nn.Module):
         )
 
         # --- MLP ---
-        self.norm_mlp = RMSNorm()
         self.mlp = MLP(self.dim, self.mlp_ratio, self.dropout_rate)
 
     @nn.compact
@@ -482,8 +476,7 @@ class BlockCausalLayer(nn.Module):
         x = x + y
 
         # --- MLP ---
-        y = self.norm_mlp(x)
-        y = self.mlp(y, deterministic=deterministic)
+        y = self.mlp(x, deterministic=deterministic)
         x = x + y
         return x, new_cache
 
@@ -642,7 +635,14 @@ class Decoder(nn.Module):
 
     dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675)
-    
+
+    def get_token_layout(self) -> TokenLayout:
+        n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
+        return TokenLayout((
+            (Modality.LATENT, self.n_latents),
+            (Modality.IMAGE, n_patches)
+        ))
+
     def setup(self):
         self.n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
         self.up_proj = nn.Dense(self.d_model, name="up_proj")
@@ -677,10 +677,7 @@ class Decoder(nn.Module):
         tokens = jnp.concatenate([latents, patches], axis=-2)
 
         # 5) Make mask
-        layout = TokenLayout((
-            (Modality.LATENT, N_l),
-            (Modality.IMAGE, self.n_patches)
-            ))
+        layout = self.get_token_layout()
         mask = layout.make_mask("decoder")
 
         x, new_caches = self.transformer(tokens, mask=mask, deterministic=deterministic, caches=caches)
@@ -732,16 +729,12 @@ class Tokenizer(nn.Module):
         Returns:
             Dictionary mapping time layer indices to KVCache objects.
         """
-        # In the decoder, time attention sees (B * S) independent sequences
-        # where S = N_latents + N_patches (total number of spatial tokens)
-        n_patches = (self.config.decoder.H // self.config.decoder.patch_size) * \
-                    (self.config.decoder.W // self.config.decoder.patch_size)
-        S_total = self.config.decoder.n_latents + n_patches
+        layout = self.decoder.get_token_layout()
         
         return create_transformer_caches(
             depth=self.config.decoder.depth,
             time_every=self.config.decoder.time_every,
-            flattened_batch_size=batch_size * S_total,
+            flattened_batch_size=batch_size * layout.S,
             window_size=window_size,
             num_kv_heads=self.config.decoder.n_kv_heads,
             head_dim=self.config.decoder.d_model // self.config.decoder.n_heads,
@@ -816,7 +809,6 @@ class Dynamics(nn.Module):
         )
         self.action_encoder = ActionEncoder(d_model=self.d_model, action_dim = self.config.action_dim)
 
-
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
@@ -842,6 +834,18 @@ class Dynamics(nn.Module):
         self.flow_x_head = nn.Dense(self.d_bottleneck * self.packing_factor, name="flow_x_head", kernel_init=nn.initializers.zeros,
                             bias_init=nn.initializers.zeros)  # zero-init
 
+    def get_token_layout(self, n_spatial: int, n_agent: int = 0) -> TokenLayout:
+        segments = [
+            (Modality.ACTION, 1),
+            (Modality.SHORTCUT_SIGNAL, 1),
+            (Modality.SHORTCUT_STEP, 1),
+            (Modality.SPATIAL, n_spatial),
+            (Modality.REGISTER, self.config.n_register),
+        ]
+        if n_agent > 0:
+            segments.append((Modality.AGENT, n_agent))
+        return TokenLayout(tuple(segments))
+
     def create_static_caches(self,
                              batch_size: int,
                              n_spatial: int,
@@ -858,13 +862,12 @@ class Dynamics(nn.Module):
             window_size: Maximum sequence length (T) to support.
             dtype: Data type for cache buffers.
         """
-        # Time attention sees (B*S) independent sequences. S includes all tokens (action, signal, step, spatial, register, agent)
-        S_total = 1 + 1 + 1 + n_spatial + n_agent + self.config.n_register 
+        layout = self.get_token_layout(n_spatial=n_spatial, n_agent=n_agent)
 
         return create_transformer_caches(
             depth=self.config.depth,
             time_every=self.config.time_every,
-            flattened_batch_size=batch_size * S_total,
+            flattened_batch_size=batch_size * layout.S,
             window_size=window_size,
             num_kv_heads=self.config.n_kv_heads,
             head_dim=self.config.d_model // self.config.n_heads,
@@ -922,9 +925,8 @@ class Dynamics(nn.Module):
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
         # make the layout for masking
-        modalities = [Modality.ACTION, Modality.SHORTCUT_SIGNAL, Modality.SHORTCUT_STEP, Modality.SPATIAL, Modality.REGISTER, Modality.AGENT]
-        segments = tuple((modality, tok.shape[2]) for modality, tok in zip(modalities, toks))
-        layout = TokenLayout(segments)
+        n_agent = agent_tokens.shape[2] if agent_tokens is not None else 0
+        layout = self.get_token_layout(n_spatial=spatial_tokens.shape[2], n_agent=n_agent)
         mask = layout.make_mask("wm_agent")
 
         x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches)
@@ -1059,8 +1061,7 @@ class PolicyHeadMTP(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
-        norm_ht=RMSNorm()(h_t)
-        x = self.projector(norm_ht, deterministic=deterministic)  # (B, T, D)
+        x = self.projector(h_t, deterministic=deterministic)  # (B, T, D)
         logits = self.out(x)                                  # (B, T, L, A)
         return logits  # softmax/sigmoid applied at loss-time based on `kind`
 
@@ -1107,8 +1108,7 @@ class RewardHeadMTP(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
-        norm_ht=RMSNorm()(h_t)
-        x = self.projector(norm_ht, deterministic=deterministic)   # (B, T, D)
+        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L, K)
         centers_log = self.centers_var.value                   # (K,)
         return logits, centers_log
@@ -1155,8 +1155,7 @@ class ValueHead(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
-        norm_ht=RMSNorm()(h_t)
-        x = self.projector(norm_ht, deterministic=deterministic)   # (B, T, D)
+        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, K)
         centers_log = self.centers_var.value                   # (K,)
         return logits, centers_log

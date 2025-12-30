@@ -7,7 +7,7 @@ import optax
 import operator
 from flax.struct import dataclass
 from flax.core import freeze, unfreeze, FrozenDict
-from einops import rearrange, repeat
+from einops import rearrange
 from enum import IntEnum
 from typing import Tuple
 import numpy as np
@@ -45,13 +45,14 @@ class Modality(IntEnum):
     AGENT = 7
     # add more as needed
 
-@dataclass  # immutable, PyTree-friendly
+@dataclass
 class TokenLayout:
     """
     Ordered token layout for a single timestep: segments define the order.
     """
     segments: Tuple[Tuple[Modality, int], ...]  # e.g., ((Modality.LATENT, n_latents), (Modality.IMAGE, n_patches), ...)
 
+    @property
     def S(self) -> int:
         return sum(n for _, n in self.segments)
 
@@ -86,14 +87,14 @@ class TokenLayout:
             - Agent tokens (query) can attend to ALL tokens (key).
         """
         modality_ids = self.modality_ids()
-        S = int(modality_ids.shape[0])
+        S = self.S
 
         # Broadcast helpers
-        q_idx = jnp.arange(S)[:, None]       # (S,1)
-        k_idx = jnp.arange(S)[None, :]       # (1,S)
+        q_idx = jnp.arange(S)[:, None]       # (S, 1)
+        k_idx = jnp.arange(S)[None, :]       # (1, S)
 
-        q_mod = modality_ids[q_idx]      # (S,1)
-        k_mod = modality_ids[k_idx]      # (1,S)
+        q_mod = modality_ids[q_idx]      # (S, 1)
+        k_mod = modality_ids[k_idx]      # (1, S)
 
         if mode == "encoder":
             # latents -> all; non-latents -> same modality only
@@ -303,6 +304,17 @@ def _ensure_dir(p: Path) -> Path:
 def _to_uint8(img_f32):
     """Convert float32 image to uint8."""
     return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
+
+def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jnp.ndarray:
+    """
+    Add a colored border to a batch of frames.
+    """
+    color = jnp.asarray(color, dtype=frames.dtype)
+    frames = frames.at[..., :width, :, :].set(color)
+    frames = frames.at[..., -width:, :, :].set(color)
+    frames = frames.at[..., :, :width, :].set(color)
+    frames = frames.at[..., :, -width:, :].set(color)
+    return frames
 
 def _stack_wide(*imgs_hwC):
     """Stack images horizontally."""

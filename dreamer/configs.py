@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 
+
 @dataclass(frozen=False)
 class DatasetConfig:
     """Configuration for dataset parameters.

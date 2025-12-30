@@ -5,7 +5,6 @@ from typing import Tuple, Dict, Any
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from dreamer.models import Tokenizer, Dynamics
 from .generation import DenoiseSchedule, video_rollout
