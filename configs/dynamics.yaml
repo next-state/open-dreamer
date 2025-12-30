@@ -3,15 +3,15 @@ defaults:
     - _self_
 
 run_name: dynamics
-tokenizer_ckpt: "logs/coinrun_hard_besttk/checkpoints/"
-ckpt_save_every: 10000
+tokenizer_ckpt: "logs/tokenizer_full_mse/checkpoints/"
+ckpt_save_every: 100000
 
 # Dynamics specific
 dynamics:
-    d_model: 128
+    d_model: 1024
     d_bottleneck: 32
     action_dim: 16
-    depth: 8
+    depth: 32
     n_heads: 4
     n_kv_heads: 2
     packing_factor: 2
@@ -25,8 +25,9 @@ dynamics:
 
 bootstrap_start: 5_000
 self_fraction: 0.25
+batch_size: 256
 
-max_steps: 50_000
+max_steps: 5_000_000
 log_every: 100
 lr: 1e-4
 
@@ -35,7 +36,7 @@ lr_schedule: wsd  # constant | wsd | cos
 init_lr: 0.0
 max_lr: 1e-4
 lr_end: 0
-warmup_steps: 5000
+warmup_steps: 50000
 wsd_decay_steps: 20000
 
-write_video_every: 5000
+write_video_every: 50000
