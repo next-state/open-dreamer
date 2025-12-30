@@ -44,13 +44,41 @@ from dreamer.utils import (
 logging.getLogger('absl').setLevel(logging.WARNING)
 
 # ---------------------------
+# Tokenizer forward apply (no module in jit)
+# ---------------------------
+
+def tokenizer_encode_apply(tokenizer_encode_fn, tokenizer_vars, videos, *, mae_key, packing_factor):
+    """
+    Wrapper for tokenizer encoding to avoid passing unhashable Tokenizer module to JIT.
+    
+    Args:
+        tokenizer_encode_fn: Partial function of tokenizer.apply with method=tokenizer.encode bound
+        tokenizer_vars: Tokenizer variables dict
+        videos: Video data to encode
+        mae_key: RNG key for MAE masking
+        packing_factor: Packing factor for latent tokens
+        
+    Returns:
+        latents: Encoded latent tokens
+        aux: Auxiliary outputs (frame_mask, keep_prob)
+    """
+    latents, aux = tokenizer_encode_fn(
+        tokenizer_vars,
+        videos,
+        packing_factor=packing_factor,
+        rngs={"mae": mae_key},
+    )
+    return latents, aux
+
+# ---------------------------
 # Training step (now using reusable components from dreamer.training)
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("dynamics", "tx", "k_max", "B_self"))
+@partial(jax.jit, static_argnames=("tokenizer_encode_fn", "dynamics", "tx", "k_max", "B_self"))
 def train_step(
-    dynamics, tx, params, opt_state, constants, latents, actions,
-    *, B_self: int, k_max: int, master_key: jnp.ndarray, step: int):
+    tokenizer_encode_fn,
+    dynamics, tx, params, opt_state, constants, tokenizer_vars, videos, actions,
+    *, k_max: int, B_self: int, master_key: jnp.ndarray, step: int):
     """
     Training step using shortcut forcing (flow matching + bootstrap self-consistency).
     
@@ -63,6 +91,8 @@ def train_step(
     Bootstrap contribution is masked to 0 when step < bootstrap_start.
     """
     step_key = jax.random.fold_in(master_key, step)
+    rng, tokenizer_key = jax.random.split(step_key, 2)
+    latents, _ = tokenizer_encode_fn(tokenizer_vars, videos, mae_key=tokenizer_key)
     
     def loss_and_aux(p):
         vars_dict = {"params": p, "constants": constants}
@@ -71,7 +101,7 @@ def train_step(
             dynamics_vars=vars_dict,
             actions=actions,
             latents=latents,
-            rng=step_key,
+            rng=rng,
             k_max=k_max,
             B_self=B_self,
             agent_tokens=None,  # Not used in dynamics pretraining
@@ -153,21 +183,44 @@ def run(cfg: DynamicsConfig):
 
     dataset = make_iterator(tokenizer_cfg.dataset)
     pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
+    # Create partial function with packing_factor bound (tokenizer_vars passed as dynamic arg)
+    base_tokenizer_encode_fn = partial(tokenizer.apply, method=tokenizer.encode)
+    tokenizer_encode_fn = partial(
+        tokenizer_encode_apply,
+        base_tokenizer_encode_fn,
+        packing_factor=cfg.dynamics.packing_factor
+    )
     for step, batch in pbar:
         if step > cfg.max_steps:
             break
         # Data
-        rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
+        rng, master_key = jax.random.split(rng, num=2)
 
         # Normalize videos
         videos = batch["videos"]
         actions = batch["actions"]
-        latents, _ = tokenizer.apply(tokenizer_vars, videos, packing_factor=cfg.dynamics.packing_factor, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
+        B_self = int(videos.shape[0] * cfg.self_fraction) * (step >= cfg.bootstrap_start)
 
-        dynamics_params, opt_state, aux = train_step(dynamics, tx, 
-            dynamics_params, opt_state, dynamics_constants, latents, actions, 
-            B_self=(videos.shape[0] // 2)*(step >= cfg.bootstrap_start), # This will make the function compile twice. TODO: see if it's worth fixing this
-            k_max=cfg.dynamics.k_max, master_key=master_key, step=step)
+        dynamics_params, opt_state, aux = train_step(
+            # Models/functions
+            tokenizer_encode_fn=tokenizer_encode_fn,
+            dynamics=dynamics,
+            tx=tx,
+            # State
+            params=dynamics_params,
+            opt_state=opt_state,
+            constants=dynamics_constants,
+            tokenizer_vars=tokenizer_vars,
+            # Data
+            videos=videos,
+            actions=actions,
+            # Config
+            k_max=cfg.dynamics.k_max,
+            B_self=B_self,
+            # RNG/step
+            master_key=master_key,
+            step=step,
+        )
 
         # Logging
         if logger.should_log(step):

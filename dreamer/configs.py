@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 
-@dataclass(frozen=False)
+@dataclass(frozen=False, unsafe_hash=True)
 class DatasetConfig:
     """Configuration for dataset parameters.
     
@@ -33,7 +33,7 @@ class DatasetConfig:
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
-@dataclass(frozen=False)
+@dataclass(frozen=False, unsafe_hash=True)
 class EncoderConfig:
     n_latents: int = 16
     d_bottleneck: int = 32
@@ -52,7 +52,7 @@ class EncoderConfig:
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
-@dataclass(frozen=False)
+@dataclass(frozen=False, unsafe_hash=True)
 class DecoderConfig:
     d_model: int = 64
     n_heads: int = 4
@@ -71,7 +71,7 @@ class DecoderConfig:
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
-@dataclass(frozen=False)
+@dataclass(frozen=False, unsafe_hash=True)
 class TokenizerConfig:
     # IO / ckpt
     run_name: str

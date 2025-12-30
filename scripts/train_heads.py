@@ -70,33 +70,6 @@ class OptimizerContainer:
     
 
 # ---------------------------
-# Tokenizer forward apply (no module in jit)
-# ---------------------------
-
-def tokenizer_encode_apply(tokenizer_encode_fn, tokenizer_vars, videos, *, mae_key, packing_factor):
-    """
-    Wrapper for tokenizer encoding to avoid passing unhashable Tokenizer module to JIT.
-    
-    Args:
-        tokenizer_encode_fn: Partial function of tokenizer.apply with method=tokenizer.encode bound
-        tokenizer_vars: Tokenizer variables dict
-        videos: Video data to encode
-        mae_key: RNG key for MAE masking
-        packing_factor: Packing factor for latent tokens
-        
-    Returns:
-        latents: Encoded latent tokens
-        aux: Auxiliary outputs (frame_mask, keep_prob)
-    """
-    latents, aux = tokenizer_encode_fn(
-        tokenizer_vars,
-        videos,
-        packing_factor=packing_factor,
-        rngs={"mae": mae_key},
-    )
-    return latents, aux
-
-# ---------------------------
 # Multi-token prediction (MTP) helpers
 # ---------------------------
 
@@ -163,9 +136,9 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
 # Training step
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("tokenizer_encode_fn", "dynamics", "task_embedder", "policy_head", "reward_head", "optimizers", "k_max", "L_mtp", "B_self", "packing_factor"))
+@partial(jax.jit, static_argnames=("tokenizer", "dynamics", "task_embedder", "policy_head", "reward_head", "optimizers", "k_max", "L_mtp", "B_self", "packing_factor"))
 def train_step(
-    tokenizer_encode_fn,
+    tokenizer: Tokenizer,
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
     policy_head: PolicyHeadMTP,
@@ -197,7 +170,7 @@ def train_step(
     Agent finetuning step with BC + reward prediction + optional dynamics loss.
     
     Args:
-        tokenizer_encode_fn: Partial function of tokenizer.apply with method=tokenizer.encode bound
+        tokenizer: Tokenizer model (frozen, passed as static arg)
         Models: dynamics, task_embedder, policy_head, reward_head
         tx_dict: Dict of optimizers for each component
         State: parameters and optimizer states
@@ -213,7 +186,13 @@ def train_step(
     rng, tokenizer_key, dyn_key = jax.random.split(rng, 3)
     
     # Encode videos to latents (frozen tokenizer - now inside train_step for JIT)
-    latents, _ = tokenizer_encode_apply(tokenizer_encode_fn, tokenizer_vars, videos, mae_key=tokenizer_key, packing_factor=packing_factor)
+    latents, _ = tokenizer.apply(
+        tokenizer_vars,
+        videos,
+        packing_factor=packing_factor,
+        method=tokenizer.encode,
+        rngs={"mae": tokenizer_key},
+    )
     
     B, T_video, _, _ = latents.shape
     
@@ -391,7 +370,6 @@ def run(cfg: BCRewConfig):
     
     # Training loop
     pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
-    tokenizer_encode_fn = partial(tokenizer.apply, method=tokenizer.encode)
     for step, batch in pbar:
         if step >= cfg.max_steps:
             break
@@ -404,14 +382,15 @@ def run(cfg: BCRewConfig):
         B, T, H, W, C = videos.shape
         B_self = int(videos.shape[0] * cfg.self_fraction) * (step >= cfg.bootstrap_start)
         
-        # Training step (tokenizer encoding now happens inside train_step for JIT)
         params, opt_states, metrics = train_step(
-            tokenizer_encode_fn=tokenizer_encode_fn,
+            # Models
+            tokenizer=tokenizer,
             dynamics=dynamics,
             task_embedder=task_embedder,
             policy_head=policy_head,
             reward_head=reward_head,
             optimizers=optimizers,
+            # State
             dynamics_params=params["dynamics"],
             dynamics_constants=dynamics_constants,
             task_embedder_params=params["task_embedder"],
@@ -420,9 +399,11 @@ def run(cfg: BCRewConfig):
             reward_constants=reward_constants,
             tokenizer_vars=tokenizer_vars,
             opt_states=opt_states,
+            # Data
             videos=videos,
             batch=batch,
             rng=step_key,
+            # Config
             k_max=dynamics.config.k_max,
             L_mtp=cfg.L,
             B_self=B_self,
