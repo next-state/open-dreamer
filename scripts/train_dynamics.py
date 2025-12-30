@@ -229,6 +229,10 @@ def run(cfg: DynamicsConfig):
             break
         # Data
         rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
+        
+        # Replicate random keys across devices
+        tokenizer_key = jax.device_put(tokenizer_key, replicated_sharding)
+        master_key = jax.device_put(master_key, replicated_sharding)
 
         # Get batch data and shard across devices
         videos = jax.device_put(batch["videos"], batch_sharding)

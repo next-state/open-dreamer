@@ -30,7 +30,7 @@ from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_borde
 # Sampling utilities
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("shape_bt", "k_max"))
+@partial(jax.jit, static_argnames=("shape_bt", "k_max", "dtype"))
 def sample_tau_for_step(
     rng: jax.Array,
     shape_bt: Tuple[int, int],
@@ -69,11 +69,13 @@ def sample_tau_for_step(
     return tau, tau_idx
 
 
-@partial(jax.jit, static_argnames=("shape_bt", "k_max"))
+@partial(jax.jit, static_argnames=("shape_bt", "k_max", "dtype"))
 def sample_step_excluding_dmin(
     rng: jax.Array,
     shape_bt: Tuple[int, int],
-    k_max: int
+    k_max: int,
+    *,
+    dtype=jnp.float32
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Sample step indices excluding the finest level (for bootstrap loss).
@@ -85,6 +87,7 @@ def sample_step_excluding_dmin(
         rng: JAX random key
         shape_bt: Tuple of (batch_size, sequence_length)
         k_max: Maximum noise resolution
+        dtype: Data type for computation
         
     Returns:
         d: (B, T) Step sizes (e.g., 1/128, 1/64, ..., 1/2, 1)
@@ -98,7 +101,7 @@ def sample_step_excluding_dmin(
     emax = jnp.log2(k_max).astype(jnp.int32)
     # Sample from [0, emax) to exclude finest level at emax
     step_idx = jax.random.randint(rng, (B_, T_), 0, emax, dtype=jnp.int32)
-    d = 1.0 / (1 << step_idx).astype(jnp.float32)
+    d = 1.0 / (1 << step_idx).astype(dtype)
     return d, step_idx
 
 
@@ -247,15 +250,15 @@ def shortcut_forcing_step(
     
     # Bootstrap rows: coarser steps (if B_self > 0)
     if B_self > 0:
-        d_self, step_idx_self = sample_step_excluding_dmin(key_step, (B_self, T), k_max)
+        d_self, step_idx_self = sample_step_excluding_dmin(key_step, (B_self, T), k_max, dtype=latents.dtype)
     else:
-        d_self = jnp.zeros((0, T), dtype=jnp.float32)
+        d_self = jnp.zeros((0, T), dtype=latents.dtype)
         step_idx_self = jnp.zeros((0, T), dtype=jnp.int32)
     
     step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)
     
     # --- Sample signal levels ---
-    sigma_full, sigma_idx_full = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx_full)
+    sigma_full, sigma_idx_full = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx_full, dtype=latents.dtype)
     sigma_emp = sigma_full[:B_emp]
     sigma_self = sigma_full[B_emp:]
     sigma_idx_self = sigma_idx_full[B_emp:]
