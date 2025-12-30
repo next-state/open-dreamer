@@ -11,7 +11,7 @@ dynamics:
     d_model: 512
     d_bottleneck: 64
     action_dim: 16
-    depth: 4
+    depth: 12
     n_heads: 8
     n_kv_heads: 2
     packing_factor: 2
@@ -27,9 +27,9 @@ dynamics:
 
 bootstrap_start: 5_000
 self_fraction: 0.25
-batch_size: 2048
+batch_size: 1024
 
-max_steps: 100_000
+max_steps: 300_000
 log_every: 100
 lr: 1e-4
 
