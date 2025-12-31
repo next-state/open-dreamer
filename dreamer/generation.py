@@ -208,25 +208,27 @@ def latent_rollout(
         actions_ctx: (B, T_ctx, ...) Context actions.
         num_steps: Number of steps to unroll.
         rng: Random number generator key.
-        initial_agent_tokens: Optional (B, T_ctx, n_agent, D) agent tokens for context.
+        initial_agent_tokens: Optional (B, T_ctx + num_steps, n_agent, D) agent tokens for context.
         
     Returns:
         latents: (B, num_steps, n_spatial, D_s)
         actions: (B, num_steps, ...)
     """
     B, T_ctx, n_spatial, D_s = latents_ctx.shape
+    n_agent = 0 if initial_agent_tokens is None else initial_agent_tokens.shape[2]
     latent_shape = (B, 1, n_spatial, D_s)
     # 1. Initialize caches and process context
     # We need to compute the max window size needed: context + rollout
     window_size = T_ctx + num_steps
-    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size)
+    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size, n_agent=n_agent)
     
     # Run dynamics on context to prefill caches and get last hidden state
     # Use clean signal for ground truth context 
     step_idx_ctx= jnp.full((B, T_ctx), schedule.step_idx, dtype=jnp.int32)
     tau_idx_ctx = jnp.full((B, T_ctx), schedule.k_max - 1, dtype=jnp.int32)
-    
-    _, (h_seq, caches) = dynamics.apply(dyn_vars, actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx, agent_tokens=initial_agent_tokens, caches=caches, deterministic=True)
+    agent_ctx = initial_agent_tokens[:, :T_ctx] if initial_agent_tokens is not None else None
+    _, (h_seq, caches) = dynamics.apply(dyn_vars, actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx, agent_tokens=agent_ctx, caches=caches, deterministic=True)
+    agent_tokens = initial_agent_tokens[:, T_ctx:] if initial_agent_tokens is not None else None
 
     # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
     h_last = h_seq[:, -1] if isinstance(h_seq, jax.Array) else None # (B, n_agent, D)
@@ -246,22 +248,30 @@ def latent_rollout(
             assert isinstance(logits, jax.Array), "Logits should be a JAX array"
             action = jax.random.categorical(rng_action, logits) # (B, L)
         
+        agent_step = None 
+        if initial_agent_tokens is not None:
+            agent_step = agent_tokens[:,step_idx][:, None]
         # Predict next latent (denoising)
-        latent_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, T_ctx, rng, caches=caches_t)
+        latent_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, T_ctx, rng,  agent_tokens=agent_step, caches=caches_t)
         
-        return (h_next, caches_next, rng), latent_next[:,0] # latent_next is (B, 1, n_spatial, D_s) 
+        return (h_next, caches_next, rng), (latent_next[:,0], h_next) # latent_next is (B, 1, n_spatial, D_s) 
 
     # Run scan
-    _, rollout_latents = jax.lax.scan(
+    _, (rollout_latents, rollout_h) = jax.lax.scan(
         scan_step,
         (h_last, caches, rng),
         jnp.arange(num_steps)
     )
+    import ipdb; ipdb.set_trace()
     
     # Unpack results
     rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
+    rollout_h = einops.rearrange(rollout_h, 't b a d -> b t a d')
     out_latents = jnp.concatenate((latents_ctx, rollout_latents), axis=1)
-    return out_latents 
+    out_agent_tokens = None
+    if agent_tokens is not None:
+        out_agent_tokens = jnp.concatenate((agent_ctx, agent_tokens), axis=1)
+    return out_latents, out_agent_tokens
 
 
 
@@ -277,7 +287,7 @@ def video_rollout(
     actions_ctx: jax.Array,
     num_steps: int,
     rng: jax.Array,
-    initial_agent_tokens: jax.Array | None = None,
+    agent_tokens: jax.Array | None = None, # (B, T_ctx + num_steps, n_agent, D)
 ):
     """
     End-to-end video generation rollout.
@@ -293,7 +303,7 @@ def video_rollout(
         actions_ctx: (B, T_ctx, ...) Context actions.
         num_steps: Number of steps to unroll.
         rng: Random number generator key.
-        initial_agent_tokens: Optional agent tokens.
+        agent_tokens: Optional agent tokens. # (B, T_ctx + num_steps, n_agent, D)
         packing_factor: Packing factor for tokens.
         dataset_mean: Mean for normalization.
         dataset_std: Std for normalization.
@@ -321,7 +331,7 @@ def video_rollout(
                                      actions_ctx,
                                      num_steps,
                                      rng,
-                                     initial_agent_tokens)
+                                     agent_tokens)
     
     # Decode
     pred_frames, _ = tokenizer.apply(tokenizer_vars,

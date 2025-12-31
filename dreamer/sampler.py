@@ -25,6 +25,7 @@ def sample_video(
     horizon: int,
     schedule_config: DenoiseSchedule,
     rng: jax.Array,
+    agent_tokens: jax.Array | None = None, # (B, T_ctx + horizon, n_agent, D)
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """
     Sample video predictions using Tokenizer and Dynamics.
@@ -92,7 +93,7 @@ def sample_video(
                                 actions_ctx=actions_ctx,
                                 num_steps=horizon,
                                 rng=rng,
-                                initial_agent_tokens=None)
+                                agent_tokens=agent_tokens)
 
     frames = jnp.clip(frames, 0, 255).astype(jnp.uint8)
     return pred_frames, tokenized_frames, frames

@@ -38,6 +38,7 @@ from dreamer.training import (
     compute_policy_loss,
     compute_reward_loss,
     run_evaluation,
+    run_agent_visualization,
     shortcut_forcing_step,
 )
 from dreamer.utils import (
@@ -367,7 +368,7 @@ def run(cfg: BCRewConfig):
 
     # Dataset
     dataset = make_iterator(tokenizer_cfg.dataset)
-    
+
     # Training loop
     pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
     for step, batch in pbar:
@@ -381,6 +382,10 @@ def run(cfg: BCRewConfig):
         actions = batch["actions"]
         B, T, H, W, C = videos.shape
         B_self = int(videos.shape[0] * cfg.self_fraction) * (step >= cfg.bootstrap_start)
+        val_videos = batch["videos"]
+        run_agent_visualization(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, params["dynamics"], dynamics_constants, task_embedder, params["task_embedder"], val_videos, jnp.asarray(actions), vis_dir, rng)
+        import ipdb; ipdb.set_trace()
+    
         
         params, opt_states, metrics = train_step(
             # Models
