@@ -123,18 +123,18 @@ class TokenLayout:
 
             # Hierarchy levels: Action=0, Obs=1, Agent=2
             # mask = level(q) >= level(k)
-            
+
             def get_level(mod):
                 # Default to 1 (Obs)
                 lvl = jnp.ones_like(mod, dtype=jnp.int32) # Default to 1 (Obs)
                 lvl = jnp.where(mod == Modality.ACTION, 0, lvl) # Set to 0 if Action
                 lvl = jnp.where(mod == Modality.AGENT, 2, lvl) # Set to 2 if Agent
-                
+
                 return lvl
 
             q_level = get_level(q_mod)
             k_level = get_level(k_mod)
-            
+
             mask = q_level >= k_level
         else:
             raise ValueError(f"Unknown mode {mode}")
@@ -148,10 +148,10 @@ class TokenLayout:
 def normalize_with_dataset_stats(videos, *, mean, std):
     """
     Normalize videos using dataset-level statistics.
-    
+
     Handles spatial images (B, T, H, W, C).
     For flattened patches, tiles the per-channel stats to match the interleaved layout.
-    
+
     Args:
         videos: input videos/patches
         mean: dataset mean (list of C floats for per-channel)
@@ -162,19 +162,19 @@ def normalize_with_dataset_stats(videos, *, mean, std):
     videos = videos.astype(jnp.float32)/255
     mean_arr = jnp.asarray(mean, dtype=videos.dtype)
     std_arr = jnp.asarray(std, dtype=videos.dtype)
-    
-    mean_c = jnp.expand_dims(mean_arr, axis=(0, 1, 2, 3)) 
-    std_c =  jnp.expand_dims(std_arr, axis=(0, 1, 2, 3)) 
-    
+
+    mean_c = jnp.expand_dims(mean_arr, axis=(0, 1, 2, 3))
+    std_c =  jnp.expand_dims(std_arr, axis=(0, 1, 2, 3))
+
     return (videos - mean_c) / std_c
 
 def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
     """
     Unnormalize videos using dataset-level statistics.
-    
+
     Handles both flattened patches (B, T, N, patch*patch*C) and spatial images (B, T, H, W, C).
     For flattened patches, tiles the per-channel stats to match the interleaved layout.
-    
+
     Args:
         normalized_videos: normalized videos/patches
         mean: dataset mean (list of C floats for per-channel)
@@ -184,10 +184,10 @@ def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
     """
     mean_arr = jnp.asarray(mean, dtype=normalized_videos.dtype)
     std_arr = jnp.asarray(std, dtype=normalized_videos.dtype)
-    
-    mean_c = jnp.expand_dims(mean_arr, axis=(0, 1, 2, 3)) 
-    std_c =  jnp.expand_dims(std_arr, axis=(0, 1, 2, 3)) 
-    
+
+    mean_c = jnp.expand_dims(mean_arr, axis=(0, 1, 2, 3))
+    std_c =  jnp.expand_dims(std_arr, axis=(0, 1, 2, 3))
+
     return (normalized_videos * std_c + mean_c)*255
 
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
@@ -287,21 +287,21 @@ def init_tokenizer(rng, tokenizer, tokenizer_cfg):
 
 def init_dynamics(rng, dynamics, tokenizer_cfg):
     rng, params_rng, dropout_rng, key = jax.random.split(rng, 4)
-    
+
     B = tokenizer_cfg.dataset.B
     T = tokenizer_cfg.dataset.T
-    
+
     dyn_cfg = dynamics.config
     enc_cfg = tokenizer_cfg.encoder
-    
+
     packing_factor = dyn_cfg.packing_factor
     n_spatial = enc_cfg.n_latents // packing_factor
     d_spatial = enc_cfg.d_bottleneck * packing_factor
-    
+
     dtype = to_jnp_dtype(dyn_cfg.dtype)
     shape = (B, T, n_spatial, d_spatial)
     packed_enc_tokens = jax.random.normal(key, shape, dtype=dtype)
-    
+
     actions = jnp.zeros((B, T), dtype=jnp.int32)
     step_idxs = jnp.zeros((B, T), dtype=jnp.int32)
     signal_idxs = jnp.zeros((B, T), dtype=jnp.int32)
@@ -406,7 +406,7 @@ def load_pretrained_tokenizer(
     new_dec_vars = with_params(dec_vars, dec_params)
     print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
     return new_enc_vars, new_dec_vars, meta
-    
+
 def from_dict(cls, d):
     field_types = {f.name: f.type for f in cls.__dataclass_fields__.values()}
     kwargs = {}
