@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP
+from dreamer.models import Dynamics, PolicyHeadMTP
 from dreamer.generation import DenoiseSchedule, next_frame
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
