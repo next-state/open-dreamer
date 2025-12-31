@@ -224,13 +224,10 @@ def unpack_mae_params(packed_params, enc_vars, dec_vars):
     return enc_vars, dec_vars
 
 
-def make_state(params, opt_state, rng, step, unreplicate=False):
-    # Pack training state as a PyTree; JAX/Orbax-friendly types only.
-    # If unreplicate=True, extract data from first device (for multi-GPU checkpointing).
-    if unreplicate:
-        params = jax.tree.map(lambda x: x[0] if isinstance(x, jax.Array) else x, params)
-        opt_state = jax.tree.map(lambda x: x[0] if isinstance(x, jax.Array) else x, opt_state)
-
+def make_state(params, opt_state, rng, step):
+    """
+    Pack training state as a PyTree for checkpointing (JAX/Orbax-friendly types only).
+    """
     return {
         "params": params,
         "opt_state": opt_state,
@@ -247,14 +244,24 @@ def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps
     mngr = ocp.CheckpointManager(path, options=options, item_names=item_names)
     return mngr
 
-def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta: dict | None = None):
+def try_restore(mngr: ocp.CheckpointManager, state_example: dict, ctx, meta: dict | None = None):
     """
-    Build abstract trees from current shapes/dtypes so Orbax can restore safely
-    (StandardRestore wants an abstract tree). :contentReference[oaicite:3]{index=3}
+    Build abstract trees from current shapes/dtypes so Orbax can restore safely.
+    
+    Creates abstract targets with sharding info from ctx so Orbax loads directly
+    into GPU memory with proper sharding/replication.
     """
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)   # :contentReference[oaicite:4]{index=4}
+    # Create abstract targets WITH sharding info for direct GPU loading
+    def to_sharded_abstract(x):
+        if isinstance(x, jax.Array):
+            # Params/opt_state are replicated across available devices
+            return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=ctx.replicated_sharding)
+        return ocp.utils.to_shape_dtype_struct(x)
+    
+    abstract_state = jax.tree_util.tree_map(to_sharded_abstract, state_example)
+    
     restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(abstract_state),                                      # :contentReference[oaicite:5]{index=5}
+        state=ocp.args.StandardRestore(abstract_state),
         meta=ocp.args.JsonRestore() if meta is not None else None
     )
     latest = mngr.latest_step()
@@ -271,8 +278,6 @@ def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict |
         meta=ocp.args.JsonSave(meta) if meta is not None else None
     )
     mngr.save(step, args=save_args)  # async by default; runs in a background thread. :contentReference[oaicite:6]{index=6}
-
-
 
 
 def init_tokenizer(rng, tokenizer, tokenizer_cfg):
@@ -340,29 +345,6 @@ def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jn
     frames = frames.at[..., :, -width:, :].set(color)
     return frames
 
-def _stack_wide(*imgs_hwC):
-    """Stack images horizontally."""
-    return np.concatenate(imgs_hwC, axis=1)
-
-def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: int = 0) -> np.ndarray:
-    """Tile a list of videos into a grid."""
-    if len(trip_list_hwC) == 0:
-        raise ValueError("Empty video list")
-    H, W3, C = trip_list_hwC[0].shape
-    B = len(trip_list_hwC)
-    nrows = math.ceil(B / ncols)
-    total = nrows * ncols
-    if total > B:
-        blank = np.full((H, W3, C), pad_color, dtype=trip_list_hwC[0].dtype)
-        trip_list_hwC = trip_list_hwC + [blank] * (total - B)
-    rows = []
-    idx = 0
-    for _ in range(nrows):
-        row_imgs = trip_list_hwC[idx:idx + ncols]
-        idx += ncols
-        rows.append(np.concatenate(row_imgs, axis=1))
-    grid = np.concatenate(rows, axis=0)
-    return grid
 
 def load_pretrained_tokenizer(
     tokenizer_ckpt_dir: str,

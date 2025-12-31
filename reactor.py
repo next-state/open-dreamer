@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 from dreamer.models import Dynamics, PolicyHeadMTP
 from dreamer.generation import DenoiseSchedule, next_frame
+from dreamer.parallel import ParallelContext
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
 import numpy as np
@@ -141,7 +142,8 @@ class DreamerVideoModel(VideoModel):
         # Load models from checkpoints
         assert isinstance(cfg, ReactorConfig)
         logger.info(f"Loading dynamics model and tokenizer from {cfg.dynamics_ckpt}")
-        self.dynamics, self.dynamics_vars, self.dynamics_cfg, self.tokenizer, self.tokenizer_vars, self.tokenizer_cfg  = Dynamics.from_pretrained(cfg.dynamics_ckpt)
+        self.ctx = ParallelContext.create(batch_size=cfg.batch_size)
+        self.dynamics, self.dynamics_vars, self.dynamics_cfg, self.tokenizer, self.tokenizer_vars, self.tokenizer_cfg  = Dynamics.from_pretrained(cfg.dynamics_ckpt, self.ctx)
         
         # Load policy if checkpoint provided
         self.policy = None

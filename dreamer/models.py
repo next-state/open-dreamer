@@ -15,7 +15,7 @@ from .utils import (
     Modality, TokenLayout, make_manager, from_dict, 
     normalize_with_dataset_stats, recursive_list_to_tuple, 
     unnormalize_with_dataset_stats, init_dynamics, init_tokenizer,
-    to_jnp_dtype
+    to_jnp_dtype, make_state, try_restore
 )
 from .data import patchify, unpatchify
 from .configs import DynamicsConfig, TokenizerConfig, DynamicsModelConfig
@@ -792,37 +792,41 @@ class Tokenizer(nn.Module):
         )
 
     @classmethod
-    def from_pretrained(cls, path, *, load_for_training: bool = False) -> Tuple["Tokenizer", Dict[Any, Any], TokenizerConfig]:
+    def from_pretrained(cls, path, ctx) -> Tuple["Tokenizer", Dict[Any, Any], TokenizerConfig]:
         mngr = make_manager(path, item_names=("meta","state"))
 
         # 1. Restore metadata to get config
-        # We need to find the latest step first
         latest = mngr.latest_step()
         if latest is None:
             raise ValueError("No checkpoint found")
 
-        # We restore just meta first
+        # Restore metadata first
         restored_meta = mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
         cfg_dict = restored_meta.meta["cfg"]
         cfg_dict = recursive_list_to_tuple(cfg_dict)
         cfg = from_dict(TokenizerConfig, cfg_dict)
 
-        # 2. Init to get structure (params + constants)
+        # 2. Initialize to get parameter structure (uses init_tokenizer from utils)
         tokenizer = cls(cfg)
         rng = jax.random.PRNGKey(0)
         rng, variables = init_tokenizer(rng, tokenizer, cfg)
 
-        # 3. Restore parameters using keys from initialized variables (so shapes/types match)
-        # Note: We only restore 'params', keeping 'constants' from init
-        restored = mngr.restore(latest, args=ocp.args.Composite(
-            state=ocp.args.StandardRestore(None)
-        ))
-
-        loaded_params = restored.state
-
-        # 4. Merge loaded params into variables
+        # 3. Restore checkpoint using try_restore with ctx for sharded GPU loading
+        # Pack encoder/decoder params as expected by checkpoint format
+        packed_params = {"enc": variables["params"]["encoder"], "dec": variables["params"]["decoder"]}
+        state_example = make_state(packed_params, {}, rng, step=0)
+        
+        restored_full = try_restore(mngr, state_example, ctx, meta={})
+        if restored_full is None:
+            raise ValueError(f"No checkpoint found in {path}")
+        
+        _, restored = restored_full
+        packed_params = restored.state["params"]
+        
+        # 4. Unpack loaded params back into variables structure
         variables = unfreeze(variables)
-        variables["params"] = loaded_params["params"]
+        variables["params"]["encoder"] = packed_params["enc"]
+        variables["params"]["decoder"] = packed_params["dec"]
         variables = freeze(variables)
 
         return tokenizer, variables, cfg
@@ -993,16 +997,16 @@ class Dynamics(nn.Module):
     
     
     @classmethod
-    def from_pretrained(cls, path) -> Tuple["Dynamics", Dict[Any, Any], "DynamicsModelConfig", "Tokenizer", Dict[Any, Any], "TokenizerConfig"]:
+    def from_pretrained(cls, path, ctx) -> Tuple["Dynamics", Dict[Any, Any], "DynamicsModelConfig", "Tokenizer", Dict[Any, Any], "TokenizerConfig"]:
         """
         Load a pretrained Dynamics model from a checkpoint directory.
         
         Args:
             path: Path to checkpoint directory
-            load_for_training: If True, load optimizer state as well (not implemented yet)
+            ctx: ParallelContext for sharded loading to GPU with proper sharding
             
         Returns:
-            Tuple of (dynamics_module, variables_dict, dynamics_config, tokenizer_config)
+            Tuple of (dynamics_module, variables_dict, dynamics_config, tokenizer, tokenizer_vars, tokenizer_config)
             where variables_dict contains both 'params' and 'constants'
         """
         mngr = make_manager(path, item_names=("meta", "state"))
@@ -1023,26 +1027,28 @@ class Dynamics(nn.Module):
         dyn_model_cfg = full_cfg.dynamics
         
         # Load tokenizer config to get spatial dimensions
-        # We need this to properly initialize the dynamics model
-        tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt)
+        tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt, ctx)
         
         if tokenizer_cfg is None:
             raise ValueError("Cannot determine spatial dimensions - tokenizer config not found. "
                            "Make sure tokenizer_ckpt is set in the dynamics config.")
         
-        # 2. Initialize model to get structure
+        # 2. Initialize to get parameter structure (uses init_dynamics from utils)
         dynamics = cls(dyn_model_cfg)
         rng = jax.random.PRNGKey(0)
         rng, dynamics_vars = init_dynamics(rng, dynamics, tokenizer_cfg)
 
-        # 3. Restore parameters from checkpoint
-        restored = mngr.restore(latest, args=ocp.args.Composite(
-            state=ocp.args.StandardRestore(None)
-        ))
+        # 3. Restore checkpoint using try_restore with ctx for sharded GPU loading
+        state_example = make_state(dynamics_vars["params"], {}, rng, step=0)
         
-        loaded_params = restored.state["params"]
+        restored = try_restore(mngr, state_example, ctx, meta={})
+        if restored is None:
+            raise ValueError(f"No checkpoint found in {path}")
         
-        # 4. Merge loaded params into variables (keeping constants from init)
+        _, r = restored
+        loaded_params = r.state["params"]
+        
+        # 4. Update variables with loaded params (keeping constants from init)
         dynamics_vars = unfreeze(dynamics_vars)
         dynamics_vars["params"] = loaded_params
         dynamics_vars = freeze(dynamics_vars)

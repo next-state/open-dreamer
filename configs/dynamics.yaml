@@ -20,8 +20,8 @@ dynamics:
     rope_theta: 10000.0
     time_every: 4
     mlp_ratio: 4
-    dropout_rate: 0.0
-    k_max: 64
+    dropout_rate: 0.05
+    k_max: 128
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 

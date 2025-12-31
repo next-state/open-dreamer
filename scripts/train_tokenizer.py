@@ -22,6 +22,7 @@ from dreamer.training import compute_psnr
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Tokenizer
+from dreamer.parallel import ParallelContext
 from dreamer.utils import (
     make_state,
     make_manager,
@@ -131,7 +132,7 @@ def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key
         # For LPIPS: use [0, 1] range
         lp = 0
         if lpips_weight > 0:
-            lp = lpips_on_mae_recon(pred / 255, videos / 255, lpips_frac)
+            lp = lpips_on_mae_recon(pred / 255.0, videos / 255.0, lpips_frac)
         
         total = mse + lpips_weight * lp
 
@@ -204,6 +205,9 @@ def run(cfg: TokenizerConfig):
             dir=str(run_dir),
         )
 
+    # Create parallel context for data parallelism
+    ctx = ParallelContext.create(batch_size=cfg.dataset.B)
+
     rng = jax.random.PRNGKey(0)
     dataset = make_iterator(cfg.dataset)
 
@@ -239,16 +243,25 @@ def run(cfg: TokenizerConfig):
     state_example = make_state(params, opt_state, rng, step=0)
     meta = {"cfg": asdict(cfg)}
 
-    restored = try_restore(mngr, state_example, meta)
+    restored = try_restore(mngr, state_example, ctx, meta)
     start_step = 0
     if restored is not None:
+        # Restored state is already sharded/replicated on GPUs via ctx
         latest_step, r = restored
         params = r.state["params"]
         opt_state = r.state["opt_state"]
         rng = r.state["rng"]
         start_step = int(r.state["step"])
         cfg = from_dict(TokenizerConfig, r.meta["cfg"])
-        print(f"[ckpt] Restored step {latest_step}")
+        print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
+    else:
+        # No checkpoint - replicate initial state to GPUs
+        params = ctx.replicate(params)
+        opt_state = ctx.replicate(opt_state)
+        print("[parallel] Replicated initial state to GPUs")
+    
+    # Always replicate variables (constants, not in checkpoint)
+    variables = ctx.replicate(variables)
 
     # ---------- Train loop ----------
     logger = MetricLogger(
@@ -267,42 +280,53 @@ def run(cfg: TokenizerConfig):
 
         rng, master_key = jax.random.split(rng)
         
-        # Normalize videos
-        videos = batch["videos"]
-        params, opt_state, aux = train_step(apply_fn, tx, variables, params, opt_state, videos, master_key=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac, dataset_mean=tuple(cfg.dataset.dataset_mean), dataset_std=tuple(cfg.dataset.dataset_std), log_gradients=cfg.log_gradients, tokenizer_loss_type=cfg.tokenizer_loss_type)
+        # Shard batch data
+        videos = ctx.shard_batch(batch["videos"])
+        
+        # Generate keys matching batch size (one per sample)
+        master_key = ctx.split_keys(master_key, count=videos.shape[0])
+        
+        params, opt_state, aux = train_step(apply_fn, tx, variables, params, opt_state, videos, master_keys=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac, dataset_mean=tuple(cfg.dataset.dataset_mean), dataset_std=tuple(cfg.dataset.dataset_std), log_gradients=cfg.log_gradients, tokenizer_loss_type=cfg.tokenizer_loss_type)
 
         if logger.should_log(step):
+            metrics_cpu = ctx.to_host_scalar(aux)
             if lr_schedule is None:
                 lr_value = cfg.lr
             else:
                 lr_value = lr_schedule(step)
-            mse = aux["loss_mse"]
-            psnr = aux["psnr"]
+            mse = metrics_cpu["loss_mse"]
+            psnr = metrics_cpu["psnr"]
             logger.log(
                 step,
                 {
-                    "loss": aux["loss_total"],
+                    "loss": metrics_cpu["loss_total"],
                     "mse": mse,
-                    "rmse": jnp.sqrt(mse),
-                    "lpips": aux["loss_lpips"],
+                    "rmse": float(jnp.sqrt(mse)),
+                    "lpips": metrics_cpu["loss_lpips"],
                     "psnr": psnr,
                     "lr": lr_value,
                     **({} if not cfg.log_gradients else {
-                        "grad/global_norm": aux["grad/global_norm"],
-                        "grad/encoder_norm": aux["grad/encoder_norm"],
-                        "grad/decoder_norm": aux["grad/decoder_norm"],
-                        "grad/encoder_std_mean": aux["grad/encoder_std_mean"],
-                        "grad/decoder_std_mean": aux["grad/decoder_std_mean"],
+                        "grad/global_norm": metrics_cpu["grad/global_norm"],
+                        "grad/encoder_norm": metrics_cpu["grad/encoder_norm"],
+                        "grad/decoder_norm": metrics_cpu["grad/decoder_norm"],
+                        "grad/encoder_std_mean": metrics_cpu["grad/encoder_std_mean"],
+                        "grad/decoder_std_mean": metrics_cpu["grad/decoder_std_mean"],
                     }),
                 },
                 pbar=pbar,
                 pbar_filter=r"^(loss|mse|lpips|psnr|lr)$",
             )
+        
+        # Save sharded arrays
         state = make_state(params, opt_state, rng, step)
         maybe_save(mngr, step, state, meta)
 
         if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
-            viz_step(apply_fn, variables, params, videos, rng, step, run_dir, use_wandb=cfg.use_wandb)
+            # Move a subset to host for visualization
+            viz_videos = jax.device_get(batch["videos"][:8])
+            viz_params = jax.device_get(params)
+            viz_variables = jax.device_get(variables)
+            viz_step(apply_fn, viz_variables, viz_params, viz_videos, rng, step, run_dir, use_wandb=cfg.use_wandb)
 
     mngr.wait_until_finished()
 

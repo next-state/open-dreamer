@@ -1,12 +1,3 @@
-# train_dynamics.py
-"""
-Dynamics model training with teacher-forced flow matching and bootstrap self-consistency.
-
-Architecture:
-  - Loads pretrained tokenizer (frozen)
-  - Trains dynamics model on latent space
-  - Periodic autoregressive evaluation with video visualization
-"""
 from __future__ import annotations
 
 import logging
@@ -17,7 +8,6 @@ from pathlib import Path
 import hydra
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec as P
 import optax
 import wandb
 from flax.core import FrozenDict
@@ -25,11 +15,12 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-from dreamer.configs import DynamicsConfig, TokenizerConfig
+from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.training import run_evaluation, shortcut_forcing_step  # NEW: Reusable training components
+from dreamer.parallel import ParallelContext
+from dreamer.training import run_evaluation, shortcut_forcing_step
 from dreamer.utils import (
     _ensure_dir,
     init_dynamics,
@@ -134,30 +125,12 @@ def run(cfg: DynamicsConfig):
     if cfg.use_wandb:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project or cfg.run_name, name=cfg.run_name, config=asdict(cfg), dir=str(run_dir))
 
-    # Validate batch size divisibility for data parallelism
-    device_count = jax.local_device_count()
-    if cfg.batch_size % device_count != 0:
-        raise ValueError(
-            f"Batch size ({cfg.batch_size}) must be divisible by "
-            f"device count ({device_count}) for data parallelism."
-        )
-
-    per_device_batch_size = cfg.batch_size // device_count
-    print(f"[data_parallel] Found {device_count} devices: {jax.local_devices()}")
-    print(f"[data_parallel] Global batch size: {cfg.batch_size}")
-    print(f"[data_parallel] Per-device batch size: {per_device_batch_size}")
+    # Create parallel context for data parallelism
+    ctx = ParallelContext.create(batch_size=cfg.batch_size)
 
     # Load frozen tokenizer
     rng = jax.random.PRNGKey(0)
-    tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(cfg.tokenizer_ckpt)
-
-    # Create device mesh for data parallelism
-    mesh = jax.make_mesh((device_count,), ('batch',))
-    print(f"[data_parallel] Created mesh: {mesh}")
-
-    # Define sharding strategies
-    batch_sharding = NamedSharding(mesh, P('batch'))      # Shard batch dimension
-    replicated_sharding = NamedSharding(mesh, P())         # Replicate across devices
+    tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, ctx)
 
     # Initialize dynamics
     dynamics = Dynamics(cfg.dynamics)
@@ -195,9 +168,10 @@ def run(cfg: DynamicsConfig):
     state_example = make_state(dynamics_params, opt_state, rng, step=0)
     meta = {"cfg": asdict(cfg)}
 
-    restored = try_restore(mngr, state_example, meta)
+    restored = try_restore(mngr, state_example, ctx, meta)
     start_step = 0
     if restored is not None:
+        # Restored state is already sharded/replicated on GPUs via ctx
         latest_step, r = restored
         dynamics_params = r.state["params"]
         opt_state = r.state["opt_state"]
@@ -207,38 +181,30 @@ def run(cfg: DynamicsConfig):
         use_wandb_override = cfg.use_wandb
         # cfg = from_dict(DynamicsConfig, r.meta["cfg"])
         cfg.use_wandb = use_wandb_override  # Keep CLI/YAML wandb setting
-        print(f"[ckpt] Restored step {latest_step}")
-
-    # Helper to replicate pytrees across devices
-    def replicate_across_devices(tree, sharding):
-        """Place a pytree on all devices with given sharding."""
-        return jax.tree.map(lambda x: jax.device_put(x, sharding), tree)
-
-    # Replicate all model state across devices
-    dynamics_params = replicate_across_devices(dynamics_params, replicated_sharding)
-    dynamics_constants = replicate_across_devices(dynamics_constants, replicated_sharding)
-    opt_state = replicate_across_devices(opt_state, replicated_sharding)
-    tokenizer_vars = replicate_across_devices(tokenizer_vars, replicated_sharding)
-
-    print(f"[data_parallel] Replicated params, constants, opt_state, and tokenizer_vars")
+        print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
+    else:
+        # No checkpoint - replicate initial state to GPUs
+        dynamics_params = ctx.replicate(dynamics_params)
+        opt_state = ctx.replicate(opt_state)
+        print("[parallel] Replicated initial state to GPUs")
+    
+    # Replicate dynamics constants
+    dynamics_constants = ctx.replicate(dynamics_constants)
 
     dataset = make_iterator(tokenizer_cfg.dataset)
     pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
     for step, batch in pbar:
         if step > cfg.max_steps:
             break
-        # Data
+        
+        # Shard batch data
         rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
-
-        # Split keys for each device
-        tokenizer_key = jax.random.split(tokenizer_key, num=device_count) # 
-        master_key = jax.random.split(master_key, num=device_count)
-        tokenizer_key = jax.device_put(tokenizer_key, batch_sharding)
-        master_key = jax.device_put(master_key, batch_sharding)
-
-        # Get batch data and shard across devices
-        videos = jax.device_put(batch["videos"], batch_sharding)
-        actions = jax.device_put(batch["actions"], batch_sharding)
+        videos = ctx.shard_batch(batch["videos"])
+        actions = ctx.shard_batch(batch["actions"])
+        
+        # Generate keys matching batch size (one per sample)
+        tokenizer_key = ctx.split_keys(tokenizer_key, count=videos.shape[0])
+        master_key = ctx.split_keys(master_key, count=videos.shape[0])
 
         # Combined encoding + training step (both phases parallelized)
         dynamics_params, opt_state, aux = encode_and_train_step(
@@ -252,18 +218,19 @@ def run(cfg: DynamicsConfig):
 
         # Logging
         if logger.should_log(step):
+            metrics_cpu = ctx.to_host_scalar(aux)
             logger.log(
                 step,
                 metrics={
-                    "flow_mse": aux["flow_mse"],
-                    "boot_mse": aux["bootstrap_mse"],
+                    "flow_mse": metrics_cpu["flow_mse"],
+                    "boot_mse": metrics_cpu["bootstrap_mse"],
                     "lr": cfg.lr if lr_schedule is None else lr_schedule(step),
                 },
                 pbar=pbar,
             )
 
-        # Save (async) when policy says we should
-        state = make_state(dynamics_params, opt_state, rng, step, unreplicate=True)
+        # Save sharded arrays directly (Orbax handles distributed write efficiently)
+        state = make_state(dynamics_params, opt_state, rng, step)
         maybe_save(mngr, step, state, meta)
 
         # Periodic lightweight AR eval
@@ -274,10 +241,10 @@ def run(cfg: DynamicsConfig):
 
             run_evaluation(
                 cfg, tokenizer_cfg, step, tokenizer,
-                jax.device_get(tokenizer_vars),
+                tokenizer_vars,
                 dynamics,
-                jax.device_get(dynamics_params),
-                jax.device_get(dynamics_constants),
+                dynamics_params,
+                dynamics_constants,
                 val_videos, jnp.asarray(val_actions), vis_dir, rng
             )
 

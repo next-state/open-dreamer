@@ -56,6 +56,7 @@ from dreamer.models import (
 )
 from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn
 from dreamer.configs import RLConfig
+from dreamer.parallel import ParallelContext
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -339,6 +340,7 @@ def load_bc_rew_checkpoint(
     bc_rew_ckpt_dir: str,
     *,
     rng: jnp.ndarray,
+    ctx,
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
     policy_head_bc: PolicyHeadMTP,
@@ -364,7 +366,7 @@ def load_bc_rew_checkpoint(
     state_example = make_state(params_example, opt_state_example, rng, step=0)
 
     mngr = make_manager(bc_rew_ckpt_dir, item_names=("state", "meta"))
-    restored = try_restore(mngr, state_example, meta_example={})
+    restored = try_restore(mngr, state_example, ctx, meta={})
     if restored is None:
         raise FileNotFoundError(f"No BC/rew checkpoint found in {bc_rew_ckpt_dir}")
 
@@ -452,6 +454,7 @@ def initialize_models(
     cfg: RLConfig,
     frames_init: jnp.ndarray,
     actions_init: jnp.ndarray,
+    ctx,
 ) -> TrainState:
     """
     Initialize all models and load pretrained checkpoints.
@@ -651,6 +654,7 @@ def initialize_models(
     dyn_vars, task_vars, pi_bc_vars, rew_vars, _ = load_bc_rew_checkpoint(
         cfg.bc_rew_ckpt,
         rng=rng,
+        ctx=ctx,
         dynamics=dynamics,
         task_embedder=task_embedder,
         policy_head_bc=policy_head_bc,
@@ -1504,6 +1508,9 @@ def run(cfg: RLConfig):
             dir=str(run_dir),
         )
 
+    # Create parallel context for data parallelism
+    ctx = ParallelContext.create(batch_size=cfg.dataset.B)
+
     # Data iterator
     next_batch = make_iterator(cfg.dataset)
 
@@ -1512,7 +1519,7 @@ def run(cfg: RLConfig):
     _, (frames_init, actions_init, rewards_init) = next_batch(init_rng)
     del rewards_init
 
-    train_state = initialize_models(cfg, frames_init, actions_init)
+    train_state = initialize_models(cfg, frames_init, actions_init, ctx)
 
     patch = cfg.patch
     k_max = cfg.k_max
@@ -1573,10 +1580,11 @@ def run(cfg: RLConfig):
 
     rng = jax.random.PRNGKey(0)
     state_example = make_state(train_state.params, train_state.opt_state, rng, step=0)
-    restored = try_restore(mngr, state_example, meta)
+    restored = try_restore(mngr, state_example, ctx, meta)
 
     start_step = 0
     if restored is not None:
+        # Restored state is already sharded/replicated on GPUs via ctx
         latest_step, r = restored
         train_state.params = r.state["params"]
         train_state.opt_state = r.state["opt_state"]
@@ -1590,7 +1598,21 @@ def run(cfg: RLConfig):
             **train_state.val_vars,
             "params": train_state.params["val"],
         }
-        print(f"[restore] Resumed from {ckpt_dir} at step={latest_step}")
+        print(f"[restore] Resumed from {ckpt_dir} at step={latest_step} (loaded directly to GPU)")
+    else:
+        # No checkpoint - replicate initial state to GPUs
+        train_state.params = ctx.replicate(train_state.params)
+        train_state.opt_state = ctx.replicate(train_state.opt_state)
+        print("[parallel] Replicated initial state to GPUs")
+    
+    # Always replicate non-checkpointed vars
+    train_state.enc_vars = ctx.replicate(train_state.enc_vars)
+    train_state.dyn_vars = ctx.replicate(train_state.dyn_vars)
+    train_state.task_vars = ctx.replicate(train_state.task_vars)
+    train_state.rew_vars = ctx.replicate(train_state.rew_vars)
+    train_state.val_vars = ctx.replicate(train_state.val_vars)
+    train_state.pi_vars = ctx.replicate(train_state.pi_vars)
+    train_state.pi_bc_vars = ctx.replicate(train_state.pi_bc_vars)
 
     # Training loop
     train_rng = jax.random.PRNGKey(2025)
@@ -1620,8 +1642,15 @@ def run(cfg: RLConfig):
         # Task IDs (currently dummy zeros)
         task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
 
-        # JITted train step
+        # Shard batch data
         train_rng, step_key = jax.random.split(train_rng)
+        videos = ctx.shard_batch(videos)
+        actions_full = ctx.shard_batch(actions_full)
+        rewards_full = ctx.shard_batch(rewards_full)
+        task_ids = ctx.shard_batch(task_ids)
+        
+        # Generate keys matching batch size (one per sample)
+        step_key = ctx.split_keys(step_key, count=videos.shape[0])
         train_start_t = time.perf_counter()
         (
             new_params,
@@ -1765,18 +1794,19 @@ def run(cfg: RLConfig):
                 wandb.log(log_payload, step=step)
 
         if logger.should_log(step):
+            metrics_cpu = ctx.to_host_scalar(aux)
             logger.log(
                 step,
                 metrics={
-                    "val_loss": aux["val_loss"],
-                    "pi_loss": aux["pi_loss"],
-                    "pi_neg": aux["pi_loss_negative"],
-                    "pi_pos": aux["pi_loss_positive"],
-                    "pi_kl": aux["pi_kl_loss"],
-                    "mean_adv": aux["mean_advantage"],
-                    "mean_td": aux["mean_td_return"],
-                    "n_pos": aux["n_positive"],
-                    "n_neg": aux["n_negative"],
+                    "val_loss": metrics_cpu["val_loss"],
+                    "pi_loss": metrics_cpu["pi_loss"],
+                    "pi_neg": metrics_cpu["pi_loss_negative"],
+                    "pi_pos": metrics_cpu["pi_loss_positive"],
+                    "pi_kl": metrics_cpu["pi_kl_loss"],
+                    "mean_adv": metrics_cpu["mean_advantage"],
+                    "mean_td": metrics_cpu["mean_td_return"],
+                    "n_pos": metrics_cpu["n_positive"],
+                    "n_neg": metrics_cpu["n_negative"],
                     "time/data": data_t,
                     "time/train": train_t,
                     "time/total": total_t,
@@ -1784,7 +1814,7 @@ def run(cfg: RLConfig):
                 pbar=pbar,
             )
 
-        # Save checkpoint
+        # Save sharded arrays directly
         state = make_state(train_state.params, train_state.opt_state, train_rng, step)
         maybe_save(mngr, step, state, meta)
 

@@ -486,8 +486,8 @@ def run_evaluation(
         normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
         normalized_gt = normalize_with_dataset_stats(gt_frames[:, -horizon:], mean=0, std=dataset_std)
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
+        psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames[:, -horizon:]/255))
         
-        psnr = compute_psnr(pred_frames[:, -horizon:]/255, gt_frames[:, -horizon:]/255)
         print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
 
         # Build visualization
