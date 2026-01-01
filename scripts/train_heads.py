@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import optax
 import wandb
 from flax.core import FrozenDict
+from flax import nnx
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
@@ -263,9 +264,20 @@ def run(cfg: BCRewConfig):
     # Load pretrained tokenizer and dynamics
     rng = jax.random.PRNGKey(0)
     print(f"[setup] Loading pretrained dynamics and tokenizer from {cfg.dynamics_ckpt}")
-    dynamics, dynamics_vars, dynamics_cfg, tokenizer, tokenizer_vars, tokenizer_cfg = Dynamics.from_pretrained(cfg.dynamics_ckpt, ctx)
-    dynamics_params = dynamics_vars["params"]
-    dynamics_constants = dynamics_vars.get("constants", FrozenDict())
+    dynamics, tokenizer = Dynamics.from_pretrained(cfg.dynamics_ckpt, ctx)
+    dynamics_cfg = dynamics.config
+    tokenizer_cfg = tokenizer.config
+    # nnx.split with multiple filters returns (graphdef, state1, state2, ...)
+    _, *dynamics_states = nnx.split(dynamics, nnx.Param, nnx.BatchStat, ...)
+    dynamics_state = nnx.State.merge(*dynamics_states)
+    dynamics_params = dynamics_state
+    dynamics_vars = {"params": dynamics_params}
+    dynamics_constants = FrozenDict()
+    
+    # For tokenizer, create similar compatibility wrappers
+    _, *tokenizer_states = nnx.split(tokenizer, nnx.Param, nnx.BatchStat, ...)
+    tokenizer_state = nnx.State.merge(*tokenizer_states)
+    tokenizer_vars = {"params": tokenizer_state}
     
     # Initialize task embedder, policy, and reward heads
     print("[setup] Initializing agent components")

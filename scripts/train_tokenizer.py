@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import wandb
+from flax import nnx
 from hydra.core.hydra_config import HydraConfig
 from jaxlpips import LPIPS
 from omegaconf import DictConfig, OmegaConf
@@ -29,12 +30,12 @@ from dreamer.utils import (
     try_restore,
     maybe_save,
     normalize_with_dataset_stats,
-    with_params,
     init_tokenizer,
     from_dict,
     get_lr_schedule,
     count_parameters_by_component,
 )
+
 # disable preallocation completely
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
@@ -45,26 +46,6 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Usage: ${mul:a,b,c,...} multiplies all arguments
 OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
 
-    
-# ------------------------
-# Forward (no module in jit)
-# ------------------------
-
-def forward_apply(apply_fn, variables, params, videos, *, mae_key, drop_key, train: bool):
-    rngs = {"mae": mae_key}
-    if train:
-        rngs["dropout"] = drop_key
-
-    # Merge optimized params into the state variables (constants, etc.)
-    variables_with_params = with_params(variables, params)
-
-    recon, mae_info = apply_fn(
-        variables_with_params,
-        videos,
-        rngs=rngs,
-        deterministic=not train,
-    )
-    return recon, mae_info
 
 # ------------------------
 # Losses
@@ -80,7 +61,6 @@ def recon_loss_from_mae(pred, target, mae_mask):
 def recon_loss_full_mse(pred, target):
     sq_err = (pred - target) ** 2
     return jnp.mean(sq_err)  # scalar
-
 
 
 lpips_loss_fn = LPIPS(pretrained_network="alexnet")
@@ -104,17 +84,15 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
 # Train step
 # ------------------------
 
-@partial(
-    jax.jit,
-    static_argnames=("apply_fn", "tx", "lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"),
-)
-def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_keys, step, lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
-    # FIXME: not entirely deterministic, because the key depends on the number of devices
-    step_key = jax.random.fold_in(master_keys[0], step)
-    mae_key, drop_key = jax.random.split(step_key, 2)
+@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"))
+def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, step, 
+               lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
+    # Split keys for MAE and dropout
+    mae_key, drop_key = jax.random.split(mae_key)
 
-    def loss_fn(p):
-        pred, (mae_mask, keep_prob) = forward_apply(apply_fn, variables, p, videos, mae_key=mae_key, drop_key=drop_key, train=True)    
+    def loss_fn(model: Tokenizer):
+        rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
+        pred, (mae_mask, keep_prob) = model(videos, deterministic=False, rngs=rngs)
 
         # For MSE: use standardized values (matches old gradient dynamics)
         pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
@@ -130,7 +108,7 @@ def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key
         psnr = compute_psnr(pred / 255.0, videos / 255.0)
         
         # For LPIPS: use [0, 1] range
-        lp = 0
+        lp = jnp.array(0.0)
         if lpips_weight > 0:
             lp = lpips_on_mae_recon(pred / 255.0, videos / 255.0, lpips_frac)
         
@@ -139,7 +117,7 @@ def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key
         aux = {"loss_total": total, "loss_mse": mse, "loss_lpips": lp, "keep_prob": keep_prob, "psnr": psnr}
         return total, aux
 
-    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
 
     if log_gradients:
         def _tree_std_mean(tree):
@@ -150,23 +128,26 @@ def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key
             return jnp.mean(jnp.stack([jnp.asarray(x, dtype=jnp.float32) for x in leaves]))
 
         aux["grad/global_norm"] = optax.global_norm(grads)
-        aux["grad/encoder_norm"] = optax.global_norm(grads["encoder"])
-        aux["grad/decoder_norm"] = optax.global_norm(grads["decoder"])
-        aux["grad/encoder_std_mean"] = _tree_std_mean(grads["encoder"])
-        aux["grad/decoder_std_mean"] = _tree_std_mean(grads["decoder"])
+        graphdef, grad_state = nnx.split(grads)
+        aux["grad/encoder_norm"] = optax.global_norm(grad_state.get("encoder", {}))
+        aux["grad/decoder_norm"] = optax.global_norm(grad_state.get("decoder", {}))
+        aux["grad/encoder_std_mean"] = _tree_std_mean(grad_state.get("encoder", {}))
+        aux["grad/decoder_std_mean"] = _tree_std_mean(grad_state.get("decoder", {}))
 
-    updates, opt_state = tx.update(grads, opt_state, params)
-    params = optax.apply_updates(params, updates)
+    # Update model with optimizer 
+    optimizer.update(model, grads)
 
-    return params, opt_state, aux
+    return aux
 
 # ------------------------
 # Visualization
 # ------------------------
 
-@partial(jax.jit, static_argnames=("apply_fn",))
-def viz_step_jit(apply_fn, variables, params, videos, *, mae_key, drop_key):
-    recon, (mask, _) = forward_apply(apply_fn, variables, params, videos, mae_key=mae_key, drop_key=drop_key, train=True)
+@partial(jax.jit, static_argnames=())
+def viz_step_jit(model: Tokenizer, videos, *, mae_key, drop_key):
+    """Visualization step with NNX model."""
+    rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
+    recon, (mask, _) = model(videos, deterministic=False, rngs=rngs)
 
     masked = videos * (1.0 - mask)
     recon_masked = masked + recon * mask
@@ -175,11 +156,11 @@ def viz_step_jit(apply_fn, variables, params, videos, *, mae_key, drop_key):
     grid = einops.rearrange(grid[:, 0], "b h w c -> h (b w) c")
     return grid.clip(0, 255).astype(jnp.uint8)
 
-def viz_step(apply_fn, variables, params, videos, rng, step, run_dir, use_wandb=False):
+def viz_step(model: Tokenizer, videos, rng, step, run_dir, use_wandb=False):
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
-    grid = viz_step_jit(apply_fn, variables, params, videos[:8,:1], mae_key=mae_key, drop_key=drop_key)
+    grid = viz_step_jit(model, videos[:8,:1], mae_key=mae_key, drop_key=drop_key)
 
     out = run_dir / "viz"
     out.mkdir(exist_ok=True, parents=True)
@@ -211,13 +192,11 @@ def run(cfg: TokenizerConfig):
     rng = jax.random.PRNGKey(0)
     dataset = make_iterator(cfg.dataset)
 
-    tokenizer = Tokenizer(cfg)
-    apply_fn = tokenizer.apply
-    rng, variables = init_tokenizer(rng, tokenizer, cfg)
-    params = variables["params"]
-    param_counts = count_parameters_by_component(params)
+    rng, tokenizer = init_tokenizer(rng, cfg)
+    param_counts = count_parameters_by_component(tokenizer)
     print(f"Parameter counts: {param_counts}")
 
+    # Learning rate schedule
     if cfg.lr_schedule == "constant":
         lr = cfg.lr
         lr_schedule = None
@@ -232,15 +211,18 @@ def run(cfg: TokenizerConfig):
             cfg.wsd_decay_steps,
         )
         lr = lr_schedule
-    # Adamw params from Genie paper.
+    
     tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
-    opt_state = tx.init(params)
+    optimizer = nnx.Optimizer(tokenizer, tx, wrt=nnx.Param)
 
     # ---------- Checkpointing ----------
     ckpt_dir = run_dir / "checkpoints"
     mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
 
-    state_example = make_state(params, opt_state, rng, step=0)
+    opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
+    
+    # Pass tokenizer directly to make_state - it will handle the splitting
+    state_example = make_state(tokenizer, opt_state, rng, step=0)
     meta = {"cfg": asdict(cfg)}
 
     restored = try_restore(mngr, state_example, ctx, meta)
@@ -248,20 +230,17 @@ def run(cfg: TokenizerConfig):
     if restored is not None:
         # Restored state is already sharded/replicated on GPUs via ctx
         latest_step, r = restored
-        params = r.state["params"]
-        opt_state = r.state["opt_state"]
+        # Update model and optimizer with restored state
+        nnx.update(tokenizer, r.state["params"])
+        nnx.update(optimizer.opt_state, r.state["opt_state"])
         rng = r.state["rng"]
         start_step = int(r.state["step"])
         cfg = from_dict(TokenizerConfig, r.meta["cfg"])
         print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
     else:
         # No checkpoint - replicate initial state to GPUs
-        params = ctx.replicate(params)
-        opt_state = ctx.replicate(opt_state)
+        tokenizer = ctx.replicate(tokenizer)
         print("[parallel] Replicated initial state to GPUs")
-    
-    # Always replicate variables (constants, not in checkpoint)
-    variables = ctx.replicate(variables)
 
     # ---------- Train loop ----------
     logger = MetricLogger(
@@ -286,7 +265,15 @@ def run(cfg: TokenizerConfig):
         # Generate keys matching batch size (one per sample)
         master_key = ctx.split_keys(master_key, count=videos.shape[0])
         
-        params, opt_state, aux = train_step(apply_fn, tx, variables, params, opt_state, videos, master_keys=master_key, step=step, lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac, dataset_mean=tuple(cfg.dataset.dataset_mean), dataset_std=tuple(cfg.dataset.dataset_std), log_gradients=cfg.log_gradients, tokenizer_loss_type=cfg.tokenizer_loss_type)
+        aux = train_step(
+            tokenizer, optimizer, videos,
+            mae_key=master_key[0], step=step,
+            lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
+            dataset_mean=tuple(cfg.dataset.dataset_mean), 
+            dataset_std=tuple(cfg.dataset.dataset_std), 
+            log_gradients=cfg.log_gradients, 
+            tokenizer_loss_type=cfg.tokenizer_loss_type
+        )
 
         if logger.should_log(step):
             metrics_cpu = ctx.to_host_scalar(aux)
@@ -318,15 +305,14 @@ def run(cfg: TokenizerConfig):
             )
         
         # Save sharded arrays
-        state = make_state(params, opt_state, rng, step)
-        maybe_save(mngr, step, state, meta)
+        opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
+        ckpt_state = make_state(tokenizer, opt_state, rng, step)
+        maybe_save(mngr, step, ckpt_state, meta)
 
         if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
             # Move a subset to host for visualization
             viz_videos = jax.device_get(batch["videos"][:8])
-            viz_params = jax.device_get(params)
-            viz_variables = jax.device_get(variables)
-            viz_step(apply_fn, viz_variables, viz_params, viz_videos, rng, step, run_dir, use_wandb=cfg.use_wandb)
+            viz_step(tokenizer, viz_videos, rng, step, run_dir, use_wandb=cfg.use_wandb)
 
     mngr.wait_until_finished()
 
