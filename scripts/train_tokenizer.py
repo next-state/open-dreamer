@@ -108,10 +108,10 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
     jax.jit,
     static_argnames=("apply_fn", "tx", "lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"),
 )
-def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key, step, lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
-     
-    step_key = jax.random.fold_in(master_key, step)
-    mae_key, drop_key = jax.random.split(step_key)
+def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_keys, step, lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
+    # FIXME: not entirely deterministic, because the key depends on the number of devices
+    step_key = jax.random.fold_in(master_keys[0], step)
+    mae_key, drop_key = jax.random.split(step_key, 2)
 
     def loss_fn(p):
         pred, (mae_mask, keep_prob) = forward_apply(apply_fn, variables, p, videos, mae_key=mae_key, drop_key=drop_key, train=True)    
@@ -127,7 +127,7 @@ def train_step(apply_fn, tx, variables, params, opt_state, videos, *, master_key
             raise ValueError(f"Invalid loss type: {tokenizer_loss_type}")
 
         # for psnr: use [0, 1] normalized pixel range.
-        psnr = compute_psnr(pred / 255, videos / 255)
+        psnr = compute_psnr(pred / 255.0, videos / 255.0)
         
         # For LPIPS: use [0, 1] range
         lp = 0

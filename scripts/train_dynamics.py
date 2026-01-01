@@ -87,7 +87,8 @@ def train_step(
     
     Bootstrap contribution is masked to 0 when step < bootstrap_start.
     """
-    step_key = jax.random.fold_in(master_key, step)
+    # FIXME: not entirely deterministic, because the key depends on the number of devices
+    step_key = jax.random.fold_in(master_key[0], step)
     
     def loss_and_aux(p):
         vars_dict = {"params": p, "constants": constants}
