@@ -380,10 +380,29 @@ def run(cfg: BCRewConfig):
         # Get videos and compute batch size
         videos = batch["videos"]
         actions = batch["actions"]
-        B, T, H, W, C = videos.shape
         B_self = int(videos.shape[0] * cfg.self_fraction) * (step >= cfg.bootstrap_start)
         val_videos = batch["videos"]
-        run_agent_visualization(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, params["dynamics"], dynamics_constants, task_embedder, params["task_embedder"], val_videos, jnp.asarray(actions), vis_dir, rng)
+        reward_vars = {"params": params["reward"], "constants": reward_constants}
+        run_agent_visualization(
+            cfg=cfg,
+            tokenizer_cfg=tokenizer_cfg,
+            step=step,
+            tokenizer=tokenizer,
+            tokenizer_vars=tokenizer_vars,
+            dynamics=dynamics,
+            dynamics_params=params["dynamics"],
+            dynamics_constants=dynamics_constants,
+            task_embedder=task_embedder,
+            task_embedder_params=params["task_embedder"],
+            reward_head=reward_head,
+            reward_vars=reward_vars,
+            policy_head=policy_head,
+            policy_params=params["policy"],
+            val_videos=val_videos,
+            val_actions=jnp.asarray(actions),
+            vis_dir=vis_dir,
+            rng=rng,
+        )
         import ipdb; ipdb.set_trace()
     
         

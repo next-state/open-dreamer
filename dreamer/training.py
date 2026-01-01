@@ -428,12 +428,16 @@ def run_agent_visualization(
     tokenizer_cfg,
     step: int,
     tokenizer,
-    tokenizer_vars: Dict[str, Any],
+    tokenizer_vars: VariableDict,
     dynamics,
     dynamics_params: Dict[str, Any],
     dynamics_constants: Dict[str, Any],
     task_embedder,
     task_embedder_params: Dict[str, Any],
+    reward_head,
+    reward_vars: VariableDict,
+    policy_head,
+    policy_params: Dict[str, Any],
     val_videos: jnp.ndarray,
     val_actions: jnp.ndarray,
     vis_dir: Path,
@@ -475,9 +479,11 @@ def run_agent_visualization(
         horizon = T - ctx_length
         task = jnp.zeros((B,), dtype=jnp.int32)
         agent_tokens = task_embedder.apply({"params": task_embedder_params}, task=task, B=B, T=T)
-        pred_frames, floor_frames, gt_frames = sample_video(
+        pred_frames, floor_frames, gt_frames, pred_actions, pred_rewards = sample_video(
             tokenizer, tokenizer_vars, dynamics, dyn_vars, 
-            val_videos, val_actions, horizon, schedule_config, rng, agent_tokens=agent_tokens
+            val_videos, val_actions, horizon, schedule_config, rng, agent_tokens=agent_tokens,
+            reward_head=reward_head, reward_vars=reward_vars,
+            policy_head=policy_head, policy_params=policy_params,
         )
         import ipdb; ipdb.set_trace()
 

@@ -6,8 +6,9 @@ from typing import Tuple, Dict, Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax.typing import VariableDict
 
-from dreamer.models import Tokenizer, Dynamics
+from dreamer.models import Tokenizer, Dynamics, RewardHeadMTP, PolicyHeadMTP
 from .generation import DenoiseSchedule, video_rollout
 
 
@@ -26,6 +27,10 @@ def sample_video(
     schedule_config: DenoiseSchedule,
     rng: jax.Array,
     agent_tokens: jax.Array | None = None, # (B, T_ctx + horizon, n_agent, D)
+    reward_head: RewardHeadMTP | jax.Array = None,
+    reward_vars: VariableDict | None = None,
+    policy_head: PolicyHeadMTP | jax.Array = None,
+    policy_params: Dict[str, Any] = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """
     Sample video predictions using Tokenizer and Dynamics.
@@ -82,7 +87,7 @@ def sample_video(
     tokenized_frames = jnp.clip(tokenized_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
-    pred_frames = video_rollout(tokenizer,
+    pred_frames, pred_actions, pred_rewards = video_rollout(tokenizer,
                                 tokenizer_vars,
                                 dynamics,
                                 dyn_vars,
@@ -93,7 +98,10 @@ def sample_video(
                                 actions_ctx=actions_ctx,
                                 num_steps=horizon,
                                 rng=rng,
-                                agent_tokens=agent_tokens)
+                                agent_tokens=agent_tokens,
+                                reward_head=reward_head,
+                                reward_vars=reward_vars,
+                                policy_head=policy_head,
+                                policy_params=policy_params)
 
-    frames = jnp.clip(frames, 0, 255).astype(jnp.uint8)
-    return pred_frames, tokenized_frames, frames
+    return pred_frames, tokenized_frames, frames, pred_actions, pred_rewards

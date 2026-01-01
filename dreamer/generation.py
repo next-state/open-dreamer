@@ -2,13 +2,18 @@ import math
 import einops
 import jax
 import jax.numpy as jnp
-from typing import Tuple 
+from typing import Tuple, Dict, Any
 
-from .models import Dynamics, KVCache, PolicyHeadMTP, Tokenizer
+from .models import Dynamics, KVCache, PolicyHeadMTP, Tokenizer, RewardHeadMTP
 
 
 from flax.struct import dataclass
 from flax.typing import VariableDict
+
+
+def _symexp(y):
+    """Inverse of symlog: converts symlog values back to real numbers."""
+    return jnp.sign(y) * (jnp.expm1(jnp.abs(y)))
 
 
 @dataclass
@@ -253,25 +258,27 @@ def latent_rollout(
             agent_step = agent_tokens[:,step_idx][:, None]
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, T_ctx, rng,  agent_tokens=agent_step, caches=caches_t)
-        
-        return (h_next, caches_next, rng), (latent_next[:,0], h_next) # latent_next is (B, 1, n_spatial, D_s) 
+        out = latent_next[:,0]
+        if initial_agent_tokens is not None:
+            out = (latent_next[:,0], h_next)
+        return (h_next, caches_next, rng), out 
 
     # Run scan
-    _, (rollout_latents, rollout_h) = jax.lax.scan(
+    rollout_h = None
+    _, outs = jax.lax.scan(
         scan_step,
         (h_last, caches, rng),
         jnp.arange(num_steps)
     )
-    import ipdb; ipdb.set_trace()
-    
-    # Unpack results
-    rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
-    rollout_h = einops.rearrange(rollout_h, 't b a d -> b t a d')
-    out_latents = jnp.concatenate((latents_ctx, rollout_latents), axis=1)
-    out_agent_tokens = None
+    rollout_latents = outs
     if agent_tokens is not None:
-        out_agent_tokens = jnp.concatenate((agent_ctx, agent_tokens), axis=1)
-    return out_latents, out_agent_tokens
+        rollout_latents,rollout_h = outs
+        rollout_h = einops.rearrange(rollout_h, 't b a d -> b t a d')
+        out_h = jnp.concatenate((h_seq, rollout_h), axis=1)
+    
+    rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
+    out_latents = jnp.concatenate((latents_ctx, rollout_latents), axis=1)
+    return out_latents, out_h
 
 
 
@@ -288,6 +295,10 @@ def video_rollout(
     num_steps: int,
     rng: jax.Array,
     agent_tokens: jax.Array | None = None, # (B, T_ctx + num_steps, n_agent, D)
+    reward_head: RewardHeadMTP | jax.Array = None,
+    reward_vars: VariableDict | None = None,
+    policy_head: PolicyHeadMTP | jax.Array = None,
+    policy_params: Dict[str, Any] = None,
 ):
     """
     End-to-end video generation rollout.
@@ -322,7 +333,7 @@ def video_rollout(
         
     # Latent Rollout
     # Returns (B, num_steps, n_spatial, D_s)
-    rollout_latents = latent_rollout(dynamics,
+    rollout_latents, rollout_h = latent_rollout(dynamics,
                                      dyn_vars,
                                      policy,
                                      policy_vars,
@@ -339,5 +350,26 @@ def video_rollout(
                                        packing_factor=dynamics.config.packing_factor,
                                        method=tokenizer.decode,
                                        deterministic=True)
+    pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
+
+    # decode heads from hidden states
+    pred_actions = pred_rewards = None
+    if rollout_h is not None:
+        #reward / policy head are given if agent tokens are given
+        # TODO: figure out why policy params needs to be passed as a dict like this.
+        policy_logits = policy_head.apply({"params": policy_params}, rollout_h, deterministic=True)  # (B, T, L, A)        
+        # Extract most likely action from policy logits
+        # Take first token (L=0) and compute argmax over action dimension
+        policy_logits_first_token = policy_logits[:, :, 0, :]  # (B, T, A)
+        logp = jax.nn.log_softmax(policy_logits_first_token, axis=-1)  # (B, T, A)
+        pred_actions = jnp.argmax(logp, axis=-1)  # (B, T)
         
-    return jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
+        # Extract predicted reward from reward logits
+        # Take first token (L=0) and compute expected reward
+        reward_logits, centers_log = reward_head.apply(reward_vars, rollout_h, deterministic=True)  # (B, T, L, K), (K,)
+        reward_logits_first_token = reward_logits[:, :, 0, :]  # (B, T, K)
+        probs = jax.nn.softmax(reward_logits_first_token, axis=-1)  # (B, T, K)
+        exp_symlog = jnp.sum(probs * centers_log[None, None, :], axis=-1)  # (B, T)
+        pred_rewards = _symexp(exp_symlog)  # (B, T)
+
+    return pred_frames, pred_actions, pred_rewards
