@@ -9,17 +9,16 @@ This module contains:
 """
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple
-import time
+from typing import Any, Dict, Tuple
 
 import einops
 import imageio.v3 as iio
 import jax
 import jax.numpy as jnp
 from einops import rearrange
-from flax.typing import VariableDict
 import optax
 import wandb
+import time
 
 from dreamer.generation import DenoiseSchedule
 from dreamer.sampler import sample_video
@@ -30,7 +29,7 @@ from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_borde
 # Sampling utilities
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("shape_bt", "k_max"))
+@partial(jax.jit, static_argnames=("shape_bt", "k_max", "dtype"))
 def sample_tau_for_step(
     rng: jax.Array,
     shape_bt: Tuple[int, int],
@@ -69,11 +68,13 @@ def sample_tau_for_step(
     return tau, tau_idx
 
 
-@partial(jax.jit, static_argnames=("shape_bt", "k_max"))
+@partial(jax.jit, static_argnames=("shape_bt", "k_max", "dtype"))
 def sample_step_excluding_dmin(
     rng: jax.Array,
     shape_bt: Tuple[int, int],
-    k_max: int
+    k_max: int,
+    *,
+    dtype=jnp.float32
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Sample step indices excluding the finest level (for bootstrap loss).
@@ -85,6 +86,7 @@ def sample_step_excluding_dmin(
         rng: JAX random key
         shape_bt: Tuple of (batch_size, sequence_length)
         k_max: Maximum noise resolution
+        dtype: Data type for computation
         
     Returns:
         d: (B, T) Step sizes (e.g., 1/128, 1/64, ..., 1/2, 1)
@@ -98,7 +100,7 @@ def sample_step_excluding_dmin(
     emax = jnp.log2(k_max).astype(jnp.int32)
     # Sample from [0, emax) to exclude finest level at emax
     step_idx = jax.random.randint(rng, (B_, T_), 0, emax, dtype=jnp.int32)
-    d = 1.0 / (1 << step_idx).astype(jnp.float32)
+    d = 1.0 / (1 << step_idx).astype(dtype)
     return d, step_idx
 
 
@@ -115,6 +117,9 @@ def compute_psnr(pred, target):
     Assumes pred and target are in the [0, 1] pixel range.
     Computes PSNR per sample, then returns the mean PSNR. 
     """
+    # Ensure float32 precision to avoid quantization artifacts
+    pred = pred.astype(jnp.float32)
+    target = target.astype(jnp.float32)
     pred_clipped = jnp.clip(pred, 0.0, 1.0)
     target_clipped = jnp.clip(target, 0.0, 1.0)
     # Compute MSE per (B, T) sample: reduce over spatial and channel dims
@@ -201,8 +206,7 @@ def compute_bootstrap_loss(
 # ---------------------------
 
 def shortcut_forcing_step(
-    dynamics_apply_fn: Callable,
-    dynamics_vars: VariableDict,
+    dynamics_model,
     actions: jnp.ndarray,
     latents: jnp.ndarray,
     rng: jax.Array,
@@ -218,14 +222,12 @@ def shortcut_forcing_step(
     and imagination training phases.
     
     Args:
-        dynamics_apply_fn: Model's apply function
-        dynamics_vars: Model variables (params + constants)
+        dynamics_model: NNX Dynamics model instance
         actions: (B, T) Action sequence
         latents: (B, T, S, D) Latent sequence (ground truth)
         rng: Random key
         k_max: Maximum noise resolution
         B_self: Number of bootstrap examples (last B_self rows of batch)
-        bootstrap_active: Whether to compute bootstrap loss
         agent_tokens: Optional (B, T, n_agent, d_model) agent tokens
         
     Returns:
@@ -239,7 +241,7 @@ def shortcut_forcing_step(
     emax = jnp.log2(k_max).astype(jnp.int32)
     
     # Split RNG
-    key_sigma, key_step, key_noise, key_drop = jax.random.split(rng, 4)
+    key_sigma, key_step, key_noise = jax.random.split(rng, 3)
     
     # --- Step indices ---
     # Empirical rows: always use finest step (d_min)
@@ -247,15 +249,15 @@ def shortcut_forcing_step(
     
     # Bootstrap rows: coarser steps (if B_self > 0)
     if B_self > 0:
-        d_self, step_idx_self = sample_step_excluding_dmin(key_step, (B_self, T), k_max)
+        d_self, step_idx_self = sample_step_excluding_dmin(key_step, (B_self, T), k_max, dtype=latents.dtype)
     else:
-        d_self = jnp.zeros((0, T), dtype=jnp.float32)
+        d_self = jnp.zeros((0, T), dtype=latents.dtype)
         step_idx_self = jnp.zeros((0, T), dtype=jnp.int32)
     
     step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)
     
     # --- Sample signal levels ---
-    sigma_full, sigma_idx_full = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx_full)
+    sigma_full, sigma_idx_full = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx_full, dtype=latents.dtype)
     sigma_emp = sigma_full[:B_emp]
     sigma_self = sigma_full[B_emp:]
     sigma_idx_self = sigma_idx_full[B_emp:]
@@ -265,8 +267,10 @@ def shortcut_forcing_step(
     z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
     
     # --- Forward pass (full batch) ---
-    drop_main, drop_h1, drop_h2 = jax.random.split(key_drop, 3)
-    z_pred_full, (h_states, _) = dynamics_apply_fn(dynamics_vars, actions, step_idx_full, sigma_idx_full, z_tilde, agent_tokens=agent_tokens, rngs={"dropout": drop_main}, deterministic=False)
+    z_pred_full, (h_states, _) = dynamics_model(
+        actions, step_idx_full, sigma_idx_full, z_tilde,
+        agent_tokens=agent_tokens, deterministic=False
+    )
     
     # --- Flow loss (empirical rows) ---
     z_pred_emp = z_pred_full[:B_emp]
@@ -289,12 +293,18 @@ def shortcut_forcing_step(
         sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
     
         # First half-step
-        z1_half1, *_ = dynamics_apply_fn(dynamics_vars, actions_self, step_idx_half, sigma_idx_self, z_tilde_self, agent_tokens=agent_tokens_self, rngs={"dropout": drop_h1}, deterministic=False)
+        z1_half1, *_ = dynamics_model(
+            actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
+            agent_tokens=agent_tokens_self, deterministic=False
+        )
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
     
         # Second half-step
-        z1_half2, *_ = dynamics_apply_fn(dynamics_vars, actions_self, step_idx_half, sigma_idx_plus, z_prime, agent_tokens=agent_tokens_self, rngs={"dropout": drop_h2}, deterministic=False)
+        z1_half2, *_ = dynamics_model(
+            actions_self, step_idx_half, sigma_idx_plus, z_prime,
+            agent_tokens=agent_tokens_self, deterministic=False
+        )
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
     
         # Bootstrap loss (computed unconditionally)
@@ -546,7 +556,6 @@ def compute_pmpo_loss(
 
 def compute_reward_loss(
     reward_head,
-    reward_vars: Any,
     h_states: jnp.ndarray,
     rewards_btL: jnp.ndarray,
     rewards_valid: jnp.ndarray,
@@ -555,8 +564,7 @@ def compute_reward_loss(
     Compute reward prediction loss with symexp twohot encoding.
     
     Args:
-        reward_head: Reward head model instance
-        reward_vars: Reward head variables dict (params + constants)
+        reward_head: Reward head NNX model instance
         h_states: (B, T, n_agent, d_model) Hidden states from dynamics
         rewards_btL: (B, T, L) Future reward values
         rewards_valid: (B, T, L) Validity mask
@@ -565,9 +573,9 @@ def compute_reward_loss(
         reward_loss: Scalar categorical cross-entropy loss
     """
     # Forward pass
-    reward_logits, centers_log = reward_head.apply(reward_vars, h_states, deterministic=True) 
+    reward_logits, centers_log = reward_head(h_states, deterministic=True) 
     
-    assert rewards_valid.dtype == jnp.bool, "rewards_valid must be of type bool"
+    assert rewards_valid.dtype == jnp.bool_, "rewards_valid must be of type bool"
     reward_targets = twohot_symlog_targets(rewards_btL, centers_log)  # (B, T, L, K)
     reward_loss_per = optax.safe_softmax_cross_entropy(logits=reward_logits, labels=reward_targets)  # (B, T, L)
     reward_loss = jnp.sum(reward_loss_per * rewards_valid) / jnp.maximum(rewards_valid.sum(), 1.0)
@@ -575,10 +583,8 @@ def compute_reward_loss(
     return reward_loss
 
 
-
 def compute_policy_loss(
     policy_head,
-    policy_params: Any,
     h_states: jnp.ndarray,
     actions: jnp.ndarray,
     actions_valid: jnp.ndarray,
@@ -587,8 +593,7 @@ def compute_policy_loss(
     Compute behavior cloning loss with multi-token prediction.
     
     Args:
-        policy_head: Policy head model instance
-        policy_params: Policy head parameters
+        policy_head: Policy head NNX model instance
         h_states: (B, T, n_agent, d_model) Hidden states from dynamics
         actions: (B, T, L) Future action labels
         actions_valid: (B, T, L) Validity mask
@@ -597,11 +602,11 @@ def compute_policy_loss(
         policy_loss: Scalar categorical cross-entropy loss
     """
     # Forward pass
-    policy_logits = policy_head.apply({"params": policy_params},h_states,deterministic=True)  # (B, T, L, A)
+    policy_logits = policy_head(h_states, deterministic=True)  # (B, T, L, A)
     
     # Categorical cross-entropy for each future action
     assert actions.dtype == jnp.int32, "actions must be of type int32"
-    assert actions_valid.dtype == jnp.bool, "actions_valid must be of type bool"
+    assert actions_valid.dtype == jnp.bool_, "actions_valid must be of type bool"
     per_token_loss = optax.softmax_cross_entropy_with_integer_labels(policy_logits, actions)
     policy_loss = jnp.sum(per_token_loss * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
     
@@ -617,10 +622,7 @@ def run_evaluation(
     tokenizer_cfg,
     step: int,
     tokenizer,
-    tokenizer_vars: Dict[str, Any],
     dynamics,
-    dynamics_params: Dict[str, Any],
-    dynamics_constants: Dict[str, Any],
     val_videos: jnp.ndarray,
     val_actions: jnp.ndarray,
     vis_dir: Path,
@@ -635,11 +637,8 @@ def run_evaluation(
         cfg: Training config (must have use_wandb attribute)
         tokenizer_cfg: Tokenizer config (for dataset stats)
         step: Current training step
-        tokenizer: Tokenizer model instance
-        tokenizer_vars: Tokenizer variables
-        dynamics: Dynamics model instance
-        dynamics_params: Dynamics parameters
-        dynamics_constants: Dynamics constants
+        tokenizer: Tokenizer NNX model instance
+        dynamics: Dynamics NNX model instance
         val_videos: (B, T, H, W, C) Validation videos
         val_actions: (B, T) Validation actions
         vis_dir: Directory to save visualizations
@@ -651,8 +650,6 @@ def run_evaluation(
 
     evaluation_schedules = {"shortcut": schedule_shortcut, "diffusion": schedule_diffusion}
 
-    dyn_vars = {"params": dynamics_params, "constants": dynamics_constants}
-
     for tag, schedule_config in evaluation_schedules.items():
         t0 = time.time()
         # FIXME: only temporary for debugging
@@ -661,7 +658,7 @@ def run_evaluation(
         horizon = val_videos.shape[1] - ctx_length
 
         pred_frames, floor_frames, gt_frames = sample_video(
-            tokenizer, tokenizer_vars, dynamics, dyn_vars, 
+            tokenizer, dynamics, 
             val_videos, val_actions, horizon, schedule_config, rng
         )
 
@@ -671,8 +668,8 @@ def run_evaluation(
         normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
         normalized_gt = normalize_with_dataset_stats(gt_frames[:, -horizon:], mean=0, std=dataset_std)
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
+        psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames[:, -horizon:]/255))
         
-        psnr = compute_psnr(pred_frames[:, -horizon:]/255, gt_frames[:, -horizon:]/255)
         print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
 
         # Build visualization

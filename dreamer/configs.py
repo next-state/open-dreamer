@@ -57,6 +57,7 @@ class EncoderConfig:
 
 @dataclass(frozen=False)
 class DecoderConfig:
+    d_bottleneck: int = 32  # Must match encoder's d_bottleneck
     d_model: int = 64
     n_heads: int = 4
     n_kv_heads: int = 2

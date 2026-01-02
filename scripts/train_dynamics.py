@@ -1,12 +1,3 @@
-# train_dynamics.py
-"""
-Dynamics model training with teacher-forced flow matching and bootstrap self-consistency.
-
-Architecture:
-  - Loads pretrained tokenizer (frozen)
-  - Trains dynamics model on latent space
-  - Periodic autoregressive evaluation with video visualization
-"""
 from __future__ import annotations
 
 import logging
@@ -17,22 +8,23 @@ from pathlib import Path
 import hydra
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec as P
 import optax
 import wandb
-from flax.core import FrozenDict
+from flax import nnx
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-from dreamer.configs import DynamicsConfig, TokenizerConfig
+from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.training import run_evaluation, shortcut_forcing_step  # NEW: Reusable training components
+from dreamer.parallel import ParallelContext
+from dreamer.training import run_evaluation, shortcut_forcing_step
 from dreamer.utils import (
     _ensure_dir,
     init_dynamics,
+    init_tokenizer,
     make_manager,
     make_state,
     maybe_save,
@@ -40,69 +32,73 @@ from dreamer.utils import (
     get_lr_schedule,
     count_parameters_by_component,
 )
-# jax.config.update("jax_debug_nans", True)
+
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
 
+
 # ---------------------------
-# Training step (now using reusable components from dreamer.training)
+# Training Step
 # ---------------------------
 
-def make_encode_and_train_step(tokenizer, dynamics, tx):
+
+def make_encode_and_train_step(k_max: int, B_self: int, packing_factor: int):
     """
-    Factory function to create a JIT-compiled encode_and_train_step with models bound.
+    Factory function to create a JIT-compiled encode_and_train_step.
 
     This avoids passing unhashable model objects as static arguments to jax.jit.
-    Instead, we bind them using functools.partial at creation time.
     """
-    @partial(jax.jit, static_argnames=("k_max", "B_self", "packing_factor"))
+    @partial(jax.jit, static_argnames=())
     def encode_and_train_step(
-        tokenizer_vars, params, opt_state, constants,
-        videos, actions,
-        *, tokenizer_key: jnp.ndarray, master_key: jnp.ndarray, step: int,
-        B_self: int, k_max: int, packing_factor: int):
-        # Phase 1: Encode videos to latents (parallelized when videos are sharded)
-        latents, _ = tokenizer.apply(
-            tokenizer_vars,
+        tokenizer: Tokenizer,
+        dynamics: Dynamics,
+        optimizer: nnx.Optimizer,
+        videos: jnp.ndarray,
+        actions: jnp.ndarray,
+        *,
+        tokenizer_key: jax.Array,
+        master_key: jax.Array,
+        step: int
+    ):
+        # Phase 1: Encode videos to latents
+        rngs = nnx.Rngs(mae=tokenizer_key)
+        latents, _ = tokenizer.encode(
             videos,
             packing_factor=packing_factor,
-            rngs={"mae": tokenizer_key},
-            method=tokenizer.encode
+            deterministic=True,
+            rngs=rngs
         )
 
-        # Phase 2: Training step (parallelized when latents are sharded)
-        new_params, new_opt_state, metrics = train_step(
-            dynamics, tx, params, opt_state, constants, latents, actions,
+        # Phase 2: Training step
+        metrics = train_step(
+            dynamics, optimizer, latents, actions,
             B_self=B_self, k_max=k_max, master_key=master_key, step=step
         )
 
-        return new_params, new_opt_state, metrics
-
+        return metrics
+    
     return encode_and_train_step
 
 
-@partial(jax.jit, static_argnames=("dynamics", "tx", "k_max", "B_self"))
+@nnx.jit(static_argnames=("k_max", "B_self"))
 def train_step(
-    dynamics, tx, params, opt_state, constants, latents, actions,
-    *, B_self: int, k_max: int, master_key: jnp.ndarray, step: int):
-    """
-    Training step using shortcut forcing (flow matching + bootstrap self-consistency).
-    
-    Now uses reusable components from dreamer.training for maintainability and code reuse.
-    
-    Branches:
-      - Empirical flow (first B_emp rows): standard flow matching at d_min = 1/k_max
-      - Bootstrap (last B_self rows): self-consistency loss with coarser d > d_min
-    
-    Bootstrap contribution is masked to 0 when step < bootstrap_start.
-    """
+    dynamics: Dynamics,
+    optimizer: nnx.Optimizer,
+    latents: jnp.ndarray,
+    actions: jnp.ndarray,
+    *,
+    B_self: int,
+    k_max: int,
+    master_key: jax.Array,
+    step: int
+):
+    # Generate step-specific key
     step_key = jax.random.fold_in(master_key, step)
-    
-    def loss_and_aux(p):
-        vars_dict = {"params": p, "constants": constants}
+
+    def loss_and_aux(dynamics_model: Dynamics):
+        """Loss function that takes the model and returns (loss, aux)."""
         losses, aux = shortcut_forcing_step(
-            dynamics_apply_fn=dynamics.apply,
-            dynamics_vars=vars_dict,
+            dynamics_model=dynamics_model,
             actions=actions,
             latents=latents,
             rng=step_key,
@@ -111,12 +107,13 @@ def train_step(
             agent_tokens=None,  # Not used in dynamics pretraining
         )
         return losses['total'], aux
-    
-    (loss_val, metrics), grads = jax.value_and_grad(loss_and_aux, has_aux=True)(params)
-    updates, new_opt_state = tx.update(grads, opt_state, params)
-    new_params = optax.apply_updates(params, updates)
-    
-    return new_params, new_opt_state, metrics
+
+    (loss_val, metrics), grads = nnx.value_and_grad(loss_and_aux, has_aux=True)(dynamics)
+
+    # Update model with optimizer 
+    optimizer.update(dynamics, grads)
+
+    return metrics
 
 # ---------------------------
 # Main
@@ -132,40 +129,31 @@ def run(cfg: DynamicsConfig):
 
     # Wandb
     if cfg.use_wandb:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project or cfg.run_name, name=cfg.run_name, config=asdict(cfg), dir=str(run_dir))
-
-    # Validate batch size divisibility for data parallelism
-    device_count = jax.local_device_count()
-    if cfg.batch_size % device_count != 0:
-        raise ValueError(
-            f"Batch size ({cfg.batch_size}) must be divisible by "
-            f"device count ({device_count}) for data parallelism."
+        wandb.init(
+            entity=cfg.wandb_entity, 
+            project=cfg.wandb_project or cfg.run_name, 
+            name=cfg.run_name, 
+            config=asdict(cfg), 
+            dir=str(run_dir)
         )
 
-    per_device_batch_size = cfg.batch_size // device_count
-    print(f"[data_parallel] Found {device_count} devices: {jax.local_devices()}")
-    print(f"[data_parallel] Global batch size: {cfg.batch_size}")
-    print(f"[data_parallel] Per-device batch size: {per_device_batch_size}")
+    # Create parallel context for data parallelism
+    ctx = ParallelContext.create(batch_size=cfg.batch_size)
 
     # Load frozen tokenizer
     rng = jax.random.PRNGKey(0)
-    tokenizer, tokenizer_vars, tokenizer_cfg = Tokenizer.from_pretrained(cfg.tokenizer_ckpt)
-
-    # Create device mesh for data parallelism
-    mesh = jax.make_mesh((device_count,), ('batch',))
-    print(f"[data_parallel] Created mesh: {mesh}")
-
-    # Define sharding strategies
-    batch_sharding = NamedSharding(mesh, P('batch'))      # Shard batch dimension
-    replicated_sharding = NamedSharding(mesh, P())         # Replicate across devices
+    
+    # Load pretrained tokenizer
+    tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, ctx)
+    
+    # Get tokenizer config for dynamics initialization
+    tokenizer_cfg = tokenizer.config
 
     # Initialize dynamics
-    dynamics = Dynamics(cfg.dynamics)
-    rng, dynamics_variables = init_dynamics(rng, dynamics, tokenizer_cfg)
-    dynamics_params = dynamics_variables["params"]
-    dynamics_constants = dynamics_variables.get("constants", FrozenDict())
-    param_counts = count_parameters_by_component(dynamics_params)
-    print(f"Parameter counts: {param_counts['transformer']/1e6}M")
+    rng, dynamics = init_dynamics(rng, cfg.dynamics, tokenizer_cfg)
+
+    param_counts = count_parameters_by_component(dynamics)
+    print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
 
     # Optimizer
     if cfg.lr_schedule == "constant":
@@ -182,83 +170,103 @@ def run(cfg: DynamicsConfig):
             cfg.wsd_decay_steps,
         )
         lr = lr_schedule
+    
     tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
-    opt_state = tx.init(dynamics_params)
+    optimizer = nnx.Optimizer(dynamics, tx, wrt=nnx.Param)
 
-    # Create JIT-compiled training step with models bound
-    encode_and_train_step = make_encode_and_train_step(tokenizer, dynamics, tx)
+    # Create JIT-compiled training step with static args bound
+    encode_and_train_step = make_encode_and_train_step(
+        k_max=cfg.dynamics.k_max,
+        B_self=0,  # Will be set dynamically based on step
+        packing_factor=cfg.dynamics.packing_factor
+    )
 
     # Logging & checkpointing
-    logger = MetricLogger( use_wandb=cfg.use_wandb, log_every=cfg.log_every, max_steps=cfg.max_steps, wandb_obj=wandb)
+    logger = MetricLogger(
+        use_wandb=cfg.use_wandb, 
+        log_every=cfg.log_every, 
+        max_steps=cfg.max_steps, 
+        wandb_obj=wandb
+    )
     mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
 
-    state_example = make_state(dynamics_params, opt_state, rng, step=0)
+    # For checkpointing dynamics
+    opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
+
+    # Pass dynamics directly to make_state - it will handle the splitting
+    state_example = make_state(dynamics, opt_state, rng, step=0)
     meta = {"cfg": asdict(cfg)}
 
-    restored = try_restore(mngr, state_example, meta)
+    restored = try_restore(mngr, state_example, ctx, meta)
     start_step = 0
     if restored is not None:
+        # Restored state is already sharded/replicated on GPUs via ctx
         latest_step, r = restored
-        dynamics_params = r.state["params"]
-        opt_state = r.state["opt_state"]
+        nnx.update(dynamics, r.state["params"])
+        nnx.update(optimizer.opt_state, r.state["opt_state"])
         rng = r.state["rng"]
         start_step = int(r.state["step"])
         # Preserve runtime flags before restoring checkpoint config
         use_wandb_override = cfg.use_wandb
-        # cfg = from_dict(DynamicsConfig, r.meta["cfg"])
         cfg.use_wandb = use_wandb_override  # Keep CLI/YAML wandb setting
-        print(f"[ckpt] Restored step {latest_step}")
-
-    # Helper to replicate pytrees across devices
-    def replicate_across_devices(tree, sharding):
-        """Place a pytree on all devices with given sharding."""
-        return jax.tree.map(lambda x: jax.device_put(x, sharding), tree)
-
-    # Replicate all model state across devices
-    dynamics_params = replicate_across_devices(dynamics_params, replicated_sharding)
-    dynamics_constants = replicate_across_devices(dynamics_constants, replicated_sharding)
-    opt_state = replicate_across_devices(opt_state, replicated_sharding)
-    tokenizer_vars = replicate_across_devices(tokenizer_vars, replicated_sharding)
-
-    print(f"[data_parallel] Replicated params, constants, opt_state, and tokenizer_vars")
+        print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
+    else:
+        # No checkpoint - replicate initial state to GPUs
+        dynamics = ctx.replicate(dynamics)
+        print("[parallel] Replicated initial state to GPUs")
 
     dataset = make_iterator(tokenizer_cfg.dataset)
     pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
     for step, batch in pbar:
         if step > cfg.max_steps:
             break
-        # Data
+        
+        # Shard batch data
         rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
+        videos = ctx.shard_data(batch["videos"])
+        actions = ctx.shard_data(batch["actions"])
+        
+        # Pass a replicated scalar key; JAX automatically shards the RNG generation based on the sharded data layout (SPMD), ensuring determinism independent of device count.
+        # Ref: https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html#computation-follows-data-sharding-and-is-automatically-parallelized
+        tokenizer_key = ctx.replicate(tokenizer_key)
+        master_key = ctx.replicate(master_key)
 
-        # Get batch data and shard across devices
-        videos = jax.device_put(batch["videos"], batch_sharding)
-        actions = jax.device_put(batch["actions"], batch_sharding)
+        # Compute B_self based on step (bootstrap activates after bootstrap_start)
+        B_self = (videos.shape[0] // 2) * int(step >= cfg.bootstrap_start)
+
+        # Recreate the step function with updated B_self
+        encode_and_train_step = make_encode_and_train_step(
+            k_max=cfg.dynamics.k_max,
+            B_self=B_self,
+            packing_factor=cfg.dynamics.packing_factor
+        )
 
         # Combined encoding + training step (both phases parallelized)
-        dynamics_params, opt_state, aux = encode_and_train_step(
-            tokenizer_vars, dynamics_params, opt_state, dynamics_constants,
+        aux = encode_and_train_step(
+            tokenizer, dynamics, optimizer,
             videos, actions,
-            tokenizer_key=tokenizer_key, master_key=master_key, step=step,
-            B_self=(videos.shape[0] // 2)*(step >= cfg.bootstrap_start),
-            k_max=cfg.dynamics.k_max,
-            packing_factor=cfg.dynamics.packing_factor
+            tokenizer_key=tokenizer_key,
+            master_key=master_key,
+            step=step
         )
 
         # Logging
         if logger.should_log(step):
+            metrics_cpu = ctx.to_host_scalar(aux)
             logger.log(
                 step,
                 metrics={
-                    "flow_mse": aux["flow_mse"],
-                    "boot_mse": aux["bootstrap_mse"],
+                    "flow_mse": metrics_cpu["flow_mse"],
+                    "boot_mse": metrics_cpu["bootstrap_mse"],
                     "lr": cfg.lr if lr_schedule is None else lr_schedule(step),
                 },
                 pbar=pbar,
             )
 
-        # Save (async) when policy says we should
-        state = make_state(dynamics_params, opt_state, rng, step)
-        maybe_save(mngr, step, state, meta)
+        # Save sharded arrays directly (Orbax handles distributed write efficiently)
+        opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
+        ckpt_state = make_state(dynamics, opt_state, rng, step)
+        maybe_save(mngr, step, ckpt_state, meta)
 
         # Periodic lightweight AR eval
         if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
@@ -267,17 +275,14 @@ def run(cfg: DynamicsConfig):
             val_actions = jax.device_get(batch["actions"][:4])
 
             run_evaluation(
-                cfg, tokenizer_cfg, step, tokenizer,
-                jax.device_get(tokenizer_vars),
-                dynamics,
-                jax.device_get(dynamics_params),
-                jax.device_get(dynamics_constants),
+                cfg, tokenizer_cfg, step, tokenizer, dynamics,
                 val_videos, jnp.asarray(val_actions), vis_dir, rng
             )
 
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:
         wandb.finish()
+
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")
 def main(cfg: DictConfig):

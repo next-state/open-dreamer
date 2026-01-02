@@ -1,12 +1,11 @@
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from dreamer.data import patchify, unpatchify
 import orbax.checkpoint as ocp
 from pathlib import Path
 import optax
 import operator
-from flax.struct import dataclass
-from flax.core import freeze, unfreeze, FrozenDict
 from einops import rearrange
 from enum import IntEnum
 from typing import Tuple
@@ -61,12 +60,13 @@ class Modality(IntEnum):
     AGENT = 7
     # add more as needed
 
-@dataclass
+@jax.tree_util.register_pytree_node_class
 class TokenLayout:
     """
     Ordered token layout for a single timestep: segments define the order.
     """
-    segments: Tuple[Tuple[Modality, int], ...]  # e.g., ((Modality.LATENT, n_latents), (Modality.IMAGE, n_patches), ...)
+    def __init__(self, segments: Tuple[Tuple[Modality, int], ...]):
+        self.segments = segments  # e.g. ((Modality.LATENT, n_latents), (Modality.IMAGE, n_patches), ...)
 
     @property
     def S(self) -> int:
@@ -144,6 +144,13 @@ class TokenLayout:
         mask = jax.lax.stop_gradient(mask)
         return mask
 
+    def tree_flatten(self):
+        return ((), self.segments)
+    
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(aux_data)
+
 
 def normalize_with_dataset_stats(videos, *, mean, std):
     """
@@ -204,34 +211,42 @@ def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
     """
     return rearrange(z_btLd, 'b t n_spatial (k d) -> b t (n_spatial k) d', n_spatial=n_spatial, k=k)
 
-# -------- Checkpoint helpers --------
-def with_params(variables, new_params):
-    # works whether `variables` is a FrozenDict or a plain dict
-    d = unfreeze(variables) if isinstance(variables, FrozenDict) else dict(variables)
-    d["params"] = new_params
-    return freeze(d)
 
-# Pack params so we can optimize both modules with one optimizer.
-def pack_mae_params(enc_vars, dec_vars):
-    return FrozenDict({
-        "enc": enc_vars["params"],
-        "dec": dec_vars["params"],
-    })
+# ============================================================================
+# Checkpointing Utilities
+# ============================================================================
 
-def unpack_mae_params(packed_params, enc_vars, dec_vars):
-    enc_vars = with_params(enc_vars, packed_params["enc"])
-    dec_vars = with_params(dec_vars, packed_params["dec"])
-    return enc_vars, dec_vars
+def make_state(model_or_dict, opt_state, rng, step):
+    """
+    Pack training state as a PyTree for checkpointing (JAX/Orbax-friendly types only).
+    
+    In NNX, we can checkpoint either:
+    - nnx.state(model) -> gets all trainable params + batch stats
+    - Just the parameters dict
 
+    Args:
+        model_or_dict: Either an NNX model or a dict of parameters
+        opt_state: Optimizer state
+        rng: Random key
+        step: Current step
 
-def make_state(params, opt_state, rng, step):
-    # Pack training state as a PyTree; JAX/Orbax-friendly types only.
+    Returns:
+        State dict suitable for Orbax checkpointing
+    """
+    # If it's a dict, use directly; otherwise extract state from NNX model
+    if isinstance(model_or_dict, dict):
+        state = model_or_dict
+    else:
+        graphdef, *states = nnx.split(model_or_dict, nnx.Param, nnx.BatchStat, ...)
+        state = nnx.State.merge(*states)
+
     return {
-        "params": params,
+        "params": state,
         "opt_state": opt_state,
         "rng": rng,
         "step": jnp.int32(step),
     }
+
 
 def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("state","meta")):
     path = Path(ckpt_dir).expanduser().resolve()
@@ -242,14 +257,25 @@ def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps
     mngr = ocp.CheckpointManager(path, options=options, item_names=item_names)
     return mngr
 
-def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta: dict | None = None):
+
+def try_restore(mngr: ocp.CheckpointManager, state_example: dict, ctx, meta: dict | None = None):
     """
-    Build abstract trees from current shapes/dtypes so Orbax can restore safely
-    (StandardRestore wants an abstract tree). :contentReference[oaicite:3]{index=3}
+    Build abstract trees from current shapes/dtypes so Orbax can restore safely.
+    
+    Creates abstract targets with sharding info from ctx so Orbax loads directly
+    into GPU memory with proper sharding/replication.
     """
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)   # :contentReference[oaicite:4]{index=4}
+    # Create abstract targets WITH sharding info for direct GPU loading
+    def to_sharded_abstract(x):
+        if isinstance(x, jax.Array):
+            # Params/opt_state are replicated across available devices
+            return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=ctx.replicated_sharding)
+        return ocp.utils.to_shape_dtype_struct(x)
+    
+    abstract_state = jax.tree_util.tree_map(to_sharded_abstract, state_example)
+    
     restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(abstract_state),                                      # :contentReference[oaicite:5]{index=5}
+        state=ocp.args.StandardRestore(abstract_state),
         meta=ocp.args.JsonRestore() if meta is not None else None
     )
     latest = mngr.latest_step()
@@ -258,6 +284,7 @@ def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta: dict | N
     restored = mngr.restore(latest, args=restore_args)
     return latest, restored
 
+
 def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict | None = None):
     if not mngr.should_save(step):  # obey save interval policy
         return
@@ -265,10 +292,14 @@ def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict |
         state=ocp.args.StandardSave(state),
         meta=ocp.args.JsonSave(meta) if meta is not None else None
     )
-    mngr.save(step, args=save_args)  # async by default; runs in a background thread. :contentReference[oaicite:6]{index=6}
+    mngr.save(step, args=save_args)  # async by default; runs in a background thread
 
 
+# ============================================================================
+# Model Initialization Utilities
+# ============================================================================
 
+<<<<<<< HEAD
 
 def init_tokenizer(rng, tokenizer, tokenizer_cfg):
     dtype = to_jnp_dtype(tokenizer_cfg.encoder.dtype)
@@ -305,13 +336,52 @@ def init_dynamics(rng, dynamics, tokenizer_cfg):
     actions = jnp.zeros((B, T), dtype=jnp.int32)
     step_idxs = jnp.zeros((B, T), dtype=jnp.int32)
     signal_idxs = jnp.zeros((B, T), dtype=jnp.int32)
+=======
+def init_tokenizer(rng, tokenizer_config):
+    """
+    Initialize a tokenizer model with NNX.
+    
+    Args:
+        rng: JAX random key
+        tokenizer_config: TokenizerConfig instance
+        
+    Returns:
+        rng: Updated random key
+        tokenizer: Initialized Tokenizer model
+    """
+    from dreamer.models import Tokenizer
 
-    variables = dynamics.init(
-        {"params": params_rng, "dropout": dropout_rng},
-        actions, step_idxs, signal_idxs, packed_enc_tokens,
-        deterministic=True,
-    )
-    return rng, variables
+    rng, model_rng = jax.random.split(rng)
+    rngs = nnx.Rngs(model_rng)
+
+    tokenizer = Tokenizer(tokenizer_config, rngs=rngs)
+
+    return rng, tokenizer
+
+
+def init_dynamics(rng, dynamics_config, tokenizer_config):
+    """
+    Initialize a dynamics model with NNX.
+    
+    Args:
+        rng: JAX random key
+        dynamics_config: DynamicsModelConfig instance
+        tokenizer_config: TokenizerConfig instance (for spatial dims)
+        
+    Returns:
+        rng: Updated random key
+        dynamics: Initialized Dynamics model
+    """
+    from dreamer.models import Dynamics
+    
+    rng, model_rng = jax.random.split(rng)
+    rngs = nnx.Rngs(model_rng)
+    
+    dynamics = Dynamics(dynamics_config, rngs=rngs)
+    
+    return rng, dynamics
+>>>>>>> origin/nnx-migration
+
 
 # -------- Training utilities (shared across scripts) --------
 
@@ -335,6 +405,7 @@ def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jn
     frames = frames.at[..., :, -width:, :].set(color)
     return frames
 
+<<<<<<< HEAD
 def _stack_wide(*imgs_hwC):
     """Stack images horizontally."""
     return np.concatenate(imgs_hwC, axis=1)
@@ -407,6 +478,9 @@ def load_pretrained_tokenizer(
     print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
     return new_enc_vars, new_dec_vars, meta
 
+=======
+    
+>>>>>>> origin/nnx-migration
 def from_dict(cls, d):
     field_types = {f.name: f.type for f in cls.__dataclass_fields__.values()}
     kwargs = {}
@@ -432,24 +506,25 @@ def _count_component(component_params):
     return total_parameters
 
 
-def count_parameters_by_component(params):
-    """Count parameters for each component of the model.
+def count_parameters_by_component(model):
+    """
+    Count parameters for each component of an NNX model.
 
     Args:
-        params: Model parameters from nnx.split(model, nnx.Param, ...)
+        model: NNX Model instance
 
     Returns:
         Dictionary with parameter counts for each component
     """
-    component_names = list(params.keys())
-    print(f"Counting all components: {component_names}")
+    # Split model to get parameter structure
+    graphdef, state, _ = nnx.split(model, nnx.Param, ...)
 
+    # Count parameters for each top-level component
     counts = {}
     total_params = 0
 
-    for name in component_names:
-        component_params = params[name]
-        count = _count_component(component_params)
+    for name, component in state.items():
+        count = _count_component(component)
         counts[name] = count
         total_params += count
 

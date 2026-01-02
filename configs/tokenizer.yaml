@@ -11,15 +11,15 @@ patch_size: 8
 dataset:
   source: custom
   array_record_path: datasets/coinrun_hard_agent_episodes/train
-  B: 48
+  B: 512
   T: 16
   H: 64
   W: 64
   C: 3
 
 encoder:
-  n_latents: 32
-  d_bottleneck: 32
+  n_latents: 16
+  d_bottleneck: 16
   d_model: 512
   n_heads: 8
   n_kv_heads: 2
@@ -38,6 +38,7 @@ encoder:
   dataset_std: ${dataset.dataset_std}
 
 decoder:
+  d_bottleneck: ${encoder.d_bottleneck}
   d_model: ${encoder.d_model}
   n_heads: ${encoder.n_heads}
   n_kv_heads: ${encoder.n_kv_heads}
@@ -59,13 +60,13 @@ decoder:
 
 max_steps: 300_000
 log_every: 100
-lr: 3e-4
+lr: 6e-4  # FIXME: consolidate with max_lr
 tokenizer_loss_type: "mse" # "mse" | "mae"
 
 # learning rate schedule
 lr_schedule: wsd  # constant | wsd | cos
 init_lr: 0.0
-max_lr: 3e-4
+max_lr: 6e-4
 lr_end: 0
 warmup_steps: 10000
 wsd_decay_steps: 30000

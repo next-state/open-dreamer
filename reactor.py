@@ -1,7 +1,8 @@
 import jax
 import jax.numpy as jnp
-from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP
+from dreamer.models import Dynamics, PolicyHeadMTP
 from dreamer.generation import DenoiseSchedule, next_frame
+from dreamer.parallel import ParallelContext
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
 import numpy as np
@@ -141,7 +142,10 @@ class DreamerVideoModel(VideoModel):
         # Load models from checkpoints
         assert isinstance(cfg, ReactorConfig)
         logger.info(f"Loading dynamics model and tokenizer from {cfg.dynamics_ckpt}")
-        self.dynamics, self.dynamics_vars, self.dynamics_cfg, self.tokenizer, self.tokenizer_vars, self.tokenizer_cfg  = Dynamics.from_pretrained(cfg.dynamics_ckpt)
+        self.ctx = ParallelContext.create(batch_size=cfg.batch_size)
+        self.dynamics, self.tokenizer = Dynamics.from_pretrained(cfg.dynamics_ckpt, self.ctx)
+        self.dynamics_cfg = self.dynamics.config
+        self.tokenizer_cfg = self.tokenizer.config
         
         # Load policy if checkpoint provided
         self.policy = None
@@ -181,11 +185,13 @@ class DreamerVideoModel(VideoModel):
             batch_size=1,
             n_spatial=self.n_spatial,
             window_size=self.window_size,
+            dtype=self.dynamics_cfg.dtype,
         )
         
         self.initial_tokenizer_cache = self.tokenizer.create_static_caches(
             batch_size=1,
             window_size=self.window_size,
+            dtype=self.tokenizer_cfg.decoder.dtype,
         )
         
         # Active caches (will be reset per session)
@@ -244,10 +250,8 @@ class DreamerVideoModel(VideoModel):
         
         # Encode frames to latents
         logger.info("Encoding frames to latents...")
-        init_latents, _ = self.tokenizer.apply(
-            self.tokenizer_vars,
+        init_latents, _ = self.tokenizer.encode(
             init_frames_jax,
-            method=self.tokenizer.encode,
             deterministic=True,
             packing_factor=self.dynamics.config.packing_factor,
         )  # Shape: (1, T//packing, n_spatial, D_s*packing)
@@ -266,8 +270,7 @@ class DreamerVideoModel(VideoModel):
         latents_noised = init_latents*self.schedule.tau_ctx + (1-self.schedule.tau_ctx)*jax.random.normal(rng_warmup, shape=init_latents.shape, dtype=init_latents.dtype)
         
         # Run through dynamics to warm up cache
-        _, (_, self.dynamics_cache) = self.dynamics.apply(
-            self.dynamics_vars,
+        _, (_, self.dynamics_cache) = self.dynamics(
             actions_ctx,
             step_indices,
             tau_indices,
@@ -279,12 +282,10 @@ class DreamerVideoModel(VideoModel):
         
         # Warm up tokenizer cache by decoding context frames
         logger.info("Warming up tokenizer cache...")
-        _, self.tokenizer_cache = self.tokenizer.apply(
-            self.tokenizer_vars,
+        _, self.tokenizer_cache = self.tokenizer.decode(
             init_latents,
             packing_factor=self.dynamics.config.packing_factor,
             caches=self.tokenizer_cache,
-            method=self.tokenizer.decode,
             deterministic=True,
         )
         
@@ -316,8 +317,6 @@ class DreamerVideoModel(VideoModel):
                 
                 # Generate next frame
                 frame_jax, h, self.dynamics_cache, self.tokenizer_cache, self.rng = self.next_frame_compiled(
-                    tokenizer_vars=self.tokenizer_vars,
-                    dynamics_vars=self.dynamics_vars,
                     action=current_action,
                     dynamics_cache=self.dynamics_cache,
                     tokenizer_cache=self.tokenizer_cache,
