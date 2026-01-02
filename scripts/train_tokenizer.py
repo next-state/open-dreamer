@@ -258,16 +258,17 @@ def run(cfg: TokenizerConfig):
             break
 
         rng, master_key = jax.random.split(rng)
+
+        # Pass a replicated scalar key; JAX automatically shards the RNG generation based on the sharded data layout (SPMD), ensuring determinism independent of device count.
+        # Ref: https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html#computation-follows-data-sharding-and-is-automatically-parallelized
+        master_key = ctx.replicate(master_key)
         
         # Shard batch data
-        videos = ctx.shard_batch(batch["videos"])
-        
-        # Generate keys matching batch size (one per sample)
-        master_key = ctx.split_keys(master_key, count=videos.shape[0])
+        videos = ctx.shard_data(batch["videos"])
         
         aux = train_step(
             tokenizer, optimizer, videos,
-            mae_key=master_key[0], step=step,
+            mae_key=master_key, step=step,
             lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
             dataset_mean=tuple(cfg.dataset.dataset_mean), 
             dataset_std=tuple(cfg.dataset.dataset_std), 

@@ -223,12 +223,13 @@ def run(cfg: DynamicsConfig):
         
         # Shard batch data
         rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
-        videos = ctx.shard_batch(batch["videos"])
-        actions = ctx.shard_batch(batch["actions"])
+        videos = ctx.shard_data(batch["videos"])
+        actions = ctx.shard_data(batch["actions"])
         
-        # Generate keys matching batch size (one per sample)
-        tokenizer_key = ctx.split_keys(tokenizer_key, count=videos.shape[0])
-        master_key = ctx.split_keys(master_key, count=videos.shape[0])
+        # Pass a replicated scalar key; JAX automatically shards the RNG generation based on the sharded data layout (SPMD), ensuring determinism independent of device count.
+        # Ref: https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html#computation-follows-data-sharding-and-is-automatically-parallelized
+        tokenizer_key = ctx.replicate(tokenizer_key)
+        master_key = ctx.replicate(master_key)
 
         # Compute B_self based on step (bootstrap activates after bootstrap_start)
         B_self = (videos.shape[0] // 2) * int(step >= cfg.bootstrap_start)
@@ -244,8 +245,8 @@ def run(cfg: DynamicsConfig):
         aux = encode_and_train_step(
             tokenizer, dynamics, optimizer,
             videos, actions,
-            tokenizer_key=tokenizer_key[0],
-            master_key=master_key[0],
+            tokenizer_key=tokenizer_key,
+            master_key=master_key,
             step=step
         )
 

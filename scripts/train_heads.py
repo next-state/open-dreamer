@@ -365,9 +365,9 @@ def run(cfg: BCRewConfig):
         rng, tokenizer_key, step_key = jax.random.split(rng, 3)
         
         # Shard batch data
-        videos = ctx.shard_batch(batch["videos"])
-        actions = ctx.shard_batch(batch["actions"])
-        rewards = ctx.shard_batch(batch["rewards"])
+        videos = ctx.shard_data(batch["videos"])
+        actions = ctx.shard_data(batch["actions"])
+        rewards = ctx.shard_data(batch["rewards"])
         
         # Generate keys matching batch size (one per sample)
         tokenizer_key = ctx.split_keys(tokenizer_key, count=videos.shape[0])
@@ -427,8 +427,8 @@ def run(cfg: BCRewConfig):
             val_actions = jax.device_get(actions[:4])
             run_evaluation(
                 cfg, tokenizer_cfg, step, 
-                tokenizer, tokenizer_vars,
-                dynamics, dynamics_params, dynamics_constants,
+                tokenizer,
+                dynamics,
                 val_videos, val_actions, vis_dir, rng
             )
     

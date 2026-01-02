@@ -1644,10 +1644,10 @@ def run(cfg: RLConfig):
 
         # Shard batch data
         train_rng, step_key = jax.random.split(train_rng)
-        videos = ctx.shard_batch(videos)
-        actions_full = ctx.shard_batch(actions_full)
-        rewards_full = ctx.shard_batch(rewards_full)
-        task_ids = ctx.shard_batch(task_ids)
+        videos = ctx.shard_data(videos)
+        actions_full = ctx.shard_data(actions_full)
+        rewards_full = ctx.shard_data(rewards_full)
+        task_ids = ctx.shard_data(task_ids)
         
         # Generate keys matching batch size (one per sample)
         step_key = ctx.split_keys(step_key, count=videos.shape[0])
