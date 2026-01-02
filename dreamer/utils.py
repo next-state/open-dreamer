@@ -10,7 +10,8 @@ from einops import rearrange
 from enum import IntEnum
 from typing import Tuple
 import numpy as np
-import math
+
+from dreamer.models import Tokenizer, Dynamics
 
 
 # --- dtype helpers ---
@@ -202,14 +203,14 @@ def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
     Requires: N_b == n_spatial * k  (e.g., 512 -> 256 with k=2).
     """
-    return rearrange(z_btLd, 'b t (n_spatial k) d -> b t n_spatial (k d)', n_spatial=n_spatial, k=k)
+    return rearrange(z_btLd, '... (n_spatial k) d -> ... n_spatial (k d)', n_spatial=n_spatial, k=k)
 
 def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,S_z, D_z_pre) -> (B,T,N_b,D_b) by splitting D_z_pre into k channels along N_b.
     Requires: N_b == n_spatial * k  (e.g., 256 -> 512 with k=2).
     """
-    return rearrange(z_btLd, 'b t n_spatial (k d) -> b t (n_spatial k) d', n_spatial=n_spatial, k=k)
+    return rearrange(z_btLd, '... n_spatial (k d) -> ... (n_spatial k) d', n_spatial=n_spatial, k=k)
 
 
 # ============================================================================
@@ -258,24 +259,12 @@ def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps
     return mngr
 
 
-def try_restore(mngr: ocp.CheckpointManager, state_example: dict, ctx, meta: dict | None = None):
+def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta: dict | None = None):
     """
     Build abstract trees from current shapes/dtypes so Orbax can restore safely.
-    
-    Creates abstract targets with sharding info from ctx so Orbax loads directly
-    into GPU memory with proper sharding/replication.
     """
-    # Create abstract targets WITH sharding info for direct GPU loading
-    def to_sharded_abstract(x):
-        if isinstance(x, jax.Array):
-            # Params/opt_state are replicated across available devices
-            return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=ctx.replicated_sharding)
-        return ocp.utils.to_shape_dtype_struct(x)
-    
-    abstract_state = jax.tree_util.tree_map(to_sharded_abstract, state_example)
-    
     restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(abstract_state),
+        state=ocp.args.StandardRestore(state_example),
         meta=ocp.args.JsonRestore() if meta is not None else None
     )
     latest = mngr.latest_step()
@@ -293,56 +282,6 @@ def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict |
         meta=ocp.args.JsonSave(meta) if meta is not None else None
     )
     mngr.save(step, args=save_args)  # async by default; runs in a background thread
-
-
-# ============================================================================
-# Model Initialization Utilities
-# ============================================================================
-
-def init_tokenizer(rng, tokenizer_config):
-    """
-    Initialize a tokenizer model with NNX.
-    
-    Args:
-        rng: JAX random key
-        tokenizer_config: TokenizerConfig instance
-        
-    Returns:
-        rng: Updated random key
-        tokenizer: Initialized Tokenizer model
-    """
-    from dreamer.models import Tokenizer
-
-    rng, model_rng = jax.random.split(rng)
-    rngs = nnx.Rngs(model_rng)
-
-    tokenizer = Tokenizer(tokenizer_config, rngs=rngs)
-
-    return rng, tokenizer
-
-
-def init_dynamics(rng, dynamics_config, tokenizer_config):
-    """
-    Initialize a dynamics model with NNX.
-    
-    Args:
-        rng: JAX random key
-        dynamics_config: DynamicsModelConfig instance
-        tokenizer_config: TokenizerConfig instance (for spatial dims)
-        
-    Returns:
-        rng: Updated random key
-        dynamics: Initialized Dynamics model
-    """
-    from dreamer.models import Dynamics
-    
-    rng, model_rng = jax.random.split(rng)
-    rngs = nnx.Rngs(model_rng)
-    
-    dynamics = Dynamics(dynamics_config, rngs=rngs)
-    
-    return rng, dynamics
-
 
 # -------- Training utilities (shared across scripts) --------
 

@@ -725,7 +725,7 @@ class Tokenizer(nnx.Module):
         )
 
     @classmethod
-    def from_pretrained(cls, checkpoint_path: str, ctx) -> "Tokenizer":        
+    def from_pretrained(cls, checkpoint_path: str) -> "Tokenizer":        
         # Load metadata to get config
         mngr = make_manager(checkpoint_path, item_names=("state", "meta"))
         latest = mngr.latest_step()
@@ -745,7 +745,7 @@ class Tokenizer(nnx.Module):
         state_example = make_state(model, {}, jax.random.PRNGKey(0), step=0)
         
         # Restore checkpoint
-        restored = try_restore(mngr, state_example, ctx, meta={})
+        restored = try_restore(mngr, state_example, meta={})
         if restored is not None:
             latest_step, r = restored
             nnx.update(model, r.state["params"])
@@ -925,13 +925,12 @@ class Dynamics(nnx.Module):
         return x1_hat, (h_t, new_caches)
 
     @classmethod
-    def from_pretrained(cls, checkpoint_path: str, ctx) -> Tuple["Dynamics", "Tokenizer"]:
+    def from_pretrained(cls, checkpoint_path: str) -> Tuple["Dynamics", "Tokenizer"]:
         """
         Load a pretrained Dynamics model and its associated Tokenizer from checkpoint.
         
         Args:
             checkpoint_path: Path to dynamics checkpoint directory
-            ctx: ParallelContext for distributed loading
             
         Returns:
             Tuple of (dynamics_model, tokenizer_model)
@@ -953,7 +952,7 @@ class Dynamics(nnx.Module):
         
         # Load the tokenizer first (dynamics was trained with a pretrained tokenizer)
         print(f"[Dynamics] Loading tokenizer from {full_cfg.tokenizer_ckpt}")
-        tokenizer = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt, ctx)
+        tokenizer = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt)
         
         # Initialize dynamics model
         dynamics = cls(dyn_model_cfg, rngs=nnx.Rngs(0))
@@ -962,7 +961,7 @@ class Dynamics(nnx.Module):
         state_example = make_state(dynamics, {}, jax.random.PRNGKey(0), step=0)
         
         # Restore checkpoint
-        restored = try_restore(mngr, state_example, ctx, meta={})
+        restored = try_restore(mngr, state_example, meta={})
         if restored is not None:
             latest_step, r = restored
             nnx.update(dynamics, r.state["params"])

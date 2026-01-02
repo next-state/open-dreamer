@@ -500,6 +500,7 @@ def run_evaluation(
 
         # Save video
         try:
+            videos = jax.device_get(videos)
             iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
         except Exception as e:
             print(f"[eval:{tag}] MP4 write failed: {e}")

@@ -1794,7 +1794,7 @@ def run(cfg: RLConfig):
                 wandb.log(log_payload, step=step)
 
         if logger.should_log(step):
-            metrics_cpu = ctx.to_host_scalar(aux)
+            metrics_cpu = jax.device_get(aux)
             logger.log(
                 step,
                 metrics={

@@ -413,7 +413,7 @@ def run(cfg: BCRewConfig):
         
         # Logging
         if logger.should_log(step):
-            metrics_cpu = ctx.to_host_scalar(metrics)
+            metrics_cpu = jax.device_get(metrics)
             logger.log(step, metrics=metrics_cpu, pbar=pbar)
         
         # Save sharded arrays directly
