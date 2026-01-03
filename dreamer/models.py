@@ -744,31 +744,32 @@ class Tokenizer(nnx.Module):
     @classmethod
     def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules) -> "Tokenizer":        
         # Load metadata to get config
-        mngr = make_manager(checkpoint_path, item_names=("state", "meta"))
-        latest = mngr.latest_step()
-        if latest is None:
-            raise ValueError(f"No checkpoint found in {checkpoint_path}")
-        
-        # Restore metadata
-        restored_meta = mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
-        cfg_dict = restored_meta.meta["cfg"]
-        cfg_dict = recursive_list_to_tuple(cfg_dict)
-        config = from_dict(TokenizerConfig, cfg_dict)
-        
-        # Initialize model
-        model = cls(config, rngs=nnx.Rngs(0), mesh_rules=mesh_rules)
-        
-        # Pass model directly to make_state - it will handle the splitting
-        state_example = make_state(model, {}, jax.random.PRNGKey(0), step=0)
-        
-        # Restore checkpoint
-        restored = try_restore(mngr, state_example, meta={})
-        if restored is not None:
-            latest_step, r = restored
-            nnx.update(model, r.state["params"])
-            print(f"[Tokenizer] Loaded checkpoint from step {latest_step}")
-        else:
-            raise ValueError(f"Could not load tokenizer from {checkpoint_path}")
+        with make_manager(checkpoint_path, item_names=("state", "meta")) as mngr:
+            latest = mngr.latest_step()
+            if latest is None:
+                raise ValueError(f"No checkpoint found in {checkpoint_path}")
+            
+            # Restore metadata
+            restored_meta = mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
+            cfg_dict = restored_meta.meta["cfg"]
+            cfg_dict = recursive_list_to_tuple(cfg_dict)
+            config = from_dict(TokenizerConfig, cfg_dict)
+            
+            # Initialize model
+            model = cls(config, rngs=nnx.Rngs(0), mesh_rules=mesh_rules)
+            
+            # Create state factory for abstract restoration
+            def state_factory():
+                return make_state(model, {}, jax.random.PRNGKey(0), step=0)
+            
+            # Restore checkpoint
+            restored = try_restore(mngr, state_factory, meta={})
+            if restored is not None:
+                latest_step, r = restored
+                nnx.update(model, r.state["params"])
+                print(f"[Tokenizer] Loaded checkpoint from step {latest_step}")
+            else:
+                raise ValueError(f"Could not load tokenizer from {checkpoint_path}")
         
         return model
 
@@ -970,38 +971,39 @@ class Dynamics(nnx.Module):
             Tuple of (dynamics_model, tokenizer_model)
         """
         # Load metadata to get config
-        mngr = make_manager(checkpoint_path, item_names=("state", "meta"))
-        latest = mngr.latest_step()
-        if latest is None:
-            raise ValueError(f"No checkpoint found in {checkpoint_path}")
-        
-        # Restore metadata
-        restored_meta = mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
-        cfg_dict = restored_meta.meta["cfg"]
-        cfg_dict = recursive_list_to_tuple(cfg_dict)
-        
-        # Extract dynamics config
-        full_cfg = from_dict(DynamicsConfig, cfg_dict)
-        dyn_model_cfg = full_cfg.dynamics
-        
-        # Load the tokenizer first (dynamics was trained with a pretrained tokenizer)
-        print(f"[Dynamics] Loading tokenizer from {full_cfg.tokenizer_ckpt}")
-        tokenizer = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
-        
-        # Initialize dynamics model
-        dynamics = cls(dyn_model_cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(0))
-        
-        # Pass dynamics directly to make_state - it will handle the splitting
-        state_example = make_state(dynamics, {}, jax.random.PRNGKey(0), step=0)
-        
-        # Restore checkpoint
-        restored = try_restore(mngr, state_example, meta={})
-        if restored is not None:
-            latest_step, r = restored
-            nnx.update(dynamics, r.state["params"])
-            print(f"[Dynamics] Loaded checkpoint from step {latest_step}")
-        else:
-            raise ValueError(f"Could not load dynamics from {checkpoint_path}")
+        with make_manager(checkpoint_path, item_names=("state", "meta")) as mngr:
+            latest = mngr.latest_step()
+            if latest is None:
+                raise ValueError(f"No checkpoint found in {checkpoint_path}")
+            
+            # Restore metadata
+            restored_meta = mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
+            cfg_dict = restored_meta.meta["cfg"]
+            cfg_dict = recursive_list_to_tuple(cfg_dict)
+            
+            # Extract dynamics config
+            full_cfg = from_dict(DynamicsConfig, cfg_dict)
+            dyn_model_cfg = full_cfg.dynamics
+            
+            # Load the tokenizer first (dynamics was trained with a pretrained tokenizer)
+            print(f"[Dynamics] Loading tokenizer from {full_cfg.tokenizer_ckpt}")
+            tokenizer = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
+            
+            # Initialize dynamics model
+            dynamics = cls(dyn_model_cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(0))
+            
+            # Create state factory for abstract restoration
+            def state_factory():
+                return make_state(dynamics, {}, jax.random.PRNGKey(0), step=0)
+            
+            # Restore checkpoint
+            restored = try_restore(mngr, state_factory, meta={})
+            if restored is not None:
+                latest_step, r = restored
+                nnx.update(dynamics, r.state["params"])
+                print(f"[Dynamics] Loaded checkpoint from step {latest_step}")
+            else:
+                raise ValueError(f"Could not load dynamics from {checkpoint_path}")
         
         return dynamics, tokenizer
 

@@ -194,89 +194,90 @@ def run(cfg: DynamicsConfig):
             max_steps=cfg.max_steps, 
             wandb_obj=wandb
         )
-        mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
 
-        # For checkpointing dynamics
         opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
-
-        # Pass dynamics directly to make_state - it will handle the splitting
-        state_example = make_state(dynamics, opt_state, rng, step=0)
         meta = {"cfg": asdict(cfg)}
 
-        restored = try_restore(mngr, state_example, meta)
-        start_step = 0
-        if restored is not None:
-            # Restored state is already sharded/replicated on GPUs
-            latest_step, r = restored
-            nnx.update(dynamics, r.state["params"])
-            nnx.update(optimizer.opt_state, r.state["opt_state"])
-            rng = r.state["rng"]
-            start_step = int(r.state["step"])
-            # Preserve runtime flags before restoring checkpoint config
-            use_wandb_override = cfg.use_wandb
-            cfg.use_wandb = use_wandb_override  # Keep CLI/YAML wandb setting
-            print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
+        # Create state factory for abstract restoration
+        def state_factory():
+            return make_state(dynamics, opt_state, rng, step=0)
 
-    dataset = make_iterator(tokenizer_cfg.dataset)
+        with make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every) as mngr:
+            restored = try_restore(mngr, state_factory, meta)
+            start_step = 0
+            if restored is not None:
+                latest_step, r = restored
+                nnx.update(dynamics, r.state["params"])
+                nnx.update(optimizer.opt_state, r.state["opt_state"])
+                rng = r.state["rng"]
+                start_step = int(r.state["step"])
+                # Preserve runtime flags before restoring checkpoint config
+                use_wandb_override = cfg.use_wandb
+                cfg.use_wandb = use_wandb_override  # Keep CLI/YAML wandb setting
+                print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
 
-    # cfg.max_steps + 1 to make sure we log and checkpoint at max_steps
-    pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps + 1)
-    for step, batch in pbar:
-        if step > cfg.max_steps:
-            break
-        
-        # Shard batch data
-        rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
-        videos = jax.device_put(batch["videos"], data_sharding)
-        actions = jax.device_put(batch["actions"], data_sharding)
+            dataset = make_iterator(tokenizer_cfg.dataset)
 
-        # Compute B_self based on step (bootstrap activates after bootstrap_start)
-        B_self = (videos.shape[0] // 2) * int(step >= cfg.bootstrap_start)
+            # cfg.max_steps + 1 to make sure we log and checkpoint at max_steps
+            pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps + 1)
+            for step, batch in pbar:
+                if step > cfg.max_steps:
+                    break
+                
+                # Shard batch data
+                rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
+                videos = jax.device_put(batch["videos"], data_sharding)
+                actions = jax.device_put(batch["actions"], data_sharding)
 
-        # Recreate the step function with updated B_self
-        encode_and_train_step = make_encode_and_train_step(
-            k_max=cfg.dynamics.k_max,
-            B_self=B_self,
-            packing_factor=cfg.dynamics.packing_factor
-        )
+                # Compute B_self based on step (bootstrap activates after bootstrap_start)
+                B_self = (videos.shape[0] // 2) * int(step >= cfg.bootstrap_start)
 
-        # Combined encoding + training step (both phases parallelized)
-        aux = encode_and_train_step(
-            tokenizer, dynamics, optimizer,
-            videos, actions,
-            tokenizer_key=tokenizer_key,
-            master_key=master_key,
-            step=step
-        )
+                # Recreate the step function with updated B_self
+                encode_and_train_step = make_encode_and_train_step(
+                    k_max=cfg.dynamics.k_max,
+                    B_self=B_self,
+                    packing_factor=cfg.dynamics.packing_factor
+                )
 
-        # Logging
-        if logger.should_log(step):
-            metrics_cpu = jax.device_get(aux)
-            logger.log(
-                step,
-                metrics={
-                    "flow_mse": metrics_cpu["flow_mse"],
-                    "boot_mse": metrics_cpu["bootstrap_mse"],
-                    "lr": cfg.lr if lr_schedule is None else lr_schedule(step),
-                },
-                pbar=pbar,
-            )
+                # Combined encoding + training step (both phases parallelized)
+                aux = encode_and_train_step(
+                    tokenizer, dynamics, optimizer,
+                    videos, actions,
+                    tokenizer_key=tokenizer_key,
+                    master_key=master_key,
+                    step=step
+                )
 
-        # Save sharded arrays directly (Orbax handles distributed write efficiently)
-        opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
-        ckpt_state = make_state(dynamics, opt_state, rng, step)
-        maybe_save(mngr, step, ckpt_state, meta)
+                # Logging
+                if logger.should_log(step):
+                    metrics_cpu = jax.device_get(aux)
+                    logger.log(
+                        step,
+                        metrics={
+                            "flow_mse": metrics_cpu["flow_mse"],
+                            "boot_mse": metrics_cpu["bootstrap_mse"],
+                            "lr": cfg.lr if lr_schedule is None else lr_schedule(step),
+                        },
+                        pbar=pbar,
+                    )
 
-        # Periodic lightweight AR eval
-        if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
-            # Use subset of batch for visualization
-            val_videos = batch["videos"][:4]
-            val_actions = batch["actions"][:4]
+                # Save sharded arrays directly (Orbax handles distributed write efficiently)
+                opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
+                ckpt_state = make_state(dynamics, opt_state, rng, step)
+                maybe_save(mngr, step, ckpt_state, meta)
 
-            run_evaluation(
-                cfg, tokenizer_cfg, step, tokenizer, dynamics,
-                val_videos, jnp.asarray(val_actions), vis_dir, rng
-            )
+                # Periodic lightweight AR eval
+                if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
+                    # Use subset of batch for visualization
+                    val_videos = batch["videos"][:4]
+                    val_actions = batch["actions"][:4]
+
+                    run_evaluation(
+                        cfg, tokenizer_cfg, step, tokenizer, dynamics,
+                        val_videos, jnp.asarray(val_actions), vis_dir, rng
+                    )
+            
+            mngr.wait_until_finished()
 
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:

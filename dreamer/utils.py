@@ -215,16 +215,14 @@ def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
 # Checkpointing Utilities
 # ============================================================================
 
-def make_state(model_or_dict, opt_state, rng, step):
+def make_state(model, opt_state, rng, step):
     """
     Pack training state as a PyTree for checkpointing (JAX/Orbax-friendly types only).
     
-    In NNX, we can checkpoint either:
-    - nnx.state(model) -> gets all trainable params + batch stats
-    - Just the parameters dict
+    Extracts parameters and batch stats from an NNX model for checkpointing.
 
     Args:
-        model_or_dict: Either an NNX model or a dict of parameters
+        model: NNX model instance
         opt_state: Optimizer state
         rng: Random key
         step: Current step
@@ -232,12 +230,8 @@ def make_state(model_or_dict, opt_state, rng, step):
     Returns:
         State dict suitable for Orbax checkpointing
     """
-    # If it's a dict, use directly; otherwise extract state from NNX model
-    if isinstance(model_or_dict, dict):
-        state = model_or_dict
-    else:
-        graphdef, *states = nnx.split(model_or_dict, nnx.Param, nnx.BatchStat, ...)
-        state = nnx.State.merge(*states)
+    graphdef, *states = nnx.split(model, nnx.Param, nnx.BatchStat, ...)
+    state = nnx.State.merge(*states)
 
     return {
         "params": state,
@@ -257,12 +251,14 @@ def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps
     return mngr
 
 
-def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta: dict | None = None):
+def try_restore(mngr: ocp.CheckpointManager, state_factory, meta: dict | None = None):
     """
-    Build abstract trees from current shapes/dtypes so Orbax can restore safely.
+    Restore checkpoint using abstract shapes for safe restoration.
     """
+    abstract_state = nnx.eval_shape(state_factory)
+    
     restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(state_example),
+        state=ocp.args.StandardRestore(abstract_state),
         meta=ocp.args.JsonRestore() if meta is not None else None
     )
     latest = mngr.latest_step()
