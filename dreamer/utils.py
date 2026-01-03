@@ -11,8 +11,6 @@ from enum import IntEnum
 from typing import Tuple
 import numpy as np
 
-from dreamer.models import Tokenizer, Dynamics
-
 
 # --- dtype helpers ---
 

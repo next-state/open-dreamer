@@ -16,6 +16,7 @@ from .utils import (
 from .data import patchify, unpatchify
 from .configs import TokenizerConfig, DynamicsModelConfig, DynamicsConfig
 from .utils import make_manager, from_dict, recursive_list_to_tuple
+from .parallel import MeshRules
 
 
 # ============================================================================
@@ -229,14 +230,15 @@ class MAEReplacer(nnx.Module):
     """Masked Autoencoder token replacer for training."""
 
     def __init__(self, D: int, p_min: float = 0.0, p_max: float = 0.9, 
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs):
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.p_min = p_min
         self.p_max = p_max
         self.dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
 
         # Learnable mask token
-        self.mask_token = nnx.Param(jax.random.normal(rngs.params(), (D,), dtype=param_dtype) * 0.02)
+        self.mask_token = nnx.Param(jax.random.normal(rngs.params(), (D,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
     def __call__(self, patches_btnd: jnp.ndarray, *, rngs: nnx.Rngs) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         # patches_btnd: (B,T,Np,D)
@@ -260,7 +262,8 @@ class MLP(nnx.Module):
 
     def __init__(self, d_model: int, mlp_ratio: float = 4.0, dropout_rate: float = 0.0,
                  swiglu: bool = True, parity_2over3: bool = False, use_norm: bool = True,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs):
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
         self.mlp_ratio = mlp_ratio
         self.dropout_rate = dropout_rate
@@ -281,11 +284,11 @@ class MLP(nnx.Module):
             self.norm = nnx.RMSNorm(d_model, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
 
         if self.swiglu:
-            self.fc_in = nnx.Linear(d_model, 2 * hidden, dtype=self.dtype, param_dtype=param_dtype, rngs=rngs)
+            self.fc_in = nnx.Linear(d_model, 2 * hidden, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
         else:
-            self.fc_in = nnx.Linear(d_model, hidden, dtype=self.dtype, param_dtype=param_dtype, rngs=rngs)
+            self.fc_in = nnx.Linear(d_model, hidden, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
 
-        self.fc_out = nnx.Linear(hidden, d_model, dtype=self.dtype, param_dtype=param_dtype, rngs=rngs)
+        self.fc_out = nnx.Linear(hidden, d_model, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
         self.dropout = nnx.Dropout(dropout_rate, rngs=rngs)
 
     def __call__(self, x: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
@@ -314,7 +317,8 @@ class GroupedQueryAttention(nnx.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, 
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  is_causal: bool = False, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs):
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.dim = dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -331,9 +335,9 @@ class GroupedQueryAttention(nnx.Module):
         head_dim = self.dim // self.num_heads
         kv_dim = self.num_kv_heads * head_dim
 
-        self.to_q = nnx.Linear(dim, dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        self.to_kv = nnx.Linear(dim, 2 * kv_dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        self.to_out = nnx.Linear(dim, dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.to_q = nnx.Linear(dim, dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
+        self.to_kv = nnx.Linear(dim, 2 * kv_dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
+        self.to_out = nnx.Linear(dim, dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
         self.dropout = nnx.Dropout(dropout_rate, rngs=rngs)
 
         if self.qk_norm_type == 'qknorm':
@@ -410,12 +414,14 @@ class SpaceSelfAttention(nnx.Module):
 
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs):
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
             rope_theta=rope_theta, is_causal=False,
-            dtype=dtype, param_dtype=param_dtype, rngs=rngs
+            dtype=dtype, param_dtype=param_dtype, 
+            mesh_rules=mesh_rules, rngs=rngs
         )
 
     def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None):
@@ -433,12 +439,14 @@ class TimeSelfAttention(nnx.Module):
 
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs):
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
             rope_theta=rope_theta, is_causal=True,
-            dtype=dtype, param_dtype=param_dtype, rngs=rngs
+            dtype=dtype, param_dtype=param_dtype, 
+            mesh_rules=mesh_rules, rngs=rngs
         )
 
     def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None):
@@ -459,7 +467,8 @@ class BlockCausalLayer(nnx.Module):
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4,
                  rope_theta: float = 10000.0, dtype: Any = jnp.float32, 
-                 param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs):
+                 param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs,
+                 mesh_rules: MeshRules):
         self.layer_index = layer_index
         self.time_every = time_every
         param_dtype = to_jnp_dtype(param_dtype)
@@ -472,17 +481,19 @@ class BlockCausalLayer(nnx.Module):
             self.attn = TimeSelfAttention(
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
-                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+                mesh_rules=mesh_rules, rngs=rngs
             )
         else:
             self.attn = SpaceSelfAttention(
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
-                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+                mesh_rules=mesh_rules, rngs=rngs
             )
 
         # MLP
-        self.mlp = MLP(dim, mlp_ratio, dropout_rate, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.mlp = MLP(dim, mlp_ratio, dropout_rate, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
 
     def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None):
         # Attention (time or space, depending on layer_index)
@@ -501,7 +512,8 @@ class BlockCausalTransformer(nnx.Module):
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, depth: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs):
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.depth = depth
         self.time_every = time_every
 
@@ -511,7 +523,8 @@ class BlockCausalTransformer(nnx.Module):
                 dim=d_model, num_heads=n_heads, num_kv_heads=n_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every,
-                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+                mesh_rules=mesh_rules, rngs=rngs
             ) for i in range(depth)
         ])
 
@@ -553,7 +566,8 @@ class Encoder(nnx.Module):
                  mae_p_min: float = 0.0, mae_p_max: float = 0.9, rope_theta: float = 10000.0,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
                  dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5),
-                 dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675), *, rngs: nnx.Rngs):
+                 dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675), *, 
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.n_latents = n_latents
         self.patch_size = patch_size
         self.dataset_mean = dataset_mean
@@ -561,17 +575,18 @@ class Encoder(nnx.Module):
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
 
-        self.patch_proj = nnx.Linear(patch_size * patch_size * 3, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        self.bottleneck_proj = nnx.Linear(d_model, d_bottleneck, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.patch_proj = nnx.Linear(patch_size * patch_size * 3, d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.bottleneck_proj = nnx.Linear(d_model, d_bottleneck, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
 
         self.transformer = BlockCausalTransformer(
             d_model=d_model, n_heads=n_heads, n_kv_heads=n_kv_heads, depth=depth,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type, mlp_ratio=mlp_ratio,
-            time_every=time_every, rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+            time_every=time_every, rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+            mesh_rules=mesh_rules, rngs=rngs
         )
 
-        self.mask_and_replace = MAEReplacer(D=d_model, p_min=mae_p_min, p_max=mae_p_max, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (n_latents, d_model), dtype=param_dtype) * 0.02)
+        self.mask_and_replace = MAEReplacer(D=d_model, p_min=mae_p_min, p_max=mae_p_max, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
+        self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (n_latents, d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
     def __call__(self, videos, *, deterministic: bool = True, packing_factor = None, rngs: nnx.Rngs = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
         # 1) takes videos in the [0,255] range
@@ -629,7 +644,8 @@ class Decoder(nnx.Module):
                  mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
                  dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5),
-                 dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675), *, rngs: nnx.Rngs):
+                 dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675), *, 
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.n_latents = n_latents
         self.patch_size = patch_size
         self.H = H
@@ -640,16 +656,17 @@ class Decoder(nnx.Module):
         param_dtype = to_jnp_dtype(param_dtype)
 
         self.n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
-        self.up_proj = nnx.Linear(d_bottleneck, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        self.patch_head = nnx.Linear(d_model, d_patch, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.up_proj = nnx.Linear(d_bottleneck, d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.patch_head = nnx.Linear(d_model, d_patch, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
 
         self.transformer = BlockCausalTransformer(
             d_model=d_model, n_heads=n_heads, n_kv_heads=n_kv_heads, depth=depth,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type, mlp_ratio=mlp_ratio,
-            time_every=time_every, rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+            time_every=time_every, rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+            mesh_rules=mesh_rules, rngs=rngs
         )
 
-        self.patch_queries = nnx.Param(jax.random.normal(rngs.params(), (self.n_patches, d_model), dtype=param_dtype) * 0.02)
+        self.patch_queries = nnx.Param(jax.random.normal(rngs.params(), (self.n_patches, d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
     def get_token_layout(self) -> TokenLayout:
         return TokenLayout((
@@ -687,14 +704,14 @@ class Decoder(nnx.Module):
 class Tokenizer(nnx.Module):
     """Complete tokenizer (encoder + decoder)."""
 
-    def __init__(self, config: TokenizerConfig, *, rngs: nnx.Rngs):
+    def __init__(self, config: TokenizerConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.config = config
 
         # Create encoder and decoder
         enc_kwargs = asdict(config.encoder)
         dec_kwargs = asdict(config.decoder)
-        enc_kwargs['rngs'] = rngs
-        dec_kwargs['rngs'] = rngs
+        enc_kwargs['rngs'], enc_kwargs['mesh_rules'] = rngs, mesh_rules
+        dec_kwargs['rngs'], dec_kwargs['mesh_rules'] = rngs, mesh_rules
         self.encoder = Encoder(**enc_kwargs)
         self.decoder = Decoder(**dec_kwargs)
 
@@ -725,7 +742,7 @@ class Tokenizer(nnx.Module):
         )
 
     @classmethod
-    def from_pretrained(cls, checkpoint_path: str) -> "Tokenizer":        
+    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules) -> "Tokenizer":        
         # Load metadata to get config
         mngr = make_manager(checkpoint_path, item_names=("state", "meta"))
         latest = mngr.latest_step()
@@ -739,7 +756,7 @@ class Tokenizer(nnx.Module):
         config = from_dict(TokenizerConfig, cfg_dict)
         
         # Initialize model
-        model = cls(config, rngs=nnx.Rngs(0))
+        model = cls(config, rngs=nnx.Rngs(0), mesh_rules=mesh_rules)
         
         # Pass model directly to make_state - it will handle the splitting
         state_example = make_state(model, {}, jax.random.PRNGKey(0), step=0)
@@ -763,16 +780,21 @@ class ActionEncoder(nnx.Module):
     """Action encoder for dynamics model."""
 
     def __init__(self, d_model: int, action_dim: int = 16, dtype: Any = jnp.float32, 
-                 param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs):
+                 param_dtype: Any = jnp.float32, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
         self.action_dim = action_dim
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
 
         # Base "action token" embedding (used always)
-        self.base_action_emb = nnx.Param(jax.random.normal(rngs.params(), (d_model,), dtype=param_dtype) * 0.02)
+        self.base_action_emb = nnx.Param(jax.random.normal(rngs.params(), (d_model,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
         # Embed categorical actions
-        self.emb_key = nnx.Embed(action_dim, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.emb_key = nnx.Embed(
+            action_dim, d_model, 
+            dtype=dtype, param_dtype=param_dtype,
+            embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
+            rngs=rngs
+        )
 
     def __call__(self, actions: Optional[jnp.ndarray], batch_time_shape: Optional[Tuple[int,int]] = None, as_tokens: bool = True):
         base_emb = self.base_action_emb.value.astype(self.emb_key.embedding.value.dtype)
@@ -797,7 +819,7 @@ class ActionEncoder(nnx.Module):
 class Dynamics(nnx.Module):
     """Dynamics model (world model)."""
 
-    def __init__(self, config: DynamicsModelConfig, *, rngs: nnx.Rngs):
+    def __init__(self, config: DynamicsModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.config = config
         self.dtype = to_jnp_dtype(config.dtype)
         self.param_dtype = to_jnp_dtype(config.param_dtype)
@@ -811,36 +833,47 @@ class Dynamics(nnx.Module):
         self.k_max = config.k_max
 
         # Project spatial tokens
-        self.spatial_proj = nnx.Linear(config.d_bottleneck * config.packing_factor, config.d_model, dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs)
+        self.spatial_proj = nnx.Linear(config.d_bottleneck * config.packing_factor, config.d_model, dtype=self.dtype, param_dtype=self.param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
 
         # Register tokens
-        self.register_tokens = nnx.Param(jax.random.normal(rngs.params(), (config.n_register, config.d_model), dtype=self.param_dtype) * 0.02)
+        self.register_tokens = nnx.Param(jax.random.normal(rngs.params(), (config.n_register, config.d_model), dtype=self.param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
         # Action encoder
-        self.action_encoder = ActionEncoder(d_model=config.d_model, action_dim=config.action_dim, dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs)
+        self.action_encoder = ActionEncoder(d_model=config.d_model, action_dim=config.action_dim, dtype=self.dtype, param_dtype=self.param_dtype, mesh_rules=mesh_rules, rngs=rngs)
 
         # Transformer
         self.transformer = BlockCausalTransformer(
             d_model=config.d_model, n_heads=config.n_heads, n_kv_heads=config.n_kv_heads,
             depth=config.depth, dropout_rate=config.dropout_rate, qk_norm_type=config.qk_norm_type,
             mlp_ratio=config.mlp_ratio, time_every=config.time_every, rope_theta=config.rope_theta,
-            dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs
+            dtype=self.dtype, param_dtype=self.param_dtype, mesh_rules=mesh_rules, rngs=rngs
         )
 
         # Discrete embeddings for shortcut conditioning
         # Step size d ∈ {1, 1/2, 1/4, ..., 1/k_max}
         # We index steps by: step_idx = log2(1/d) ∈ {0, 1, 2, ..., log2(k_max)}
         self.num_step_bins = int(math.log2(config.k_max)) + 1
-        self.step_embed = nnx.Embed(self.num_step_bins, config.d_model, dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs)
+        self.step_embed = nnx.Embed(
+            self.num_step_bins, config.d_model, 
+            dtype=self.dtype, param_dtype=self.param_dtype,
+            embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
+            rngs=rngs
+        )
 
         # Signal level τ ∈ {0, d, 2d, ..., 1 - d, 1}
         # We index signals by: signal_idx = τ * k_max ∈ {0, 1, 2, ..., k_max}
-        self.signal_embed = nnx.Embed(config.k_max, config.d_model, dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs)
+        self.signal_embed = nnx.Embed(
+            config.k_max, config.d_model,
+            dtype=self.dtype, param_dtype=self.param_dtype,
+            embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
+            rngs=rngs
+        )
 
         # Output head (zero-init)
         self.flow_x_head = nnx.Linear(
             config.d_model, config.d_bottleneck * config.packing_factor,
-            kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros,
+            kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
+            bias_init=nnx.initializers.zeros,
             dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs
         )
 
@@ -925,12 +958,13 @@ class Dynamics(nnx.Module):
         return x1_hat, (h_t, new_caches)
 
     @classmethod
-    def from_pretrained(cls, checkpoint_path: str) -> Tuple["Dynamics", "Tokenizer"]:
+    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules) -> Tuple["Dynamics", "Tokenizer"]:
         """
         Load a pretrained Dynamics model and its associated Tokenizer from checkpoint.
         
         Args:
             checkpoint_path: Path to dynamics checkpoint directory
+            mesh_rules: MeshRules for sharding strategy
             
         Returns:
             Tuple of (dynamics_model, tokenizer_model)
@@ -952,10 +986,10 @@ class Dynamics(nnx.Module):
         
         # Load the tokenizer first (dynamics was trained with a pretrained tokenizer)
         print(f"[Dynamics] Loading tokenizer from {full_cfg.tokenizer_ckpt}")
-        tokenizer = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt)
+        tokenizer = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
         
         # Initialize dynamics model
-        dynamics = cls(dyn_model_cfg, rngs=nnx.Rngs(0))
+        dynamics = cls(dyn_model_cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(0))
         
         # Pass dynamics directly to make_state - it will handle the splitting
         state_example = make_state(dynamics, {}, jax.random.PRNGKey(0), step=0)

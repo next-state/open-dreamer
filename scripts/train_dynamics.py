@@ -19,7 +19,7 @@ from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.parallel import create_data_model_parallel
+from dreamer.parallel import create_data_model_parallel, MeshRules
 from dreamer.training import run_evaluation, shortcut_forcing_step
 from dreamer.utils import (
     _ensure_dir,
@@ -140,16 +140,23 @@ def run(cfg: DynamicsConfig):
     device_count = len(devices)
     mesh, data_sharding = create_data_model_parallel(device_count, 1)
 
+    mesh_rules = MeshRules(
+        embed=None,
+        mlp='model',
+        attn='model',
+        data='data',
+        )
+
     with jax.set_mesh(mesh):
         key = jax.random.PRNGKey(0)
         rng, init_key = jax.random.split(key)
     
         # Load pretrained tokenizer
-        tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt)
+        tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
         tokenizer_cfg = tokenizer.config
 
         # Initialize dynamics
-        dynamics = Dynamics(cfg.dynamics, rngs=nnx.Rngs(init_key))
+        dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
 
         param_counts = count_parameters_by_component(dynamics)
         print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")

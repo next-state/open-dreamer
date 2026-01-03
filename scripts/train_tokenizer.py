@@ -23,7 +23,7 @@ from dreamer.training import compute_psnr
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Tokenizer
-from dreamer.parallel import create_data_model_parallel
+from dreamer.parallel import create_data_model_parallel, MeshRules
 from dreamer.utils import (
     make_state,
     make_manager,
@@ -191,11 +191,18 @@ def run(cfg: TokenizerConfig):
     device_count = len(devices)
     mesh, data_sharding = create_data_model_parallel(device_count, 1)
 
+    mesh_rules = MeshRules(
+        embed=None,
+        mlp='model',
+        attn='model',
+        data='data',
+        )
+
     with jax.set_mesh(mesh):
         # Create the model
         key = jax.random.key(0)
         rng, init_key = jax.random.split(key)
-        tokenizer = Tokenizer(cfg, rngs=nnx.Rngs(init_key))
+        tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
 
         param_counts = count_parameters_by_component(tokenizer)
         print(f"Parameter counts: {param_counts}")
