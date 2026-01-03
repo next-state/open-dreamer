@@ -277,9 +277,30 @@ def try_restore(mngr: ocp.CheckpointManager, state_factory):
     # Create abstract state for restoration
     abstract_state = nnx.eval_shape(state_factory)
     
+    # Create a replicated sharding for the current device topology
+    # This allows restoring checkpoints saved with different device counts
+    replicated_sharding = jax.sharding.NamedSharding(
+        jax.sharding.Mesh(jax.devices(), axis_names=('_unused',)),
+        jax.sharding.PartitionSpec()
+    )
+    
+    # Replace all ShapeDtypeStruct with arrays that have explicit sharding
+    def add_sharding_to_abstract(tree):
+        def _process_leaf(x):
+            if isinstance(x, jax.ShapeDtypeStruct):
+                # Create a jax.Array with explicit sharding
+                return jax.device_put(
+                    jnp.zeros(x.shape, dtype=x.dtype),
+                    replicated_sharding
+                )
+            return x
+        return jax.tree_util.tree_map(_process_leaf, tree)
+    
+    target_state = add_sharding_to_abstract(abstract_state)
+    
     # Always try to restore metadata if it exists in the checkpoint
     restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(abstract_state),
+        state=ocp.args.StandardRestore(target_state),
         meta=ocp.args.JsonRestore()
     )
     
