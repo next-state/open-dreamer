@@ -299,44 +299,6 @@ def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict |
 # Model Initialization Utilities
 # ============================================================================
 
-<<<<<<< HEAD
-
-def init_tokenizer(rng, tokenizer, tokenizer_cfg):
-    dtype = to_jnp_dtype(tokenizer_cfg.encoder.dtype)
-    rng, params_rng, mae_rng, dropout_rng, key = jax.random.split(rng, 5)
-    dummy = jax.random.uniform(
-        key,
-        (tokenizer_cfg.dataset.B, tokenizer_cfg.dataset.T, tokenizer_cfg.dataset.H, tokenizer_cfg.dataset.W, tokenizer_cfg.dataset.C),
-        dtype=dtype,
-    )
-    variables = tokenizer.init(
-        {"params": params_rng, "mae": mae_rng, "dropout": dropout_rng},
-        dummy,
-        deterministic=False,
-    )
-    return rng, variables
-
-def init_dynamics(rng, dynamics, tokenizer_cfg):
-    rng, params_rng, dropout_rng, key = jax.random.split(rng, 4)
-
-    B = tokenizer_cfg.dataset.B
-    T = tokenizer_cfg.dataset.T
-
-    dyn_cfg = dynamics.config
-    enc_cfg = tokenizer_cfg.encoder
-
-    packing_factor = dyn_cfg.packing_factor
-    n_spatial = enc_cfg.n_latents // packing_factor
-    d_spatial = enc_cfg.d_bottleneck * packing_factor
-
-    dtype = to_jnp_dtype(dyn_cfg.dtype)
-    shape = (B, T, n_spatial, d_spatial)
-    packed_enc_tokens = jax.random.normal(key, shape, dtype=dtype)
-
-    actions = jnp.zeros((B, T), dtype=jnp.int32)
-    step_idxs = jnp.zeros((B, T), dtype=jnp.int32)
-    signal_idxs = jnp.zeros((B, T), dtype=jnp.int32)
-=======
 def init_tokenizer(rng, tokenizer_config):
     """
     Initialize a tokenizer model with NNX.
@@ -380,7 +342,6 @@ def init_dynamics(rng, dynamics_config, tokenizer_config):
     dynamics = Dynamics(dynamics_config, rngs=rngs)
     
     return rng, dynamics
->>>>>>> origin/nnx-migration
 
 
 # -------- Training utilities (shared across scripts) --------
@@ -405,82 +366,6 @@ def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jn
     frames = frames.at[..., :, -width:, :].set(color)
     return frames
 
-<<<<<<< HEAD
-def _stack_wide(*imgs_hwC):
-    """Stack images horizontally."""
-    return np.concatenate(imgs_hwC, axis=1)
-
-def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: int = 0) -> np.ndarray:
-    """Tile a list of videos into a grid."""
-    if len(trip_list_hwC) == 0:
-        raise ValueError("Empty video list")
-    H, W3, C = trip_list_hwC[0].shape
-    B = len(trip_list_hwC)
-    nrows = math.ceil(B / ncols)
-    total = nrows * ncols
-    if total > B:
-        blank = np.full((H, W3, C), pad_color, dtype=trip_list_hwC[0].dtype)
-        trip_list_hwC = trip_list_hwC + [blank] * (total - B)
-    rows = []
-    idx = 0
-    for _ in range(nrows):
-        row_imgs = trip_list_hwC[idx:idx + ncols]
-        idx += ncols
-        rows.append(np.concatenate(row_imgs, axis=1))
-    grid = np.concatenate(rows, axis=0)
-    return grid
-
-def load_pretrained_tokenizer(
-    tokenizer_ckpt_dir: str,
-    *,
-    rng: jnp.ndarray,
-    encoder,
-    decoder,
-    enc_vars,
-    dec_vars,
-    sample_patches_btnd,
-):
-    """Load pretrained tokenizer checkpoint."""
-    meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
-    latest = meta_mngr.latest_step()
-    if latest is None:
-        raise FileNotFoundError(f"No tokenizer checkpoint found in {tokenizer_ckpt_dir}")
-    restored_meta = meta_mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
-    meta = restored_meta.meta
-    enc_kwargs = meta["enc_kwargs"]
-    n_lat, d_b = enc_kwargs["n_latents"], enc_kwargs["d_bottleneck"]
-
-    rng_e1, rng_d1 = jax.random.split(rng)
-    B, T = sample_patches_btnd.shape[:2]
-    fake_z = jnp.zeros((B, T, n_lat, d_b), dtype=jnp.float32)
-    dec_vars = decoder.init({"params": rng_d1, "dropout": rng_d1}, fake_z, deterministic=True)
-
-    packed_example = pack_mae_params(enc_vars, dec_vars)
-    import optax
-    tx_dummy = optax.adamw(1e-4)
-    opt_state_example = tx_dummy.init(packed_example)
-    state_example = make_state(packed_example, opt_state_example, rng_e1, step=0)
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)
-
-    tok_mngr = make_manager(tokenizer_ckpt_dir, item_names=("state", "meta"))
-    restored = tok_mngr.restore(
-        latest,
-        args=ocp.args.Composite(
-            state=ocp.args.StandardRestore(abstract_state),
-            meta=ocp.args.JsonRestore(),
-        ),
-    )
-    packed_params = restored.state["params"]
-    enc_params = packed_params["enc"]
-    dec_params = packed_params["dec"]
-    new_enc_vars = with_params(enc_vars, enc_params)
-    new_dec_vars = with_params(dec_vars, dec_params)
-    print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
-    return new_enc_vars, new_dec_vars, meta
-
-=======
-    
->>>>>>> origin/nnx-migration
 def from_dict(cls, d):
     field_types = {f.name: f.type for f in cls.__dataclass_fields__.values()}
     kwargs = {}

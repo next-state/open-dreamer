@@ -413,11 +413,9 @@ def compute_td_lambda_returns(
 
 
 def compute_value_loss(
-    value_head,
-    val_vars: VariableDict,
-    hidden_states: jnp.ndarray,
+    val_logits: jnp.ndarray,
+    centers_log_val: jnp.ndarray,
     td_returns: jnp.ndarray,
-    rng: jax.Array,
 ) -> jnp.ndarray:
     """
     Compute value head loss using symexp twohot targets.
@@ -426,11 +424,9 @@ def compute_value_loss(
     using the two-hot encoding for improved learning across varying scales.
     
     Args:
-        value_head: Value head model instance
-        val_vars: Value head variables (params + constants)
-        hidden_states: (B, T+1, d_model) Hidden states from imagination
+        val_logits: (B, T, K) Logits from value head forward pass
+        centers_log_val: (K,) Bin centers in symlog space
         td_returns: (B, T) TD(λ) return targets
-        rng: Random key for dropout
         
     Returns:
         loss: Scalar categorical cross-entropy loss
@@ -440,22 +436,13 @@ def compute_value_loss(
         - Uses symexp encoding to handle returns of varying magnitude
         - Two-hot targets provide smoother gradients than one-hot
     """
-    # Forward pass (on all timesteps except last)
-    val_logits, centers_log_val = value_head.apply(
-        val_vars,
-        hidden_states[:, :-1],  # (B, T, d_model)
-        rngs={"dropout": rng},
-        deterministic=False,
-    )  # (B, T, K)
-    
     # Convert TD returns to two-hot targets
     twohot_targets = jax.lax.stop_gradient(
         twohot_symlog_targets(td_returns, centers_log_val)
     )  # (B, T, K)
     
-    # Cross-entropy loss
-    logq_val = jax.nn.log_softmax(val_logits, axis=-1)  # (B, T, K)
-    val_ce = -jnp.sum(twohot_targets * logq_val, axis=-1)  # (B, T)
+    # Cross-entropy loss using optax
+    val_ce = optax.safe_softmax_cross_entropy(logits=val_logits, labels=twohot_targets)  # (B, T)
     val_loss = jnp.mean(val_ce)
     
     return val_loss
@@ -532,8 +519,7 @@ def compute_pmpo_loss(
     
     # KL(π_θ || π_BC) regularization
     logp_bc = jax.nn.log_softmax(policy_prior_logits, axis=-1)
-    p_pi = jax.nn.softmax(policy_logits, axis=-1)
-    kl_per_state = jnp.sum(p_pi * (logp_pi - logp_bc), axis=-1)  # (B, T)
+    kl_per_state = optax.losses.kl_divergence_with_log_targets(logp_pi, logp_bc)  # (B, T)
     kl_loss = beta * jnp.mean(kl_per_state)
     
     # Total policy loss

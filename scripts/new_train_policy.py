@@ -57,17 +57,7 @@ from dreamer.training import (
 from dreamer.generation import latent_rollout, DenoiseSchedule
 from dreamer.data import make_iterator
 from dreamer.configs import RLConfig, DynamicsConfig
-from dreamer.utils import (
-    temporal_patchify,
-    pack_bottleneck_to_spatial,
-    normalize_with_dataset_stats,
-    make_manager,
-    to_jnp_dtype,
-    make_state,
-    try_restore,
-    from_dict,
-    recursive_list_to_tuple,
-)
+from dreamer.utils import make_manager
 from dreamer.logging import MetricLogger
 
 logging.getLogger('absl').setLevel(logging.WARNING)
@@ -286,7 +276,6 @@ def train_step(
     packing_factor = dynamics.config.packing_factor
     
     # Encode context frames
-    # Using deterministic=True, so no RNG needed for MAE dropout
     z_ctx, _ = tokenizer.encode(
         videos[:, :T_ctx],
         deterministic=True,
@@ -341,31 +330,24 @@ def train_step(
         h_sg = jax.lax.stop_gradient(hidden_states)
         
         # ---------------------------
-        # 2. Compute rewards (direct NNX call)
+        # 2. Compute rewards 
         # ---------------------------
-        # Per nnx_basics.html: Call modules directly
-        rew_logits, centers_log_rew = reward_head(
-            h_sg[:, :-1],  # (B, T_ctx + H - 1, n_agent, d_model)
-            deterministic=True,
-        )
+        # Predict rewards from rollout hidden states only
+        # Rewards r_{t+1} are predicted from state s_t
+        rew_logits = reward_head(rollout_hidden, deterministic=True)[:,:,0] # with [:,:,0] we only take the first head
         # Convert to scalar rewards
         probs_rew = jax.nn.softmax(rew_logits, axis=-1)
-        rewards = jnp.sum(probs_rew * symexp(centers_log_rew), axis=-1)
-        rewards = rewards[:, -horizon:]  # (B, H)
+        rewards = jnp.sum(probs_rew * symexp(reward_head.symexp_centers_log), axis=-1)
+        rewards = jax.lax.stop_gradient(rewards)
+        # rewards is now (B, H) corresponding to r_{T_ctx+1}...r_{T_ctx+H}
         
         # ---------------------------
-        # 3. Compute values (direct NNX call)
+        # 3. Compute values 
         # ---------------------------
-        rng_val = rngs()
-        
-        val_logits, centers_log_val = value_head(
-            h_sg,  # (B, T_ctx + H, n_agent, d_model)
-            deterministic=False,
-            rngs=nnx.Rngs(dropout=rng_val),
-        )
+        val_logits = value_head(h_sg, deterministic=False, rngs=rngs)[:,:,0] # with [:,:,0] we only take the first head
         # Convert to scalar values
         probs_val = jax.nn.softmax(val_logits, axis=-1)
-        values = jnp.sum(probs_val * symexp(centers_log_val), axis=-1)
+        values = jnp.sum(probs_val * symexp(value_head.symexp_centers_log), axis=-1)
         values = values[:, -horizon-1:]  # (B, H+1)
         
         # 4. Compute TD-lambda returns
@@ -379,30 +361,18 @@ def train_step(
         # ---------------------------
         # 5. Compute value loss
         # ---------------------------
-        # Note: compute_value_loss uses Linen-style apply internally
-        # We need to pass compatible vars
-        val_vars = {'params': nnx.state(value_head, nnx.Param)}
-        
+        # Use value head outputs from above (no re-computation needed)
         val_loss = compute_value_loss(
-            value_head=value_head,
-            val_vars=val_vars,
-            hidden_states=h_sg[:, -horizon-1:],
+            val_logits=val_logits[:, -horizon-1:-1],  # (B, H, K)
+            centers_log_val=value_head.symexp_centers_log,
             td_returns=td_returns,
-            rng=rng_val,
         )
         
         # ---------------------------
-        # 6. Compute policy logits (direct NNX calls)
+        # 6. Compute policy logits 
         # ---------------------------
-        pi_bc_logits = policy_bc(
-            h_sg[:, -horizon:],
-            deterministic=True,
-        )  # (B, H, A)
-        
-        pi_logits = policy_head(
-            hidden_states[:, -horizon:],
-            deterministic=False,
-        )  # (B, H, A)
+        pi_bc_logits = policy_bc(h_sg[:, -horizon:], deterministic=True)  # (B, H, A)
+        pi_logits =  policy_head(h_sg[:, -horizon:], deterministic=False, rngs=rngs)  # (B, H, A)
         
         # 7. Compute advantages
         advantages = td_returns - values[:, :-1]  # (B, H)
