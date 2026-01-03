@@ -84,13 +84,12 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
 # ------------------------
 
 @nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"))
-def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, step, 
+def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, dropout_key, step, 
                lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
-    # Split keys for MAE and dropout
-    mae_key, drop_key = jax.random.split(mae_key)
 
     def loss_fn(model: Tokenizer):
-        rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
+        # Create RNG inside the loss function to avoid trace level issues with grad
+        rngs = nnx.Rngs(mae=mae_key, dropout=dropout_key)
         pred, (mae_mask, keep_prob) = model(videos, deterministic=False, rngs=rngs)
 
         # For MSE: use standardized values (matches old gradient dynamics)
@@ -212,15 +211,7 @@ def run(cfg: TokenizerConfig):
             lr = cfg.lr
             lr_schedule = None
         else:
-            lr_schedule = get_lr_schedule(
-                cfg.lr_schedule,
-                cfg.init_lr,
-                cfg.max_lr,
-                cfg.lr_end,
-                cfg.max_steps,
-                cfg.warmup_steps,
-                cfg.wsd_decay_steps,
-            )
+            lr_schedule = get_lr_schedule(cfg.lr_schedule, cfg.init_lr, cfg.max_lr, cfg.lr_end, cfg.max_steps, cfg.warmup_steps, cfg.wsd_decay_steps)
             lr = lr_schedule
         
         tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
@@ -230,19 +221,22 @@ def run(cfg: TokenizerConfig):
         ckpt_dir = run_dir / "checkpoints"
         meta = {"cfg": asdict(cfg)}
         
-        opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
-        
         # Create state factory for abstract restoration
+        # This must create abstract shapes without capturing concrete arrays
         def state_factory():
-            return make_state(tokenizer, opt_state, rng, step=0)
+            return make_state(tokenizer, optimizer, rng, step=0)
 
         with make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every) as mngr:
-            restored = try_restore(mngr, state_factory, meta)
+            restored = try_restore(mngr, state_factory)
             start_step = 0
             if restored is not None:
                 latest_step, r = restored
-                nnx.update(tokenizer, r.state["params"])
-                nnx.update(optimizer.opt_state, r.state["opt_state"])
+                nnx.update(tokenizer, r.state["model_state"])
+                # Merge graphdef and state to recreate the optimizer state object
+                opt_state_restored = nnx.merge(r.state["opt_graphdef"], r.state["opt_state"])
+                # Replace the entire optimizer.opt_state with the restored one
+                optimizer.opt_state = opt_state_restored
+                
                 rng = r.state["rng"]
                 start_step = int(r.state["step"])
                 cfg = from_dict(TokenizerConfig, r.meta["cfg"])
@@ -260,20 +254,23 @@ def run(cfg: TokenizerConfig):
 
             # cfg.max_steps + 1 to make sure we log and checkpoint at max_steps
             pbar = tqdm(enumerate(dataset, start = start_step), total=cfg.max_steps + 1)
+            
             for step, batch in pbar:
                 if step < start_step:
                     continue
                 if step >= cfg.max_steps:
                     break
 
-                rng, master_key = jax.random.split(rng)
+                # Create fresh RNG state for this step by folding in step number
+                step_rng = jax.random.fold_in(rng, step)
+                mae_key, dropout_key = jax.random.split(step_rng)
                 
                 # Shard batch data
                 videos = jax.device_put(batch["videos"], data_sharding)
                 
                 aux = train_step(
                     tokenizer, optimizer, videos,
-                    mae_key=master_key, step=step,
+                    mae_key=mae_key, dropout_key=dropout_key, step=step,
                     lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
                     dataset_mean=tuple(cfg.dataset.dataset_mean), 
                     dataset_std=tuple(cfg.dataset.dataset_std), 
@@ -310,15 +307,14 @@ def run(cfg: TokenizerConfig):
                         pbar_filter=r"^(loss|mse|lpips|psnr|lr)$",
                     )
                 
-                # Save sharded arrays
-                opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
-                ckpt_state = make_state(tokenizer, opt_state, rng, step)
+                # Save checkpoint state
+                ckpt_state = make_state(tokenizer, optimizer, rng, step)
                 maybe_save(mngr, step, ckpt_state, meta)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
-                    viz_step(tokenizer, viz_videos, rng, step, run_dir, use_wandb=cfg.use_wandb)
+                    viz_step(tokenizer, viz_videos, step_rng, step, run_dir, use_wandb=cfg.use_wandb)
             
             mngr.wait_until_finished()
 

@@ -169,9 +169,9 @@ class RotaryEmbedding1D(nnx.Module):
         self.dtype = to_jnp_dtype(dtype)
         self.param_dtype = to_jnp_dtype(param_dtype)
 
-        # Precompute inverse frequencies
+        # Precompute inverse frequencies as a Variable (not a Param, so it won't be trained)
         inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
-        self.inv_freq = inv_freq
+        self.inv_freq = nnx.Variable(inv_freq)
 
     def __call__(self, q, k, start_pos=0):
         """
@@ -181,7 +181,7 @@ class RotaryEmbedding1D(nnx.Module):
         """
         T = q.shape[1]
         t_indices = jnp.arange(T, dtype=self.dtype) + start_pos
-        freqs = jnp.outer(t_indices, self.inv_freq) # (T, dim//2)
+        freqs = jnp.outer(t_indices, self.inv_freq.value) # (T, dim//2)
 
         freqs_cos = jnp.cos(freqs).astype(self.dtype)
         freqs_sin = jnp.sin(freqs).astype(self.dtype)
@@ -289,9 +289,9 @@ class MLP(nnx.Module):
             self.fc_in = nnx.Linear(d_model, hidden, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
 
         self.fc_out = nnx.Linear(hidden, d_model, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
-        self.dropout = nnx.Dropout(dropout_rate, rngs=rngs)
+        self.dropout = nnx.Dropout(dropout_rate)
 
-    def __call__(self, x: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> jnp.ndarray:
         if self.use_norm:
             x = self.norm(x)
 
@@ -305,9 +305,9 @@ class MLP(nnx.Module):
             h = self.fc_in(x)
             h = nnx.gelu(h)
 
-        h = self.dropout(h, deterministic=deterministic)
+        h = self.dropout(h, deterministic=deterministic, rngs=rngs)
         y = self.fc_out(h)
-        y = self.dropout(y, deterministic=deterministic)
+        y = self.dropout(y, deterministic=deterministic, rngs=rngs)
         return y
 
 
@@ -338,7 +338,7 @@ class GroupedQueryAttention(nnx.Module):
         self.to_q = nnx.Linear(dim, dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
         self.to_kv = nnx.Linear(dim, 2 * kv_dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
         self.to_out = nnx.Linear(dim, dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
-        self.dropout = nnx.Dropout(dropout_rate, rngs=rngs)
+        self.dropout = nnx.Dropout(dropout_rate)
 
         if self.qk_norm_type == 'qknorm':
             self.q_ln = nnx.RMSNorm(head_dim, use_scale=True, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
@@ -346,7 +346,7 @@ class GroupedQueryAttention(nnx.Module):
 
         self.rope = RotaryEmbedding1D(dim=head_dim, theta=self.rope_theta, dtype=dtype, param_dtype=param_dtype)
 
-    def __call__(self, x, mask, *args, cache: Optional[KVCache] = None, deterministic: bool = True):
+    def __call__(self, x, mask, *args, cache: Optional[KVCache] = None, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None):
         """
         https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html
         B = batch size
@@ -405,7 +405,7 @@ class GroupedQueryAttention(nnx.Module):
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
-        out = self.dropout(out, deterministic=deterministic)
+        out = self.dropout(out, deterministic=deterministic, rngs=rngs)
 
         return out, new_cache
 
@@ -424,12 +424,12 @@ class SpaceSelfAttention(nnx.Module):
             mesh_rules=mesh_rules, rngs=rngs
         )
 
-    def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None):
+    def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None, rngs: Optional[nnx.Rngs] = None):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B T) S D")
 
-        out, _ = self.attn(x, mask=mask, cache=None, deterministic=deterministic)
+        out, _ = self.attn(x, mask=mask, cache=None, deterministic=deterministic, rngs=rngs)
 
         out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
         return out, None  # Return None for cache consistency
@@ -449,13 +449,13 @@ class TimeSelfAttention(nnx.Module):
             mesh_rules=mesh_rules, rngs=rngs
         )
 
-    def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None):
+    def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None, rngs: Optional[nnx.Rngs] = None):
         # mask does nothing, but is required for API consistency
         # x: (B, T, S, D) -> attention across T, causal
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
 
-        out, new_cache = self.attn(x, mask=None, cache=cache, deterministic=deterministic)
+        out, new_cache = self.attn(x, mask=None, cache=cache, deterministic=deterministic, rngs=rngs)
 
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         return out, new_cache
@@ -495,14 +495,14 @@ class BlockCausalLayer(nnx.Module):
         # MLP
         self.mlp = MLP(dim, mlp_ratio, dropout_rate, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
 
-    def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None):
+    def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None, rngs: Optional[nnx.Rngs] = None):
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
-        y, new_cache = self.attn(y, mask=mask, deterministic=deterministic, cache=cache)
+        y, new_cache = self.attn(y, mask=mask, deterministic=deterministic, cache=cache, rngs=rngs)
         x = x + y
 
         # MLP
-        y = self.mlp(x, deterministic=deterministic)
+        y = self.mlp(x, deterministic=deterministic, rngs=rngs)
         x = x + y
         return x, new_cache
 
@@ -528,13 +528,14 @@ class BlockCausalTransformer(nnx.Module):
             ) for i in range(depth)
         ])
 
-    def __call__(self, x, mask, *, deterministic: bool = True, caches: Optional[Dict[int, KVCache]] = None):
+    def __call__(self, x, mask, *, deterministic: bool = True, caches: Optional[Dict[int, KVCache]] = None, rngs: Optional[nnx.Rngs] = None):
         """
         Args:
             x: input tensor
             mask: attention mask
             deterministic: whether to use deterministic mode (no dropout)
             caches: optional dict mapping layer_index -> KVCache
+            rngs: optional RNG state for dropout
 
         Returns:
             output tensor and updated caches (always returns tuple, caches can be None)
@@ -546,7 +547,7 @@ class BlockCausalTransformer(nnx.Module):
             is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
 
-            x, new_cache_i = layer(x, mask=mask, deterministic=deterministic, cache=cache_i)
+            x, new_cache_i = layer(x, mask=mask, deterministic=deterministic, cache=cache_i, rngs=rngs)
 
             if new_caches is not None and new_cache_i is not None:
                 new_caches[time_index] = new_cache_i
@@ -620,7 +621,7 @@ class Encoder(nnx.Module):
         mask = layout.make_mask("encoder")  # (1, 1, q_len, k_len)
 
         # 5) Feed tokens into transformer
-        encoded_tokens, _ = self.transformer(tokens, mask=mask, deterministic=deterministic)
+        encoded_tokens, _ = self.transformer(tokens, mask=mask, deterministic=deterministic, rngs=rngs)
 
         # 6) Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
@@ -674,7 +675,7 @@ class Decoder(nnx.Module):
             (Modality.IMAGE, self.n_patches)
         ))
 
-    def __call__(self, z: jnp.ndarray, *, deterministic: bool = True, packing_factor = None, caches: Optional[Dict[int, KVCache]] = None):
+    def __call__(self, z: jnp.ndarray, *, deterministic: bool = True, packing_factor = None, caches: Optional[Dict[int, KVCache]] = None, rngs: Optional[nnx.Rngs] = None):
         if packing_factor is not None:
             z = rearrange(z, "b t n (p d) -> b t (n p) d", p=packing_factor)
             
@@ -692,7 +693,7 @@ class Decoder(nnx.Module):
         layout = self.get_token_layout()
         mask = layout.make_mask("decoder")
 
-        x, new_caches = self.transformer(tokens, mask=mask, deterministic=deterministic, caches=caches)
+        x, new_caches = self.transformer(tokens, mask=mask, deterministic=deterministic, caches=caches, rngs=rngs)
         # 6) Prediction head over the patch-query slice
 
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
@@ -717,14 +718,14 @@ class Tokenizer(nnx.Module):
 
     def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs = None):
         z, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs)
-        recon, _ = self.decoder(z, deterministic=deterministic)
+        recon, _ = self.decoder(z, deterministic=deterministic, rngs=rngs)
         return recon, aux
 
     def encode(self, videos, *, deterministic: bool = True, packing_factor = None, rngs: nnx.Rngs = None):
         return self.encoder(videos, deterministic=deterministic, packing_factor=packing_factor, rngs=rngs)
 
-    def decode(self, z, *, deterministic: bool = True, caches=None, packing_factor = None):
-        frames, caches = self.decoder(z, deterministic=deterministic, packing_factor=packing_factor, caches=caches)
+    def decode(self, z, *, deterministic: bool = True, caches=None, packing_factor = None, rngs: Optional[nnx.Rngs] = None):
+        frames, caches = self.decoder(z, deterministic=deterministic, packing_factor=packing_factor, caches=caches, rngs=rngs)
         return frames, caches
 
     def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> Dict[int, KVCache]:
@@ -907,7 +908,7 @@ class Dynamics(nnx.Module):
 
     def __call__(self, actions, step_indices, tau_indices, packed_enc_tokens, *,
                 agent_tokens: Optional[jnp.ndarray] = None, deterministic: bool = True,
-                caches: Optional[Dict[int, KVCache]] = None):
+                caches: Optional[Dict[int, KVCache]] = None, rngs: Optional[nnx.Rngs] = None):
         """
         Args:
           packed_enc_tokens:      (B, T, n_spatial, d_spatial) packed encoder tokens
@@ -951,7 +952,7 @@ class Dynamics(nnx.Module):
         layout = self.get_token_layout(n_spatial=spatial_tokens.shape[2], n_agent=n_agent)
         mask = layout.make_mask("wm_agent")
 
-        x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches)
+        x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches, rngs=rngs)
 
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
         x1_hat = self.flow_x_head(spatial_tokens)
@@ -1070,9 +1071,9 @@ class PolicyHeadMTP(nnx.Module):
         # Single matmul that produces all L offsets at once: (… , D) -> (…, L, A)
         self.out = nnx.Linear(d_model, L * action_dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
+    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> jnp.ndarray:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
-        x = self.projector(h_t, deterministic=deterministic)  # (B, T, D)
+        x = self.projector(h_t, deterministic=deterministic, rngs=rngs)  # (B, T, D)
         logits = self.out(x)                                  # (B, T, L*A)
         logits = rearrange(logits, 'b t (l a) -> b t l a', l=self.L, a=self.action_dim)
         return logits
@@ -1104,9 +1105,9 @@ class RewardHeadMTP(nnx.Module):
         log_edges = jnp.linspace(self.log_low, self.log_high, self.num_bins)
         self.symexp_centers_log = log_edges
 
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, '... n c -> ... (n c)')
-        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
+        x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L*K)
         logits = rearrange(logits, '... (l k) -> ... l k', l=self.L, k=self.num_bins)
         return logits, self.symexp_centers_log
@@ -1137,8 +1138,8 @@ class ValueHead(nnx.Module):
         log_edges = jnp.linspace(self.log_low, self.log_high, self.num_bins)
         self.symexp_centers_log = log_edges
 
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
-        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
+        x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, K)
         return logits, self.symexp_centers_log

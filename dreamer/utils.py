@@ -215,26 +215,33 @@ def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
 # Checkpointing Utilities
 # ============================================================================
 
-def make_state(model, opt_state, rng, step):
+def make_state(model, optimizer, rng, step):
     """
     Pack training state as a PyTree for checkpointing (JAX/Orbax-friendly types only).
     
-    Extracts parameters and batch stats from an NNX model for checkpointing.
+    Extracts graphdefs and states from NNX model and optimizer for proper checkpointing.
 
     Args:
         model: NNX model instance
-        opt_state: Optimizer state
+        optimizer: NNX Optimizer instance
         rng: Random key
         step: Current step
 
     Returns:
-        State dict suitable for Orbax checkpointing
+        State dict suitable for Orbax checkpointing with both graphdefs and states
     """
-    graphdef, *states = nnx.split(model, nnx.Param, nnx.BatchStat, ...)
-    state = nnx.State.merge(*states)
+    # Split model to get both graphdef and state
+    # Use ... to capture all variables (Param, BatchStat, and any other attributes like RoPE's inv_freq)
+    model_graphdef, *model_states = nnx.split(model, nnx.Param, nnx.BatchStat, ...)
+    model_state = nnx.State.merge(*model_states)
+    
+    # Split optimizer state to get both graphdef and state
+    opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
 
     return {
-        "params": state,
+        "model_graphdef": model_graphdef,
+        "model_state": model_state,
+        "opt_graphdef": opt_graphdef,
         "opt_state": opt_state,
         "rng": rng,
         "step": jnp.int32(step),
@@ -251,19 +258,31 @@ def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps
     return mngr
 
 
-def try_restore(mngr: ocp.CheckpointManager, state_factory, meta: dict | None = None):
+def try_restore(mngr: ocp.CheckpointManager, state_factory):
     """
     Restore checkpoint using abstract shapes for safe restoration.
-    """
-    abstract_state = nnx.eval_shape(state_factory)
     
-    restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(abstract_state),
-        meta=ocp.args.JsonRestore() if meta is not None else None
-    )
+    Args:
+        mngr: Orbax CheckpointManager instance
+        state_factory: Callable that returns an abstract state structure
+        
+    Returns:
+        Tuple of (latest_step, restored) if checkpoint exists, None otherwise
+        restored contains both .state and .meta attributes
+    """
     latest = mngr.latest_step()
     if latest is None:
         return None
+    
+    # Create abstract state for restoration
+    abstract_state = nnx.eval_shape(state_factory)
+    
+    # Always try to restore metadata if it exists in the checkpoint
+    restore_args = ocp.args.Composite(
+        state=ocp.args.StandardRestore(abstract_state),
+        meta=ocp.args.JsonRestore()
+    )
+    
     restored = mngr.restore(latest, args=restore_args)
     return latest, restored
 
@@ -271,11 +290,13 @@ def try_restore(mngr: ocp.CheckpointManager, state_factory, meta: dict | None = 
 def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict | None = None):
     if not mngr.should_save(step):  # obey save interval policy
         return
-    save_args = ocp.args.Composite(
-        state=ocp.args.StandardSave(state),
-        meta=ocp.args.JsonSave(meta) if meta is not None else None
+    mngr.save(
+        step,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardSave(state),
+            meta=ocp.args.JsonSave(meta if meta is not None else {})
+        )
     )
-    mngr.save(step, args=save_args)  # async by default; runs in a background thread
 
 # -------- Training utilities (shared across scripts) --------
 
