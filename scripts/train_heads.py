@@ -104,11 +104,11 @@ def gather_future_actions(actions_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
 
 
 def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """
+    f"""
     Gather future rewards for multi-token prediction.
     
-    At timestep t, predicts rewards[t], rewards[t+1], ..., rewards[t+L-1]
-    (Following Dreamer convention: r_t is the reward from h_t)
+    At timestep t, predicts rewards[t+1], ..., rewards[t+L]
+    (Following Dreamer convention: r[t+1] is the reward from executing a[t+1] from h_t)
     
     Args:
         rewards_bt: (B, T) reward values
@@ -119,15 +119,14 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
         valid_btL: (B, T, L) mask (0 for invalid)
     """
     B, T = rewards_bt.shape
-    rewards_pad = jnp.pad(rewards_bt, ((0, 0), (0, L - 1)), constant_values=0.0)
+    rewards_pad = jnp.pad(rewards_bt, ((0, 0), (0, L)), constant_values=jnp.nan)
     
-    offsets = jnp.arange(0, L)  # [0, 1, ..., L-1]
+    offsets = jnp.arange(1, L + 1)  # [1, 2, ..., L]
     indices = jnp.arange(T)[:, None] + offsets[None, :]  # (T, L)
     rewards_btL = rewards_pad[:, indices]  # (B, T, L)
     
-    # Valid when: t >= 1 AND 1 <= t+offset < T
-    # (skip r0 which is dummy, and stay in bounds)
-    valid_btL = (indices >= 1) & (indices < T) & (jnp.arange(T)[:, None] >= 1)
+    # Valid when: t >= 0 AND 0 <= t+offset < T
+    valid_btL = (indices >= 0) & (indices < T)
     valid_btL = jnp.broadcast_to(valid_btL[None, :, :], (B, T, L))
     
     return rewards_btL, valid_btL
@@ -216,7 +215,7 @@ def train_step(
         
         # TODO: See if we should compute the losses and the gradients sequentially (see figure 2 of https://arxiv.org/pdf/2404.19737 and comment in pull request #16)
         policy_loss = compute_policy_loss(policy_head, pol_p, h_states, actions_btL, actions_valid)
-        reward_loss = compute_reward_loss(reward_head, {"params": rew_p, "constants": reward_constants}, h_states, rewards_btL, rewards_valid)
+        reward_loss, reward_metrics = compute_reward_loss(reward_head, {"params": rew_p, "constants": reward_constants}, h_states, rewards_btL, rewards_valid)
         
         # Combine losses with weights
         w_policy_loss = loss_weight_policy * policy_loss
@@ -236,7 +235,8 @@ def train_step(
             "w_dynamics_loss": w_dynamics_loss,
             # Other metrics
             "flow_mse": dyn_aux["flow_mse"],
-            "bootstrap_mse": dyn_aux["bootstrap_mse"]
+            "bootstrap_mse": dyn_aux["bootstrap_mse"],
+            **reward_metrics
         }
         
         return total_loss, aux
@@ -381,31 +381,37 @@ def run(cfg: BCRewConfig):
         videos = batch["videos"]
         actions = batch["actions"]
         B_self = int(videos.shape[0] * cfg.self_fraction) * (step >= cfg.bootstrap_start)
-        val_videos = batch["videos"]
-        reward_vars = {"params": params["reward"], "constants": reward_constants}
-        run_agent_visualization(
-            cfg=cfg,
-            tokenizer_cfg=tokenizer_cfg,
-            step=step,
-            tokenizer=tokenizer,
-            tokenizer_vars=tokenizer_vars,
-            dynamics=dynamics,
-            dynamics_params=params["dynamics"],
-            dynamics_constants=dynamics_constants,
-            task_embedder=task_embedder,
-            task_embedder_params=params["task_embedder"],
-            reward_head=reward_head,
-            reward_vars=reward_vars,
-            policy_head=policy_head,
-            policy_params=params["policy"],
-            val_videos=val_videos,
-            val_actions=jnp.asarray(actions),
-            vis_dir=vis_dir,
-            rng=rng,
-        )
-        import ipdb; ipdb.set_trace()
-    
-        
+        # val_videos = batch["videos"]
+        # val_rewards = batch["rewards"]
+
+        # if (batch['rewards'] >= 10).any():
+        #     print("debugging step", step)
+        #     import ipdb; ipdb.set_trace()
+        # else:
+        #     print("skipping step", step)
+        #     continue
+        # reward_vars = {"params": params["reward"], "constants": reward_constants}
+        # run_agent_visualization(
+        #     cfg=cfg,
+        #     tokenizer_cfg=tokenizer_cfg,
+        #     step=step,
+        #     tokenizer=tokenizer,
+        #     tokenizer_vars=tokenizer_vars,
+        #     dynamics=dynamics,
+        #     dynamics_params=params["dynamics"],
+        #     dynamics_constants=dynamics_constants,
+        #     task_embedder=task_embedder,
+        #     task_embedder_params=params["task_embedder"],
+        #     reward_head=reward_head,
+        #     reward_vars=reward_vars,
+        #     policy_head=policy_head,
+        #     policy_params=params["policy"],
+        #     val_videos=val_videos,
+        #     val_actions=jnp.asarray(actions),
+        #     val_rewards=val_rewards,
+        #     vis_dir=vis_dir,
+        #     rng=rng,
+        # )    
         params, opt_states, metrics = train_step(
             # Models
             tokenizer=tokenizer,
@@ -449,8 +455,29 @@ def run(cfg: BCRewConfig):
         if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
             # Use current batch as validation data (simplest approach)
             val_videos = batch["videos"]
-            run_evaluation(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, params["dynamics"], dynamics_constants, val_videos, jnp.asarray(actions), vis_dir, rng)
-    
+            val_rewards = batch["rewards"]
+            reward_vars = {"params": params["reward"], "constants": reward_constants}
+            run_agent_visualization(
+                cfg=cfg,
+                tokenizer_cfg=tokenizer_cfg,
+                step=step,
+                tokenizer=tokenizer,
+                tokenizer_vars=tokenizer_vars,
+                dynamics=dynamics,
+                dynamics_params=params["dynamics"],
+                dynamics_constants=dynamics_constants,
+                task_embedder=task_embedder,
+                task_embedder_params=params["task_embedder"],
+                reward_head=reward_head,
+                reward_vars=reward_vars,
+                policy_head=policy_head,
+                policy_params=params["policy"],
+                val_videos=val_videos,
+                val_actions=jnp.asarray(actions),
+                val_rewards=val_rewards,
+                vis_dir=vis_dir,
+                rng=rng,
+            )    
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:
         wandb.finish()

@@ -13,13 +13,13 @@ dataset:
   diversify_data: true
 
 action_dim: 16
-n_agent: 4
+n_agent: 8
 
 # Training hyperparameters
 bootstrap_start: 5000
 self_fraction: 0.25
 
-max_steps: 50_000
+max_steps: 1_000_000
 log_every: 100
 write_video_every: 5000
 
@@ -30,13 +30,13 @@ lr_dynamics: 1e-4
 
 # Multi-token prediction settings
 L: ${n_agent}
-num_reward_bins: 101
-reward_log_low: -5.0  
+num_reward_bins: 11
+reward_log_low: 0.0  
 reward_log_high: 3.0
 n_tasks: 128
 use_task_ids: true
 
 # Loss weighting
 loss_weight_shortcut: 1.0
-loss_weight_policy: 0.3
-loss_weight_reward: 0.3
+loss_weight_policy: 1.0
+loss_weight_reward: 10.0

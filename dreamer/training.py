@@ -383,8 +383,18 @@ def compute_reward_loss(
     reward_targets = twohot_symlog_targets(rewards_btL, centers_log)  # (B, T, L, K)
     reward_loss_per = optax.safe_softmax_cross_entropy(logits=reward_logits, labels=reward_targets)  # (B, T, L)
     reward_loss = jnp.sum(reward_loss_per * rewards_valid) / jnp.maximum(rewards_valid.sum(), 1.0)
-    
-    return reward_loss
+    # add metrics on loss over when reward is nonzero and when it is zero.
+    reward_nonzero = (rewards_btL > 0) * rewards_valid
+    reward_zero = (rewards_btL == 0) * rewards_valid
+    reward_nonzero_count = reward_nonzero.sum()
+    reward_zero_count = reward_zero.sum()
+    metrics = {
+        "reward_nonzero_count": reward_nonzero_count,
+        "reward_zero_count": reward_zero_count,
+        "reward_loss_nonzero": jnp.sum(reward_loss_per * reward_nonzero) / jnp.maximum(reward_nonzero_count, 1.0),
+        "reward_loss_zero": jnp.sum(reward_loss_per * reward_zero) / jnp.maximum(reward_zero_count, 1.0),
+    }
+    return reward_loss, metrics
 
 
 
@@ -440,6 +450,7 @@ def run_agent_visualization(
     policy_params: Dict[str, Any],
     val_videos: jnp.ndarray,
     val_actions: jnp.ndarray,
+    val_rewards: jnp.ndarray,
     vis_dir: Path,
     rng: jax.Array,
 ):
@@ -485,7 +496,6 @@ def run_agent_visualization(
             reward_head=reward_head, reward_vars=reward_vars,
             policy_head=policy_head, policy_params=policy_params,
         )
-        import ipdb; ipdb.set_trace()
 
         # Compute metrics
         dt = time.time() - t0
