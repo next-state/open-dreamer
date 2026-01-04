@@ -12,6 +12,7 @@ from typing import Tuple
 import numpy as np
 
 
+
 # --- dtype helpers ---
 
 def to_jnp_dtype(dtype: str | jnp.dtype) -> jnp.dtype:
@@ -227,42 +228,62 @@ def make_state(model, optimizer, rng, step):
     }
 
 
-def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("state","meta")):
+def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("model_state", "optimizer_state", "rng_state", "meta")):
     path = Path(ckpt_dir).expanduser().resolve()
     path.mkdir(parents=True, exist_ok=True)
     options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, save_interval_steps=save_interval_steps)
-    # item_names gives nice attribute access on restore: restored.state, restored.meta
+    # item_names gives nice attribute access on restore: restored.model_state, restored.optimizer_state, etc.
     mngr = ocp.CheckpointManager(path, options=options, item_names=item_names)
     return mngr
 
 
-def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta_example: dict | None = None):
+def try_restore(mngr: ocp.CheckpointManager, model_factory, optimizer_factory, mesh, rng):
     """
-    Build abstract trees from current shapes/dtypes so Orbax can restore safely
-    (StandardRestore wants an abstract tree). :contentReference[oaicite:3]{index=3}
+    Restore checkpoint using abstract shapes for safe restoration.
+    
+    Args:
+        mngr: Orbax CheckpointManager instance
+        model_factory: Callable that returns a model instance
+        optimizer_factory: Callable that returns an optimizer instance
+        mesh: JAX mesh to use for sharding
+        rng: RNG state to use for restoration structure
+        
+    Returns:
+        Tuple of (latest_step, restored) if checkpoint exists, None otherwise
+        restored is a namespace with .model, .optimizer, .rng, and .meta attributes
     """
     latest = mngr.latest_step()
     if latest is None:
         return None
-        
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)   # :contentReference[oaicite:4]{index=4}
+    
+    # cfg = ocp.args.Composite(meta=ocp.args.JsonRestore()).meta["cfg"]
+    
+    model_graphdef, model_abs_state = nnx.get_abstract_model(model_factory, mesh)
+    optimizer_graphdef, optimizer_abs_state = nnx.get_abstract_model(optimizer_factory, mesh)
+    
+    # Always try to restore metadata if it exists in the checkpoint
     restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(abstract_state),                                      # :contentReference[oaicite:5]{index=5}
-        meta=ocp.args.JsonRestore() if meta_example is not None else None
+        model_state=ocp.args.StandardRestore(model_abs_state),
+        optimizer_state=ocp.args.StandardRestore(optimizer_abs_state),
+        rng_state=ocp.args.ArrayRestore(),
+        meta=ocp.args.JsonRestore()
     )
     
     restored = mngr.restore(latest, args=restore_args)
     return latest, restored
 
 
-def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict | None = None):
+def maybe_save(mngr: ocp.CheckpointManager, step: int, model: nnx.Module, optimizer: nnx.Optimizer, rng, meta: dict | None = None):
     if not mngr.should_save(step):  # obey save interval policy
         return
     assert meta is not None
+    model_state, optimizer_state = nnx.state(model), nnx.state(optimizer)
     mngr.save(
         step,
         args=ocp.args.Composite(
-            state=ocp.args.StandardSave(state),
+            model_state=ocp.args.StandardSave(model_state),
+            optimizer_state=ocp.args.StandardSave(optimizer_state),
+            rng_state=ocp.args.ArraySave(rng),
             meta=ocp.args.JsonSave(meta)
         )
     )
