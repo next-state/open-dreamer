@@ -746,20 +746,27 @@ class Tokenizer(nnx.Module):
     @classmethod
     def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, mesh: Mesh) -> "Tokenizer":        
         # Load metadata to get config
-        with make_manager(checkpoint_path, item_names=("state", "meta")) as mngr:
+        with make_manager(checkpoint_path) as mngr:
             latest = mngr.latest_step()
             if latest is None:
                 raise ValueError(f"No checkpoint found in {checkpoint_path}")
             
-            # Restore metadata
-            meta = mngr.metadata() # meta = RootMetadata(internal_metadata={}, custom_metadata={})
-            config = from_dict(TokenizerConfig, meta) 
-            graphdef, abs_state = nnx.get_abstract_model( lambda: cls(config, mesh_rules = mesh_rules, rngs=nnx.Rngs(0)), mesh)
+            # First, restore only metadata to get config
+            meta_restore_args = ocp.args.Composite(meta=ocp.args.JsonRestore())
+            meta_restored = mngr.restore(latest, args=meta_restore_args)
+            config = from_dict(TokenizerConfig, meta_restored.meta["cfg"])
             
-            # Initialize model
-            state = mngr.restore(target=abs_state)["model_state"]
+            # Create model factory with the correct config
+            model_factory = lambda: cls(config, mesh_rules=mesh_rules, rngs=nnx.Rngs(0))
+            graphdef, abs_state = nnx.get_abstract_model(model_factory, mesh)
+            
+            # Now restore only the model state
+            model_restore_args = ocp.args.Composite(
+                model_state=ocp.args.StandardRestore(abs_state)
+            )
+            model_restored = mngr.restore(latest, args=model_restore_args)
         
-        return nnx.merge(graphdef, state)
+        return nnx.merge(graphdef, model_restored.model_state)
 
 # ============================================================================
 # Dynamics
