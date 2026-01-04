@@ -152,7 +152,7 @@ def run(cfg: DynamicsConfig):
         rng, init_key = jax.random.split(key)
     
         # Load pretrained tokenizer
-        tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
+        tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules, mesh=mesh)
         tokenizer_cfg = tokenizer.config
 
         # Initialize dynamics

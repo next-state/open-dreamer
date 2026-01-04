@@ -216,32 +216,11 @@ def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
 # ============================================================================
 
 def make_state(model, optimizer, rng, step):
-    """
-    Pack training state as a PyTree for checkpointing (JAX/Orbax-friendly types only).
+    model_state = nnx.state(model)
+    opt_state   = nnx.state(optimizer)
     
-    Extracts graphdefs and states from NNX model and optimizer for proper checkpointing.
-
-    Args:
-        model: NNX model instance
-        optimizer: NNX Optimizer instance
-        rng: Random key
-        step: Current step
-
-    Returns:
-        State dict suitable for Orbax checkpointing with both graphdefs and states
-    """
-    # Split model to get both graphdef and state
-    # Use ... to capture all variables (Param, BatchStat, and any other attributes like RoPE's inv_freq)
-    model_graphdef, *model_states = nnx.split(model, nnx.Param, nnx.BatchStat, ...)
-    model_state = nnx.State.merge(*model_states)
-    
-    # Split optimizer state to get both graphdef and state
-    opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
-
     return {
-        "model_graphdef": model_graphdef,
         "model_state": model_state,
-        "opt_graphdef": opt_graphdef,
         "opt_state": opt_state,
         "rng": rng,
         "step": jnp.int32(step),
@@ -251,57 +230,25 @@ def make_state(model, optimizer, rng, step):
 def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("state","meta")):
     path = Path(ckpt_dir).expanduser().resolve()
     path.mkdir(parents=True, exist_ok=True)
-    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep,
-                                           save_interval_steps=save_interval_steps)
+    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, save_interval_steps=save_interval_steps)
     # item_names gives nice attribute access on restore: restored.state, restored.meta
     mngr = ocp.CheckpointManager(path, options=options, item_names=item_names)
     return mngr
 
 
-def try_restore(mngr: ocp.CheckpointManager, state_factory):
+def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta_example: dict | None = None):
     """
-    Restore checkpoint using abstract shapes for safe restoration.
-    
-    Args:
-        mngr: Orbax CheckpointManager instance
-        state_factory: Callable that returns an abstract state structure
-        
-    Returns:
-        Tuple of (latest_step, restored) if checkpoint exists, None otherwise
-        restored contains both .state and .meta attributes
+    Build abstract trees from current shapes/dtypes so Orbax can restore safely
+    (StandardRestore wants an abstract tree). :contentReference[oaicite:3]{index=3}
     """
     latest = mngr.latest_step()
     if latest is None:
         return None
-    
-    # Create abstract state for restoration
-    abstract_state = nnx.eval_shape(state_factory)
-    
-    # Create a replicated sharding for the current device topology
-    # This allows restoring checkpoints saved with different device counts
-    replicated_sharding = jax.sharding.NamedSharding(
-        jax.sharding.Mesh(jax.devices(), axis_names=('_unused',)),
-        jax.sharding.PartitionSpec()
-    )
-    
-    # Replace all ShapeDtypeStruct with arrays that have explicit sharding
-    def add_sharding_to_abstract(tree):
-        def _process_leaf(x):
-            if isinstance(x, jax.ShapeDtypeStruct):
-                # Create a jax.Array with explicit sharding
-                return jax.device_put(
-                    jnp.zeros(x.shape, dtype=x.dtype),
-                    replicated_sharding
-                )
-            return x
-        return jax.tree_util.tree_map(_process_leaf, tree)
-    
-    target_state = add_sharding_to_abstract(abstract_state)
-    
-    # Always try to restore metadata if it exists in the checkpoint
+        
+    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)   # :contentReference[oaicite:4]{index=4}
     restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(target_state),
-        meta=ocp.args.JsonRestore()
+        state=ocp.args.StandardRestore(abstract_state),                                      # :contentReference[oaicite:5]{index=5}
+        meta=ocp.args.JsonRestore() if meta_example is not None else None
     )
     
     restored = mngr.restore(latest, args=restore_args)
@@ -311,11 +258,12 @@ def try_restore(mngr: ocp.CheckpointManager, state_factory):
 def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict | None = None):
     if not mngr.should_save(step):  # obey save interval policy
         return
+    assert meta is not None
     mngr.save(
         step,
         args=ocp.args.Composite(
             state=ocp.args.StandardSave(state),
-            meta=ocp.args.JsonSave(meta if meta is not None else {})
+            meta=ocp.args.JsonSave(meta)
         )
     )
 

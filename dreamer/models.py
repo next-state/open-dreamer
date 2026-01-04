@@ -6,6 +6,7 @@ from typing import Optional, Tuple, Any, Dict
 from einops import rearrange, repeat
 from dataclasses import asdict
 import math
+from jax.sharding import Mesh
 import orbax.checkpoint as ocp
 from .utils import (
     Modality, TokenLayout, 
@@ -743,7 +744,7 @@ class Tokenizer(nnx.Module):
         )
 
     @classmethod
-    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules) -> "Tokenizer":        
+    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, mesh: Mesh) -> "Tokenizer":        
         # Load metadata to get config
         with make_manager(checkpoint_path, item_names=("state", "meta")) as mngr:
             latest = mngr.latest_step()
@@ -751,28 +752,14 @@ class Tokenizer(nnx.Module):
                 raise ValueError(f"No checkpoint found in {checkpoint_path}")
             
             # Restore metadata
-            restored_meta = mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
-            cfg_dict = restored_meta.meta["cfg"]
-            cfg_dict = recursive_list_to_tuple(cfg_dict)
-            config = from_dict(TokenizerConfig, cfg_dict)
+            meta = mngr.metadata() # meta = RootMetadata(internal_metadata={}, custom_metadata={})
+            config = from_dict(TokenizerConfig, meta) 
+            graphdef, abs_state = nnx.get_abstract_model( lambda: cls(config, mesh_rules = mesh_rules, rngs=nnx.Rngs(0)), mesh)
             
             # Initialize model
-            model = cls(config, rngs=nnx.Rngs(0), mesh_rules=mesh_rules)
-            
-            # Create state factory for abstract restoration
-            def state_factory():
-                return make_state(model, {}, jax.random.PRNGKey(0), step=0)
-            
-            # Restore checkpoint
-            restored = try_restore(mngr, state_factory, meta={})
-            if restored is not None:
-                latest_step, r = restored
-                nnx.update(model, r.state["params"])
-                print(f"[Tokenizer] Loaded checkpoint from step {latest_step}")
-            else:
-                raise ValueError(f"Could not load tokenizer from {checkpoint_path}")
+            state = mngr.restore(target=abs_state)["model_state"]
         
-        return model
+        return nnx.merge(graphdef, state)
 
 # ============================================================================
 # Dynamics

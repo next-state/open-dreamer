@@ -189,13 +189,7 @@ def run(cfg: TokenizerConfig):
     devices = jax.devices()
     device_count = len(devices)
     mesh, data_sharding = create_data_model_parallel(device_count, 1)
-
-    mesh_rules = MeshRules(
-        embed=None,
-        mlp='model',
-        attn='model',
-        data='data',
-        )
+    mesh_rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
 
     with jax.set_mesh(mesh):
         # Create the model
@@ -232,11 +226,7 @@ def run(cfg: TokenizerConfig):
             if restored is not None:
                 latest_step, r = restored
                 nnx.update(tokenizer, r.state["model_state"])
-                # Merge graphdef and state to recreate the optimizer state object
-                opt_state_restored = nnx.merge(r.state["opt_graphdef"], r.state["opt_state"])
-                # Replace the entire optimizer.opt_state with the restored one
-                optimizer.opt_state = opt_state_restored
-                
+                nnx.update(optimizer, r.state["opt_state"])
                 rng = r.state["rng"]
                 start_step = int(r.state["step"])
                 cfg = from_dict(TokenizerConfig, r.meta["cfg"])
