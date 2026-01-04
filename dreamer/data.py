@@ -385,10 +385,16 @@ def make_bouncing_square_iterator(
 
 
 
-def make_iterator(cfg: DatasetConfig):
+def make_iterator(cfg: DatasetConfig, seq_len: int | None = None):
     """
     Factory function to create a data iterator based on config.
+
+    Args:
+        cfg: Dataset configuration
+        seq_len: Override sequence length (if None, uses cfg.T)
     """
+    T = seq_len if seq_len is not None else cfg.T
+
     if cfg.source == "bouncing_square":
         if cfg.diversify_data:
             fg_min, fg_max = 0, 255
@@ -396,10 +402,10 @@ def make_iterator(cfg: DatasetConfig):
         else:
             fg_min, fg_max = 128, 128
             bg_min, bg_max = 255, 255
-            
+
         return make_bouncing_square_iterator(
             batch_size=cfg.B,
-            time_steps=cfg.T,
+            time_steps=T,
             height=cfg.H,
             width=cfg.W,
             channels=cfg.C,
@@ -416,11 +422,11 @@ def make_iterator(cfg: DatasetConfig):
     elif cfg.source == "custom":
         return coinrun_loader.get_dataloader(
             array_record_paths=cfg.array_record_path,
-            seq_len=cfg.T,
+            seq_len=T,
             global_batch_size=cfg.B,
             image_h=cfg.H,
             image_w=cfg.W,
-            image_c=cfg.C, 
+            image_c=cfg.C,
             num_workers=22,
             print_filter_warnings=False,
         )

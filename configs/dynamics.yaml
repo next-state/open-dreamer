@@ -42,3 +42,10 @@ warmup_steps: 50000
 wsd_decay_steps: 20000
 
 write_video_every: 50000
+
+# Alternating batch lengths (paper Section 3.4)
+seq_len_short: 16
+seq_len_long: 256
+context_length: 192
+long_batch_ratio: 0.1
+finetune_start_step: 250_000

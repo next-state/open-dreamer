@@ -156,6 +156,39 @@ def create_transformer_caches(
     return caches
 
 
+def make_sliding_window_causal_mask(
+    query_len: int,
+    key_len: int,
+    context_length: int
+) -> jnp.ndarray:
+    """
+    Create sliding window causal mask for sequences longer than context_length.
+
+    Each query position q can attend to keys in range:
+        [max(0, q - context_length + 1), q]
+
+    Args:
+        query_len: Query sequence length (T)
+        key_len: Key sequence length (T)
+        context_length: Maximum attention window size
+
+    Returns:
+        mask: (1, 1, query_len, key_len) boolean array
+    """
+    q_idx = jnp.arange(query_len)[:, None]  # (T, 1)
+    k_idx = jnp.arange(key_len)[None, :]    # (1, T)
+
+    # Causal constraint: k <= q
+    causal = k_idx <= q_idx
+
+    # Window constraint: k >= q - context_length + 1
+    window = k_idx >= (q_idx - context_length + 1)
+
+    # Combine both constraints
+    mask = jnp.logical_and(causal, window)
+    return mask[None, None, :, :]  # (1, 1, T, T)
+
+
 # ============================================================================
 # Building Blocks
 # ============================================================================
@@ -314,10 +347,11 @@ class MLP(nnx.Module):
 class GroupedQueryAttention(nnx.Module):
     """Grouped Query Attention with optional QK normalization and RoPE."""
 
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, 
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  is_causal: bool = False, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 context_length: int = 192,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.dim = dim
         self.num_heads = num_heads
@@ -325,6 +359,7 @@ class GroupedQueryAttention(nnx.Module):
         self.dropout_rate = dropout_rate
         self.qk_norm_type = qk_norm_type
         self.is_causal = is_causal
+        self.context_length = context_length
         self.rope_theta = rope_theta
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
@@ -375,7 +410,7 @@ class GroupedQueryAttention(nnx.Module):
         start_pos = cache.index if cache is not None else 0
         q, k = self.rope(q, k, start_pos=start_pos)
 
-        # KV cache
+        # KV cache and masking logic
         if self.is_causal and cache is not None:
             # CACHED INFERENCE MODE
             new_cache = cache.update(k, v)
@@ -383,17 +418,31 @@ class GroupedQueryAttention(nnx.Module):
             T = q.shape[1]
             k_attn, v_attn, cache_mask = new_cache.get_ordered_kv(query_len=T)
 
-            attn_is_causal = False # Handled manually by cache_mask
-            if mask is not None:
-                mask_attn = jnp.logical_and(mask, cache_mask)
+            attn_is_causal = False  # Handled manually by cache_mask
+            mask_attn = jnp.logical_and(mask, cache_mask) if mask is not None else cache_mask
+
+        elif self.is_causal:
+            # TRAINING MODE with causal attention
+            new_cache = None
+            k_attn, v_attn = k, v
+            T = q.shape[1]
+
+            if T > self.context_length:
+                # Long sequences: use sliding window causal mask
+                attn_is_causal = False
+                sliding_mask = make_sliding_window_causal_mask(T, T, self.context_length)
+                mask_attn = jnp.logical_and(mask, sliding_mask) if mask is not None else sliding_mask
             else:
-                mask_attn = cache_mask
+                # Short sequences: standard causal mask
+                attn_is_causal = True
+                mask_attn = mask
+
         else:
-            # TRAINING or NON-CAUSAL (SPACE) ATTENTION
+            # NON-CAUSAL (SPACE) ATTENTION
             new_cache = None
             k_attn, v_attn = k, v
             mask_attn = mask
-            attn_is_causal = self.is_causal
+            attn_is_causal = False
 
         # SDPA
         attn = jax.nn.dot_product_attention(
@@ -414,13 +463,15 @@ class SpaceSelfAttention(nnx.Module):
 
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 context_length: int = 192,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
             rope_theta=rope_theta, is_causal=False,
-            dtype=dtype, param_dtype=param_dtype, 
+            context_length=context_length,
+            dtype=dtype, param_dtype=param_dtype,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -439,13 +490,15 @@ class TimeSelfAttention(nnx.Module):
 
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 context_length: int = 192,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
             rope_theta=rope_theta, is_causal=True,
-            dtype=dtype, param_dtype=param_dtype, 
+            context_length=context_length,
+            dtype=dtype, param_dtype=param_dtype,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -463,10 +516,10 @@ class TimeSelfAttention(nnx.Module):
 class BlockCausalLayer(nnx.Module):
     """Single block-causal transformer layer (alternating space/time attention)."""
 
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, 
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4,
-                 rope_theta: float = 10000.0, dtype: Any = jnp.float32, 
+                 rope_theta: float = 10000.0, context_length: int = 192, dtype: Any = jnp.float32,
                  param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs,
                  mesh_rules: MeshRules):
         self.layer_index = layer_index
@@ -481,14 +534,14 @@ class BlockCausalLayer(nnx.Module):
             self.attn = TimeSelfAttention(
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
-                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+                rope_theta=rope_theta, context_length=context_length, dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             )
         else:
             self.attn = SpaceSelfAttention(
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
-                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+                rope_theta=rope_theta, context_length=context_length, dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             )
 
@@ -512,7 +565,8 @@ class BlockCausalTransformer(nnx.Module):
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, depth: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 context_length: int = 192,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.depth = depth
         self.time_every = time_every
@@ -523,7 +577,7 @@ class BlockCausalTransformer(nnx.Module):
                 dim=d_model, num_heads=n_heads, num_kv_heads=n_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every,
-                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+                rope_theta=rope_theta, context_length=context_length, dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             ) for i in range(depth)
         ])
@@ -820,8 +874,9 @@ class ActionEncoder(nnx.Module):
 class Dynamics(nnx.Module):
     """Dynamics model (world model)."""
 
-    def __init__(self, config: DynamicsModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, config: DynamicsModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs, context_length: int = 192):
         self.config = config
+        self.context_length = context_length
         self.dtype = to_jnp_dtype(config.dtype)
         self.param_dtype = to_jnp_dtype(config.param_dtype)
         self.d_model = config.d_model
@@ -847,6 +902,7 @@ class Dynamics(nnx.Module):
             d_model=config.d_model, n_heads=config.n_heads, n_kv_heads=config.n_kv_heads,
             depth=config.depth, dropout_rate=config.dropout_rate, qk_norm_type=config.qk_norm_type,
             mlp_ratio=config.mlp_ratio, time_every=config.time_every, rope_theta=config.rope_theta,
+            context_length=self.context_length,
             dtype=self.dtype, param_dtype=self.param_dtype, mesh_rules=mesh_rules, rngs=rngs
         )
 

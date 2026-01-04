@@ -261,6 +261,13 @@ class DynamicsConfig:
     # eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
+    # Alternating batch lengths (paper Section 3.4)
+    seq_len_short: int = 16
+    seq_len_long: int = 256
+    context_length: int = 192
+    long_batch_ratio: float = 0.1
+    finetune_start_step: int = 250_000
+
 @dataclass(frozen=True)
 class BCRewConfig:
     # IO / ckpt

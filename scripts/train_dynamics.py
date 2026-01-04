@@ -40,14 +40,10 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # ---------------------------
 
 
-def make_encode_and_train_step(k_max: int, B_self: int, packing_factor: int):
-    """
-    Factory function to create a JIT-compiled encode_and_train_step.
-
-    This avoids passing unhashable model objects as static arguments to jax.jit.
-    """
+def make_short_batch_train_fn(k_max: int, packing_factor: int):
+    """Factory for short batch training step (JIT compiled separately)."""
     @partial(jax.jit, static_argnames=())
-    def encode_and_train_step(
+    def short_batch_step(
         tokenizer: Tokenizer,
         dynamics: Dynamics,
         optimizer: nnx.Optimizer,
@@ -56,26 +52,57 @@ def make_encode_and_train_step(k_max: int, B_self: int, packing_factor: int):
         *,
         tokenizer_key: jax.Array,
         master_key: jax.Array,
-        step: int
+        step: int,
+        B_self: int
     ):
-        # Phase 1: Encode videos to latents
+        # Encode
         rngs = nnx.Rngs(mae=tokenizer_key)
         latents, _ = tokenizer.encode(
-            videos,
-            packing_factor=packing_factor,
-            deterministic=True,
-            rngs=rngs
+            videos, packing_factor=packing_factor,
+            deterministic=True, rngs=rngs
         )
 
-        # Phase 2: Training step
+        # Train
         metrics = train_step(
             dynamics, optimizer, latents, actions,
-            B_self=B_self, k_max=k_max, master_key=master_key, step=step
+            B_self=B_self, k_max=k_max,
+            master_key=master_key, step=step
+        )
+        return metrics
+
+    return short_batch_step
+
+
+def make_long_batch_train_fn(k_max: int, packing_factor: int):
+    """Factory for long batch training step (JIT compiled separately)."""
+    @partial(jax.jit, static_argnames=())
+    def long_batch_step(
+        tokenizer: Tokenizer,
+        dynamics: Dynamics,
+        optimizer: nnx.Optimizer,
+        videos: jnp.ndarray,
+        actions: jnp.ndarray,
+        *,
+        tokenizer_key: jax.Array,
+        master_key: jax.Array,
+        step: int,
+        B_self: int
+    ):
+        # Same implementation (separate JIT boundary)
+        rngs = nnx.Rngs(mae=tokenizer_key)
+        latents, _ = tokenizer.encode(
+            videos, packing_factor=packing_factor,
+            deterministic=True, rngs=rngs
         )
 
+        metrics = train_step(
+            dynamics, optimizer, latents, actions,
+            B_self=B_self, k_max=k_max,
+            master_key=master_key, step=step
+        )
         return metrics
-    
-    return encode_and_train_step
+
+    return long_batch_step
 
 
 @nnx.jit(static_argnames=("k_max", "B_self"))
@@ -119,6 +146,19 @@ def train_step(
 
 def run(cfg: DynamicsConfig):
     """Main training loop."""
+    # Validate alternating batch length configuration
+    if cfg.seq_len_long <= cfg.context_length:
+        raise ValueError(
+            f"seq_len_long ({cfg.seq_len_long}) must be > context_length ({cfg.context_length}) "
+            "to prevent overfitting to start frames (paper Section 3.4)"
+        )
+    if not 0.0 <= cfg.long_batch_ratio <= 1.0:
+        raise ValueError(f"long_batch_ratio must be in [0, 1], got {cfg.long_batch_ratio}")
+    if cfg.seq_len_short >= cfg.seq_len_long:
+        raise ValueError(f"seq_len_short ({cfg.seq_len_short}) must be < seq_len_long ({cfg.seq_len_long})")
+    if cfg.finetune_start_step > cfg.max_steps:
+        print(f"[warning] finetune_start_step ({cfg.finetune_start_step}) > max_steps ({cfg.max_steps})")
+
     # Setup directories
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
@@ -155,8 +195,8 @@ def run(cfg: DynamicsConfig):
         tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
         tokenizer_cfg = tokenizer.config
 
-        # Initialize dynamics
-        dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        # Initialize dynamics with context_length for sliding window attention
+        dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key), context_length=cfg.context_length)
 
         param_counts = count_parameters_by_component(dynamics)
         print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
@@ -180,10 +220,20 @@ def run(cfg: DynamicsConfig):
         tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
         optimizer = nnx.Optimizer(dynamics, tx, wrt=nnx.Param)
 
-        # Create JIT-compiled training step with static args bound
-        encode_and_train_step = make_encode_and_train_step(
+        # Create both short and long batch iterators
+        print(f"[setup] Creating short batch iterator (T={cfg.seq_len_short})")
+        dataset_short = make_iterator(tokenizer_cfg.dataset, seq_len=cfg.seq_len_short)
+        print(f"[setup] Creating long batch iterator (T={cfg.seq_len_long})")
+        dataset_long = make_iterator(tokenizer_cfg.dataset, seq_len=cfg.seq_len_long)
+
+        # Create both training functions (JIT compiled separately)
+        print(f"[setup] Creating training functions with context_length={cfg.context_length}")
+        short_batch_train_fn = make_short_batch_train_fn(
             k_max=cfg.dynamics.k_max,
-            B_self=0,  # Will be set dynamically based on step
+            packing_factor=cfg.dynamics.packing_factor
+        )
+        long_batch_train_fn = make_long_batch_train_fn(
+            k_max=cfg.dynamics.k_max,
             packing_factor=cfg.dynamics.packing_factor
         )
 
@@ -216,36 +266,51 @@ def run(cfg: DynamicsConfig):
                 cfg.use_wandb = use_wandb_override  # Keep CLI/YAML wandb setting
                 print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
 
-            dataset = make_iterator(tokenizer_cfg.dataset)
+            # Interleave short and long batch iterators
+            short_iter = iter(dataset_short)
+            long_iter = iter(dataset_long)
 
             # cfg.max_steps + 1 to make sure we log and checkpoint at max_steps
-            pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps + 1)
-            for step, batch in pbar:
+            pbar = tqdm(range(start_step, cfg.max_steps + 1), total=cfg.max_steps + 1 - start_step)
+            for step in pbar:
                 if step > cfg.max_steps:
                     break
-                
+
+                # Decide batch type based on training phase
+                if step >= cfg.finetune_start_step:
+                    # Finetuning phase: 100% long batches
+                    use_long_batch = True
+                else:
+                    # Alternating phase: probabilistic sampling
+                    rng, decision_key = jax.random.split(rng)
+                    use_long_batch = (jax.random.uniform(decision_key) < cfg.long_batch_ratio)
+
+                # Fetch appropriate batch and training function
+                if use_long_batch:
+                    batch = next(long_iter)
+                    train_fn = long_batch_train_fn
+                    batch_type = "long"
+                else:
+                    batch = next(short_iter)
+                    train_fn = short_batch_train_fn
+                    batch_type = "short"
+
                 # Shard batch data
                 rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
                 videos = jax.device_put(batch["videos"], data_sharding)
                 actions = jax.device_put(batch["actions"], data_sharding)
 
-                # Compute B_self based on step (bootstrap activates after bootstrap_start)
+                # Compute B_self (bootstrap examples)
                 B_self = (videos.shape[0] // 2) * int(step >= cfg.bootstrap_start)
 
-                # Recreate the step function with updated B_self
-                encode_and_train_step = make_encode_and_train_step(
-                    k_max=cfg.dynamics.k_max,
-                    B_self=B_self,
-                    packing_factor=cfg.dynamics.packing_factor
-                )
-
-                # Combined encoding + training step (both phases parallelized)
-                aux = encode_and_train_step(
+                # Training step
+                aux = train_fn(
                     tokenizer, dynamics, optimizer,
                     videos, actions,
                     tokenizer_key=tokenizer_key,
                     master_key=master_key,
-                    step=step
+                    step=step,
+                    B_self=B_self
                 )
 
                 # Logging
@@ -257,6 +322,9 @@ def run(cfg: DynamicsConfig):
                             "flow_mse": metrics_cpu["flow_mse"],
                             "boot_mse": metrics_cpu["bootstrap_mse"],
                             "lr": cfg.lr if lr_schedule is None else lr_schedule(step),
+                            "batch_type": batch_type,
+                            "seq_len": cfg.seq_len_long if use_long_batch else cfg.seq_len_short,
+                            "is_finetuning": int(step >= cfg.finetune_start_step),
                         },
                         pbar=pbar,
                     )
