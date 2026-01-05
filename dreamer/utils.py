@@ -6,9 +6,10 @@ import orbax.checkpoint as ocp
 from pathlib import Path
 import optax
 import operator
+import grain
 from einops import rearrange
 from enum import IntEnum
-from typing import Tuple
+from typing import Tuple, cast
 import numpy as np
 
 
@@ -215,57 +216,73 @@ def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
 # Checkpointing Utilities
 # ============================================================================
 
-def make_state(model, optimizer, rng, step):
+def build_checkpoint_manager(ckpt_dir: Path, 
+                             save_interval_steps: int, 
+                             max_to_keep: int,
+                             max_steps: int) -> ocp.CheckpointManager:
+    handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
+
+    # Model (Weights)
+    handler_registry.add("model_state", ocp.args.StandardSave, ocp.handlers.StandardCheckpointHandler)
+    handler_registry.add("model_state", ocp.args.StandardRestore, ocp.handlers.StandardCheckpointHandler)
+
+    # Optimizer (Momentum, Step, etc)
+    handler_registry.add("optimizer_state", ocp.args.StandardSave, ocp.handlers.StandardCheckpointHandler)
+    handler_registry.add("optimizer_state", ocp.args.StandardRestore, ocp.handlers.StandardCheckpointHandler)
+
+    # Dataloader
+    handler_registry.add("train_dataloader_state", grain.checkpoint.CheckpointSave, cast(ocp.handlers.CheckpointHandler, grain.checkpoint.CheckpointHandler))
+    handler_registry.add("train_dataloader_state", grain.checkpoint.CheckpointRestore, cast(ocp.handlers.CheckpointHandler, grain.checkpoint.CheckpointHandler))
+    
+    # RNG
+    handler_registry.add("rng", ocp.args.StandardSave, ocp.handlers.StandardCheckpointHandler)
+    handler_registry.add("rng", ocp.args.StandardRestore, ocp.handlers.StandardCheckpointHandler)
+
+    # Meta
+    handler_registry.add("meta", ocp.args.JsonSave, ocp.handlers.JsonCheckpointHandler)
+    handler_registry.add("meta", ocp.args.JsonRestore, ocp.handlers.JsonCheckpointHandler)
+
+    checkpoint_options = ocp.CheckpointManagerOptions(
+        save_interval_steps=save_interval_steps,
+        max_to_keep=max_to_keep,
+        save_on_steps=[max_steps - 1],
+    )
+    return ocp.CheckpointManager(ckpt_dir, options=checkpoint_options, handler_registry=handler_registry)
+
+
+def try_restore(
+    checkpoint_manager: ocp.CheckpointManager,
+    model: nnx.Module,
+    optimizer: nnx.Optimizer,
+    train_iterator: grain.DataLoaderIterator,
+    rng: jax.Array,
+) -> tuple[
+    int, nnx.Module, nnx.Optimizer, grain.DataLoaderIterator, jax.Array
+]:
+    step = checkpoint_manager.latest_step()
+
+    if step is None:
+        print("No checkpoint found, starting from scratch.")
+        return 0, model, optimizer, train_iterator, rng
+
     model_state = nnx.state(model)
-    opt_state   = nnx.state(optimizer)
+    optimizer_state = nnx.state(optimizer)
     
-    return {
-        "model_state": model_state,
-        "opt_state": opt_state,
-        "rng": rng,
-        "step": jnp.int32(step),
-    }
-
-
-def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("state","meta")):
-    path = Path(ckpt_dir).expanduser().resolve()
-    path.mkdir(parents=True, exist_ok=True)
-    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, save_interval_steps=save_interval_steps)
-    # item_names gives nice attribute access on restore: restored.state, restored.meta
-    mngr = ocp.CheckpointManager(path, options=options, item_names=item_names)
-    return mngr
-
-
-def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta_example: dict | None = None):
-    """
-    Build abstract trees from current shapes/dtypes so Orbax can restore safely
-    (StandardRestore wants an abstract tree). :contentReference[oaicite:3]{index=3}
-    """
-    latest = mngr.latest_step()
-    if latest is None:
-        return None
-        
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)   # :contentReference[oaicite:4]{index=4}
     restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(abstract_state),                                      # :contentReference[oaicite:5]{index=5}
-        meta=ocp.args.JsonRestore() if meta_example is not None else None
+        model_state=ocp.args.StandardRestore(model_state),  # type: ignore
+        optimizer_state=ocp.args.StandardRestore(optimizer_state),  # type: ignore
+        train_dataloader_state=grain.checkpoint.CheckpointRestore(train_iterator),  # type: ignore
+        rng=ocp.args.StandardRestore({'key': rng}),  # type: ignore
     )
+
+    restored = checkpoint_manager.restore(step, args=restore_args)
+    nnx.update(model, restored["model_state"])
+    nnx.update(optimizer, restored["optimizer_state"])
+    train_iterator = restored["train_dataloader_state"]
+    rng = restored["rng"]["key"]
     
-    restored = mngr.restore(latest, args=restore_args)
-    return latest, restored
-
-
-def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict | None = None):
-    if not mngr.should_save(step):  # obey save interval policy
-        return
-    assert meta is not None
-    mngr.save(
-        step,
-        args=ocp.args.Composite(
-            state=ocp.args.StandardSave(state),
-            meta=ocp.args.JsonSave(meta)
-        )
-    )
+    print(f"Restored dataloader and model state from step {step}")
+    return step + 1, model, optimizer, train_iterator, rng
 
 # -------- Training utilities (shared across scripts) --------
 

@@ -5,6 +5,7 @@ from functools import partial
 from pathlib import Path
 
 import einops
+import grain
 import hydra
 import imageio
 import jax
@@ -17,6 +18,7 @@ from hydra.core.hydra_config import HydraConfig
 from jaxlpips import LPIPS
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
+import orbax.checkpoint as ocp
 
 from dreamer.configs import TokenizerConfig
 from dreamer.training import compute_psnr
@@ -25,14 +27,11 @@ from dreamer.logging import MetricLogger
 from dreamer.models import Tokenizer
 from dreamer.parallel import create_data_model_parallel, MeshRules
 from dreamer.utils import (
-    make_state,
-    make_manager,
-    try_restore,
-    maybe_save,
     normalize_with_dataset_stats,
-    from_dict,
     get_lr_schedule,
     count_parameters_by_component,
+    build_checkpoint_manager,
+    try_restore,
 )
 
 # disable preallocation completely
@@ -192,45 +191,48 @@ def run(cfg: TokenizerConfig):
     mesh_rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
 
     with jax.set_mesh(mesh):
-        # Create the model
-        key = jax.random.key(0)
-        rng, init_key = jax.random.split(key)
-        tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        def init_tokenizer(tokenizer_key):
+            tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(tokenizer_key))
 
-        param_counts = count_parameters_by_component(tokenizer)
-        print(f"Parameter counts: {param_counts}")
+            param_counts = count_parameters_by_component(tokenizer)
+            print(f"Parameter counts: {param_counts}")
 
-        # Learning rate schedule
-        if cfg.lr_schedule == "constant":
-            lr = cfg.lr
-            lr_schedule = None
-        else:
-            lr_schedule = get_lr_schedule(cfg.lr_schedule, cfg.init_lr, cfg.max_lr, cfg.lr_end, cfg.max_steps, cfg.warmup_steps, cfg.wsd_decay_steps)
-            lr = lr_schedule
-        
-        tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
-        optimizer = nnx.Optimizer(tokenizer, tx, wrt=nnx.Param)
+            return tokenizer
 
-        # ---------- Checkpointing ----------
+        def init_optimizer(tokenizer: Tokenizer):
+            # Learning rate schedule
+            if cfg.lr_schedule == "constant":
+                lr = cfg.lr
+                lr_schedule = None
+            else:
+                lr_schedule = get_lr_schedule(cfg.lr_schedule, cfg.init_lr, cfg.max_lr, cfg.lr_end, cfg.max_steps, cfg.warmup_steps, cfg.wsd_decay_steps)
+                lr = lr_schedule
+            
+            tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
+            optimizer = nnx.Optimizer(tokenizer, tx, wrt=nnx.Param)
+            return optimizer, lr_schedule
+
+        # Checkpointing
         ckpt_dir = run_dir / "checkpoints"
         meta = {"cfg": asdict(cfg)}
-        
-        # Create state factory for abstract restoration
-        # This must create abstract shapes without capturing concrete arrays
-        def state_factory():
-            return make_state(tokenizer, optimizer, rng, step=0)
 
-        with make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every) as mngr:
-            restored = try_restore(mngr, state_factory)
-            start_step = 0
-            if restored is not None:
-                latest_step, r = restored
-                nnx.update(tokenizer, r.state["model_state"])
-                nnx.update(optimizer, r.state["opt_state"])
-                rng = r.state["rng"]
-                start_step = int(r.state["step"])
-                cfg = from_dict(TokenizerConfig, r.meta["cfg"])
-                print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
+        max_to_keep = cfg.ckpt_max_to_keep
+        save_interval_steps = cfg.ckpt_save_every
+        max_steps = cfg.max_steps
+
+        train_dataloader = make_iterator(cfg.dataset)
+        train_iterator = iter(train_dataloader)  # type: ignore
+
+        # Initialize models
+        key = jax.random.key(0)
+        rng, init_key = jax.random.split(key)
+        tokenizer = init_tokenizer(init_key)
+        optimizer, lr_schedule = init_optimizer(tokenizer)
+
+        with build_checkpoint_manager(ckpt_dir, save_interval_steps, max_to_keep, max_steps) as checkpoint_manager:
+            start_step, tokenizer, optimizer, train_iterator, rng = try_restore(
+                checkpoint_manager, tokenizer, optimizer, train_iterator, rng
+            )
 
             # ---------- Train loop ----------
             logger = MetricLogger(
@@ -240,14 +242,8 @@ def run(cfg: TokenizerConfig):
                 wandb_obj=wandb,
             )
 
-            dataset = make_iterator(cfg.dataset)
-
-            # cfg.max_steps + 1 to make sure we log and checkpoint at max_steps
-            pbar = tqdm(enumerate(dataset, start = start_step), total=cfg.max_steps + 1)
-            
+            pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step,total=max_steps)
             for step, batch in pbar:
-                if step < start_step:
-                    continue
                 if step >= cfg.max_steps:
                     break
 
@@ -298,15 +294,23 @@ def run(cfg: TokenizerConfig):
                     )
                 
                 # Save checkpoint state
-                ckpt_state = make_state(tokenizer, optimizer, rng, step)
-                maybe_save(mngr, step, ckpt_state, meta)
+                if checkpoint_manager.should_save(step):
+                    model_state = nnx.state(tokenizer)
+                    optimizer_state = nnx.state(optimizer)
+                    
+                    checkpoint_manager_args = ocp.args.Composite(
+                        model_state=ocp.args.StandardSave(model_state),  # type: ignore
+                        optimizer_state=ocp.args.StandardSave(optimizer_state),  # type: ignore
+                        train_dataloader_state=grain.checkpoint.CheckpointSave(train_iterator),  # type: ignore
+                        rng=ocp.args.StandardSave({'key': rng}),  # type: ignore
+                        meta=ocp.args.JsonSave(meta),  # type: ignore
+                    )
+                    checkpoint_manager.save(step, args=checkpoint_manager_args)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
                     viz_step(tokenizer, viz_videos, step_rng, step, run_dir, use_wandb=cfg.use_wandb)
-            
-            mngr.wait_until_finished()
 
     if cfg.use_wandb and wandb.run is not None:
         wandb.finish()

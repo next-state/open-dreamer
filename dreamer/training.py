@@ -19,6 +19,7 @@ from einops import rearrange
 import optax
 import wandb
 import time
+from flax import nnx
 
 from dreamer.generation import DenoiseSchedule
 from dreamer.sampler import sample_video
@@ -239,9 +240,10 @@ def shortcut_forcing_step(
     B, T, S, D = latents.shape
     B_emp = B - B_self
     emax = jnp.log2(k_max).astype(jnp.int32)
-    
+
     # Split RNG
-    key_sigma, key_step, key_noise = jax.random.split(rng, 3)
+    key_sigma, key_step, key_noise, key_dropout = jax.random.split(rng, 4)
+    rngs = nnx.Rngs(dropout=key_dropout)
     
     # --- Step indices ---
     # Empirical rows: always use finest step (d_min)
@@ -269,7 +271,7 @@ def shortcut_forcing_step(
     # --- Forward pass (full batch) ---
     z_pred_full, (h_states, _) = dynamics_model(
         actions, step_idx_full, sigma_idx_full, z_tilde,
-        agent_tokens=agent_tokens, deterministic=False
+        agent_tokens=agent_tokens, deterministic=False, rngs=rngs
     )
     
     # --- Flow loss (empirical rows) ---
@@ -295,7 +297,7 @@ def shortcut_forcing_step(
         # First half-step
         z1_half1, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
-            agent_tokens=agent_tokens_self, deterministic=False
+            agent_tokens=agent_tokens_self, deterministic=False, rngs=rngs
         )
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
@@ -303,7 +305,7 @@ def shortcut_forcing_step(
         # Second half-step
         z1_half2, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
-            agent_tokens=agent_tokens_self, deterministic=False
+            agent_tokens=agent_tokens_self, deterministic=False, rngs=rngs
         )
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
     

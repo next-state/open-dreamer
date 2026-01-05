@@ -14,6 +14,8 @@ from flax import nnx
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
+import orbax.checkpoint as ocp
+import grain
 
 from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator
@@ -23,9 +25,7 @@ from dreamer.parallel import create_data_model_parallel, MeshRules
 from dreamer.training import run_evaluation, shortcut_forcing_step
 from dreamer.utils import (
     _ensure_dir,
-    make_manager,
-    make_state,
-    maybe_save,
+    build_checkpoint_manager,
     try_restore,
     get_lr_schedule,
     count_parameters_by_component,
@@ -152,7 +152,7 @@ def run(cfg: DynamicsConfig):
         rng, init_key = jax.random.split(key)
     
         # Load pretrained tokenizer
-        tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules, mesh=mesh)
+        tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
         tokenizer_cfg = tokenizer.config
 
         # Initialize dynamics
@@ -195,33 +195,21 @@ def run(cfg: DynamicsConfig):
             wandb_obj=wandb
         )
 
-        opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
         meta = {"cfg": asdict(cfg)}
 
-        # Create state factory for abstract restoration
-        def state_factory():
-            return make_state(dynamics, opt_state, rng, step=0)
+        # Create data iterator
+        train_dataloader = make_iterator(tokenizer_cfg.dataset)  # FIXME: in a future update, we must decouple dataset from model
+        train_iterator = iter(train_dataloader)  # type: ignore
 
-        with make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every) as mngr:
-            restored = try_restore(mngr, state_factory, meta)
-            start_step = 0
-            if restored is not None:
-                latest_step, r = restored
-                nnx.update(dynamics, r.state["params"])
-                nnx.update(optimizer.opt_state, r.state["opt_state"])
-                rng = r.state["rng"]
-                start_step = int(r.state["step"])
-                # Preserve runtime flags before restoring checkpoint config
-                use_wandb_override = cfg.use_wandb
-                cfg.use_wandb = use_wandb_override  # Keep CLI/YAML wandb setting
-                print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
+        with build_checkpoint_manager(ckpt_dir, cfg.ckpt_save_every, cfg.ckpt_max_to_keep, cfg.max_steps) as checkpoint_manager:
+            start_step, dynamics, optimizer, train_iterator, rng = try_restore(
+                checkpoint_manager, dynamics, optimizer, train_iterator, rng
+            )
 
-            dataset = make_iterator(tokenizer_cfg.dataset)
-
-            # cfg.max_steps + 1 to make sure we log and checkpoint at max_steps
-            pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps + 1)
+            # Training loop
+            pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step, total=cfg.max_steps)
             for step, batch in pbar:
-                if step > cfg.max_steps:
+                if step >= cfg.max_steps:
                     break
                 
                 # Shard batch data
@@ -261,10 +249,19 @@ def run(cfg: DynamicsConfig):
                         pbar=pbar,
                     )
 
-                # Save sharded arrays directly (Orbax handles distributed write efficiently)
-                opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
-                ckpt_state = make_state(dynamics, opt_state, rng, step)
-                maybe_save(mngr, step, ckpt_state, meta)
+                # Save checkpoint
+                if checkpoint_manager.should_save(step):
+                    model_state = nnx.state(dynamics)
+                    optimizer_state = nnx.state(optimizer)
+
+                    checkpoint_manager_args = ocp.args.Composite(
+                        model_state=ocp.args.StandardSave(model_state),  # type: ignore
+                        optimizer_state=ocp.args.StandardSave(optimizer_state),  # type: ignore
+                        train_dataloader_state=grain.checkpoint.CheckpointSave(train_iterator),  # type: ignore
+                        rng=ocp.args.StandardSave({'key': rng}),  # type: ignore
+                        meta=ocp.args.JsonSave(meta),  # type: ignore
+                    )
+                    checkpoint_manager.save(step, args=checkpoint_manager_args)
 
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
@@ -276,8 +273,6 @@ def run(cfg: DynamicsConfig):
                         cfg, tokenizer_cfg, step, tokenizer, dynamics,
                         val_videos, jnp.asarray(val_actions), vis_dir, rng
                     )
-            
-            mngr.wait_until_finished()
 
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:

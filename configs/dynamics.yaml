@@ -9,7 +9,7 @@ ckpt_save_every: 25000
 # Dynamics specific
 dynamics:
     d_model: 512
-    d_bottleneck: 64
+    d_bottleneck: 16
     action_dim: 16
     depth: 12
     n_heads: 8
