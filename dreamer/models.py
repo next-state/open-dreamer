@@ -12,7 +12,7 @@ from .utils import (
     Modality, TokenLayout, 
     normalize_with_dataset_stats, 
     unnormalize_with_dataset_stats, to_jnp_dtype,
-    make_state, try_restore
+    try_restore
 )
 from .data import patchify, unpatchify
 from .configs import TokenizerConfig, DynamicsModelConfig, DynamicsConfig

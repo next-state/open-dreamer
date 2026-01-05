@@ -24,7 +24,6 @@ from dreamer.utils import (
     _ensure_dir,
     from_dict,
     make_manager,
-    make_state,
     get_lr_schedule,
     count_parameters_by_component,
     maybe_save,
@@ -39,59 +38,80 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Training Step
 # ---------------------------
 
-@nnx.jit
-def train_step(
+# ---------------------------
+# Training Step
+# ---------------------------
+
+
+
+@nnx.jit(static_argnames=("packing_factor", "k_max", "B_self"))
+def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
     videos: jnp.ndarray,
     actions: jnp.ndarray,
-    videos_self: jnp.ndarray,
-    actions_self: jnp.ndarray,
     *,
     tokenizer_key: jax.Array,
     master_key: jax.Array,
+    step: int,
+    packing_factor:int,
+    B_self:int,
+    k_max:int,
+
 ):
-    """Single training step: encode videos and update dynamics model."""
-    # Encode videos to latents
+    # Phase 1: Encode videos to latents
     rngs = nnx.Rngs(mae=tokenizer_key)
     latents, _ = tokenizer.encode(
         videos,
-        packing_factor=dynamics.config.packing_factor,
+        packing_factor=packing_factor,
         deterministic=True,
         rngs=rngs
     )
-    
-    latents_self, _ = tokenizer.encode(
-        videos_self,
-        packing_factor=dynamics.config.packing_factor,
-        deterministic=True,
-        rngs=rngs
-    )
-    
-    # Combine empirical and self-consistency batches
-    latents_full = jnp.concatenate([latents, latents_self], axis=0)
-    actions_full = jnp.concatenate([actions, actions_self], axis=0)
-    B_self = videos_self.shape[0]
 
-    # Compute loss and gradients
+    # Phase 2: Training step
+    metrics = train_step(
+        dynamics, optimizer, latents, actions,
+        B_self=B_self, k_max=k_max, master_key=master_key, step=step
+    )
+
+    return metrics
+
+
+@nnx.jit(static_argnames=("k_max", "B_self"))
+def train_step(
+    dynamics: Dynamics,
+    optimizer: nnx.Optimizer,
+    latents: jnp.ndarray,
+    actions: jnp.ndarray,
+    *,
+    B_self: int,
+    k_max: int,
+    master_key: jax.Array,
+    step: int
+):
+    # Generate step-specific key
+    step_key = jax.random.fold_in(master_key, step)
+
     def loss_and_aux(dynamics_model: Dynamics):
+        """Loss function that takes the model and returns (loss, aux)."""
         losses, aux = shortcut_forcing_step(
             dynamics_model=dynamics_model,
-            actions=actions_full,
-            latents=latents_full,
-            rng=master_key,
-            k_max=dynamics.config.k_max,
+            actions=actions,
+            latents=latents,
+            rng=step_key,
+            k_max=k_max,
             B_self=B_self,
-            agent_tokens=None,
+            agent_tokens=None,  # Not used in dynamics pretraining
         )
         return losses['total'], aux
 
     (loss_val, metrics), grads = nnx.value_and_grad(loss_and_aux, has_aux=True)(dynamics)
+
+    # Update model with optimizer 
     optimizer.update(dynamics, grads)
 
     return metrics
-
 
 # ---------------------------
 # Main
@@ -196,27 +216,16 @@ def run(cfg: DynamicsConfig):
                 videos = jax.device_put(batch["videos"], data_sharding)
                 actions = jax.device_put(batch["actions"], data_sharding)
 
-                # Split batch into empirical and bootstrap parts
-                if step >= cfg.bootstrap_start:
-                    split_idx = videos.shape[0] // 2
-                    videos_emp = videos[:split_idx]
-                    actions_emp = actions[:split_idx]
-                    videos_self = videos[split_idx:]
-                    actions_self = actions[split_idx:]
-                else:
-                    # No bootstrap: use full batch as empirical, empty bootstrap
-                    videos_emp = videos
-                    actions_emp = actions
-                    videos_self = videos[:0]  # Empty slice with correct shape
-                    actions_self = actions[:0]
-
                 # Training step
-                aux = train_step(
+                aux = encode_and_train_step(
                     tokenizer, dynamics, optimizer,
-                    videos_emp, actions_emp,
-                    videos_self, actions_self,
+                    videos, actions,
                     tokenizer_key=tokenizer_key,
                     master_key=master_key,
+                    step=step,
+                    packing_factor=cfg.dynamics.packing_factor,
+                    B_self=cfg.dataset.B//2,
+                    k_max=cfg.dynamics.k_max,
                 )
 
                 # Logging
