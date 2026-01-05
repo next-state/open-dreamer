@@ -104,11 +104,12 @@ def gather_future_actions(actions_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
 
 
 def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray, jnp.ndarray]:
-    f"""
+    """
     Gather future rewards for multi-token prediction.
     
-    At timestep t, predicts rewards[t+1], ..., rewards[t+L]
-    (Following Dreamer convention: r[t+1] is the reward from executing a[t+1] from h_t)
+    At timestep t, predicts rewards[t], ..., rewards[t+L-1]
+    (Following Dreamer convention: r[t] is the reward from executing a[t] from h[t-1]. 
+    Therefore h[t] should be sufficient to predict r[t] since h[t] attends over (h[t-1], a[t]).)
     
     Args:
         rewards_bt: (B, T) reward values
@@ -119,18 +120,18 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
         valid_btL: (B, T, L) mask (0 for invalid)
     """
     B, T = rewards_bt.shape
-    rewards_pad = jnp.pad(rewards_bt, ((0, 0), (0, L)), constant_values=jnp.nan)
+    rewards_pad = jnp.pad(rewards_bt, ((0,0),(0,L-1)), constant_values=jnp.nan)
     
-    offsets = jnp.arange(1, L + 1)  # [1, 2, ..., L]
+    # Vectorized version: offsets start at 0 to predict CURRENT and next L-1 values
+    offsets = jnp.arange(0, L)  # (L,) = [0, 1, ..., L-1]
     indices = jnp.arange(T)[:, None] + offsets[None, :]  # (T, L)
     rewards_btL = rewards_pad[:, indices]  # (B, T, L)
     
-    # Valid when: t >= 0 AND 0 <= t+offset < T
-    valid_btL = (indices >= 0) & (indices < T)
-    valid_btL = jnp.broadcast_to(valid_btL[None, :, :], (B, T, L))
+    # Validity: reward value cannot be NaN
+    # Since we pad out-of-bounds positions with NaN, checking for NaN is sufficient
+    valid_btL = ~jnp.isnan(rewards_btL)  # (B, T, L)
     
     return rewards_btL, valid_btL
-
 
 # ---------------------------
 # Training step
@@ -381,37 +382,6 @@ def run(cfg: BCRewConfig):
         videos = batch["videos"]
         actions = batch["actions"]
         B_self = int(videos.shape[0] * cfg.self_fraction) * (step >= cfg.bootstrap_start)
-        # val_videos = batch["videos"]
-        # val_rewards = batch["rewards"]
-
-        # if (batch['rewards'] >= 10).any():
-        #     print("debugging step", step)
-        #     import ipdb; ipdb.set_trace()
-        # else:
-        #     print("skipping step", step)
-        #     continue
-        # reward_vars = {"params": params["reward"], "constants": reward_constants}
-        # run_agent_visualization(
-        #     cfg=cfg,
-        #     tokenizer_cfg=tokenizer_cfg,
-        #     step=step,
-        #     tokenizer=tokenizer,
-        #     tokenizer_vars=tokenizer_vars,
-        #     dynamics=dynamics,
-        #     dynamics_params=params["dynamics"],
-        #     dynamics_constants=dynamics_constants,
-        #     task_embedder=task_embedder,
-        #     task_embedder_params=params["task_embedder"],
-        #     reward_head=reward_head,
-        #     reward_vars=reward_vars,
-        #     policy_head=policy_head,
-        #     policy_params=params["policy"],
-        #     val_videos=val_videos,
-        #     val_actions=jnp.asarray(actions),
-        #     val_rewards=val_rewards,
-        #     vis_dir=vis_dir,
-        #     rng=rng,
-        # )    
         params, opt_states, metrics = train_step(
             # Models
             tokenizer=tokenizer,

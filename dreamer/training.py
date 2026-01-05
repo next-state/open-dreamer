@@ -16,6 +16,8 @@ import einops
 import imageio.v3 as iio
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
+import numpy as np
 from einops import rearrange
 from flax.typing import VariableDict
 import optax
@@ -433,6 +435,87 @@ def compute_policy_loss(
 # ---------------------------
 # Evaluation and visualization
 # ---------------------------
+
+def _save_reward_gridplot(
+    fig_path: Path,
+    gt_rewards_bt: np.ndarray,
+    pred_rewards_bt: np.ndarray,
+    title: str,
+    *,
+    num_plots: int | None = None,
+):
+    """
+    Save a grid of subplots comparing predicted and ground truth rewards.
+
+    Args:
+        fig_path: Path to save the plot.
+        gt_rewards_bt: (B, T) Ground truth rewards.
+        pred_rewards_bt: (B, T) Predicted rewards.
+        title: Figure title.
+        num_plots: Optional number of batch elements to plot (defaults to all).
+    """
+    gt = np.asarray(gt_rewards_bt)
+    pred = np.asarray(pred_rewards_bt)
+    assert gt.ndim == 2 and pred.ndim == 2, (gt.shape, pred.shape)
+
+    B = int(min(gt.shape[0], pred.shape[0]))
+    if num_plots is None:
+        num_plots = B
+    num_plots = int(min(num_plots, B))
+    if num_plots <= 0:
+        return
+
+    # Clamp to shared time dimension (defensive: pred may include ctx while GT may not, or vice versa).
+    T = int(min(gt.shape[1], pred.shape[1]))
+    xs = np.arange(1, T + 1)
+
+    # Auto square-ish grid.
+    ncols = int(np.ceil(np.sqrt(num_plots)))
+    nrows = int(np.ceil(num_plots / ncols))
+
+    # Size tuned for ~48 plots: 6x8 -> (16, 12).
+    fig_w = max(8.0, 2.0 * ncols)
+    fig_h = max(6.0, 1.5 * nrows)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(fig_w, fig_h),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    axes_flat = axes.ravel()
+
+    gt_handle = pred_handle = None
+    for i in range(num_plots):
+        ax = axes_flat[i]
+        (gt_handle,) = ax.plot(xs, gt[i, :T], label="GT", linewidth=1.5)
+        (pred_handle,) = ax.plot(xs, pred[i, :T], label="Pred", linewidth=1.5)
+        ax.set_title(f"b{i}", fontsize=8)
+        ax.grid(True, alpha=0.25, linewidth=0.5)
+
+    # Hide unused axes.
+    for j in range(num_plots, len(axes_flat)):
+        axes_flat[j].axis("off")
+
+    # Labels only on outer edges to reduce clutter.
+    for ax in axes[-1, :]:
+        ax.set_xlabel("timestep (+offset)")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("reward")
+
+    fig.suptitle(title, fontsize=11)
+    if gt_handle is not None and pred_handle is not None:
+        fig.legend(
+            [gt_handle, pred_handle],
+            ["GT reward", "Pred reward"],
+            loc="upper right",
+            frameon=False,
+        )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    fig.savefig(fig_path, dpi=140)
+    plt.close(fig)
+
 def run_agent_visualization(
     cfg,
     tokenizer_cfg,
@@ -508,13 +591,26 @@ def run_agent_visualization(
         print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
 
         # Build visualization
-        num_videos = min(4, pred_frames.shape[0])
+        num_videos = min(48, pred_frames.shape[0])
         frames = [floor_frames, gt_frames, pred_frames]
         stacked_frames = jnp.stack(frames)[:, :num_videos]
         videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
 
         # Save artifacts
         tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+        
+        # Build grid plot of predicted reward and actual reward.
+        gt_rewards = np.asarray(val_rewards)
+        pred_rewards_np = np.asarray(pred_rewards)
+        num_plots = min(num_videos, pred_rewards_np.shape[0], gt_rewards.shape[0])
+        plot_path = tag_dir / f"{tag}_reward_grid.png"
+        _save_reward_gridplot(
+            plot_path,
+            gt_rewards[:num_plots],
+            pred_rewards_np[:num_plots],
+            title=f"{tag} reward curves (step={step:06d})",
+            num_plots=num_plots,
+        )
         mp4_path = tag_dir / f"{tag}_grid.mp4"
 
         # Save video
@@ -585,7 +681,7 @@ def run_evaluation(
         ctx_length = 4
         horizon = val_videos.shape[1] - ctx_length
 
-        pred_frames, floor_frames, gt_frames = sample_video(
+        pred_frames, floor_frames, gt_frames, _, _ = sample_video(
             tokenizer, tokenizer_vars, dynamics, dyn_vars, 
             val_videos, val_actions, horizon, schedule_config, rng
         )
