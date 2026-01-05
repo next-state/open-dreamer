@@ -200,6 +200,7 @@ def train_step(
         dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
         
         # TODO: See if we should compute the losses and the gradients sequentially (see figure 2 of https://arxiv.org/pdf/2404.19737 and comment in pull request #16)
+        # TODO: put gather_future_rewards and gather_future_actions inside of the compute_policy_loss function and compute_future_actions functions
         policy_loss = compute_policy_loss(policy_head, pol_p, h_states, actions_btL, actions_valid)
         reward_loss = compute_reward_loss(reward_head, {"params": rew_p, "constants": reward_constants}, h_states, rewards_btL, rewards_valid)
         

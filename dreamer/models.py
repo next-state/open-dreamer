@@ -1093,15 +1093,14 @@ class RewardHeadMTP(nnx.Module):
         self.out = nnx.Linear(d_model, L * num_bins, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
         # Precompute bin centers as a constant
-        log_edges = jnp.linspace(self.log_low, self.log_high, self.num_bins)
-        self.symexp_centers_log = log_edges
+        self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
 
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, '... n c -> ... (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L*K)
         logits = rearrange(logits, '... (l k) -> ... l k', l=self.L, k=self.num_bins)
-        return logits, self.symexp_centers_log
+        return logits 
 
 
 class ValueHead(nnx.Module):
@@ -1126,11 +1125,10 @@ class ValueHead(nnx.Module):
         self.out = nnx.Linear(d_model, num_bins, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
         # Precompute bin centers as a constant
-        log_edges = jnp.linspace(self.log_low, self.log_high, self.num_bins)
-        self.symexp_centers_log = log_edges
+        self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
 
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, K)
-        return logits, self.symexp_centers_log
+        return logits

@@ -334,6 +334,11 @@ def symlog(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.sign(x) * jnp.log1p(jnp.abs(x))
 
 
+def symexp(y: jnp.ndarray) -> jnp.ndarray:
+    """Inverse of symlog: symmetric exponential transform."""
+    return jnp.sign(y) * (jnp.expm1(jnp.abs(y)))
+
+
 def twohot_symlog_targets(values: jnp.ndarray, centers_log: jnp.ndarray) -> jnp.ndarray:
     """
     Convert scalar values to two-hot targets in symlog space.
@@ -364,6 +369,175 @@ def twohot_symlog_targets(values: jnp.ndarray, centers_log: jnp.ndarray) -> jnp.
     oh_l = jax.nn.one_hot(idx_l, K)
     oh_r = jax.nn.one_hot(idx_r, K)
     return oh_l * (1.0 - frac)[..., None] + oh_r * frac[..., None]
+
+
+# ---------------------------
+# RL Training Losses
+# ---------------------------
+
+def compute_td_lambda_returns(
+    rewards: jnp.ndarray,
+    values: jnp.ndarray,
+    gamma: float,
+    lambda_: float,
+) -> jnp.ndarray:
+    """
+    Compute TD(λ) returns via backward scan.
+    
+    At timestep t, the TD(λ) return is:
+        R^λ[t] = r[t+1] + γ * ((1-λ) V[t+1] + λ R^λ[t+1])
+    
+    With bootstrap condition: R^λ[T] = V[T]
+    
+    Args:
+        rewards: (B, T) rewards received at each step (r_1...r_T)
+        values: (B, T+1) value predictions (V_0...V_T, includes bootstrap)
+        gamma: Discount factor
+        lambda_: TD(λ) mixing parameter
+        
+    Returns:
+        td_returns: (B, T) TD(λ) targets for value training
+    """
+    def step(carry, inputs):
+        G_next = carry
+        r_t1, v_t1 = inputs
+        G_t = r_t1 + gamma * ((1 - lambda_) * v_t1 + lambda_ * G_next)
+        return G_t, G_t
+    
+    r_rev = rewards[:, ::-1]  # (B, T): r_T...r_1
+    v_next = values[:, 1:]
+    v_next_rev = v_next[:, ::-1]  # (B, T): V(s_T...s_1)
+    _, G_rev = jax.lax.scan(
+        step,
+        values[:, -1],  # Bootstrap with V[T]
+        (r_rev.T, v_next_rev.T),
+    )
+    td_returns = rearrange(G_rev[::-1], "T B -> B T")  # (B, T)
+    return td_returns
+
+
+def compute_value_loss(
+    val_logits: jnp.ndarray,
+    centers_log_val: jnp.ndarray,
+    td_returns: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Compute value head loss using symexp twohot targets.
+    
+    The value head predicts a distribution over symlog-transformed values,
+    using the two-hot encoding for improved learning across varying scales.
+    
+    Args:
+        val_logits: (B, T, K) Logits from value head forward pass
+        centers_log_val: (K,) Bin centers in symlog space
+        td_returns: (B, T) TD(λ) return targets
+        
+    Returns:
+        loss: Scalar categorical cross-entropy loss
+        
+    Notes:
+        - Trains on states s_0..s_{T-1} to predict returns R_0..R_{T-1}
+        - Uses symexp encoding to handle returns of varying magnitude
+        - Two-hot targets provide smoother gradients than one-hot
+    """
+    # Convert TD returns to two-hot targets
+    twohot_targets = jax.lax.stop_gradient(
+        twohot_symlog_targets(td_returns, centers_log_val)
+    )  # (B, T, K)
+    
+    # Cross-entropy loss using optax
+    val_ce = optax.safe_softmax_cross_entropy(logits=val_logits, labels=twohot_targets)  # (B, T)
+    val_loss = jnp.mean(val_ce)
+    
+    return val_loss
+
+
+def compute_pmpo_loss(
+    policy_logits: jnp.ndarray,
+    actions: jnp.ndarray,
+    advantages: jnp.ndarray,
+    policy_prior_logits: jnp.ndarray,
+    alpha: float = 0.5,
+    beta: float = 0.3,
+) -> Tuple[jnp.ndarray, Dict[str, Any]]:
+    """
+    Compute PMPO (Probabilistic Policy Optimization) loss.
+    
+    PMPO balances positive and negative advantages using sign-only information,
+    making it robust to return scale variations across tasks.
+    
+    Loss components:
+        1. Negative advantage states: maximize log-prob (encourage action)
+        2. Positive advantage states: minimize log-prob (discourage action)
+        3. KL divergence to behavioral prior (regularization)
+    
+    Args:
+        policy_logits: (B, T, A) Unnormalized logits from current policy
+        actions: (B, T) Action labels taken in imagination
+        advantages: (B, T) Advantage estimates A(s,a) = R^λ - V(s)
+        policy_prior_logits: (B, T, A) Logits from frozen BC policy (prior)
+        alpha: Weight balancing positive/negative sets (default: 0.5)
+        beta: Weight for KL regularization (default: 0.3)
+        
+    Returns:
+        loss: Scalar PMPO loss
+        aux: Dict containing:
+            - loss_negative: Contribution from negative advantage states
+            - loss_positive: Contribution from positive advantage states
+            - kl_loss: KL divergence regularization term
+            - n_positive: Number of states with A >= 0
+            - n_negative: Number of states with A < 0
+    """
+    # Compute log probabilities
+    logp_pi = jax.nn.log_softmax(policy_logits, axis=-1)  # (B, T, A)
+    A_dim = logp_pi.shape[-1]
+    
+    # Log-prob of imagined actions
+    actions_onehot = jax.nn.one_hot(actions.astype(jnp.int32), A_dim)
+    logp_actions = jnp.sum(actions_onehot * logp_pi, axis=-1)  # (B, T)
+    
+    # Flatten for easier indexing
+    logp_flat = rearrange(logp_actions, "B T -> (B T)")
+    advantages_flat = rearrange(advantages, "B T -> (B T)")
+    
+    # Partition into positive/negative advantage sets
+    mask_positive = advantages_flat >= 0
+    mask_negative = advantages_flat < 0
+    
+    n_positive = jnp.sum(mask_positive)
+    n_negative = jnp.sum(mask_negative)
+    
+    # Negative set: encourage high log-prob (maximize)
+    loss_negative = jnp.where(
+        n_negative > 0,
+        (1 - alpha) * jnp.sum(jnp.where(mask_negative, logp_flat, 0.0)) / n_negative,
+        0.0,
+    )
+    
+    # Positive set: discourage high log-prob (minimize)
+    loss_positive = jnp.where(
+        n_positive > 0,
+        -alpha * jnp.sum(jnp.where(mask_positive, logp_flat, 0.0)) / n_positive,
+        0.0,
+    )
+    
+    # KL(π_θ || π_BC) regularization
+    logp_bc = jax.nn.log_softmax(policy_prior_logits, axis=-1)
+    kl_per_state = optax.losses.kl_divergence_with_log_targets(logp_pi, logp_bc)  # (B, T)
+    kl_loss = beta * jnp.mean(kl_per_state)
+    
+    # Total policy loss
+    pi_loss = loss_negative + loss_positive + kl_loss
+    
+    aux = {
+        'loss_negative': loss_negative,
+        'loss_positive': loss_positive,
+        'kl_loss': kl_loss,
+        'n_positive': n_positive,
+        'n_negative': n_negative,
+    }
+    
+    return pi_loss, aux
 
 
 # ---------------------------

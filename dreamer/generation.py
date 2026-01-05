@@ -263,7 +263,11 @@ def latent_rollout(
         initial_agent_tokens: Optional (B, T_ctx, n_agent, D) agent tokens for context.
         
     Returns:
-        latents: (B, T_ctx + num_steps, n_spatial, D_s)
+        Dict with:
+            'latents': (B, T_ctx + num_steps, n_spatial, D_s) Full trajectory
+            'actions': (B, num_steps, ...) Generated actions
+            'hidden_states': (B, num_steps, n_agent, D) Hidden states from rollout
+            'context_hidden': (B, T_ctx, n_agent, D) Hidden states from context
     """
     B, T_ctx, n_spatial, D_s = latents_ctx.shape
     latent_shape = (B, 1, n_spatial, D_s)
@@ -306,10 +310,10 @@ def latent_rollout(
             dynamics, schedule, action, latent_shape, rng, caches=caches_t
         )
         
-        return (h_next, caches_next, rng), latent_next[:,0] # latent_next is (B, 1, n_spatial, D_s) 
+        return (h_next, caches_next, rng), (latent_next[:,0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
 
     # Run scan
-    _, rollout_latents = jax.lax.scan(
+    _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
         scan_step,
         (h_last, caches, rng),
         jnp.arange(num_steps)
@@ -317,8 +321,17 @@ def latent_rollout(
     
     # Unpack results
     rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
+    rollout_actions = einops.rearrange(rollout_actions, 't b ... -> b t ...')
+    rollout_hidden = einops.rearrange(rollout_hidden, 't b n d -> b t n d')
+    
     out_latents = jnp.concatenate((latents_ctx, rollout_latents), axis=1)
-    return out_latents 
+    
+    return {
+        'latents': out_latents,
+        'actions': rollout_actions,
+        'hidden_states': rollout_hidden,
+        'context_hidden': h_seq,
+    } 
 
 
 def video_rollout(
