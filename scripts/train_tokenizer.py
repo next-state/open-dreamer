@@ -25,7 +25,6 @@ from dreamer.logging import MetricLogger
 from dreamer.models import Tokenizer
 from dreamer.parallel import create_data_model_parallel, MeshRules
 from dreamer.utils import (
-    make_state,
     make_manager,
     try_restore,
     maybe_save,
