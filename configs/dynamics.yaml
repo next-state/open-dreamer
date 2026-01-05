@@ -6,9 +6,18 @@ run_name: dynamics
 tokenizer_ckpt: logs/tokenizer/checkpoints/
 ckpt_save_every: 10_000
 
-# Dynamics specific
+dataset:
+  source: custom
+  array_record_path: datasets/coinrun_hard_agent_episodes/train
+  B: 64
+  T: 64
+  H: 64
+  W: 64
+  C: 3
+
+#Dynamics specific
 dynamics:
-    d_model: 512
+    d_model: 1024
     d_bottleneck: 16
     action_dim: 16
     depth: 12
@@ -41,4 +50,4 @@ lr_end: 0
 warmup_steps: 50000
 wsd_decay_steps: 20000
 
-write_video_every: 50000
+write_video_every: 5_000

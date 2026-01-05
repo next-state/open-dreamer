@@ -216,18 +216,6 @@ def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
 # Checkpointing Utilities
 # ============================================================================
 
-def make_state(model, optimizer, rng, step):
-    model_state = nnx.state(model)
-    opt_state   = nnx.state(optimizer)
-    
-    return {
-        "model_state": model_state,
-        "opt_state": opt_state,
-        "rng": rng,
-        "step": jnp.int32(step),
-    }
-
-
 def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("model_state", "optimizer_state", "rng_state", "meta")):
     path = Path(ckpt_dir).expanduser().resolve()
     path.mkdir(parents=True, exist_ok=True)

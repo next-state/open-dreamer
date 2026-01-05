@@ -183,7 +183,7 @@ def run(cfg: DynamicsConfig):
                 cfg = from_dict(DynamicsConfig, r.meta["cfg"])
                 print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
 
-            dataset = make_iterator(tokenizer_cfg.dataset)
+            dataset = make_iterator(cfg.dataset)
 
             # cfg.max_steps + 1 to make sure we log and checkpoint at max_steps
             pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps + 1)
