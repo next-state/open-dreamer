@@ -66,7 +66,7 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         image_w: int,
         image_c: int,
         *,
-        p_include_reward: float = 0.8,
+        p_include_reward: float = 0.0,
     ):
         """Initializes the transformation with processing parameters."""
         self.seq_len = seq_len
@@ -152,7 +152,7 @@ def get_dataloader(
     num_workers: int = 1,
     prefetch_buffer_size: int = 1,
     seed: int = 42,
-    p_include_reward: float = 0.8,
+    p_include_reward: float = 0.0,
     *,
     print_filter_warnings: bool = True,
 ):

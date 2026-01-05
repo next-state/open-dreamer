@@ -367,7 +367,7 @@ def run(cfg: BCRewConfig):
     param_counts = count_parameters_by_component(params)
     print(f"Parameter counts: {param_counts}")
 
-    # Dataset
+    tokenizer_cfg.dataset.p_include_reward = cfg.dataset.p_include_reward
     dataset = make_iterator(tokenizer_cfg.dataset)
 
     # Training loop

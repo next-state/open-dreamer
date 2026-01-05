@@ -8,9 +8,7 @@ dynamics_ckpt: "logs/fixed_d_model512_n_register32_depth6_k_max64_dropout0.05_qk
 ckpt_save_every: 100_000
 
 dataset:
-  B: 48
-  T: 16
-  diversify_data: true
+  p_include_reward: 0.8 # oversample chunks with nonzero reward.
 
 action_dim: 16
 n_agent: 8

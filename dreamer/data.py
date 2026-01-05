@@ -424,6 +424,7 @@ def make_iterator(cfg: DatasetConfig):
             image_c=cfg.C, 
             num_workers=8,
             print_filter_warnings=False,
+            p_include_reward=cfg.p_include_reward,
         )
     else:
         raise ValueError(f"Unknown dataset source: {cfg.source}")

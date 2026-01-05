@@ -32,6 +32,9 @@ class DatasetConfig:
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
+    
+    # reward-biased slicing probability (0.0 = disabled, 0.8 = 80% chance to include windows with nonzero reward)
+    p_include_reward: float = 0.0
 
 @dataclass(frozen=False, unsafe_hash=True)
 class EncoderConfig:
