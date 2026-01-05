@@ -16,6 +16,7 @@ import imageio.v3 as iio
 import jax
 import jax.numpy as jnp
 from einops import rearrange
+from flax import nnx
 import optax
 import wandb
 import time
@@ -241,7 +242,7 @@ def shortcut_forcing_step(
     emax = jnp.log2(k_max).astype(jnp.int32)
     
     # Split RNG
-    key_sigma, key_step, key_noise = jax.random.split(rng, 3)
+    key_sigma, key_step, key_noise, key_dropout1, key_dropout2, key_dropout3 = jax.random.split(rng, 6)
     
     # --- Step indices ---
     # Empirical rows: always use finest step (d_min)
@@ -267,9 +268,10 @@ def shortcut_forcing_step(
     z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
     
     # --- Forward pass (full batch) ---
+    rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
         actions, step_idx_full, sigma_idx_full, z_tilde,
-        agent_tokens=agent_tokens, deterministic=False
+        agent_tokens=agent_tokens, deterministic=False, rngs=rngs1
     )
     
     # --- Flow loss (empirical rows) ---
@@ -293,17 +295,19 @@ def shortcut_forcing_step(
         sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
     
         # First half-step
+        rngs2 = nnx.Rngs(dropout=key_dropout2)
         z1_half1, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
-            agent_tokens=agent_tokens_self, deterministic=False
+            agent_tokens=agent_tokens_self, deterministic=False, rngs=rngs2
         )
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
     
         # Second half-step
+        rngs3 = nnx.Rngs(dropout=key_dropout3)
         z1_half2, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
-            agent_tokens=agent_tokens_self, deterministic=False
+            agent_tokens=agent_tokens_self, deterministic=False, rngs=rngs3
         )
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
     
@@ -674,6 +678,7 @@ def run_evaluation(
 
         # Save video
         try:
+            videos = jax.device_get(videos)
             iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
         except Exception as e:
             print(f"[eval:{tag}] MP4 write failed: {e}")

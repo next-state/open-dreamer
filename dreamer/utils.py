@@ -10,7 +10,7 @@ from einops import rearrange
 from enum import IntEnum
 from typing import Tuple
 import numpy as np
-import math
+
 
 
 # --- dtype helpers ---
@@ -202,147 +202,79 @@ def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
     Requires: N_b == n_spatial * k  (e.g., 512 -> 256 with k=2).
     """
-    return rearrange(z_btLd, 'b t (n_spatial k) d -> b t n_spatial (k d)', n_spatial=n_spatial, k=k)
+    return rearrange(z_btLd, '... (n_spatial k) d -> ... n_spatial (k d)', n_spatial=n_spatial, k=k)
 
 def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,S_z, D_z_pre) -> (B,T,N_b,D_b) by splitting D_z_pre into k channels along N_b.
     Requires: N_b == n_spatial * k  (e.g., 256 -> 512 with k=2).
     """
-    return rearrange(z_btLd, 'b t n_spatial (k d) -> b t (n_spatial k) d', n_spatial=n_spatial, k=k)
+    return rearrange(z_btLd, '... n_spatial (k d) -> ... (n_spatial k) d', n_spatial=n_spatial, k=k)
 
 
 # ============================================================================
 # Checkpointing Utilities
 # ============================================================================
 
-def make_state(model_or_dict, opt_state, rng, step):
-    """
-    Pack training state as a PyTree for checkpointing (JAX/Orbax-friendly types only).
-    
-    In NNX, we can checkpoint either:
-    - nnx.state(model) -> gets all trainable params + batch stats
-    - Just the parameters dict
-
-    Args:
-        model_or_dict: Either an NNX model or a dict of parameters
-        opt_state: Optimizer state
-        rng: Random key
-        step: Current step
-
-    Returns:
-        State dict suitable for Orbax checkpointing
-    """
-    # If it's a dict, use directly; otherwise extract state from NNX model
-    if isinstance(model_or_dict, dict):
-        state = model_or_dict
-    else:
-        graphdef, *states = nnx.split(model_or_dict, nnx.Param, nnx.BatchStat, ...)
-        state = nnx.State.merge(*states)
-
-    return {
-        "params": state,
-        "opt_state": opt_state,
-        "rng": rng,
-        "step": jnp.int32(step),
-    }
-
-
-def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("state","meta")):
+def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("model_state", "optimizer_state", "rng_state", "meta")):
     path = Path(ckpt_dir).expanduser().resolve()
     path.mkdir(parents=True, exist_ok=True)
-    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep,
-                                           save_interval_steps=save_interval_steps)
-    # item_names gives nice attribute access on restore: restored.state, restored.meta
+    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, save_interval_steps=save_interval_steps)
+    # item_names gives nice attribute access on restore: restored.model_state, restored.optimizer_state, etc.
     mngr = ocp.CheckpointManager(path, options=options, item_names=item_names)
     return mngr
 
 
-def try_restore(mngr: ocp.CheckpointManager, state_example: dict, ctx, meta: dict | None = None):
+def try_restore(mngr: ocp.CheckpointManager, model_factory, optimizer_factory, mesh, rng):
     """
-    Build abstract trees from current shapes/dtypes so Orbax can restore safely.
+    Restore checkpoint using abstract shapes for safe restoration.
     
-    Creates abstract targets with sharding info from ctx so Orbax loads directly
-    into GPU memory with proper sharding/replication.
+    Args:
+        mngr: Orbax CheckpointManager instance
+        model_factory: Callable that returns a model instance
+        optimizer_factory: Callable that returns an optimizer instance
+        mesh: JAX mesh to use for sharding
+        rng: RNG state to use for restoration structure
+        
+    Returns:
+        Tuple of (latest_step, restored) if checkpoint exists, None otherwise
+        restored is a namespace with .model, .optimizer, .rng, and .meta attributes
     """
-    # Create abstract targets WITH sharding info for direct GPU loading
-    def to_sharded_abstract(x):
-        if isinstance(x, jax.Array):
-            # Params/opt_state are replicated across available devices
-            return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=ctx.replicated_sharding)
-        return ocp.utils.to_shape_dtype_struct(x)
-    
-    abstract_state = jax.tree_util.tree_map(to_sharded_abstract, state_example)
-    
-    restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(abstract_state),
-        meta=ocp.args.JsonRestore() if meta is not None else None
-    )
     latest = mngr.latest_step()
     if latest is None:
         return None
+    
+    # cfg = ocp.args.Composite(meta=ocp.args.JsonRestore()).meta["cfg"]
+    
+    model_graphdef, model_abs_state = nnx.get_abstract_model(model_factory, mesh)
+    optimizer_graphdef, optimizer_abs_state = nnx.get_abstract_model(optimizer_factory, mesh)
+    
+    # Always try to restore metadata if it exists in the checkpoint
+    restore_args = ocp.args.Composite(
+        model_state=ocp.args.StandardRestore(model_abs_state),
+        optimizer_state=ocp.args.StandardRestore(optimizer_abs_state),
+        rng_state=ocp.args.ArrayRestore(),
+        meta=ocp.args.JsonRestore()
+    )
+    
     restored = mngr.restore(latest, args=restore_args)
     return latest, restored
 
 
-def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict | None = None):
+def maybe_save(mngr: ocp.CheckpointManager, step: int, model: nnx.Module, optimizer: nnx.Optimizer, rng, meta: dict | None = None):
     if not mngr.should_save(step):  # obey save interval policy
         return
-    save_args = ocp.args.Composite(
-        state=ocp.args.StandardSave(state),
-        meta=ocp.args.JsonSave(meta) if meta is not None else None
+    assert meta is not None
+    model_state, optimizer_state = nnx.state(model), nnx.state(optimizer)
+    mngr.save(
+        step,
+        args=ocp.args.Composite(
+            model_state=ocp.args.StandardSave(model_state),
+            optimizer_state=ocp.args.StandardSave(optimizer_state),
+            rng_state=ocp.args.ArraySave(rng),
+            meta=ocp.args.JsonSave(meta)
+        )
     )
-    mngr.save(step, args=save_args)  # async by default; runs in a background thread
-
-
-# ============================================================================
-# Model Initialization Utilities
-# ============================================================================
-
-def init_tokenizer(rng, tokenizer_config):
-    """
-    Initialize a tokenizer model with NNX.
-    
-    Args:
-        rng: JAX random key
-        tokenizer_config: TokenizerConfig instance
-        
-    Returns:
-        rng: Updated random key
-        tokenizer: Initialized Tokenizer model
-    """
-    from dreamer.models import Tokenizer
-
-    rng, model_rng = jax.random.split(rng)
-    rngs = nnx.Rngs(model_rng)
-
-    tokenizer = Tokenizer(tokenizer_config, rngs=rngs)
-
-    return rng, tokenizer
-
-
-def init_dynamics(rng, dynamics_config, tokenizer_config):
-    """
-    Initialize a dynamics model with NNX.
-    
-    Args:
-        rng: JAX random key
-        dynamics_config: DynamicsModelConfig instance
-        tokenizer_config: TokenizerConfig instance (for spatial dims)
-        
-    Returns:
-        rng: Updated random key
-        dynamics: Initialized Dynamics model
-    """
-    from dreamer.models import Dynamics
-    
-    rng, model_rng = jax.random.split(rng)
-    rngs = nnx.Rngs(model_rng)
-    
-    dynamics = Dynamics(dynamics_config, rngs=rngs)
-    
-    return rng, dynamics
-
 
 # -------- Training utilities (shared across scripts) --------
 

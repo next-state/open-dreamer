@@ -3,13 +3,22 @@ defaults:
     - _self_
 
 run_name: dynamics
-tokenizer_ckpt: logs/t-demo2-bf16-fp32/checkpoints/
-ckpt_save_every: 25000
+tokenizer_ckpt: logs/tokenizer/checkpoints/
+ckpt_save_every: 10_000
 
-# Dynamics specific
+dataset:
+  source: custom
+  array_record_path: datasets/coinrun_hard_agent_episodes/train
+  B: 256
+  T: 64
+  H: 64
+  W: 64
+  C: 3
+
+#Dynamics specific
 dynamics:
-    d_model: 512
-    d_bottleneck: 64
+    d_model: 1024
+    d_bottleneck: 16
     action_dim: 16
     depth: 12
     n_heads: 8
@@ -27,7 +36,6 @@ dynamics:
 
 bootstrap_start: 5_000
 self_fraction: 0.25
-batch_size: 1024
 
 max_steps: 300_000
 log_every: 100
@@ -41,4 +49,4 @@ lr_end: 0
 warmup_steps: 50000
 wsd_decay_steps: 20000
 
-write_video_every: 50000
+write_video_every: 5_000

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict
-from functools import partial
 from pathlib import Path
 
 import hydra
@@ -19,18 +18,16 @@ from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.parallel import ParallelContext
+from dreamer.parallel import create_data_model_parallel, MeshRules
 from dreamer.training import run_evaluation, shortcut_forcing_step
 from dreamer.utils import (
     _ensure_dir,
-    init_dynamics,
-    init_tokenizer,
+    from_dict,
     make_manager,
-    make_state,
-    maybe_save,
-    try_restore,
     get_lr_schedule,
     count_parameters_by_component,
+    maybe_save,
+    try_restore,
 )
 
 # Suppress absl info logs
@@ -41,43 +38,44 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Training Step
 # ---------------------------
 
+# ---------------------------
+# Training Step
+# ---------------------------
 
-def make_encode_and_train_step(k_max: int, B_self: int, packing_factor: int):
-    """
-    Factory function to create a JIT-compiled encode_and_train_step.
 
-    This avoids passing unhashable model objects as static arguments to jax.jit.
-    """
-    @partial(jax.jit, static_argnames=())
-    def encode_and_train_step(
-        tokenizer: Tokenizer,
-        dynamics: Dynamics,
-        optimizer: nnx.Optimizer,
-        videos: jnp.ndarray,
-        actions: jnp.ndarray,
-        *,
-        tokenizer_key: jax.Array,
-        master_key: jax.Array,
-        step: int
-    ):
-        # Phase 1: Encode videos to latents
-        rngs = nnx.Rngs(mae=tokenizer_key)
-        latents, _ = tokenizer.encode(
-            videos,
-            packing_factor=packing_factor,
-            deterministic=True,
-            rngs=rngs
-        )
 
-        # Phase 2: Training step
-        metrics = train_step(
-            dynamics, optimizer, latents, actions,
-            B_self=B_self, k_max=k_max, master_key=master_key, step=step
-        )
+@nnx.jit(static_argnames=("packing_factor", "k_max", "B_self"))
+def encode_and_train_step(
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
+    optimizer: nnx.Optimizer,
+    videos: jnp.ndarray,
+    actions: jnp.ndarray,
+    *,
+    tokenizer_key: jax.Array,
+    master_key: jax.Array,
+    step: int,
+    packing_factor:int,
+    B_self:int,
+    k_max:int,
 
-        return metrics
-    
-    return encode_and_train_step
+):
+    # Phase 1: Encode videos to latents
+    rngs = nnx.Rngs(mae=tokenizer_key)
+    latents, _ = tokenizer.encode(
+        videos,
+        packing_factor=packing_factor,
+        deterministic=True,
+        rngs=rngs
+    )
+
+    # Phase 2: Training step
+    metrics = train_step(
+        dynamics, optimizer, latents, actions,
+        B_self=B_self, k_max=k_max, master_key=master_key, step=step
+    )
+
+    return metrics
 
 
 @nnx.jit(static_argnames=("k_max", "B_self"))
@@ -137,147 +135,127 @@ def run(cfg: DynamicsConfig):
             dir=str(run_dir)
         )
 
-    # Create parallel context for data parallelism
-    ctx = ParallelContext.create(batch_size=cfg.batch_size)
+    # Parallelism
+    devices = jax.devices()
+    device_count = len(devices)
+    mesh, data_sharding = create_data_model_parallel(device_count, 1)
 
-    # Load frozen tokenizer
-    rng = jax.random.PRNGKey(0)
-    
-    # Load pretrained tokenizer
-    tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, ctx)
-    
-    # Get tokenizer config for dynamics initialization
-    tokenizer_cfg = tokenizer.config
-
-    # Initialize dynamics
-    rng, dynamics = init_dynamics(rng, cfg.dynamics, tokenizer_cfg)
-
-    param_counts = count_parameters_by_component(dynamics)
-    print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
-
-    # Optimizer
-    if cfg.lr_schedule == "constant":
-        lr = cfg.lr
-        lr_schedule = None
-    else:
-        lr_schedule = get_lr_schedule(
-            cfg.lr_schedule,
-            cfg.init_lr,
-            cfg.max_lr,
-            cfg.lr_end,
-            cfg.max_steps,
-            cfg.warmup_steps,
-            cfg.wsd_decay_steps,
-        )
-        lr = lr_schedule
-    
-    tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
-    optimizer = nnx.Optimizer(dynamics, tx, wrt=nnx.Param)
-
-    # Create JIT-compiled training step with static args bound
-    encode_and_train_step = make_encode_and_train_step(
-        k_max=cfg.dynamics.k_max,
-        B_self=0,  # Will be set dynamically based on step
-        packing_factor=cfg.dynamics.packing_factor
+    mesh_rules = MeshRules(
+        embed=None,
+        mlp='model',
+        attn='model',
+        data='data',
     )
 
-    # Logging & checkpointing
-    logger = MetricLogger(
-        use_wandb=cfg.use_wandb, 
-        log_every=cfg.log_every, 
-        max_steps=cfg.max_steps, 
-        wandb_obj=wandb
-    )
-    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
+    with jax.set_mesh(mesh):
+        key = jax.random.PRNGKey(0)
+        rng, init_key = jax.random.split(key)
+    
+        # Load pretrained tokenizer
+        tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules, mesh=mesh)
+        tokenizer_cfg = tokenizer.config
 
-    # For checkpointing dynamics
-    opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
+        # Initialize dynamics
+        dynamics_factory = lambda: Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        dynamics = dynamics_factory()
+        param_counts = count_parameters_by_component(dynamics)
+        print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
 
-    # Pass dynamics directly to make_state - it will handle the splitting
-    state_example = make_state(dynamics, opt_state, rng, step=0)
-    meta = {"cfg": asdict(cfg)}
-
-    restored = try_restore(mngr, state_example, ctx, meta)
-    start_step = 0
-    if restored is not None:
-        # Restored state is already sharded/replicated on GPUs via ctx
-        latest_step, r = restored
-        nnx.update(dynamics, r.state["params"])
-        nnx.update(optimizer.opt_state, r.state["opt_state"])
-        rng = r.state["rng"]
-        start_step = int(r.state["step"])
-        # Preserve runtime flags before restoring checkpoint config
-        use_wandb_override = cfg.use_wandb
-        cfg.use_wandb = use_wandb_override  # Keep CLI/YAML wandb setting
-        print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
-    else:
-        # No checkpoint - replicate initial state to GPUs
-        dynamics = ctx.replicate(dynamics)
-        print("[parallel] Replicated initial state to GPUs")
-
-    dataset = make_iterator(tokenizer_cfg.dataset)
-    pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
-    for step, batch in pbar:
-        if step > cfg.max_steps:
-            break
+        # Optimizer
+        if cfg.lr_schedule == "constant":
+            lr = cfg.lr
+            lr_schedule = None
+        else:
+            lr_schedule = get_lr_schedule(
+                cfg.lr_schedule,
+                cfg.init_lr,
+                cfg.max_lr,
+                cfg.lr_end,
+                cfg.max_steps,
+                cfg.warmup_steps,
+                cfg.wsd_decay_steps,
+            )
+            lr = lr_schedule
         
-        # Shard batch data
-        rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
-        videos = ctx.shard_data(batch["videos"])
-        actions = ctx.shard_data(batch["actions"])
-        
-        # Pass a replicated scalar key; JAX automatically shards the RNG generation based on the sharded data layout (SPMD), ensuring determinism independent of device count.
-        # Ref: https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html#computation-follows-data-sharding-and-is-automatically-parallelized
-        tokenizer_key = ctx.replicate(tokenizer_key)
-        master_key = ctx.replicate(master_key)
-
-        # Compute B_self based on step (bootstrap activates after bootstrap_start)
-        B_self = (videos.shape[0] // 2) * int(step >= cfg.bootstrap_start)
-
-        # Recreate the step function with updated B_self
-        encode_and_train_step = make_encode_and_train_step(
-            k_max=cfg.dynamics.k_max,
-            B_self=B_self,
-            packing_factor=cfg.dynamics.packing_factor
+        tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
+        optimizer_factory = lambda: nnx.Optimizer(dynamics_factory(), tx, wrt=nnx.Param)
+        optimizer = optimizer_factory()
+        # Logging & checkpointing
+        logger = MetricLogger(
+            use_wandb=cfg.use_wandb, 
+            log_every=cfg.log_every, 
+            max_steps=cfg.max_steps, 
+            wandb_obj=wandb
         )
 
-        # Combined encoding + training step (both phases parallelized)
-        aux = encode_and_train_step(
-            tokenizer, dynamics, optimizer,
-            videos, actions,
-            tokenizer_key=tokenizer_key,
-            master_key=master_key,
-            step=step
-        )
+        meta = {"cfg": asdict(cfg)}
 
-        # Logging
-        if logger.should_log(step):
-            metrics_cpu = ctx.to_host_scalar(aux)
-            logger.log(
-                step,
-                metrics={
-                    "flow_mse": metrics_cpu["flow_mse"],
-                    "boot_mse": metrics_cpu["bootstrap_mse"],
-                    "lr": cfg.lr if lr_schedule is None else lr_schedule(step),
-                },
-                pbar=pbar,
-            )
 
-        # Save sharded arrays directly (Orbax handles distributed write efficiently)
-        opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
-        ckpt_state = make_state(dynamics, opt_state, rng, step)
-        maybe_save(mngr, step, ckpt_state, meta)
+        with make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every) as mngr:
+            restored = try_restore(mngr, dynamics_factory, optimizer_factory, mesh, rng)
+            start_step = 0
+            if restored is not None:
+                latest_step, r = restored
+                nnx.update(dynamics, r.model_state)
+                nnx.update(optimizer, r.optimizer_state)
+                rng = r.rng_state
+                start_step = int(latest_step)
+                cfg = from_dict(DynamicsConfig, r.meta["cfg"])
+                print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
 
-        # Periodic lightweight AR eval
-        if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
-            # Use subset of batch for visualization (move to host)
-            val_videos = jax.device_get(batch["videos"][:4])
-            val_actions = jax.device_get(batch["actions"][:4])
+            dataset = make_iterator(cfg.dataset)
 
-            run_evaluation(
-                cfg, tokenizer_cfg, step, tokenizer, dynamics,
-                val_videos, jnp.asarray(val_actions), vis_dir, rng
-            )
+            # cfg.max_steps + 1 to make sure we log and checkpoint at max_steps
+            pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps + 1)
+            for step, batch in pbar:
+                if step > cfg.max_steps:
+                    break
+                
+                # Shard batch data
+                rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
+                videos = jax.device_put(batch["videos"], data_sharding)
+                actions = jax.device_put(batch["actions"], data_sharding)
+
+                # Training step
+                aux = encode_and_train_step(
+                    tokenizer, dynamics, optimizer,
+                    videos, actions,
+                    tokenizer_key=tokenizer_key,
+                    master_key=master_key,
+                    step=step,
+                    packing_factor=cfg.dynamics.packing_factor,
+                    B_self=cfg.dataset.B//2,
+                    k_max=cfg.dynamics.k_max,
+                )
+
+                # Logging
+                if logger.should_log(step):
+                    metrics_cpu = jax.device_get(aux)
+                    logger.log(
+                        step,
+                        metrics={
+                            "flow_mse": metrics_cpu["flow_mse"],
+                            "boot_mse": metrics_cpu["bootstrap_mse"],
+                            "lr": cfg.lr if lr_schedule is None else lr_schedule(step),
+                        },
+                        pbar=pbar,
+                    )
+
+                # Save sharded arrays directly (Orbax handles distributed write efficiently)
+                maybe_save(mngr, step, dynamics, optimizer, rng, meta)
+
+                # Periodic lightweight AR eval
+                if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
+                    # Use subset of batch for visualization
+                    val_videos = batch["videos"][:4]
+                    val_actions = batch["actions"][:4]
+
+                    run_evaluation(
+                        cfg, tokenizer_cfg, step, tokenizer, dynamics,
+                        val_videos, jnp.asarray(val_actions), vis_dir, rng
+                    )
+            
+            mngr.wait_until_finished()
 
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:

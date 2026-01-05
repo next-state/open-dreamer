@@ -1,73 +1,50 @@
-from dataclasses import dataclass
-from typing import Any
 import jax
+import math
+from dataclasses import dataclass
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
-PyTree = Any # Type alias for PyTree
+@dataclass(unsafe_hash=True)
+class MeshRules:
+  embed: str | None = None
+  mlp: str | None = None
+  attn: str | None = None
+  data: str | None = None
 
-@dataclass
-class ParallelContext:
-    """
-    Manages mesh, sharding, and device placement for data parallelism.
-    """
-    mesh: Mesh
-    data_sharding: NamedSharding
-    replicated_sharding: NamedSharding
-    device_count: int
+  def __call__(self, *keys: str) -> tuple[str, ...]:
+    return tuple(getattr(self, key) for key in keys)
 
-    @classmethod
-    def create(cls, batch_size: int) -> "ParallelContext":
-        devices = jax.devices()
-        device_count = len(devices)
-        
-        if batch_size % device_count != 0:
-            raise ValueError(
-                f"Batch size ({batch_size}) must be divisible by "
-                f"device count ({device_count}) for data parallelism."
-            )
-        
-        # Create device mesh
-        mesh = Mesh(devices, axis_names=('data',))
-        
-        # Define sharding strategies
-        data_sharding = NamedSharding(mesh, P('data', None))
-        replicated_sharding = NamedSharding(mesh, P())
-        
-        ctx = cls(
-            mesh=mesh,
-            data_sharding=data_sharding,
-            replicated_sharding=replicated_sharding,
-            device_count=device_count,
-        )
-        
-        print(f"[parallel] Created context with {device_count} devices")
-        print(f"[parallel] Global batch size: {batch_size}")
-        print(f"[parallel] Per-device batch size: {batch_size // device_count}")
-        print(f"[parallel] Devices: {devices}")
-        
-        return ctx
-    
-    def shard_data(self, tree: PyTree) -> PyTree:
-        """Shard data along the batch dimension (Axis 0)."""
-        return jax.tree.map(
-            lambda x: jax.device_put(x, self.data_sharding), 
-            tree
-        )
 
-    def replicate(self, tree: PyTree) -> PyTree:
-        """Replicate scalars/params to all devices."""
-        return jax.tree.map(
-            lambda x: jax.device_put(x, self.replicated_sharding),
-            tree
+# mesh_rules = MeshRules(
+#   embed=None,  # Replicated
+#   mlp='model',  # Model-parallel
+#   attn='model',  # Model-parallel
+#   data='data',  # Data-parallel
+# )
+
+
+def create_data_model_parallel(
+    data_shards: int = 1,
+    model_shards: int = 1
+) -> tuple[Mesh, NamedSharding]:
+    """Creates a data-model parallel mesh and data sharding."""
+    devices = jax.devices()
+    device_count = len(devices)
+
+    axis_shapes = (data_shards, model_shards)
+    axis_names = ('data', 'model')
+
+    prod_axis_shapes = math.prod(axis_shapes)
+    if device_count != prod_axis_shapes:
+        raise ValueError(
+            f"Device count ({device_count}) does not match the product of "
+            f"axis shapes ({prod_axis_shapes})."
         )
     
-    def to_host_scalar(self, tree: PyTree) -> PyTree:
-        """
-        Convert metrics/scalars from device to host, converting to Python scalars.
-        """
-        def _to_scalar(x):
-            if isinstance(x, jax.Array):
-                return x.item() if x.ndim == 0 else jax.device_get(x)
-            return x
-        return jax.tree.map(_to_scalar, tree)
+    mesh = jax.make_mesh(axis_shapes, axis_names)
+    data_sharding = NamedSharding(mesh, P('data', None))
+
+    print(f"[parallel] Devices ({device_count}): {devices}")
+    print(f"[parallel] Mesh axis shapes: {axis_shapes}, axis names: {axis_names}")
+    
+    return mesh, data_sharding

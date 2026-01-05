@@ -23,14 +23,12 @@ from dreamer.training import compute_psnr
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Tokenizer
-from dreamer.parallel import ParallelContext
+from dreamer.parallel import create_data_model_parallel, MeshRules
 from dreamer.utils import (
-    make_state,
     make_manager,
     try_restore,
     maybe_save,
     normalize_with_dataset_stats,
-    init_tokenizer,
     from_dict,
     get_lr_schedule,
     count_parameters_by_component,
@@ -85,13 +83,12 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
 # ------------------------
 
 @nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"))
-def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, step, 
+def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, dropout_key, step, 
                lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
-    # Split keys for MAE and dropout
-    mae_key, drop_key = jax.random.split(mae_key)
 
     def loss_fn(model: Tokenizer):
-        rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
+        # Create RNG inside the loss function to avoid trace level issues with grad
+        rngs = nnx.Rngs(mae=mae_key, dropout=dropout_key)
         pred, (mae_mask, keep_prob) = model(videos, deterministic=False, rngs=rngs)
 
         # For MSE: use standardized values (matches old gradient dynamics)
@@ -161,6 +158,7 @@ def viz_step(model: Tokenizer, videos, rng, step, run_dir, use_wandb=False):
     mae_key, drop_key = jax.random.split(rng)
 
     grid = viz_step_jit(model, videos[:8,:1], mae_key=mae_key, drop_key=drop_key)
+    grid = jax.device_get(grid)
 
     out = run_dir / "viz"
     out.mkdir(exist_ok=True, parents=True)
@@ -186,136 +184,127 @@ def run(cfg: TokenizerConfig):
             dir=str(run_dir),
         )
 
-    # Create parallel context for data parallelism
-    ctx = ParallelContext.create(batch_size=cfg.dataset.B)
+    # Parallelism
+    devices = jax.devices()
+    device_count = len(devices)
+    mesh, data_sharding = create_data_model_parallel(device_count, 1)
+    mesh_rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
 
-    rng = jax.random.PRNGKey(0)
-    dataset = make_iterator(cfg.dataset)
+    with jax.set_mesh(mesh):
+        # Create the model
+        key = jax.random.key(0)
+        rng, init_key = jax.random.split(key)
+        tokenizer_factory = lambda: Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        tokenizer = tokenizer_factory()
 
-    rng, tokenizer = init_tokenizer(rng, cfg)
-    param_counts = count_parameters_by_component(tokenizer)
-    print(f"Parameter counts: {param_counts}")
+        param_counts = count_parameters_by_component(tokenizer)
+        print(f"Parameter counts: {param_counts}")
 
-    # Learning rate schedule
-    if cfg.lr_schedule == "constant":
-        lr = cfg.lr
-        lr_schedule = None
-    else:
-        lr_schedule = get_lr_schedule(
-            cfg.lr_schedule,
-            cfg.init_lr,
-            cfg.max_lr,
-            cfg.lr_end,
-            cfg.max_steps,
-            cfg.warmup_steps,
-            cfg.wsd_decay_steps,
-        )
-        lr = lr_schedule
-    
-    tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
-    optimizer = nnx.Optimizer(tokenizer, tx, wrt=nnx.Param)
-
-    # ---------- Checkpointing ----------
-    ckpt_dir = run_dir / "checkpoints"
-    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
-
-    opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
-    
-    # Pass tokenizer directly to make_state - it will handle the splitting
-    state_example = make_state(tokenizer, opt_state, rng, step=0)
-    meta = {"cfg": asdict(cfg)}
-
-    restored = try_restore(mngr, state_example, ctx, meta)
-    start_step = 0
-    if restored is not None:
-        # Restored state is already sharded/replicated on GPUs via ctx
-        latest_step, r = restored
-        # Update model and optimizer with restored state
-        nnx.update(tokenizer, r.state["params"])
-        nnx.update(optimizer.opt_state, r.state["opt_state"])
-        rng = r.state["rng"]
-        start_step = int(r.state["step"])
-        cfg = from_dict(TokenizerConfig, r.meta["cfg"])
-        print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
-    else:
-        # No checkpoint - replicate initial state to GPUs
-        tokenizer = ctx.replicate(tokenizer)
-        print("[parallel] Replicated initial state to GPUs")
-
-    # ---------- Train loop ----------
-    logger = MetricLogger(
-        use_wandb=cfg.use_wandb,
-        log_every=cfg.log_every,
-        max_steps=cfg.max_steps,
-        wandb_obj=wandb,
-    )
-
-    pbar = tqdm(enumerate(dataset, start = start_step), total=cfg.max_steps)
-    for step, batch in pbar:
-        if step < start_step:
-            continue
-        if step >= cfg.max_steps:
-            break
-
-        rng, master_key = jax.random.split(rng)
-
-        # Pass a replicated scalar key; JAX automatically shards the RNG generation based on the sharded data layout (SPMD), ensuring determinism independent of device count.
-        # Ref: https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html#computation-follows-data-sharding-and-is-automatically-parallelized
-        master_key = ctx.replicate(master_key)
+        # Learning rate schedule
+        if cfg.lr_schedule == "constant":
+            lr = cfg.lr
+            lr_schedule = None
+        else:
+            lr_schedule = get_lr_schedule(cfg.lr_schedule, cfg.init_lr, cfg.max_lr, cfg.lr_end, cfg.max_steps, cfg.warmup_steps, cfg.wsd_decay_steps)
+            lr = lr_schedule
         
-        # Shard batch data
-        videos = ctx.shard_data(batch["videos"])
-        
-        aux = train_step(
-            tokenizer, optimizer, videos,
-            mae_key=master_key, step=step,
-            lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
-            dataset_mean=tuple(cfg.dataset.dataset_mean), 
-            dataset_std=tuple(cfg.dataset.dataset_std), 
-            log_gradients=cfg.log_gradients, 
-            tokenizer_loss_type=cfg.tokenizer_loss_type
-        )
+        tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
+        optimizer_factory = lambda: nnx.Optimizer(tokenizer_factory(), tx, wrt=nnx.Param)
+        optimizer = optimizer_factory()
 
-        if logger.should_log(step):
-            metrics_cpu = ctx.to_host_scalar(aux)
-            if lr_schedule is None:
-                lr_value = cfg.lr
-            else:
-                lr_value = lr_schedule(step)
-            mse = metrics_cpu["loss_mse"]
-            psnr = metrics_cpu["psnr"]
-            logger.log(
-                step,
-                {
-                    "loss": metrics_cpu["loss_total"],
-                    "mse": mse,
-                    "rmse": float(jnp.sqrt(mse)),
-                    "lpips": metrics_cpu["loss_lpips"],
-                    "psnr": psnr,
-                    "lr": lr_value,
-                    **({} if not cfg.log_gradients else {
-                        "grad/global_norm": metrics_cpu["grad/global_norm"],
-                        "grad/encoder_norm": metrics_cpu["grad/encoder_norm"],
-                        "grad/decoder_norm": metrics_cpu["grad/decoder_norm"],
-                        "grad/encoder_std_mean": metrics_cpu["grad/encoder_std_mean"],
-                        "grad/decoder_std_mean": metrics_cpu["grad/decoder_std_mean"],
-                    }),
-                },
-                pbar=pbar,
-                pbar_filter=r"^(loss|mse|lpips|psnr|lr)$",
+        # ---------- Checkpointing ----------
+        ckpt_dir = run_dir / "checkpoints"
+        meta = {"cfg": asdict(cfg)}
+        
+        # Create state factory for abstract restoration
+        # This must create abstract shapes without capturing concrete arrays
+
+        with make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every) as mngr:
+            restored = try_restore(mngr, tokenizer_factory, optimizer_factory, mesh, rng)
+            start_step = 0
+            if restored is not None:
+                latest_step, r = restored
+                nnx.update(tokenizer, r.model_state)
+                nnx.update(optimizer, r.optimizer_state)
+                rng = r.rng_state
+                start_step = int(latest_step)
+                cfg = from_dict(TokenizerConfig, r.meta["cfg"])
+                print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
+
+            # ---------- Train loop ----------
+            logger = MetricLogger(
+                use_wandb=cfg.use_wandb,
+                log_every=cfg.log_every,
+                max_steps=cfg.max_steps,
+                wandb_obj=wandb,
             )
-        
-        # Save sharded arrays
-        opt_graphdef, opt_state = nnx.split(optimizer.opt_state)
-        ckpt_state = make_state(tokenizer, opt_state, rng, step)
-        maybe_save(mngr, step, ckpt_state, meta)
 
-        if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
-            # Move a subset to host for visualization
-            viz_videos = jax.device_get(batch["videos"][:8])
-            viz_step(tokenizer, viz_videos, rng, step, run_dir, use_wandb=cfg.use_wandb)
+            dataset = make_iterator(cfg.dataset)
 
-    mngr.wait_until_finished()
+            # cfg.max_steps + 1 to make sure we log and checkpoint at max_steps
+            pbar = tqdm(enumerate(dataset, start = start_step), total=cfg.max_steps + 1)
+            
+            for step, batch in pbar:
+                if step < start_step:
+                    continue
+                if step >= cfg.max_steps:
+                    break
+
+                # Create fresh RNG state for this step by folding in step number
+                step_rng = jax.random.fold_in(rng, step)
+                mae_key, dropout_key = jax.random.split(step_rng)
+                
+                # Shard batch data
+                videos = jax.device_put(batch["videos"], data_sharding)
+                
+                aux = train_step(
+                    tokenizer, optimizer, videos,
+                    mae_key=mae_key, dropout_key=dropout_key, step=step,
+                    lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
+                    dataset_mean=tuple(cfg.dataset.dataset_mean), 
+                    dataset_std=tuple(cfg.dataset.dataset_std), 
+                    log_gradients=cfg.log_gradients, 
+                    tokenizer_loss_type=cfg.tokenizer_loss_type
+                )
+
+                if logger.should_log(step):
+                    metrics_cpu = jax.device_get(aux)
+                    if lr_schedule is None:
+                        lr_value = cfg.lr
+                    else:
+                        lr_value = lr_schedule(step)
+                    mse = metrics_cpu["loss_mse"]
+                    psnr = metrics_cpu["psnr"]
+                    logger.log(
+                        step,
+                        {
+                            "loss": metrics_cpu["loss_total"],
+                            "mse": mse,
+                            "rmse": float(jnp.sqrt(mse)),
+                            "lpips": metrics_cpu["loss_lpips"],
+                            "psnr": psnr,
+                            "lr": lr_value,
+                            **({} if not cfg.log_gradients else {
+                                "grad/global_norm": metrics_cpu["grad/global_norm"],
+                                "grad/encoder_norm": metrics_cpu["grad/encoder_norm"],
+                                "grad/decoder_norm": metrics_cpu["grad/decoder_norm"],
+                                "grad/encoder_std_mean": metrics_cpu["grad/encoder_std_mean"],
+                                "grad/decoder_std_mean": metrics_cpu["grad/decoder_std_mean"],
+                            }),
+                        },
+                        pbar=pbar,
+                        pbar_filter=r"^(loss|mse|lpips|psnr|lr)$",
+                    )
+                
+                # Save checkpoint state
+                maybe_save(mngr, step, tokenizer, optimizer, rng, meta)
+
+                if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
+                    # Move a subset to host for visualization
+                    viz_videos = batch["videos"][:8]
+                    viz_step(tokenizer, viz_videos, step_rng, step, run_dir, use_wandb=cfg.use_wandb)
+            
+            mngr.wait_until_finished()
 
     if cfg.use_wandb and wandb.run is not None:
         wandb.finish()
