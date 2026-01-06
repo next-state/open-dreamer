@@ -6,17 +6,17 @@ from typing import Optional, Tuple, Any, Dict
 from einops import rearrange, repeat
 from dataclasses import asdict
 import math
-from jax.sharding import Mesh
+from pathlib import Path
 import orbax.checkpoint as ocp
 from .utils import (
-    Modality, TokenLayout, 
-    normalize_with_dataset_stats, 
-    unnormalize_with_dataset_stats, to_jnp_dtype,
-    try_restore
+    Modality, TokenLayout,
+    normalize_with_dataset_stats,
+    unnormalize_with_dataset_stats,
+    to_jnp_dtype,
+    from_dict
 )
 from .data import patchify, unpatchify
 from .configs import TokenizerConfig, DynamicsModelConfig, DynamicsConfig
-from .utils import make_manager, from_dict, recursive_list_to_tuple
 from .parallel import MeshRules
 
 
@@ -744,29 +744,35 @@ class Tokenizer(nnx.Module):
         )
 
     @classmethod
-    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, mesh: Mesh) -> "Tokenizer":        
-        # Load metadata to get config
-        with make_manager(checkpoint_path) as mngr:
-            latest = mngr.latest_step()
-            if latest is None:
-                raise ValueError(f"No checkpoint found in {checkpoint_path}")
-            
-            # First, restore only metadata to get config
-            meta_restore_args = ocp.args.Composite(meta=ocp.args.JsonRestore())
-            meta_restored = mngr.restore(latest, args=meta_restore_args)
-            config = from_dict(TokenizerConfig, meta_restored.meta["cfg"])
-            
-            # Create model factory with the correct config
-            model_factory = lambda: cls(config, mesh_rules=mesh_rules, rngs=nnx.Rngs(0))
-            graphdef, abs_state = nnx.get_abstract_model(model_factory, mesh)
-            
-            # Now restore only the model state
-            model_restore_args = ocp.args.Composite(
-                model_state=ocp.args.StandardRestore(abs_state)
-            )
-            model_restored = mngr.restore(latest, args=model_restore_args)
+    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: Optional[nnx.Rngs] = None) -> "Tokenizer":   
+        if rngs is None:
+            rngs = nnx.Rngs(0)
         
-        return nnx.merge(graphdef, model_restored.model_state)
+        checkpoint_path = str(Path(checkpoint_path).resolve())
+        with ocp.CheckpointManager(checkpoint_path) as checkpoint_manager:
+            step = checkpoint_manager.latest_step()
+            if step is None:
+                raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
+
+            # Load metadata to get config
+            meta_restore_args = ocp.args.Composite(
+                meta=ocp.args.JsonRestore(),  # type: ignore
+            )
+            meta_restored = checkpoint_manager.restore(step, args=meta_restore_args)
+            cfg = from_dict(TokenizerConfig, meta_restored["meta"]["cfg"])
+
+            # Initialize model with config
+            model = cls(cfg, mesh_rules=mesh_rules, rngs=rngs)
+
+            # Now restore only the model state
+            model_state = nnx.state(model)
+            model_restore_args = ocp.args.Composite(
+                model_state=ocp.args.StandardRestore(model_state)  # type: ignore
+            )
+            restored = checkpoint_manager.restore(step, args=model_restore_args)
+            nnx.update(model, restored['model_state'])
+
+        return model
 
 # ============================================================================
 # Dynamics
@@ -954,49 +960,47 @@ class Dynamics(nnx.Module):
         return x1_hat, (h_t, new_caches)
 
     @classmethod
-    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, mesh: Mesh) -> Tuple["Dynamics", "Tokenizer"]:
+    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: Optional[nnx.Rngs] = None) -> Tuple["Dynamics", "Tokenizer"]:
         """
         Load a pretrained Dynamics model and its associated Tokenizer from checkpoint.
-        
+
         Args:
             checkpoint_path: Path to dynamics checkpoint directory
             mesh_rules: MeshRules for sharding strategy
-            mesh: JAX mesh for sharding
-            
+            rngs: Optional RNG state (defaults to Rngs(0))
+
         Returns:
             Tuple of (dynamics_model, tokenizer_model)
         """
-        # Load metadata to get config
-        with make_manager(checkpoint_path) as mngr:
-            latest = mngr.latest_step()
-            if latest is None:
-                raise ValueError(f"No checkpoint found in {checkpoint_path}")
-            
-            # First, restore only metadata to get config
-            meta_restore_args = ocp.args.Composite(meta=ocp.args.JsonRestore())
-            meta_restored = mngr.restore(latest, args=meta_restore_args)
-            cfg_dict = meta_restored.meta["cfg"]
-            cfg_dict = recursive_list_to_tuple(cfg_dict)
-            
-            # Extract dynamics config
-            full_cfg = from_dict(DynamicsConfig, cfg_dict)
+        if rngs is None:
+            rngs = nnx.Rngs(0)
+
+        checkpoint_path = str(Path(checkpoint_path).resolve())
+        with ocp.CheckpointManager(checkpoint_path) as checkpoint_manager:
+            step = checkpoint_manager.latest_step()
+            if step is None:
+                raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
+
+            # Load metadata to get config
+            meta_restore_args = ocp.args.Composite(
+                meta=ocp.args.JsonRestore()  # type: ignore
+            )
+            meta_restored = checkpoint_manager.restore(step, args=meta_restore_args)
+            full_cfg = from_dict(DynamicsConfig, meta_restored["meta"]["cfg"])
             dyn_model_cfg = full_cfg.dynamics
-            
-            # Load the tokenizer first (dynamics was trained with a pretrained tokenizer)
-            print(f"[Dynamics] Loading tokenizer from {full_cfg.tokenizer_ckpt}")
-            tokenizer = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt, mesh_rules=mesh_rules, mesh=mesh)
-            
-            # Create model factory with the correct config
-            model_factory = lambda: cls(dyn_model_cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(0))
-            graphdef, abs_state = nnx.get_abstract_model(model_factory, mesh)
-            
-            # Now restore only the model state
-            model_restore_args = ocp.args.Composite(model_state=ocp.args.StandardRestore(abs_state))
-            model_restored = mngr.restore(latest, args=model_restore_args)
-            
-            dynamics = nnx.merge(graphdef, model_restored.model_state)
-            print(f"[Dynamics] Loaded checkpoint from step {latest}")
-        
+
+            # Load tokenizer
+            tokenizer = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt, mesh_rules=mesh_rules, rngs=rngs)
+
+            # Create and restore dynamics model states
+            dynamics = cls(dyn_model_cfg, mesh_rules=mesh_rules, rngs=rngs)
+            dynamics_state = nnx.state(dynamics)
+            model_restore_args = ocp.args.Composite(
+                model_state=ocp.args.StandardRestore(dynamics_state),  # type: ignore
+            )
+            restored = checkpoint_manager.restore(step, args=model_restore_args)
+            nnx.update(dynamics, restored['model_state'])
+
         return dynamics, tokenizer
 
 class TaskEmbedder(nnx.Module):

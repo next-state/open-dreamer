@@ -25,11 +25,10 @@ from dreamer.logging import MetricLogger
 from dreamer.models import Tokenizer
 from dreamer.parallel import create_data_model_parallel, MeshRules
 from dreamer.utils import (
-    make_manager,
+    build_checkpoint_manager,
     try_restore,
     maybe_save,
     normalize_with_dataset_stats,
-    from_dict,
     get_lr_schedule,
     count_parameters_by_component,
 )
@@ -172,9 +171,13 @@ def viz_step(model: Tokenizer, videos, rng, step, run_dir, use_wandb=False):
 # ------------------------
 
 def run(cfg: TokenizerConfig):
+    # Setup
     run_dir = Path(HydraConfig.get().runtime.output_dir)
-    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+    ckpt_dir = run_dir / "checkpoints"
+    meta = {"cfg": asdict(cfg)}
+    print(f"[setup] output dir: {run_dir.resolve()}")
 
+    # Logging
     if cfg.use_wandb:
         wandb.init(
             entity=cfg.wandb_entity,
@@ -183,6 +186,12 @@ def run(cfg: TokenizerConfig):
             config=asdict(cfg),
             dir=str(run_dir),
         )
+    logger = MetricLogger(
+        use_wandb=cfg.use_wandb,
+        log_every=cfg.log_every,
+        max_steps=cfg.max_steps,
+        wandb_obj=wandb,
+    )
 
     # Parallelism
     devices = jax.devices()
@@ -191,12 +200,11 @@ def run(cfg: TokenizerConfig):
     mesh_rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
 
     with jax.set_mesh(mesh):
-        # Create the model
         key = jax.random.key(0)
         rng, init_key = jax.random.split(key)
-        tokenizer_factory = lambda: Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
-        tokenizer = tokenizer_factory()
 
+        # Initialize tokenizer
+        tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(tokenizer)
         print(f"Parameter counts: {param_counts}")
 
@@ -208,45 +216,23 @@ def run(cfg: TokenizerConfig):
             lr_schedule = get_lr_schedule(cfg.lr_schedule, cfg.init_lr, cfg.max_lr, cfg.lr_end, cfg.max_steps, cfg.warmup_steps, cfg.wsd_decay_steps)
             lr = lr_schedule
         
+        # Optimizer
         tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
-        optimizer_factory = lambda: nnx.Optimizer(tokenizer_factory(), tx, wrt=nnx.Param)
-        optimizer = optimizer_factory()
+        optimizer = nnx.Optimizer(tokenizer, tx, wrt=nnx.Param)
 
-        # ---------- Checkpointing ----------
-        ckpt_dir = run_dir / "checkpoints"
-        meta = {"cfg": asdict(cfg)}
-        
-        # Create state factory for abstract restoration
-        # This must create abstract shapes without capturing concrete arrays
+        # Data iterator
+        train_dataloader = make_iterator(cfg.dataset)
+        train_iterator = iter(train_dataloader)  # type: ignore
 
-        with make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every) as mngr:
-            restored = try_restore(mngr, tokenizer_factory, optimizer_factory, mesh, rng)
-            start_step = 0
-            if restored is not None:
-                latest_step, r = restored
-                nnx.update(tokenizer, r.model_state)
-                nnx.update(optimizer, r.optimizer_state)
-                rng = r.rng_state
-                start_step = int(latest_step)
-                cfg = from_dict(TokenizerConfig, r.meta["cfg"])
-                print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
-
-            # ---------- Train loop ----------
-            logger = MetricLogger(
-                use_wandb=cfg.use_wandb,
-                log_every=cfg.log_every,
-                max_steps=cfg.max_steps,
-                wandb_obj=wandb,
+        with build_checkpoint_manager(ckpt_dir, cfg.ckpt_max_to_keep, cfg.ckpt_save_every, cfg.max_steps) as checkpoint_manager:
+            # Resume from checkpoint
+            start_step, tokenizer, optimizer, train_iterator, rng = try_restore(
+                checkpoint_manager, tokenizer, optimizer, train_iterator, rng
             )
 
-            dataset = make_iterator(cfg.dataset)
-
-            # cfg.max_steps + 1 to make sure we log and checkpoint at max_steps
-            pbar = tqdm(enumerate(dataset, start = start_step), total=cfg.max_steps + 1)
-            
+            # Training loop
+            pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step,total=cfg.max_steps)
             for step, batch in pbar:
-                if step < start_step:
-                    continue
                 if step >= cfg.max_steps:
                     break
 
@@ -296,15 +282,13 @@ def run(cfg: TokenizerConfig):
                         pbar_filter=r"^(loss|mse|lpips|psnr|lr)$",
                     )
                 
-                # Save checkpoint state
-                maybe_save(mngr, step, tokenizer, optimizer, rng, meta)
+                # Checkpointing
+                maybe_save(checkpoint_manager, step, tokenizer, optimizer, train_iterator, rng, meta)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
                     viz_step(tokenizer, viz_videos, step_rng, step, run_dir, use_wandb=cfg.use_wandb)
-            
-            mngr.wait_until_finished()
 
     if cfg.use_wandb and wandb.run is not None:
         wandb.finish()

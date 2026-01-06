@@ -5,12 +5,12 @@ from dreamer.data import patchify, unpatchify
 import orbax.checkpoint as ocp
 from pathlib import Path
 import optax
+import grain
 import operator
 from einops import rearrange
 from enum import IntEnum
-from typing import Tuple
+from typing import Tuple, TypeVar, cast
 import numpy as np
-
 
 
 # --- dtype helpers ---
@@ -216,65 +216,87 @@ def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
 # Checkpointing Utilities
 # ============================================================================
 
-def make_manager(ckpt_dir: str | Path, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("model_state", "optimizer_state", "rng_state", "meta")):
-    path = Path(ckpt_dir).expanduser().resolve()
-    path.mkdir(parents=True, exist_ok=True)
-    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, save_interval_steps=save_interval_steps)
-    # item_names gives nice attribute access on restore: restored.model_state, restored.optimizer_state, etc.
-    mngr = ocp.CheckpointManager(path, options=options, item_names=item_names)
-    return mngr
+def build_checkpoint_manager(
+        ckpt_dir: Path,
+        max_to_keep: int,
+        save_interval_steps: int,
+        max_steps: int,
+        item_names=("model_state", "optimizer_state", "train_dataloader_state", "rngs", "meta"),
+    ) -> ocp.CheckpointManager:
+
+    checkpoint_options = ocp.CheckpointManagerOptions(
+        max_to_keep=max_to_keep,
+        save_interval_steps=save_interval_steps,
+        save_on_steps=[max_steps - 1],  # always save at the end
+    )
+
+    # TODO: check if Checkpointer can manage grain.Dataloader itself without an explicit ocp.handlers.DefaultCheckpointHandlerRegistry
+    # handler_registry and item_names are mutually exclusive
+
+    return ocp.CheckpointManager(ckpt_dir, options=checkpoint_options, item_names=item_names)
 
 
-def try_restore(mngr: ocp.CheckpointManager, model_factory, optimizer_factory, mesh, rng):
-    """
-    Restore checkpoint using abstract shapes for safe restoration.
-    
-    Args:
-        mngr: Orbax CheckpointManager instance
-        model_factory: Callable that returns a model instance
-        optimizer_factory: Callable that returns an optimizer instance
-        mesh: JAX mesh to use for sharding
-        rng: RNG state to use for restoration structure
+ModelT = TypeVar('ModelT', bound=nnx.Module)
+
+
+def try_restore(
+        checkpoint_manager: ocp.CheckpointManager,
+        model: ModelT,
+        optimizer: nnx.Optimizer,
+        train_iterator: grain.DataLoaderIterator,
+        rngs: jax.Array,
+    ) -> tuple[
+        int, ModelT, nnx.Optimizer, grain.DataLoaderIterator, jax.Array
+    ]:
+
+    step = checkpoint_manager.latest_step()
+    if step is None:
+        print("No checkpoint found, starting from scratch.")
+        return 0, model, optimizer, train_iterator, rngs
         
-    Returns:
-        Tuple of (latest_step, restored) if checkpoint exists, None otherwise
-        restored is a namespace with .model, .optimizer, .rng, and .meta attributes
-    """
-    latest = mngr.latest_step()
-    if latest is None:
-        return None
+    model_state = nnx.state(model)
+    optimizer_state = nnx.state(optimizer)
     
-    # cfg = ocp.args.Composite(meta=ocp.args.JsonRestore()).meta["cfg"]
-    
-    model_graphdef, model_abs_state = nnx.get_abstract_model(model_factory, mesh)
-    optimizer_graphdef, optimizer_abs_state = nnx.get_abstract_model(optimizer_factory, mesh)
-    
-    # Always try to restore metadata if it exists in the checkpoint
     restore_args = ocp.args.Composite(
-        model_state=ocp.args.StandardRestore(model_abs_state),
-        optimizer_state=ocp.args.StandardRestore(optimizer_abs_state),
-        rng_state=ocp.args.ArrayRestore(),
-        meta=ocp.args.JsonRestore()
+        model_state=ocp.args.StandardRestore(model_state),  # type: ignore
+        optimizer_state=ocp.args.StandardRestore(optimizer_state),  # type: ignore
+        train_dataloader_state=grain.checkpoint.CheckpointRestore(train_iterator),  # type: ignore
+        rngs=ocp.args.StandardRestore({"key": rngs}),  # type: ignore
     )
     
-    restored = mngr.restore(latest, args=restore_args)
-    return latest, restored
+    restored = checkpoint_manager.restore(step, args=restore_args)
+    nnx.update(model, restored["model_state"])
+    nnx.update(optimizer, restored["optimizer_state"])
+    train_iterator = restored["train_dataloader_state"]
+    rngs = restored["rngs"]["key"]
+    print(f"Restored checkpoint from step {step}.")
+
+    return step + 1, model, optimizer, train_iterator, rngs
 
 
-def maybe_save(mngr: ocp.CheckpointManager, step: int, model: nnx.Module, optimizer: nnx.Optimizer, rng, meta: dict | None = None):
-    if not mngr.should_save(step):  # obey save interval policy
+def maybe_save(
+        checkpoint_manager: ocp.CheckpointManager,
+        step: int,
+        model: nnx.Module,
+        optimizer: nnx.Optimizer,
+        train_iterator: grain.DataLoaderIterator,
+        rngs: jax.Array,
+        meta: dict,
+    ) -> None:
+    if not checkpoint_manager.should_save(step):
         return
-    assert meta is not None
-    model_state, optimizer_state = nnx.state(model), nnx.state(optimizer)
-    mngr.save(
-        step,
-        args=ocp.args.Composite(
-            model_state=ocp.args.StandardSave(model_state),
-            optimizer_state=ocp.args.StandardSave(optimizer_state),
-            rng_state=ocp.args.ArraySave(rng),
-            meta=ocp.args.JsonSave(meta)
-        )
+
+    model_state = nnx.state(model)
+    optimizer_state = nnx.state(optimizer)
+
+    checkpoint_manager_args = ocp.args.Composite(
+        model_state=ocp.args.StandardSave(model_state),  # type: ignore
+        optimizer_state=ocp.args.StandardSave(optimizer_state),  # type: ignore
+        train_dataloader_state=grain.checkpoint.CheckpointSave(train_iterator),  # type: ignore
+        rngs=ocp.args.StandardSave({'key': rngs}),  # type: ignore
+        meta=ocp.args.JsonSave(meta)  # type: ignore
     )
+    checkpoint_manager.save(step, args=checkpoint_manager_args)
 
 # -------- Training utilities (shared across scripts) --------
 
@@ -283,9 +305,11 @@ def _ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
 
+
 def _to_uint8(img_f32):
     """Convert float32 image to uint8."""
     return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
+
 
 def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jnp.ndarray:
     """
@@ -298,6 +322,7 @@ def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jn
     frames = frames.at[..., :, -width:, :].set(color)
     return frames
 
+
 def from_dict(cls, d):
     field_types = {f.name: f.type for f in cls.__dataclass_fields__.values()}
     kwargs = {}
@@ -309,12 +334,6 @@ def from_dict(cls, d):
             kwargs[k] = v
     return cls(**kwargs)
 
-def recursive_list_to_tuple(d):
-    if isinstance(d, list):
-        return tuple(recursive_list_to_tuple(x) for x in d)
-    if isinstance(d, dict):
-        return {k: recursive_list_to_tuple(v) for k, v in d.items()}
-    return d
 
 def _count_component(component_params):
     """Count total parameters in a component."""

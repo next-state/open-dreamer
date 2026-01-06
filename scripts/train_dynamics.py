@@ -22,8 +22,7 @@ from dreamer.parallel import create_data_model_parallel, MeshRules
 from dreamer.training import run_evaluation, shortcut_forcing_step
 from dreamer.utils import (
     _ensure_dir,
-    from_dict,
-    make_manager,
+    build_checkpoint_manager,
     get_lr_schedule,
     count_parameters_by_component,
     maybe_save,
@@ -37,12 +36,6 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # ---------------------------
 # Training Step
 # ---------------------------
-
-# ---------------------------
-# Training Step
-# ---------------------------
-
-
 
 @nnx.jit(static_argnames=("packing_factor", "k_max", "B_self"))
 def encode_and_train_step(
@@ -118,14 +111,14 @@ def train_step(
 # ---------------------------
 
 def run(cfg: DynamicsConfig):
-    """Main training loop."""
     # Setup directories
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
+    meta = {"cfg": asdict(cfg)}
     print(f"[setup] output dir: {run_dir.resolve()}")
 
-    # Wandb
+    # Logging
     if cfg.use_wandb:
         wandb.init(
             entity=cfg.wandb_entity, 
@@ -134,34 +127,33 @@ def run(cfg: DynamicsConfig):
             config=asdict(cfg), 
             dir=str(run_dir)
         )
+    logger = MetricLogger(
+        use_wandb=cfg.use_wandb, 
+        log_every=cfg.log_every, 
+        max_steps=cfg.max_steps, 
+        wandb_obj=wandb
+    )
 
     # Parallelism
     devices = jax.devices()
     device_count = len(devices)
     mesh, data_sharding = create_data_model_parallel(device_count, 1)
-
-    mesh_rules = MeshRules(
-        embed=None,
-        mlp='model',
-        attn='model',
-        data='data',
-    )
+    mesh_rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
 
     with jax.set_mesh(mesh):
         key = jax.random.PRNGKey(0)
         rng, init_key = jax.random.split(key)
     
         # Load pretrained tokenizer
-        tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules, mesh=mesh)
+        tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
         tokenizer_cfg = tokenizer.config
 
         # Initialize dynamics
-        dynamics_factory = lambda: Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
-        dynamics = dynamics_factory()
+        dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(dynamics)
         print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
 
-        # Optimizer
+        # Learning rate schedule
         if cfg.lr_schedule == "constant":
             lr = cfg.lr
             lr_schedule = None
@@ -177,38 +169,24 @@ def run(cfg: DynamicsConfig):
             )
             lr = lr_schedule
         
+        # Optimizer
         tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
-        optimizer_factory = lambda: nnx.Optimizer(dynamics_factory(), tx, wrt=nnx.Param)
-        optimizer = optimizer_factory()
-        # Logging & checkpointing
-        logger = MetricLogger(
-            use_wandb=cfg.use_wandb, 
-            log_every=cfg.log_every, 
-            max_steps=cfg.max_steps, 
-            wandb_obj=wandb
-        )
+        optimizer = nnx.Optimizer(dynamics, tx, wrt=nnx.Param)
 
-        meta = {"cfg": asdict(cfg)}
+        # Data iterator
+        train_dataloader = make_iterator(tokenizer_cfg.dataset)  # FIXME: in a future update, we must decouple dataset from model
+        train_iterator = iter(train_dataloader)  # type: ignore
 
+        with build_checkpoint_manager(ckpt_dir, cfg.ckpt_max_to_keep, cfg.ckpt_save_every, cfg.max_steps) as checkpoint_manager:
+            # Resume from checkpoint
+            start_step, dynamics, optimizer, train_iterator, rng = try_restore(
+                checkpoint_manager, dynamics, optimizer, train_iterator, rng
+            )
 
-        with make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every) as mngr:
-            restored = try_restore(mngr, dynamics_factory, optimizer_factory, mesh, rng)
-            start_step = 0
-            if restored is not None:
-                latest_step, r = restored
-                nnx.update(dynamics, r.model_state)
-                nnx.update(optimizer, r.optimizer_state)
-                rng = r.rng_state
-                start_step = int(latest_step)
-                cfg = from_dict(DynamicsConfig, r.meta["cfg"])
-                print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
-
-            dataset = make_iterator(cfg.dataset)
-
-            # cfg.max_steps + 1 to make sure we log and checkpoint at max_steps
-            pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps + 1)
+            # Training loop
+            pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step, total=cfg.max_steps)
             for step, batch in pbar:
-                if step > cfg.max_steps:
+                if step >= cfg.max_steps:
                     break
                 
                 # Shard batch data
@@ -241,8 +219,8 @@ def run(cfg: DynamicsConfig):
                         pbar=pbar,
                     )
 
-                # Save sharded arrays directly (Orbax handles distributed write efficiently)
-                maybe_save(mngr, step, dynamics, optimizer, rng, meta)
+                # Checkpointing
+                maybe_save(checkpoint_manager, step, dynamics, optimizer, train_iterator, rng, meta)
 
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
@@ -254,8 +232,6 @@ def run(cfg: DynamicsConfig):
                         cfg, tokenizer_cfg, step, tokenizer, dynamics,
                         val_videos, jnp.asarray(val_actions), vis_dir, rng
                     )
-            
-            mngr.wait_until_finished()
 
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:
