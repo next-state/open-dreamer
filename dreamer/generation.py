@@ -376,16 +376,7 @@ def video_rollout(
         
     # Latent Rollout
     # Returns (B, T_ctx + num_steps, n_spatial, D_s)
-    rollout_latents = latent_rollout(
-        dynamics,
-        policy,
-        schedule,
-        latents_ctx,
-        actions_ctx,
-        num_steps,
-        rng,
-        initial_agent_tokens
-    )
+    rollout_latents = latent_rollout(dynamics, policy, schedule, latents_ctx, actions_ctx, num_steps, rng, initial_agent_tokens)['latents']
     
     # Decode
     pred_frames, _ = tokenizer.decode(
