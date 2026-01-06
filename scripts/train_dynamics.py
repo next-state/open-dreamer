@@ -155,12 +155,6 @@ def run(cfg: DynamicsConfig):
         tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules, mesh=mesh)
         tokenizer_cfg = tokenizer.config
 
-        # Initialize dynamics
-        dynamics_factory = lambda: Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
-        dynamics = dynamics_factory()
-        param_counts = count_parameters_by_component(dynamics)
-        print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
-
         # Optimizer
         if cfg.lr_schedule == "constant":
             lr = cfg.lr
@@ -178,8 +172,11 @@ def run(cfg: DynamicsConfig):
             lr = lr_schedule
         
         tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
+
+        # Create state factory for abstract restoration
+        dynamics_factory = lambda: Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         optimizer_factory = lambda: nnx.Optimizer(dynamics_factory(), tx, wrt=nnx.Param)
-        optimizer = optimizer_factory()
+
         # Logging & checkpointing
         logger = MetricLogger(
             use_wandb=cfg.use_wandb, 
@@ -189,19 +186,9 @@ def run(cfg: DynamicsConfig):
         )
 
         meta = {"cfg": asdict(cfg)}
-
-
+        
         with make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every) as mngr:
-            restored = try_restore(mngr, dynamics_factory, optimizer_factory, mesh, rng)
-            start_step = 0
-            if restored is not None:
-                latest_step, r = restored
-                nnx.update(dynamics, r.model_state)
-                nnx.update(optimizer, r.optimizer_state)
-                rng = r.rng_state
-                start_step = int(latest_step)
-                cfg = from_dict(DynamicsConfig, r.meta["cfg"])
-                print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
+            dynamics, optimizer, rng, start_step = try_restore(mngr, dynamics_factory, optimizer_factory, mesh, rng)
 
             dataset = make_iterator(cfg.dataset)
 

@@ -194,11 +194,6 @@ def run(cfg: TokenizerConfig):
         # Create the model
         key = jax.random.key(0)
         rng, init_key = jax.random.split(key)
-        tokenizer_factory = lambda: Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
-        tokenizer = tokenizer_factory()
-
-        param_counts = count_parameters_by_component(tokenizer)
-        print(f"Parameter counts: {param_counts}")
 
         # Learning rate schedule
         if cfg.lr_schedule == "constant":
@@ -209,27 +204,17 @@ def run(cfg: TokenizerConfig):
             lr = lr_schedule
         
         tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
+        
+        # Create state factory for abstract restoration
+        tokenizer_factory = lambda: Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         optimizer_factory = lambda: nnx.Optimizer(tokenizer_factory(), tx, wrt=nnx.Param)
-        optimizer = optimizer_factory()
 
         # ---------- Checkpointing ----------
         ckpt_dir = run_dir / "checkpoints"
         meta = {"cfg": asdict(cfg)}
         
-        # Create state factory for abstract restoration
-        # This must create abstract shapes without capturing concrete arrays
-
         with make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every) as mngr:
-            restored = try_restore(mngr, tokenizer_factory, optimizer_factory, mesh, rng)
-            start_step = 0
-            if restored is not None:
-                latest_step, r = restored
-                nnx.update(tokenizer, r.model_state)
-                nnx.update(optimizer, r.optimizer_state)
-                rng = r.rng_state
-                start_step = int(latest_step)
-                cfg = from_dict(TokenizerConfig, r.meta["cfg"])
-                print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
+            tokenizer, optimizer, rng, start_step = try_restore(mngr, tokenizer_factory, optimizer_factory, mesh, rng)
 
             # ---------- Train loop ----------
             logger = MetricLogger(

@@ -240,9 +240,9 @@ def try_restore(mngr: ocp.CheckpointManager, model_factory, optimizer_factory, m
         Tuple of (latest_step, restored) if checkpoint exists, None otherwise
         restored is a namespace with .model, .optimizer, .rng, and .meta attributes
     """
-    latest = mngr.latest_step()
-    if latest is None:
-        return None
+    latest_step = mngr.latest_step()
+    if latest_step is None:
+        return model_factory(), optimizer_factory(), rng, 0
     
     # cfg = ocp.args.Composite(meta=ocp.args.JsonRestore()).meta["cfg"]
     
@@ -257,8 +257,16 @@ def try_restore(mngr: ocp.CheckpointManager, model_factory, optimizer_factory, m
         meta=ocp.args.JsonRestore()
     )
     
-    restored = mngr.restore(latest, args=restore_args)
-    return latest, restored
+    restored = mngr.restore(latest_step, args=restore_args)
+    
+    model = nnx.merge(model_graphdef, restored.model_state)
+    optimizer = nnx.merge(optimizer_graphdef, restored.optimizer_state)
+    rng = restored.rng_state
+    
+    param_counts = count_parameters_by_component(model)
+    print(f"Parameter counts: {param_counts}")
+    
+    return model, optimizer, rng, int(latest_step)
 
 
 def maybe_save(mngr: ocp.CheckpointManager, step: int, model: nnx.Module, optimizer: nnx.Optimizer, rng, meta: dict | None = None):
