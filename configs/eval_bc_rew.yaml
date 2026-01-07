@@ -10,7 +10,6 @@ param_dtype: ${param_dtype}
 
 dataset:
   B: 8
-  diversify_data: true
 
 action_dim: 4
 

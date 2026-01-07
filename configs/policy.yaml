@@ -11,7 +11,6 @@ param_dtype: ${param_dtype}
 
 dataset:
   B: 64
-  diversify_data: true
 
 action_dim: 4
 

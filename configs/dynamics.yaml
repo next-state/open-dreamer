@@ -7,7 +7,6 @@ tokenizer_ckpt: logs/tokenizer/checkpoints/
 ckpt_save_every: 10_000
 
 dataset:
-  source: custom
   array_record_path: datasets/coinrun_hard_agent_episodes/train
   B: 256
   T: 64
