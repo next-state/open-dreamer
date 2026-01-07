@@ -5,12 +5,12 @@ defaults:
 ckpt_max_to_keep: 2
 
 # WandB
-use_wandb: True
+use_wandb: False
 wandb_entity: Null
 wandb_project: tiny_dreamer_4
 
 # Precision
-dtype: float32
+dtype: bfloat16
 param_dtype: float32
 
 # Hydra

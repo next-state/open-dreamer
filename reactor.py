@@ -1,7 +1,8 @@
 import jax
 import jax.numpy as jnp
-from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP
+from dreamer.models import Dynamics, PolicyHeadMTP
 from dreamer.generation import DenoiseSchedule, next_frame
+from dreamer.parallel import create_data_model_parallel
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
 import numpy as np
@@ -141,74 +142,79 @@ class DreamerVideoModel(VideoModel):
         # Load models from checkpoints
         assert isinstance(cfg, ReactorConfig)
         logger.info(f"Loading dynamics model and tokenizer from {cfg.dynamics_ckpt}")
-        self.dynamics, self.dynamics_vars, self.dynamics_cfg, self.tokenizer, self.tokenizer_vars, self.tokenizer_cfg  = Dynamics.from_pretrained(cfg.dynamics_ckpt)
-        
-        # Load policy if checkpoint provided
-        self.policy = None
-        self.policy_vars = None
-        if cfg.policy_ckpt is not None:
-            raise NotImplementedError("Loading policy from checkpoint is not implemented yet")
-            logger.info(f"Loading policy from {cfg.policy_ckpt}")
-            self.policy, self.policy_vars, self.policy_cfg = PolicyHeadMTP.from_pretrained(cfg.policy_ckpt)
-        
-        # Initialize denoising schedule
-        self.schedule = DenoiseSchedule.init(num_steps=cfg.num_steps, k_max=self.dynamics_cfg.k_max, tau_ctx=cfg.tau_ctx)
-        
-        # Compute latent shape from dynamics config
-        H, W = self.size
-        packing_factor = self.dynamics.config.packing_factor
-        n_latents = self.tokenizer_cfg.decoder.n_latents
-        
-        # Calculate number of spatial tokens
-        self.n_spatial = n_latents // packing_factor
-        self.window_size = self.tokenizer_cfg.dataset.T//packing_factor
-        
-        # Get bottleneck dimension from encoder config
-        D_s = self.tokenizer_cfg.encoder.d_bottleneck
-        
-        # Set latent shape: (1, 1, n_spatial, D_s)
-        self.latent_shape = (1, 1, n_latents//packing_factor, D_s*packing_factor)
-        
-        # Initialize use_agent flag
-        self.use_agent = self.policy is not None
-        
-        # Random key
-        self.rng = jax.random.PRNGKey(0)
-        
-        # Initialize KV caches for both dynamics and tokenizer
-        logger.info("Initializing KV caches...")
-        self.initial_dynamics_cache = self.dynamics.create_static_caches(
-            batch_size=1,
-            n_spatial=self.n_spatial,
-            window_size=self.window_size,
-        )
-        
-        self.initial_tokenizer_cache = self.tokenizer.create_static_caches(
-            batch_size=1,
-            window_size=self.window_size,
-        )
-        
-        # Active caches (will be reset per session)
-        self.dynamics_cache = None
-        self.tokenizer_cache = None
-        
-        # Create JIT-compiled version of next_frame
-        # Use jax.tree_util.Partial to properly handle non-hashable objects like Flax modules
-        logger.info("Compiling next_frame function...")
-        from jax.tree_util import Partial
-        
-        next_frame_partial = Partial(
-            next_frame,
-            tokenizer=self.tokenizer,
-            dynamics=self.dynamics,
-            schedule=self.schedule,
-            latent_shape=self.latent_shape,
-        )
-        self.next_frame_compiled = jax.jit(next_frame_partial)
-        
-        logger.info("Dreamer initialization complete")
-        print("DEBUG: Dreamer initialization complete", flush=True)
-
+        mesh, data_sharding = create_data_model_parallel(1, 1)
+        with jax.set_mesh(mesh):
+            self.dynamics, self.tokenizer = Dynamics.from_pretrained(cfg.dynamics_ckpt, self.ctx)
+            self.dynamics_cfg = self.dynamics.config
+            self.tokenizer_cfg = self.tokenizer.config
+            
+            # Load policy if checkpoint provided
+            self.policy = None
+            self.policy_vars = None
+            if cfg.policy_ckpt is not None:
+                raise NotImplementedError("Loading policy from checkpoint is not implemented yet")
+                logger.info(f"Loading policy from {cfg.policy_ckpt}")
+                self.policy, self.policy_vars, self.policy_cfg = PolicyHeadMTP.from_pretrained(cfg.policy_ckpt)
+            
+            # Initialize denoising schedule
+            self.schedule = DenoiseSchedule.init(num_steps=cfg.num_steps, k_max=self.dynamics_cfg.k_max, tau_ctx=cfg.tau_ctx)
+            
+            # Compute latent shape from dynamics config
+            H, W = self.size
+            packing_factor = self.dynamics.config.packing_factor
+            n_latents = self.tokenizer_cfg.decoder.n_latents
+            
+            # Calculate number of spatial tokens
+            self.n_spatial = n_latents // packing_factor
+            self.window_size = self.tokenizer_cfg.dataset.T//packing_factor
+            
+            # Get bottleneck dimension from encoder config
+            D_s = self.tokenizer_cfg.encoder.d_bottleneck
+            
+            # Set latent shape: (1, 1, n_spatial, D_s)
+            self.latent_shape = (1, 1, n_latents//packing_factor, D_s*packing_factor)
+            
+            # Initialize use_agent flag
+            self.use_agent = self.policy is not None
+            
+            # Random key
+            self.rng = jax.random.PRNGKey(0)
+            
+            # Initialize KV caches for both dynamics and tokenizer
+            logger.info("Initializing KV caches...")
+            self.initial_dynamics_cache = self.dynamics.create_static_caches(
+                batch_size=1,
+                n_spatial=self.n_spatial,
+                window_size=self.window_size,
+                dtype=self.dynamics_cfg.dtype,
+            )
+            
+            self.initial_tokenizer_cache = self.tokenizer.create_static_caches(
+                batch_size=1,
+                window_size=self.window_size,
+                dtype=self.tokenizer_cfg.decoder.dtype,
+            )
+            
+            # Active caches (will be reset per session)
+            self.dynamics_cache = None
+            self.tokenizer_cache = None
+            
+            # Create JIT-compiled version of next_frame
+            # Use jax.tree_util.Partial to properly handle non-hashable objects like Flax modules
+            logger.info("Compiling next_frame function...")
+            from jax.tree_util import Partial
+            
+            next_frame_partial = Partial(
+                next_frame,
+                tokenizer=self.tokenizer,
+                dynamics=self.dynamics,
+                schedule=self.schedule,
+                latent_shape=self.latent_shape,
+            )
+            self.next_frame_compiled = jax.jit(next_frame_partial)
+            
+            logger.info("Dreamer initialization complete")
+            print("DEBUG: Dreamer initialization complete", flush=True)
 
     def start_session(self) -> None:
         """
@@ -244,10 +250,8 @@ class DreamerVideoModel(VideoModel):
         
         # Encode frames to latents
         logger.info("Encoding frames to latents...")
-        init_latents, _ = self.tokenizer.apply(
-            self.tokenizer_vars,
+        init_latents, _ = self.tokenizer.encode(
             init_frames_jax,
-            method=self.tokenizer.encode,
             deterministic=True,
             packing_factor=self.dynamics.config.packing_factor,
         )  # Shape: (1, T//packing, n_spatial, D_s*packing)
@@ -266,8 +270,7 @@ class DreamerVideoModel(VideoModel):
         latents_noised = init_latents*self.schedule.tau_ctx + (1-self.schedule.tau_ctx)*jax.random.normal(rng_warmup, shape=init_latents.shape, dtype=init_latents.dtype)
         
         # Run through dynamics to warm up cache
-        _, (_, self.dynamics_cache) = self.dynamics.apply(
-            self.dynamics_vars,
+        _, (_, self.dynamics_cache) = self.dynamics(
             actions_ctx,
             step_indices,
             tau_indices,
@@ -279,12 +282,10 @@ class DreamerVideoModel(VideoModel):
         
         # Warm up tokenizer cache by decoding context frames
         logger.info("Warming up tokenizer cache...")
-        _, self.tokenizer_cache = self.tokenizer.apply(
-            self.tokenizer_vars,
+        _, self.tokenizer_cache = self.tokenizer.decode(
             init_latents,
             packing_factor=self.dynamics.config.packing_factor,
             caches=self.tokenizer_cache,
-            method=self.tokenizer.decode,
             deterministic=True,
         )
         
@@ -316,8 +317,6 @@ class DreamerVideoModel(VideoModel):
                 
                 # Generate next frame
                 frame_jax, h, self.dynamics_cache, self.tokenizer_cache, self.rng = self.next_frame_compiled(
-                    tokenizer_vars=self.tokenizer_vars,
-                    dynamics_vars=self.dynamics_vars,
                     action=current_action,
                     dynamics_cache=self.dynamics_cache,
                     tokenizer_cache=self.tokenizer_cache,

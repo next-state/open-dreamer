@@ -1,10 +1,10 @@
 # sampling logic for debugging / visualization. Not JIT friendly.
 from __future__ import annotations
-from typing import Tuple, Dict, Any
-
+from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
 from dreamer.models import Tokenizer, Dynamics
 from .generation import DenoiseSchedule, video_rollout
@@ -16,10 +16,8 @@ from .generation import DenoiseSchedule, video_rollout
 
 def sample_video(
     tokenizer: Tokenizer,
-    tokenizer_vars: Dict[str, Any],
     dynamics: Dynamics,
-    dyn_vars: Dict[str, Any],
-    frames: jax.Array,     # (B, T, H, W, C) in [0, 1]
+    frames: jax.Array,     # (B, T, H, W, C) in [0, 255]
     actions: jax.Array,    # (B, T)
     horizon: int,
     schedule_config: DenoiseSchedule,
@@ -27,32 +25,32 @@ def sample_video(
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """
     Sample video predictions using Tokenizer and Dynamics.
-    
+
     Args:
-        tokenizer: Tokenizer module (has encode/decode methods)
-        tokenizer_vars: Combined variables dict with 'params' and 'constants'
-        dynamics: Dynamics model
-        dyn_vars: Dynamics variables dict
-        frames: Input video frames (B, T, H, W, C) in [0, 255]
+        tokenizer: Tokenizer NNX model (has encode/decode methods)
+        dynamics: Dynamics NNX model
+        frames: Input video frames (B, T, H, W, C) in [0, 255] uint8
         actions: Action sequence (B, T)
+        horizon: Number of future frames to predict
         schedule_config: DenoiseSchedule with rollout parameters
+        rng: Random key
     
     Returns:
-        pred_frames: (B, ctx+horizon, H, W, C) predicted frames (uint8)
-        tokenized_frames: (B, ctx+horizon, H, W, C) tokenizer reconstruction (GT latents decoded) (uint8)
-        frames: (B, ctx+horizon, H, W, C) ground truth frames (uint8)
+        pred_frames: (B, ctx+horizon, H, W, C) predicted frames [0, 255] uint8
+        tokenized_frames: (B, ctx+horizon, H, W, C) tokenizer reconstruction (GT latents decoded) [0, 255] uint8
+        frames: (B, ctx+horizon, H, W, C) ground truth frames [0, 255] uint8
     """
     B, T, H, W, C = frames.shape
 
     rng, mae_key = jax.random.split(rng)
+    rngs = nnx.Rngs(mae=mae_key)
 
-    # encode frames to clean latents
-    latents, _ = tokenizer.apply(
-        tokenizer_vars, frames,
+    # Encode frames to clean latents
+    latents, _ = tokenizer.encode(
+        frames,
         packing_factor=dynamics.config.packing_factor,
-        method=tokenizer.encode, 
-        rngs={"mae": mae_key},
-        deterministic=True
+        deterministic=True,
+        rngs=rngs
     )
     
     # Split context vs future
@@ -72,27 +70,26 @@ def sample_video(
 
     # Tokenized frames for visualization
     latents_for_tokenized_frames = jnp.concatenate([latents_ctx, latents_future], axis=1)
-    tokenized_frames, _ = tokenizer.apply(
-        tokenizer_vars, latents_for_tokenized_frames, packing_factor=dynamics.config.packing_factor,
-        method=tokenizer.decode, 
+    tokenized_frames, _ = tokenizer.decode(
+        latents_for_tokenized_frames,
+        packing_factor=dynamics.config.packing_factor,
         deterministic=True
     )
     tokenized_frames = jnp.clip(tokenized_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
     actions_future = jnp.array(actions_future)
-    pred_frames = video_rollout(tokenizer,
-                                tokenizer_vars,
-                                dynamics,
-                                dyn_vars,
-                                policy=actions_future,
-                                policy_vars=None,
-                                schedule=schedule_config,
-                                frames_ctx=frames_ctx,
-                                actions_ctx=actions_ctx,
-                                num_steps=horizon,
-                                rng=rng,
-                                initial_agent_tokens=None)
+    pred_frames = video_rollout(
+        tokenizer,
+        dynamics,
+        policy=actions_future,
+        schedule=schedule_config,
+        frames_ctx=frames_ctx,
+        actions_ctx=actions_ctx,
+        num_steps=horizon,
+        rng=rng,
+        initial_agent_tokens=None
+    )
 
     frames = jnp.clip(frames, 0, 255).astype(jnp.uint8)
     return pred_frames, tokenized_frames, frames

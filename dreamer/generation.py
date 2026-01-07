@@ -9,7 +9,6 @@ from .models import Dynamics, KVCache, PolicyHeadMTP, Tokenizer
 
 
 from flax.struct import dataclass
-from flax.typing import VariableDict
 
 
 @dataclass
@@ -69,7 +68,6 @@ class DenoiseSchedule:
 
 def next_latent(
     dynamics: Dynamics,
-    dyn_vars: VariableDict,
     schedule: DenoiseSchedule,
     action: jax.Array,                 # (B, 1)
     latent_shape: Tuple,                   # (B, 1, n_spatial, D_s)
@@ -84,8 +82,7 @@ def next_latent(
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
 
     Args:
-        dynamics: Dynamics model (Flax Module)
-        dyn_vars: Variables for dynamics (params + collections)
+        dynamics: Dynamics NNX model
         schedule: Precomputed DenoiseSchedule
         action: (B, 1) action for current step
         latent_shape: Tuple representing the shape of the latent (B, 1, n_spatial, D_s)
@@ -147,7 +144,10 @@ def next_latent(
             tau_indices    = jnp.concatenate([tau_idx_prefill, tau_idx_decode, tau_idx_curr], axis=1) # (B, T_ctx+1)
 
         # Dynamics call
-        latent_clean_pred_seq, (h_seq, _) = dynamics.apply(dyn_vars, actions_input, step_indices, tau_indices, latent_input, agent_tokens=agent_tokens, deterministic=True, caches=caches)
+        latent_clean_pred_seq, (h_seq, _) = dynamics(
+            actions_input, step_indices, tau_indices, latent_input,
+            agent_tokens=agent_tokens, deterministic=True, caches=caches
+        )
 
         latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
         h_last = h_seq[:, -1, :, :] if isinstance(h_seq, jax.Array) else h_seq # (B, n_agent, d_model)
@@ -172,7 +172,11 @@ def next_latent(
         rng, new_random_key = jax.random.split(rng)
         latent_noised_caching = latent_t_final*schedule.tau_ctx + (1-schedule.tau_ctx)*jax.random.normal(new_random_key, shape=latent_t_final.shape, dtype=latent_t_final.dtype)
 
-        _, (h_seq_final, caches_new) = dynamics.apply(dyn_vars, action, step_indices, tau_indices, latent_noised_caching, agent_tokens=agent_tokens, deterministic=True, caches=caches)
+        # Dynamics call
+        _, (h_seq_final, caches_new) = dynamics(
+            action, step_indices, tau_indices, latent_noised_caching,
+            agent_tokens=agent_tokens, deterministic=True, caches=caches
+        )
         h_last = h_seq_final[:, -1, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
     else:
         h_last = h_history[-1] if h_history is not None else None  # (B, n_agent, d_model)
@@ -184,9 +188,7 @@ def next_latent(
 
 def next_frame(
     tokenizer: Tokenizer,
-    tokenizer_vars: Dict,
     dynamics: Dynamics,
-    dynamics_vars: Dict,
     schedule: DenoiseSchedule,
     action: jax.Array,
     latent_shape: Tuple,
@@ -199,10 +201,8 @@ def next_frame(
     Generate next frame using dynamics model and decode to pixels.
     
     Args:
-        tokenizer: Tokenizer model for decoding
-        tokenizer_vars: Tokenizer parameters
-        dynamics: Dynamics model
-        dynamics_vars: Dynamics parameters
+        tokenizer: Tokenizer NNX model for decoding
+        dynamics: Dynamics NNX model
         schedule: Denoising schedule
         action: Action to condition on (B,) - categorical integer array
         latent_shape: Shape of latent (B, 1, n_spatial, D_s)
@@ -216,7 +216,6 @@ def next_frame(
     # Generate next latent using τ-ladder denoising
     latent, h_last, dynamics_cache_updated, rng = next_latent(
         dynamics=dynamics,
-        dyn_vars=dynamics_vars,
         schedule=schedule,
         action=action,  # Shape (1,) - categorical integer
         latent_shape=latent_shape,
@@ -226,14 +225,11 @@ def next_frame(
         caches=dynamics_cache,
     )
     
-    # Decode latent to frame
-    # latent shape: (B, 1, n_spatial, D_s)
-    frame, tokenizer_cache_updated = tokenizer.apply(
-        tokenizer_vars,
+    # Decoder call
+    frame, tokenizer_cache_updated = tokenizer.decode(
         latent,
         packing_factor=dynamics.config.packing_factor,
         caches=tokenizer_cache,
-        method=tokenizer.decode,
         deterministic=True,
     )
     
@@ -245,9 +241,7 @@ def next_frame(
 
 def latent_rollout(
     dynamics: Dynamics,
-    dyn_vars: VariableDict,
     policy: PolicyHeadMTP | jax.Array,
-    policy_vars: VariableDict | None,
     schedule: DenoiseSchedule,
     latents_ctx: jax.Array,
     actions_ctx: jax.Array,
@@ -256,14 +250,11 @@ def latent_rollout(
     initial_agent_tokens: jax.Array | None = None,
 ):
     """
-    TODO: we might want to add the Value head and the Reward head as well
     Autoregressive rollout in latent space.
-    
+
     Args:
-        dynamics: Dynamics model.
-        dyn_vars: Variables for dynamics.
-        policy: Policy model or array of fixed actions (B, num_steps, ...).
-        policy_vars: Variables for policy.
+        dynamics: Dynamics NNX model.
+        policy: Policy NNX model or array of fixed actions (B, num_steps, ...).
         schedule: DenoiseSchedule.
         latents_ctx: (B, T_ctx, n_spatial, D_s) Context latents.
         actions_ctx: (B, T_ctx, ...) Context actions.
@@ -272,22 +263,25 @@ def latent_rollout(
         initial_agent_tokens: Optional (B, T_ctx, n_agent, D) agent tokens for context.
         
     Returns:
-        latents: (B, num_steps, n_spatial, D_s)
-        actions: (B, num_steps, ...)
+        latents: (B, T_ctx + num_steps, n_spatial, D_s)
     """
     B, T_ctx, n_spatial, D_s = latents_ctx.shape
     latent_shape = (B, 1, n_spatial, D_s)
     # 1. Initialize caches and process context
     # We need to compute the max window size needed: context + rollout
     window_size = T_ctx + num_steps
-    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size)
+    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size, dtype=latents_ctx.dtype)
     
     # Run dynamics on context to prefill caches and get last hidden state
     # Use clean signal for ground truth context 
     step_idx_ctx= jnp.full((B, T_ctx), schedule.step_idx, dtype=jnp.int32)
     tau_idx_ctx = jnp.full((B, T_ctx), schedule.k_max - 1, dtype=jnp.int32)
     
-    _, (h_seq, caches) = dynamics.apply(dyn_vars, actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx, agent_tokens=initial_agent_tokens, caches=caches, deterministic=True)
+    # Dynamics call
+    _, (h_seq, caches) = dynamics(
+        actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx,
+        agent_tokens=initial_agent_tokens, caches=caches, deterministic=True
+    )
 
     # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
     h_last = h_seq[:, -1] if isinstance(h_seq, jax.Array) else None # (B, n_agent, D)
@@ -302,13 +296,15 @@ def latent_rollout(
         if isinstance(policy, jax.Array):
             action = policy[:, step_idx]
         else:
-            assert policy_vars is not None
-            logits = policy.apply(policy_vars, h_t, deterministic=False)
+            # Policy call
+            logits = policy(h_t, deterministic=False)
             assert isinstance(logits, jax.Array), "Logits should be a JAX array"
             action = jax.random.categorical(rng_action, logits) # (B, L)
         
         # Predict next latent (denoising)
-        latent_next, h_next, caches_next, rng = next_latent(dynamics, dyn_vars, schedule, action, latent_shape, rng, caches=caches_t)
+        latent_next, h_next, caches_next, rng = next_latent(
+            dynamics, schedule, action, latent_shape, rng, caches=caches_t
+        )
         
         return (h_next, caches_next, rng), latent_next[:,0] # latent_next is (B, 1, n_spatial, D_s) 
 
@@ -325,14 +321,10 @@ def latent_rollout(
     return out_latents 
 
 
-
 def video_rollout(
     tokenizer: Tokenizer,
-    tokenizer_vars: VariableDict,
     dynamics: Dynamics,
-    dyn_vars: VariableDict,
     policy: PolicyHeadMTP | jax.Array,
-    policy_vars: VariableDict | None,
     schedule: DenoiseSchedule,
     frames_ctx: jax.Array,
     actions_ctx: jax.Array,
@@ -342,53 +334,51 @@ def video_rollout(
 ):
     """
     End-to-end video generation rollout.
+
     Args:
-        tokenizer: Tokenizer model.
-        tokenizer_vars: Variables for tokenizer.
-        dynamics: Dynamics model.
-        dyn_vars: Variables for dynamics.
-        policy: Policy model or array of fixed actions.
-        policy_vars: Variables for policy.
+        tokenizer: Tokenizer NNX model.
+        dynamics: Dynamics NNX model.
+        policy: Policy NNX model or array of fixed actions.
         schedule: DenoiseSchedule.
-        frames_ctx: (B, T_ctx, H, W, C) context frames (0-1 range, unnormalized).
+        frames_ctx: (B, T_ctx, H, W, C) context frames (0-255 range).
         actions_ctx: (B, T_ctx, ...) Context actions.
         num_steps: Number of steps to unroll.
         rng: Random number generator key.
         initial_agent_tokens: Optional agent tokens.
-        packing_factor: Packing factor for tokens.
-        dataset_mean: Mean for normalization.
-        dataset_std: Std for normalization.
     Returns:
         pred_frames: (B, T_ctx + num_steps, H, W, C)
     """
+    from flax import nnx
     
     # Tokenize
     rng, mae_key = jax.random.split(rng)
-    latents_ctx, _ = tokenizer.apply(tokenizer_vars,
-                                frames_ctx, 
-                                packing_factor=dynamics.config.packing_factor, 
-                                method=tokenizer.encode, 
-                                rngs={"mae": mae_key}, 
-                                deterministic=True) # Encode returns (B, T, L, D)
+    rngs = nnx.Rngs(mae=mae_key)
+    
+    latents_ctx, _ = tokenizer.encode(
+        frames_ctx, 
+        packing_factor=dynamics.config.packing_factor, 
+        deterministic=True,
+        rngs=rngs
+    ) # Encode returns (B, T, L, D)
         
     # Latent Rollout
-    # Returns (B, num_steps, n_spatial, D_s)
-    rollout_latents = latent_rollout(dynamics,
-                                     dyn_vars,
-                                     policy,
-                                     policy_vars,
-                                     schedule,
-                                     latents_ctx,
-                                     actions_ctx,
-                                     num_steps,
-                                     rng,
-                                     initial_agent_tokens)
+    # Returns (B, T_ctx + num_steps, n_spatial, D_s)
+    rollout_latents = latent_rollout(
+        dynamics,
+        policy,
+        schedule,
+        latents_ctx,
+        actions_ctx,
+        num_steps,
+        rng,
+        initial_agent_tokens
+    )
     
     # Decode
-    pred_frames, _ = tokenizer.apply(tokenizer_vars,
-                                       rollout_latents,
-                                       packing_factor=dynamics.config.packing_factor,
-                                       method=tokenizer.decode,
-                                       deterministic=True)
+    pred_frames, _ = tokenizer.decode(
+        rollout_latents,
+        packing_factor=dynamics.config.packing_factor,
+        deterministic=True
+    )
         
     return jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)

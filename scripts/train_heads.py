@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import optax
 import wandb
 from flax.core import FrozenDict
+from flax import nnx
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
@@ -35,6 +36,7 @@ from dreamer.configs import BCRewConfig
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
+from dreamer.parallel import ParallelContext
 from dreamer.training import (
     compute_policy_loss,
     compute_reward_loss,
@@ -198,6 +200,7 @@ def train_step(
         dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
         
         # TODO: See if we should compute the losses and the gradients sequentially (see figure 2 of https://arxiv.org/pdf/2404.19737 and comment in pull request #16)
+        # TODO: put gather_future_rewards and gather_future_actions inside of the compute_policy_loss function and compute_future_actions functions
         policy_loss = compute_policy_loss(policy_head, pol_p, h_states, actions_btL, actions_valid)
         reward_loss = compute_reward_loss(reward_head, {"params": rew_p, "constants": reward_constants}, h_states, rewards_btL, rewards_valid)
         
@@ -256,12 +259,26 @@ def run(cfg: BCRewConfig):
             dir=str(run_dir),
         )
     
+    # Create parallel context for data parallelism
+    ctx = ParallelContext.create(batch_size=cfg.dataset.B)
+    
     # Load pretrained tokenizer and dynamics
     rng = jax.random.PRNGKey(0)
     print(f"[setup] Loading pretrained dynamics and tokenizer from {cfg.dynamics_ckpt}")
-    dynamics, dynamics_vars, dynamics_cfg, tokenizer, tokenizer_vars, tokenizer_cfg = Dynamics.from_pretrained(cfg.dynamics_ckpt)
-    dynamics_params = dynamics_vars["params"]
-    dynamics_constants = dynamics_vars.get("constants", FrozenDict())
+    dynamics, tokenizer = Dynamics.from_pretrained(cfg.dynamics_ckpt, ctx)
+    dynamics_cfg = dynamics.config
+    tokenizer_cfg = tokenizer.config
+    # nnx.split with multiple filters returns (graphdef, state1, state2, ...)
+    _, *dynamics_states = nnx.split(dynamics, nnx.Param, nnx.BatchStat, ...)
+    dynamics_state = nnx.State.merge(*dynamics_states)
+    dynamics_params = dynamics_state
+    dynamics_vars = {"params": dynamics_params}
+    dynamics_constants = FrozenDict()
+    
+    # For tokenizer, create similar compatibility wrappers
+    _, *tokenizer_states = nnx.split(tokenizer, nnx.Param, nnx.BatchStat, ...)
+    tokenizer_state = nnx.State.merge(*tokenizer_states)
+    tokenizer_vars = {"params": tokenizer_state}
     
     # Initialize task embedder, policy, and reward heads
     print("[setup] Initializing agent components")
@@ -313,9 +330,10 @@ def run(cfg: BCRewConfig):
     )
     meta = {"cfg": asdict(cfg)}
     
-    restored = try_restore(mngr, state_example, meta)
+    restored = try_restore(mngr, state_example, ctx, meta)
     start_step = 0
     if restored is not None:
+        # Restored state is already sharded/replicated on GPUs via ctx
         latest_step, r = restored
         task_embedder_params = r.state["params"]["task_embedder"]
         policy_params = r.state["params"]["policy"]
@@ -324,7 +342,17 @@ def run(cfg: BCRewConfig):
         opt_states = r.state["opt_state"]
         rng = r.state["rng"]
         start_step = int(r.state["step"])
-        print(f"[ckpt] Restored step {latest_step}")
+        print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
+    else:
+        # No checkpoint - replicate initial state to GPUs
+        task_embedder_params = ctx.replicate(task_embedder_params)
+        policy_params = ctx.replicate(policy_params)
+        reward_params = ctx.replicate(reward_params)
+        opt_states = ctx.replicate(opt_states)
+        print("[parallel] Replicated initial state to GPUs")
+    
+    # Replicate reward constants
+    reward_constants = ctx.replicate(reward_constants)
     
     # Dataset
     dataset = make_iterator(cfg.dataset)
@@ -337,14 +365,23 @@ def run(cfg: BCRewConfig):
         
         rng, tokenizer_key, step_key = jax.random.split(rng, 3)
         
+        # Shard batch data
+        videos = ctx.shard_data(batch["videos"])
+        actions = ctx.shard_data(batch["actions"])
+        rewards = ctx.shard_data(batch["rewards"])
+        
+        # Generate keys matching batch size (one per sample)
+        tokenizer_key = ctx.split_keys(tokenizer_key, count=videos.shape[0])
+        step_key = ctx.split_keys(step_key, count=videos.shape[0])
+        
         # Encode videos to latents (frozen tokenizer - outside train_step)
-        # Inline JIT using a lambda
-        videos = batch["videos"]
-        actions = batch["actions"]
         B, T, H, W, C = videos.shape
         # shift the actions by one and put the "first action token" = 15 at the beginning 
         actions = jnp.concatenate((jnp.full_like(actions[:,0:1], fill_value = 15), actions[:,:-1]), axis=1) # TODO: pass this to the train step!
         latents, _ = tokenizer.apply(tokenizer_vars, videos, packing_factor=dynamics_cfg.packing_factor, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
+        
+        # Create batch dict with sharded data
+        batch_sharded = {"actions": actions, "rewards": rewards}
         
         # Training step
         new_params, opt_states, metrics = train_step(
@@ -361,7 +398,7 @@ def run(cfg: BCRewConfig):
             reward_constants=reward_constants,
             opt_states=opt_states,
             latents=latents,
-            batch=batch,
+            batch=batch_sharded,
             rng=step_key,
             step=step,
             k_max=dynamics.config.k_max,
@@ -377,17 +414,24 @@ def run(cfg: BCRewConfig):
         
         # Logging
         if logger.should_log(step):
-            logger.log(step, metrics=metrics, pbar=pbar)
+            metrics_cpu = jax.device_get(metrics)
+            logger.log(step, metrics=metrics_cpu, pbar=pbar)
         
-        # Save checkpoint
+        # Save sharded arrays directly
         state = make_state(new_params, opt_states, rng, step)
         maybe_save(mngr, step, state, meta)
         
         # Periodic lightweight AR eval
         if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
-            # Use current batch as validation data (simplest approach)
-            val_videos = batch["videos"]
-            run_evaluation(cfg, tokenizer_cfg, step, tokenizer, tokenizer_vars, dynamics, dynamics_params, dynamics_constants, val_videos, actions, vis_dir, rng)
+            # Use current batch as validation data (simplest approach) - move to host
+            val_videos = jax.device_get(batch["videos"][:4])
+            val_actions = jax.device_get(actions[:4])
+            run_evaluation(
+                cfg, tokenizer_cfg, step, 
+                tokenizer,
+                dynamics,
+                val_videos, val_actions, vis_dir, rng
+            )
     
     # Finish wandb run
     if cfg.use_wandb and wandb.run is not None:

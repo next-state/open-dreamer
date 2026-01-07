@@ -421,7 +421,7 @@ def make_iterator(cfg: DatasetConfig):
             image_h=cfg.H,
             image_w=cfg.W,
             image_c=cfg.C, 
-            num_workers=8,
+            num_workers=22,
             print_filter_warnings=False,
         )
     else:
