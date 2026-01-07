@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from dreamer.data import patchify, unpatchify
 import orbax.checkpoint as ocp
 from pathlib import Path
 import optax
@@ -11,6 +10,7 @@ from einops import rearrange
 from enum import IntEnum
 from typing import Tuple, TypeVar, cast
 import numpy as np
+
 
 
 # --- dtype helpers ---
@@ -38,6 +38,24 @@ def is_pow2_frac(x: float) -> bool:
     return abs(1.0 / inv - x) < 1e-8 and (inv & (inv - 1)) == 0
 
 # --- helpers ---
+# 
+def patchify(x: jnp.ndarray, patch: int) -> jnp.ndarray:
+    """
+    x: (B, H, W, C)  ->  patches: (B, N, D)
+      where N = (H/patch)*(W/patch), D = patch*patch*C
+    """
+    patches = rearrange(x, "... (hp p1) (wp p2) c -> ... (hp wp) (p1 p2 c)", p1=patch, p2=patch)
+    return patches
+
+def unpatchify(patches: jnp.ndarray, patch: int, H: int, W: int) -> jnp.ndarray:
+    """
+    patches: (B, N, D)  ->  x: (B, H, W, C)
+      where N = (H/patch)*(W/patch), D = patch*patch*C
+    """
+    image = rearrange(patches, "... (hp wp) (p1 p2 c) -> ... (hp p1) (wp p2) c", hp=H//patch, wp=W//patch, p1=patch, p2=patch)
+    return image
+    
+    
 temporal_patchify = jax.jit(
     jax.vmap(patchify, in_axes=(1, None), out_axes=1),  # (B,T,H,W,C) -> (B,T,Np,Dp)
     static_argnames=("patch",),

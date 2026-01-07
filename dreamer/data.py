@@ -1,25 +1,188 @@
-import coinrun_data.dataloader as coinrun_loader
+import jax
+import numpy as np
+import grain
+from typing import Any
+import pickle
+import glob
+import os
+
 from .configs import DatasetConfig
 
 
-def make_iterator(cfg: DatasetConfig):
-    """
-    Create data iterator for recorded trajectories in ArrayRecord format.
 
-    Args:
-        cfg: DatasetConfig with batch size, sequence length, and dataset path
-
-    Returns:
-        Grain dataloader that yields batches of (videos, actions, rewards)
+class EpisodeLengthFilter(grain.transforms.Filter):
     """
-    return coinrun_loader.get_dataloader(
-        array_record_paths=cfg.array_record_path,
-        seq_len=cfg.T,
-        global_batch_size=cfg.B,
-        image_h=cfg.H,
-        image_w=cfg.W,
-        image_c=cfg.C,
-        num_workers=8,
-        print_filter_warnings=False,
-        p_include_reward=cfg.p_include_reward,
+    A Grain Filter that keeps only episodes with sufficient length.
+    """
+
+    def __init__(
+        self,
+        seq_len: int,
+        image_h: int,
+        image_w: int,
+        image_c: int,
+        *,
+        print_filter_warnings: bool = True,
+    ):
+        self.seq_len = seq_len
+        self.image_h = image_h
+        self.image_w = image_w
+        self.image_c = image_c
+        self.print_filter_warnings = print_filter_warnings
+
+    def filter(self, element: Any) -> bool:
+        assert isinstance(element, bytes)
+        element = pickle.loads(element)
+
+        current_episode_len = element["sequence_length"]
+        if current_episode_len < self.seq_len:
+            if self.print_filter_warnings:
+                print(
+                    f"Filtering out episode with length {current_episode_len}, which is "
+                    f"shorter than the requested sequence length {self.seq_len}."
+                )
+            return False
+
+        return True
+
+
+class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
+    """
+    A Grain Transformation that combines parsing, slicing, and normalizing.
+    """
+
+    def __init__(
+        self,
+        seq_len: int,
+        image_h: int,
+        image_w: int,
+        image_c: int,
+        *,
+        p_include_reward: float = 0.0,
+    ):
+        self.seq_len = seq_len
+        self.image_h = image_h
+        self.image_w = image_w
+        self.image_c = image_c
+        self.p_include_reward = float(p_include_reward)
+
+    def random_map(self, element: dict, rng: np.random.Generator) -> Any:
+        assert isinstance(element, bytes)
+        element = pickle.loads(element)
+
+        video_shape = (
+            element["sequence_length"],
+            self.image_h,
+            self.image_w,
+            self.image_c,
+        )
+        episode_tensor = np.frombuffer(element["raw_video"], dtype=np.uint8)
+        episode_tensor = episode_tensor.reshape(video_shape)
+
+        current_episode_len = episode_tensor.shape[0]
+        if current_episode_len < self.seq_len:
+            raise ValueError(
+                f"Episode length {current_episode_len} is shorter than "
+                f"requested sequence length {self.seq_len}."
+            )
+
+        max_start_idx = current_episode_len - self.seq_len
+        rewards_tensor = np.array(element["rewards"])
+
+        start_idx = None
+        if self.p_include_reward > 0.0 and rng.random() < self.p_include_reward:
+            reward_ts = np.flatnonzero(rewards_tensor > 0)
+            if reward_ts.size > 0:
+                t = int(rng.choice(reward_ts))
+                start_min = max(0, t - (self.seq_len - 1))
+                start_max = min(t, max_start_idx)
+                start_idx = int(rng.integers(start_min, start_max + 1))
+
+        if start_idx is None:
+            start_idx = int(rng.integers(0, max_start_idx + 1))
+
+        seq = episode_tensor[start_idx : start_idx + self.seq_len]
+
+        data_dict = {"videos": seq}
+        actions_tensor = np.array(element["actions"])
+        data_dict["actions"] = actions_tensor[start_idx : start_idx + self.seq_len]
+        data_dict["rewards"] = rewards_tensor[start_idx : start_idx + self.seq_len]
+
+        return data_dict
+
+
+def make_iterator(
+    cfg: DatasetConfig,
+    num_workers: int = 22,
+    prefetch_buffer_size: int = 1,
+    seed: int = 42,
+    print_filter_warnings: bool = False,
+):
+    """
+    Creates a data loading pipeline using Grain from a DatasetConfig.
+    """
+    array_record_paths = cfg.array_record_path
+    
+    if not array_record_paths:
+        raise ValueError("array_record_path cannot be empty.")
+    
+    if isinstance(array_record_paths, str):
+        if os.path.isdir(array_record_paths):
+            array_record_paths = [
+                os.path.join(array_record_paths, f)
+                for f in os.listdir(array_record_paths)
+                if f.endswith(".array_record")
+            ]
+        else:
+            array_record_paths = [array_record_paths]
+
+    num_processes = jax.process_count()
+
+    if cfg.B % num_processes != 0:
+        raise ValueError(
+            f"Global batch size {cfg.B} must be divisible by "
+            f"the number of JAX processes {num_processes}."
+        )
+    per_process_batch_size = cfg.B // num_processes
+
+    source = grain.sources.ArrayRecordDataSource(array_record_paths)
+
+    sampler = grain.samplers.IndexSampler(
+        num_records=len(source),
+        shard_options=grain.sharding.ShardByJaxProcess(drop_remainder=True),
+        shuffle=True,
+        num_epochs=None,
+        seed=seed,
     )
+
+    operations = [
+        EpisodeLengthFilter(
+            seq_len=cfg.T,
+            image_h=cfg.H,
+            image_w=cfg.W,
+            image_c=cfg.C,
+            print_filter_warnings=print_filter_warnings,
+        ),
+        ProcessEpisodeAndSlice(
+            seq_len=cfg.T,
+            image_h=cfg.H,
+            image_w=cfg.W,
+            image_c=cfg.C,
+            p_include_reward=cfg.p_include_reward,
+        ),
+        grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
+    ]
+
+    dataloader = grain.DataLoader(
+        data_source=source,
+        sampler=sampler,
+        operations=operations,
+        worker_count=num_workers,
+        worker_buffer_size=1,
+        read_options=grain.ReadOptions(
+            prefetch_buffer_size=prefetch_buffer_size,
+            num_threads=1,
+        ),
+    )
+
+    return dataloader
