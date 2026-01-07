@@ -1,8 +1,6 @@
 import logging
 import os
-from dataclasses import asdict
 from functools import partial
-from pathlib import Path
 
 import einops
 import hydra
@@ -13,9 +11,8 @@ import numpy as np
 import optax
 import wandb
 from flax import nnx
-from hydra.core.hydra_config import HydraConfig
 from jaxlpips import LPIPS
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import TokenizerConfig
@@ -23,14 +20,16 @@ from dreamer.training import compute_psnr
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Tokenizer
-from dreamer.parallel import create_data_model_parallel, MeshRules
+from dreamer.parallel import build_parallel
 from dreamer.utils import (
     build_checkpoint_manager,
     try_restore,
     maybe_save,
     normalize_with_dataset_stats,
-    get_lr_schedule,
     count_parameters_by_component,
+    setup_training_directories,
+    build_lr_schedule,
+    build_optimizer,
 )
 
 # disable preallocation completely
@@ -152,16 +151,14 @@ def viz_step_jit(model: Tokenizer, videos, *, mae_key, drop_key):
     grid = einops.rearrange(grid[:, 0], "b h w c -> h (b w) c")
     return grid.clip(0, 255).astype(jnp.uint8)
 
-def viz_step(model: Tokenizer, videos, rng, step, run_dir, use_wandb=False):
+def viz_step(model: Tokenizer, videos, rng, step, vis_dir, use_wandb=False):
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
     grid = viz_step_jit(model, videos[:8,:1], mae_key=mae_key, drop_key=drop_key)
     grid = jax.device_get(grid)
 
-    out = run_dir / "viz"
-    out.mkdir(exist_ok=True, parents=True)
-    imageio.imwrite(out / f"step_{step:06d}.png", grid)
+    imageio.imwrite(vis_dir / f"step_{step:06d}.png", grid)
 
     if use_wandb:
         wandb.log({"reconstruction": wandb.Image(np.array(grid), caption=f"Step {step}")}, step=step)
@@ -172,10 +169,7 @@ def viz_step(model: Tokenizer, videos, rng, step, run_dir, use_wandb=False):
 
 def run(cfg: TokenizerConfig):
     # Setup
-    run_dir = Path(HydraConfig.get().runtime.output_dir)
-    ckpt_dir = run_dir / "checkpoints"
-    meta = {"cfg": asdict(cfg)}
-    print(f"[setup] output dir: {run_dir.resolve()}")
+    run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
 
     # Logging
     if cfg.use_wandb:
@@ -183,7 +177,7 @@ def run(cfg: TokenizerConfig):
             entity=cfg.wandb_entity,
             project=cfg.wandb_project or cfg.run_name,
             name=cfg.run_name,
-            config=asdict(cfg),
+            config=OmegaConf.to_container(cfg, resolve=True),
             dir=str(run_dir),
         )
     logger = MetricLogger(
@@ -194,13 +188,10 @@ def run(cfg: TokenizerConfig):
     )
 
     # Parallelism
-    devices = jax.devices()
-    device_count = len(devices)
-    mesh, data_sharding = create_data_model_parallel(device_count, 1)
-    mesh_rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
+    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
     with jax.set_mesh(mesh):
-        key = jax.random.key(0)
+        key = jax.random.key(cfg.seed)
         rng, init_key = jax.random.split(key)
 
         # Initialize tokenizer
@@ -208,23 +199,17 @@ def run(cfg: TokenizerConfig):
         param_counts = count_parameters_by_component(tokenizer)
         print(f"Parameter counts: {param_counts}")
 
-        # Learning rate schedule
-        if cfg.lr_schedule == "constant":
-            lr = cfg.lr
-            lr_schedule = None
-        else:
-            lr_schedule = get_lr_schedule(cfg.lr_schedule, cfg.init_lr, cfg.max_lr, cfg.lr_end, cfg.max_steps, cfg.warmup_steps, cfg.wsd_decay_steps)
-            lr = lr_schedule
+        # Build learning rate schedule
+        lr_schedule = build_lr_schedule(cfg.schedule, cfg.max_steps)
         
-        # Optimizer
-        tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
-        optimizer = nnx.Optimizer(tokenizer, tx, wrt=nnx.Param)
+        # Build optimizer
+        optimizer = build_optimizer(tokenizer, lr_schedule, cfg.optimizer)
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
-        with build_checkpoint_manager(ckpt_dir, cfg.ckpt_max_to_keep, cfg.ckpt_save_every, cfg.max_steps) as checkpoint_manager:
+        with build_checkpoint_manager(ckpt_dir, cfg.ckpt, cfg.max_steps) as checkpoint_manager:
             # Resume from checkpoint
             start_step, tokenizer, optimizer, train_iterator, rng = try_restore(
                 checkpoint_manager, tokenizer, optimizer, train_iterator, rng
@@ -255,10 +240,7 @@ def run(cfg: TokenizerConfig):
 
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(aux)
-                    if lr_schedule is None:
-                        lr_value = cfg.lr
-                    else:
-                        lr_value = lr_schedule(step)
+                    lr_value = lr_schedule(step)
                     mse = metrics_cpu["loss_mse"]
                     psnr = metrics_cpu["psnr"]
                     logger.log(
@@ -288,20 +270,16 @@ def run(cfg: TokenizerConfig):
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
-                    viz_step(tokenizer, viz_videos, step_rng, step, run_dir, use_wandb=cfg.use_wandb)
+                    viz_step(tokenizer, viz_videos, step_rng, step, vis_dir, use_wandb=cfg.use_wandb)
 
     if cfg.use_wandb and wandb.run is not None:
         wandb.finish()
 
-# ------------------------
-# Hydra entry
-# ------------------------
 
 @hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
-def main(cfg: DictConfig):
-    schema = OmegaConf.structured(TokenizerConfig)
-    cfg = OmegaConf.merge(schema, cfg)
-    run(OmegaConf.to_object(cfg))
+def main(cfg: TokenizerConfig):
+    run(cfg)
+
 
 if __name__ == "__main__":
     main()

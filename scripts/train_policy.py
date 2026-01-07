@@ -67,7 +67,8 @@ from dreamer.utils import (
     try_restore,
     maybe_save,
     pack_mae_params,
-    _ensure_dir, _to_uint8,
+    setup_training_directories,
+    _to_uint8,
     to_jnp_dtype,
 )
 from dreamer.imagination import (
@@ -1492,10 +1493,8 @@ def train_step(
 
 
 def run(cfg: RLConfig):
-    run_dir = Path(HydraConfig.get().runtime.output_dir)
-    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
-    vis_dir = _ensure_dir(run_dir / "viz")
-    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+    # Setup
+    run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
 
     # Initialize wandb if enabled
     if cfg.use_wandb:
@@ -1826,12 +1825,8 @@ def run(cfg: RLConfig):
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="policy")
-def main(cfg: DictConfig):
-    schema = OmegaConf.structured(RLConfig)
-    cfg = OmegaConf.merge(schema, cfg)
-    rl_cfg = OmegaConf.to_object(cfg)
-    
-    run(rl_cfg)
+def main(cfg: RLConfig):
+    run(cfg)
 
 
 if __name__ == "__main__":

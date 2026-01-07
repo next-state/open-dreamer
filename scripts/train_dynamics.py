@@ -1,32 +1,29 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
-from pathlib import Path
 
 import hydra
 import jax
 import jax.numpy as jnp
-import optax
 import wandb
 from flax import nnx
-from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import MetricLogger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.parallel import create_data_model_parallel, MeshRules
+from dreamer.parallel import build_parallel
 from dreamer.training import run_evaluation, shortcut_forcing_step
 from dreamer.utils import (
-    _ensure_dir,
     build_checkpoint_manager,
-    get_lr_schedule,
     count_parameters_by_component,
     maybe_save,
     try_restore,
+    setup_training_directories,
+    build_lr_schedule,
+    build_optimizer,
 )
 
 # Suppress absl info logs
@@ -111,20 +108,16 @@ def train_step(
 # ---------------------------
 
 def run(cfg: DynamicsConfig):
-    # Setup directories
-    run_dir = Path(HydraConfig.get().runtime.output_dir)
-    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
-    vis_dir = _ensure_dir(run_dir / "viz")
-    meta = {"cfg": asdict(cfg)}
-    print(f"[setup] output dir: {run_dir.resolve()}")
+    # Setup
+    run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
 
     # Logging
     if cfg.use_wandb:
         wandb.init(
-            entity=cfg.wandb_entity, 
-            project=cfg.wandb_project or cfg.run_name, 
-            name=cfg.run_name, 
-            config=asdict(cfg), 
+            entity=cfg.wandb_entity,
+            project=cfg.wandb_project or cfg.run_name,
+            name=cfg.run_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
             dir=str(run_dir)
         )
     logger = MetricLogger(
@@ -135,13 +128,10 @@ def run(cfg: DynamicsConfig):
     )
 
     # Parallelism
-    devices = jax.devices()
-    device_count = len(devices)
-    mesh, data_sharding = create_data_model_parallel(device_count, 1)
-    mesh_rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
+    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
     with jax.set_mesh(mesh):
-        key = jax.random.PRNGKey(0)
+        key = jax.random.PRNGKey(cfg.seed)
         rng, init_key = jax.random.split(key)
     
         # Load pretrained tokenizer
@@ -153,31 +143,17 @@ def run(cfg: DynamicsConfig):
         param_counts = count_parameters_by_component(dynamics)
         print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
 
-        # Learning rate schedule
-        if cfg.lr_schedule == "constant":
-            lr = cfg.lr
-            lr_schedule = None
-        else:
-            lr_schedule = get_lr_schedule(
-                cfg.lr_schedule,
-                cfg.init_lr,
-                cfg.max_lr,
-                cfg.lr_end,
-                cfg.max_steps,
-                cfg.warmup_steps,
-                cfg.wsd_decay_steps,
-            )
-            lr = lr_schedule
+        # Build learning rate schedule
+        lr_schedule = build_lr_schedule(cfg.schedule, cfg.max_steps)
         
-        # Optimizer
-        tx = optax.adamw(lr, b1=0.9, b2=0.9, weight_decay=1e-4)
-        optimizer = nnx.Optimizer(dynamics, tx, wrt=nnx.Param)
+        # Build optimizer
+        optimizer = build_optimizer(dynamics, lr_schedule, cfg.optimizer)
 
         # Data iterator
-        train_dataloader = make_iterator(tokenizer_cfg.dataset)  # FIXME: in a future update, we must decouple dataset from model
+        train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
-        with build_checkpoint_manager(ckpt_dir, cfg.ckpt_max_to_keep, cfg.ckpt_save_every, cfg.max_steps) as checkpoint_manager:
+        with build_checkpoint_manager(ckpt_dir, cfg.ckpt, cfg.max_steps) as checkpoint_manager:
             # Resume from checkpoint
             start_step, dynamics, optimizer, train_iterator, rng = try_restore(
                 checkpoint_manager, dynamics, optimizer, train_iterator, rng
@@ -209,12 +185,13 @@ def run(cfg: DynamicsConfig):
                 # Logging
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(aux)
+                    lr_value = lr_schedule(step)
                     logger.log(
                         step,
                         metrics={
                             "flow_mse": metrics_cpu["flow_mse"],
                             "boot_mse": metrics_cpu["bootstrap_mse"],
-                            "lr": cfg.lr if lr_schedule is None else lr_schedule(step),
+                            "lr": lr_value,
                         },
                         pbar=pbar,
                     )
@@ -239,11 +216,9 @@ def run(cfg: DynamicsConfig):
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")
-def main(cfg: DictConfig):
-    schema = OmegaConf.structured(DynamicsConfig)
-    cfg = OmegaConf.merge(schema, cfg)
-    realism_cfg = OmegaConf.to_object(cfg)
-    run(realism_cfg)
+def main(cfg: DynamicsConfig):
+    run(cfg)
+
 
 if __name__ == "__main__":
     main()

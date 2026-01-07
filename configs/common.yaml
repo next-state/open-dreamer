@@ -1,8 +1,13 @@
 defaults:
   - _self_
 
-# Logging / Checkpointing
-ckpt_max_to_keep: 2
+# Random seed
+seed: 0
+
+# Checkpointing
+ckpt:
+  max_to_keep: 2
+  save_interval_steps: 10_000
 
 # WandB
 use_wandb: False
@@ -12,6 +17,9 @@ wandb_project: tiny_dreamer_4
 # Precision
 dtype: bfloat16
 param_dtype: float32
+
+# Parallel
+parallel_strategy: data  # data | fsdp | tp
 
 # Hydra
 hydra:

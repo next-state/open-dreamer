@@ -44,7 +44,7 @@ from dreamer.training import (
     shortcut_forcing_step,
 )
 from dreamer.utils import (
-    _ensure_dir,
+    setup_training_directories,
     make_manager,
     make_state,
     maybe_save,
@@ -243,11 +243,8 @@ def train_step(
 
 def run(cfg: BCRewConfig):
     """Main training loop for agent finetuning."""
-    # Setup directories
-    run_dir = Path(HydraConfig.get().runtime.output_dir)
-    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
-    vis_dir = _ensure_dir(run_dir / "viz")
-    print(f"[setup] output dir: {run_dir.resolve()}")
+    # Setup
+    run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
     
     # Wandb
     if cfg.use_wandb:
@@ -441,11 +438,8 @@ def run(cfg: BCRewConfig):
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="bc_rew")
-def main(cfg: DictConfig):
-    schema = OmegaConf.structured(BCRewConfig)
-    cfg = OmegaConf.merge(schema, cfg)
-    agent_cfg = OmegaConf.to_object(cfg)
-    run(agent_cfg)
+def main(cfg: BCRewConfig):
+    run(cfg)
 
 
 if __name__ == "__main__":

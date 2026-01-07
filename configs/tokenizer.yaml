@@ -1,31 +1,25 @@
 defaults:
   - common
   - _self_
+  - dataset: coinrun
 
 run_name: tokenizer
-ckpt_max_to_keep: 1
-ckpt_save_every: 10_000
+
+ckpt:
+  max_to_keep: 1
+  save_interval_steps: 10_000
 
 patch_size: 8
-
-dataset:
-  source: custom
-  array_record_path: datasets/coinrun_hard_agent_episodes/train
-  B: 128
-  T: 64
-  H: 64
-  W: 64
-  C: 3
 
 encoder:
   n_latents: 16
   d_bottleneck: 16
-  d_model: 512
+  d_model: 32
   n_heads: 8
   n_kv_heads: 2
   depth: 4
   dropout_rate: 0.05
-  qk_norm_type: quest  # options: qknorm, quest, null
+  qk_norm_type: quest  # qknorm | quest | null
   rope_theta: 10000.0
   time_every: 4
   mae_p_min: 0.0
@@ -60,17 +54,22 @@ decoder:
 
 max_steps: 300_000
 log_every: 100
-lr: 6e-4  # FIXME: consolidate with max_lr
-tokenizer_loss_type: "mse" # "mse" | "mae"
-
-# learning rate schedule
-lr_schedule: wsd  # constant | wsd | cos
-init_lr: 0.0
-max_lr: 6e-4
-lr_end: 0
-warmup_steps: 10000
-wsd_decay_steps: 30000
+tokenizer_loss_type: mse  # mse | mae
 log_gradients: false
+
+schedule:
+  schedule_type: wsd  # constant | wsd | cos
+  lr: 6e-4  # constant LR or peak LR for schedules
+  init_lr: 0.0
+  lr_end: 0.0
+  warmup_steps: 10_000
+  wsd_decay_steps: 30_000
+
+optimizer:
+  optimizer_type: adamw
+  b1: 0.9
+  b2: 0.9
+  weight_decay: 1e-4
 
 lpips_weight: 0.2
 lpips_frac: 0.5
