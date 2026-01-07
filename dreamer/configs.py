@@ -37,7 +37,7 @@ class DatasetConfig:
     # reward-biased slicing probability (0.0 = disabled, 0.8 = 80% chance to include windows with nonzero reward)
     p_include_reward: float = 0.0
 
-@dataclass(frozen=False, unsafe_hash=True)
+@dataclass(frozen=False)
 class EncoderConfig:
     n_latents: int = 16
     d_bottleneck: int = 32
@@ -52,12 +52,15 @@ class EncoderConfig:
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
-
+    dtype: str = "float32"
+    param_dtype: str = "float32"
+    
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
-@dataclass(frozen=False, unsafe_hash=True)
+@dataclass(frozen=False)
 class DecoderConfig:
+    d_bottleneck: int = 32  # Must match encoder's d_bottleneck
     d_model: int = 64
     n_heads: int = 4
     n_kv_heads: int = 2
@@ -69,13 +72,15 @@ class DecoderConfig:
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
+    dtype: str = "float32"
+    param_dtype: str = "float32"
     H: int = 64
     W: int = 64
-
+    
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
-@dataclass(frozen=False, unsafe_hash=True)
+@dataclass(frozen=False)
 class TokenizerConfig:
     # IO / ckpt
     run_name: str
@@ -104,6 +109,10 @@ class TokenizerConfig:
     lpips_frac: float = 0.5
     visualize_every: int = 10_000
     tokenizer_loss_type: str = "mae" # "mse" | "mae"
+
+    # precision
+    dtype: str = "float32"
+    param_dtype: str = "float32"
 
     # learning rate schedule
     # - "constant": use lr
@@ -209,6 +218,8 @@ class DynamicsModelConfig:
     time_every: int = 4
     mlp_ratio: float = 4.0
     dropout_rate: float = 0.0
+    dtype: str = "float32"
+    param_dtype: str = "float32"
 
     # schedule
     k_max: int = 8
@@ -241,9 +252,14 @@ class DynamicsConfig:
     warmup_steps: int = 5_000
     wsd_decay_steps: int = 20_000
 
+    # precision
+    dtype: str = "float32"
+    param_dtype: str = "float32"
+
     # schedule
     bootstrap_start: int = 5_000
     self_fraction: float = 0.25
+    batch_size: int = 16
 
     # eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
@@ -275,6 +291,10 @@ class BCRewConfig:
     max_steps: int = 1_000_000_000
     log_every: int = 5_000
 
+    # precision
+    dtype: str = "float32"
+    param_dtype: str = "float32"
+    
     # Learning rates
     lr_policy: float = 1e-4
     lr_reward: float = 1e-4
@@ -344,6 +364,10 @@ class EvalConfig:
 
     # Visualization
     max_examples_to_plot: int = 4  # number of sequences to render as strips
+
+    # Precision
+    dtype: str = "float32"
+    param_dtype: str = "float32"
 
     # Safety: ensure heads never see future actions when predicting next actions
     paranoid_no_leak: bool = True
