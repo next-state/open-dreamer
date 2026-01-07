@@ -7,7 +7,7 @@ name: bouncing_square
 source: custom
 array_record_path: datasets/coinrun_hard_agent_episodes/train
 
-B: 8
+B: 128
 T: 64
 H: 64
 W: 64
