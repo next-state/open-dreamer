@@ -420,9 +420,10 @@ def make_iterator(cfg: DatasetConfig):
             global_batch_size=cfg.B,
             image_h=cfg.H,
             image_w=cfg.W,
-            image_c=cfg.C, 
-            num_workers=22,
+            image_c=cfg.C,
+            num_workers=8,
             print_filter_warnings=False,
+            p_include_reward=cfg.p_include_reward,
         )
     else:
         raise ValueError(f"Unknown dataset source: {cfg.source}")

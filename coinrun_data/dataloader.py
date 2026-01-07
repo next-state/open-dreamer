@@ -59,12 +59,21 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
     A Grain Transformation that combines parsing, slicing, and normalizing.
     """
 
-    def __init__(self, seq_len: int, image_h: int, image_w: int, image_c: int):
+    def __init__(
+        self,
+        seq_len: int,
+        image_h: int,
+        image_w: int,
+        image_c: int,
+        *,
+        p_include_reward: float = 0.0,
+    ):
         """Initializes the transformation with processing parameters."""
         self.seq_len = seq_len
         self.image_h = image_h
         self.image_w = image_w
         self.image_c = image_c
+        self.p_include_reward = float(p_include_reward)
 
     def random_map(self, element: dict, rng: np.random.Generator) -> Any:
         """
@@ -101,20 +110,34 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
         max_start_idx = current_episode_len - self.seq_len
 
-        start_idx = rng.integers(0, max_start_idx + 1)
+        # Optionally bias slicing to include sparse rewards.
+        # Assumption for CoinRun sparse reward setting: rewards are either 0.0 or 10.0.
+        # If the episode contains a 10.0 reward, then with probability p_include_reward,
+        # we pick a window guaranteed to include at least one rewarding timestep.
+        # Load rewards once as an ndarray for all logic below
+        rewards_tensor = np.array(element["rewards"])
+
+        start_idx = None
+        if self.p_include_reward > 0.0 and rng.random() < self.p_include_reward:
+            reward_ts = np.flatnonzero(rewards_tensor > 0)
+            if reward_ts.size > 0:
+                t = int(rng.choice(reward_ts))
+                start_min = max(0, t - (self.seq_len - 1))
+                start_max = min(t, max_start_idx)
+                start_idx = int(rng.integers(start_min, start_max + 1))
+
+        if start_idx is None:
+            start_idx = int(rng.integers(0, max_start_idx + 1))
 
         seq = episode_tensor[start_idx : start_idx + self.seq_len]
 
         data_dict = {"videos": seq}
-        if "actions" in element.keys():
-            actions_tensor = np.array(element["actions"])
-            actions = actions_tensor[start_idx : start_idx + self.seq_len]
-            data_dict["actions"] = actions
-        
-        if "rewards" in element.keys():
-            rewards_tensor = np.array(element["rewards"])
-            rewards = rewards_tensor[start_idx : start_idx + self.seq_len]
-            data_dict["rewards"] = rewards
+        actions_tensor = np.array(element["actions"])
+        actions = actions_tensor[start_idx : start_idx + self.seq_len]
+        data_dict["actions"] = actions
+
+        rewards = rewards_tensor[start_idx : start_idx + self.seq_len]
+        data_dict["rewards"] = rewards
 
         return data_dict
 
@@ -129,6 +152,7 @@ def get_dataloader(
     num_workers: int = 1,
     prefetch_buffer_size: int = 1,
     seed: int = 42,
+    p_include_reward: float = 0.0,
     *,
     print_filter_warnings: bool = True,
 ):
@@ -174,7 +198,11 @@ def get_dataloader(
             print_filter_warnings=print_filter_warnings,
         ),
         ProcessEpisodeAndSlice(
-            seq_len=seq_len, image_h=image_h, image_w=image_w, image_c=image_c
+            seq_len=seq_len,
+            image_h=image_h,
+            image_w=image_w,
+            image_c=image_c,
+            p_include_reward=p_include_reward,
         ),
         grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
     ]
