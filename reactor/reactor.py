@@ -32,7 +32,7 @@ User Input → input_to_action() → Action Array
 @dataclass
 class ReactorConfig:
     """Configuration for Dreamer reactor runtime."""
-    dynamics_ckpt: str = 'logs/ed/checkpoints'
+    dynamics_ckpt: str = 'logs/dynamics/checkpoints'
     policy_ckpt: Optional[str] = None
     
     # Denoising schedule
