@@ -10,6 +10,7 @@ class DatasetConfig:
     This config is shared across all experiments (tokenizer, dynamics, policy)
     to ensure consistent data loading.
     """
+    name: str = "coinrun"
 
     # Batch and sequence dimensions
     B: int = 32  # batch size
