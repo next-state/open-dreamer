@@ -133,36 +133,19 @@ class RLConfig:
     # dataset config
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     action_dim: int = 4
+    n_agent: int = 1  # number of agent tokens for dynamics
 
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4
-    n_agent: int = 1
-    agent_space_mode: str = "wm_agent"
+    # Training hyperparameters
+    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
+    self_fraction: float = 0.25   # used once we pass bootstrap_start
 
-    # schedule
-    k_max: int = 8
-
-    # train
+    # Train
     max_steps: int = 1_000_000_000
     log_every: int = 5_000
     lr: float = 3e-4
 
     # eval media toggle
     write_video_every: int = 10_000
-    visualize_every: int = 25_000
 
     # RL-specific
     L: int = 2
