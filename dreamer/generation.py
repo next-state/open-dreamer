@@ -263,11 +263,7 @@ def latent_rollout(
         initial_agent_tokens: Optional (B, T_ctx, n_agent, D) agent tokens for context.
         
     Returns:
-        Dict with:
-            'latents': (B, T_ctx + num_steps, n_spatial, D_s) Full trajectory
-            'actions': (B, num_steps, ...) Generated actions
-            'hidden_states': (B, num_steps, n_agent, D) Hidden states from rollout
-            'context_hidden': (B, T_ctx, n_agent, D) Hidden states from context
+        latents: (B, T_ctx + num_steps, n_spatial, D_s)
     """
     B, T_ctx, n_spatial, D_s = latents_ctx.shape
     latent_shape = (B, 1, n_spatial, D_s)
@@ -325,14 +321,13 @@ def latent_rollout(
     rollout_hidden = einops.rearrange(rollout_hidden, 't b n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
     
     out_latents = jnp.concatenate((latents_ctx, rollout_latents), axis=1)
-    
+
     return {
         'latents': out_latents,
         'actions': rollout_actions,
         'hidden_states': rollout_hidden,
         'context_hidden': h_seq,
     } 
-
 
 def video_rollout(
     tokenizer: Tokenizer,

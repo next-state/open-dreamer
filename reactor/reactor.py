@@ -1,8 +1,9 @@
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from dreamer.models import Dynamics, PolicyHeadMTP
 from dreamer.generation import DenoiseSchedule, next_frame
-from dreamer.parallel import create_data_model_parallel
+from dreamer.parallel import create_data_model_parallel, MeshRules
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
 import numpy as np
@@ -31,7 +32,7 @@ User Input → input_to_action() → Action Array
 @dataclass
 class ReactorConfig:
     """Configuration for Dreamer reactor runtime."""
-    dynamics_ckpt: str = 'logs/ed/checkpoints'
+    dynamics_ckpt: str = 'logs/dynamics/checkpoints'
     policy_ckpt: Optional[str] = None
     
     # Denoising schedule
@@ -143,8 +144,13 @@ class DreamerVideoModel(VideoModel):
         assert isinstance(cfg, ReactorConfig)
         logger.info(f"Loading dynamics model and tokenizer from {cfg.dynamics_ckpt}")
         mesh, data_sharding = create_data_model_parallel(1, 1)
+        mesh_rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
         with jax.set_mesh(mesh):
-            self.dynamics, self.tokenizer = Dynamics.from_pretrained(cfg.dynamics_ckpt, self.ctx)
+            self.dynamics, self.tokenizer = Dynamics.from_pretrained(
+                cfg.dynamics_ckpt, 
+                mesh_rules=mesh_rules,
+                rngs=nnx.Rngs(0)
+            )
             self.dynamics_cfg = self.dynamics.cfg
             self.tokenizer_cfg = self.tokenizer.cfg
             
@@ -254,6 +260,7 @@ class DreamerVideoModel(VideoModel):
             init_frames_jax,
             deterministic=True,
             packing_factor=self.dynamics.cfg.packing_factor,
+            rngs=nnx.Rngs(mae=rng_encoder),
         )  # Shape: (1, T//packing, n_spatial, D_s*packing)
         
         # Warm up dynamics cache by processing context latents
@@ -287,6 +294,7 @@ class DreamerVideoModel(VideoModel):
             packing_factor=self.dynamics.cfg.packing_factor,
             caches=self.tokenizer_cache,
             deterministic=True,
+            rngs=None,
         )
         
         # Show the last context frame to the user
