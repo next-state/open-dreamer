@@ -17,7 +17,7 @@ from .utils import (
 )
 from .configs import TokenizerConfig, DynamicsModelConfig, DynamicsConfig, EncoderModelConfig, DecoderModelConfig, MuPConfig
 from .parallel import MeshRules
-from .mup import mup_attention_scale, mup_output_init
+from .mup import mup_output_init
 
 
 # ============================================================================
@@ -343,15 +343,14 @@ class GroupedQueryAttention(nnx.Module):
         head_dim = self.dim // self.num_heads
         kv_dim = self.num_kv_heads * head_dim
 
-        # μP: Store attention scale (1/d_head for μP, 1/√d_head for standard)
-        mup_enabled = mup_config is not None and mup_config.enabled
-        self.attn_scale = mup_attention_scale(head_dim, mup_enabled)
+        # μP: Store boolean flag for attention scaling (computed inline in __call__)
+        self.use_mup_scale = mup_config is not None and mup_config.enabled
 
         self.to_q = nnx.Linear(dim, dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
         self.to_kv = nnx.Linear(dim, 2 * kv_dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
 
         # μP: Output projection uses scaled init
-        if mup_enabled:
+        if self.use_mup_scale:
             to_out_init = mup_output_init(dim, mup_config.base_width)
         else:
             to_out_init = nnx.initializers.lecun_normal()
@@ -380,8 +379,14 @@ class GroupedQueryAttention(nnx.Module):
         kv = self.to_kv(x)
         k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
 
-        # μP: Use stored attention scale (1/d_head for μP, 1/√d_head for standard)
-        scale = self.attn_scale
+        # Compute attention scale inline (μP: 1/d_head, standard: 1/√d_head)
+        # Using inline computation ensures JAX treats this as a trace-time constant
+        head_dim = q.shape[-1]
+        if self.use_mup_scale:
+            scale = 1.0 / head_dim  # μP scaling
+        else:
+            scale = head_dim ** -0.5  # Standard scaling
+
         if self.qk_norm_type == 'qknorm':
             q = self.q_ln(q)
             k = self.k_ln(k)

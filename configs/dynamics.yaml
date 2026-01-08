@@ -32,7 +32,7 @@ dynamics:
     param_dtype: ${param_dtype}
 
 bootstrap_start: 5_000
-self_fraction: 0.25
+self_fracchtion: 0.25
 
 max_steps: 300_000
 
