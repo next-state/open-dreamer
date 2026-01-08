@@ -4,7 +4,6 @@ from flax import nnx
 import jax
 from typing import Optional, Tuple, Any, Dict
 from einops import rearrange, repeat
-from dataclasses import asdict
 import math
 from pathlib import Path
 import orbax.checkpoint as ocp
@@ -16,7 +15,7 @@ from .utils import (
     from_dict
 )
 from .data import patchify, unpatchify
-from .configs import TokenizerConfig, DynamicsModelConfig, DynamicsConfig
+from .configs import TokenizerConfig, DynamicsModelConfig, DynamicsConfig, EncoderModelConfig, DecoderModelConfig
 from .parallel import MeshRules
 
 
@@ -562,33 +561,26 @@ class BlockCausalTransformer(nnx.Module):
 class Encoder(nnx.Module):
     """Vision encoder with MAE masking."""
 
-    def __init__(self, d_model: int, n_latents: int, patch_size: int, n_heads: int,
-                 n_kv_heads: int, depth: int, d_bottleneck: int, dropout_rate: float = 0.0,
-                 qk_norm_type: str | None = None, mlp_ratio: float = 4.0, time_every: int = 4,
-                 mae_p_min: float = 0.0, mae_p_max: float = 0.9, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
-                 dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5),
-                 dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675), *, 
-                 mesh_rules: MeshRules, rngs: nnx.Rngs):
-        self.n_latents = n_latents
-        self.patch_size = patch_size
-        self.dataset_mean = dataset_mean
-        self.dataset_std = dataset_std
-        dtype = to_jnp_dtype(dtype)
-        param_dtype = to_jnp_dtype(param_dtype)
+    def __init__(self, cfg: EncoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.n_latents = cfg.n_latents
+        self.patch_size = cfg.patch_size
+        self.dataset_mean = cfg.dataset_mean
+        self.dataset_std = cfg.dataset_std
+        dtype = to_jnp_dtype(cfg.dtype)
+        param_dtype = to_jnp_dtype(cfg.param_dtype)
 
-        self.patch_proj = nnx.Linear(patch_size * patch_size * 3, d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
-        self.bottleneck_proj = nnx.Linear(d_model, d_bottleneck, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.patch_proj = nnx.Linear(cfg.patch_size * cfg.patch_size * 3, cfg.d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.bottleneck_proj = nnx.Linear(cfg.d_model, cfg.d_bottleneck, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
 
         self.transformer = BlockCausalTransformer(
-            d_model=d_model, n_heads=n_heads, n_kv_heads=n_kv_heads, depth=depth,
-            dropout_rate=dropout_rate, qk_norm_type=qk_norm_type, mlp_ratio=mlp_ratio,
-            time_every=time_every, rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+            d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
+            dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
+            time_every=cfg.time_every, rope_theta=cfg.rope_theta, dtype=dtype, param_dtype=param_dtype,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
-        self.mask_and_replace = MAEReplacer(D=d_model, p_min=mae_p_min, p_max=mae_p_max, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
-        self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (n_latents, d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
+        self.mask_and_replace = MAEReplacer(D=cfg.d_model, p_min=cfg.mae_p_min, p_max=cfg.mae_p_max, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
+        self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_latents, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
     def __call__(self, videos, *, deterministic: bool = True, packing_factor = None, rngs: nnx.Rngs = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
         # 1) takes videos in the [0,255] range
@@ -640,35 +632,28 @@ class Decoder(nnx.Module):
     reconstructions at per-patch query tokens.
     """
 
-    def __init__(self, d_model: int, d_bottleneck: int, n_heads: int, n_kv_heads: int, depth: int,
-                 n_latents: int, patch_size: int, d_patch: int, H: int, W: int,
-                 dropout_rate: float = 0.0, qk_norm_type: str | None = None,
-                 mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
-                 dataset_mean: Tuple[float, ...] = (0.5, 0.5, 0.5),
-                 dataset_std: Tuple[float, ...] = (0.288675, 0.288675, 0.288675), *, 
-                 mesh_rules: MeshRules, rngs: nnx.Rngs):
-        self.n_latents = n_latents
-        self.patch_size = patch_size
-        self.H = H
-        self.W = W
-        self.dataset_mean = dataset_mean
-        self.dataset_std = dataset_std
-        dtype = to_jnp_dtype(dtype)
-        param_dtype = to_jnp_dtype(param_dtype)
+    def __init__(self, cfg: DecoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.n_latents = cfg.n_latents
+        self.patch_size = cfg.patch_size
+        self.H = cfg.H
+        self.W = cfg.W
+        self.dataset_mean = cfg.dataset_mean
+        self.dataset_std = cfg.dataset_std
+        dtype = to_jnp_dtype(cfg.dtype)
+        param_dtype = to_jnp_dtype(cfg.param_dtype)
 
         self.n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
-        self.up_proj = nnx.Linear(d_bottleneck, d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
-        self.patch_head = nnx.Linear(d_model, d_patch, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.up_proj = nnx.Linear(cfg.d_bottleneck, cfg.d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.patch_head = nnx.Linear(cfg.d_model, cfg.d_patch, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
 
         self.transformer = BlockCausalTransformer(
-            d_model=d_model, n_heads=n_heads, n_kv_heads=n_kv_heads, depth=depth,
-            dropout_rate=dropout_rate, qk_norm_type=qk_norm_type, mlp_ratio=mlp_ratio,
-            time_every=time_every, rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+            d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
+            dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
+            time_every=cfg.time_every, rope_theta=cfg.rope_theta, dtype=dtype, param_dtype=param_dtype,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
-        self.patch_queries = nnx.Param(jax.random.normal(rngs.params(), (self.n_patches, d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
+        self.patch_queries = nnx.Param(jax.random.normal(rngs.params(), (self.n_patches, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
     def get_token_layout(self) -> TokenLayout:
         return TokenLayout((
@@ -678,7 +663,7 @@ class Decoder(nnx.Module):
 
     def __call__(self, z: jnp.ndarray, *, deterministic: bool = True, packing_factor = None, caches: Optional[Dict[int, KVCache]] = None, rngs: Optional[nnx.Rngs] = None):
         if packing_factor is not None:
-            z = rearrange(z, "b t n (p d) -> b t (n p) d", p=packing_factor)
+            z = rearrange(z, "... n (p d) -> ... (n p) d", p=packing_factor)
             
         B, T, N_l, d_bottleneck = z.shape
         # 1) Up-project latent bottleneck to d_model (per latent token)
@@ -706,16 +691,12 @@ class Decoder(nnx.Module):
 class Tokenizer(nnx.Module):
     """Complete tokenizer (encoder + decoder)."""
 
-    def __init__(self, config: TokenizerConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
-        self.config = config
+    def __init__(self, cfg: TokenizerConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.cfg = cfg
 
         # Create encoder and decoder
-        enc_kwargs = asdict(config.encoder)
-        dec_kwargs = asdict(config.decoder)
-        enc_kwargs['rngs'], enc_kwargs['mesh_rules'] = rngs, mesh_rules
-        dec_kwargs['rngs'], dec_kwargs['mesh_rules'] = rngs, mesh_rules
-        self.encoder = Encoder(**enc_kwargs)
-        self.decoder = Decoder(**dec_kwargs)
+        self.encoder = Encoder(cfg.encoder, mesh_rules=mesh_rules, rngs=rngs)
+        self.decoder = Decoder(cfg.decoder, mesh_rules=mesh_rules, rngs=rngs)
 
     def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs = None):
         z, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs)
@@ -734,12 +715,12 @@ class Tokenizer(nnx.Module):
         layout = self.decoder.get_token_layout()
         
         return create_transformer_caches(
-            depth=self.config.decoder.depth,
-            time_every=self.config.decoder.time_every,
+            depth=self.cfg.decoder.depth,
+            time_every=self.cfg.decoder.time_every,
             flattened_batch_size=batch_size * layout.S,
             window_size=window_size,
-            num_kv_heads=self.config.decoder.n_kv_heads,
-            head_dim=self.config.decoder.d_model // self.config.decoder.n_heads,
+            num_kv_heads=self.cfg.decoder.n_kv_heads,
+            head_dim=self.cfg.decoder.d_model // self.cfg.decoder.n_heads,
             dtype=dtype
         )
 
@@ -821,42 +802,42 @@ class ActionEncoder(nnx.Module):
 class Dynamics(nnx.Module):
     """Dynamics model (world model)."""
 
-    def __init__(self, config: DynamicsModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
-        self.config = config
-        self.dtype = to_jnp_dtype(config.dtype)
-        self.param_dtype = to_jnp_dtype(config.param_dtype)
-        self.d_model = config.d_model
-        self.d_bottleneck = config.d_bottleneck
-        self.depth = config.depth
-        self.n_heads = config.n_heads
-        self.n_kv_heads = config.n_kv_heads
-        self.packing_factor = config.packing_factor
-        self.n_register = config.n_register
-        self.k_max = config.k_max
+    def __init__(self, cfg: DynamicsModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.cfg = cfg
+        self.dtype = to_jnp_dtype(cfg.dtype)
+        self.param_dtype = to_jnp_dtype(cfg.param_dtype)
+        self.d_model = cfg.d_model
+        self.d_bottleneck = cfg.d_bottleneck
+        self.depth = cfg.depth
+        self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads
+        self.packing_factor = cfg.packing_factor
+        self.n_register = cfg.n_register
+        self.k_max = cfg.k_max
 
         # Project spatial tokens
-        self.spatial_proj = nnx.Linear(config.d_bottleneck * config.packing_factor, config.d_model, dtype=self.dtype, param_dtype=self.param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.spatial_proj = nnx.Linear(cfg.d_bottleneck * cfg.packing_factor, cfg.d_model, dtype=self.dtype, param_dtype=self.param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
 
         # Register tokens
-        self.register_tokens = nnx.Param(jax.random.normal(rngs.params(), (config.n_register, config.d_model), dtype=self.param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
+        self.register_tokens = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_register, cfg.d_model), dtype=self.param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
         # Action encoder
-        self.action_encoder = ActionEncoder(d_model=config.d_model, action_dim=config.action_dim, dtype=self.dtype, param_dtype=self.param_dtype, mesh_rules=mesh_rules, rngs=rngs)
+        self.action_encoder = ActionEncoder(d_model=cfg.d_model, action_dim=cfg.action_dim, dtype=self.dtype, param_dtype=self.param_dtype, mesh_rules=mesh_rules, rngs=rngs)
 
         # Transformer
         self.transformer = BlockCausalTransformer(
-            d_model=config.d_model, n_heads=config.n_heads, n_kv_heads=config.n_kv_heads,
-            depth=config.depth, dropout_rate=config.dropout_rate, qk_norm_type=config.qk_norm_type,
-            mlp_ratio=config.mlp_ratio, time_every=config.time_every, rope_theta=config.rope_theta,
+            d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads,
+            depth=cfg.depth, dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type,
+            mlp_ratio=cfg.mlp_ratio, time_every=cfg.time_every, rope_theta=cfg.rope_theta,
             dtype=self.dtype, param_dtype=self.param_dtype, mesh_rules=mesh_rules, rngs=rngs
         )
 
         # Discrete embeddings for shortcut conditioning
         # Step size d ∈ {1, 1/2, 1/4, ..., 1/k_max}
         # We index steps by: step_idx = log2(1/d) ∈ {0, 1, 2, ..., log2(k_max)}
-        self.num_step_bins = int(math.log2(config.k_max)) + 1
+        self.num_step_bins = int(math.log2(cfg.k_max)) + 1
         self.step_embed = nnx.Embed(
-            self.num_step_bins, config.d_model, 
+            self.num_step_bins, cfg.d_model, 
             dtype=self.dtype, param_dtype=self.param_dtype,
             embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
             rngs=rngs
@@ -865,7 +846,7 @@ class Dynamics(nnx.Module):
         # Signal level τ ∈ {0, d, 2d, ..., 1 - d, 1}
         # We index signals by: signal_idx = τ * k_max ∈ {0, 1, 2, ..., k_max}
         self.signal_embed = nnx.Embed(
-            config.k_max, config.d_model,
+            cfg.k_max, cfg.d_model,
             dtype=self.dtype, param_dtype=self.param_dtype,
             embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
             rngs=rngs
@@ -873,7 +854,7 @@ class Dynamics(nnx.Module):
 
         # Output head (zero-init)
         self.flow_x_head = nnx.Linear(
-            config.d_model, config.d_bottleneck * config.packing_factor,
+            cfg.d_model, cfg.d_bottleneck * cfg.packing_factor,
             kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
             bias_init=nnx.initializers.zeros,
             dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs
@@ -885,7 +866,7 @@ class Dynamics(nnx.Module):
             (Modality.SHORTCUT_SIGNAL, 1),
             (Modality.SHORTCUT_STEP, 1),
             (Modality.SPATIAL, n_spatial),
-            (Modality.REGISTER, self.config.n_register),
+            (Modality.REGISTER, self.cfg.n_register),
         ]
         if n_agent > 0:
             segments.append((Modality.AGENT, n_agent))
@@ -897,12 +878,12 @@ class Dynamics(nnx.Module):
         layout = self.get_token_layout(n_spatial=n_spatial, n_agent=n_agent)
 
         return create_transformer_caches(
-            depth=self.config.depth,
-            time_every=self.config.time_every,
+            depth=self.cfg.depth,
+            time_every=self.cfg.time_every,
             flattened_batch_size=batch_size * layout.S,
             window_size=window_size,
-            num_kv_heads=self.config.n_kv_heads,
-            head_dim=self.config.d_model // self.config.n_heads,
+            num_kv_heads=self.cfg.n_kv_heads,
+            head_dim=self.cfg.d_model // self.cfg.n_heads,
             dtype=dtype
         )
 

@@ -48,7 +48,7 @@ def sample_video(
     # Encode frames to clean latents
     latents, _ = tokenizer.encode(
         frames,
-        packing_factor=dynamics.config.packing_factor,
+        packing_factor=dynamics.cfg.packing_factor,
         deterministic=True,
         rngs=rngs
     )
@@ -72,7 +72,7 @@ def sample_video(
     latents_for_tokenized_frames = jnp.concatenate([latents_ctx, latents_future], axis=1)
     tokenized_frames, _ = tokenizer.decode(
         latents_for_tokenized_frames,
-        packing_factor=dynamics.config.packing_factor,
+        packing_factor=dynamics.cfg.packing_factor,
         deterministic=True
     )
     tokenized_frames = jnp.clip(tokenized_frames, 0, 255).astype(jnp.uint8)

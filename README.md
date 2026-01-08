@@ -40,7 +40,6 @@ Then, the agent is trained with RL in the world model. The reward is the proximi
   - `train_dynamics.py` -- Trains the interactive dynamics model on top of the frozen tokenizer.
   - `train_bc_rew_heads.py` -- Adds behavior cloning and reward prediction heads on the world model (agent tokens + reward head).
   - `train_policy.py` -- Runs Dreamer‑style RL purely in imagination using the learned world model and heads (PMPO-style update).
-  - `eval_bc_rew_heads.py` -- Evaluation script to verify BC / reward finetuning
 - **Docs & logs**
   - `docs/` -- Figures, videos, and notes from development (e.g., reconstructions, imagination rollouts).
 

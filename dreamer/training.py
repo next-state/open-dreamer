@@ -18,7 +18,6 @@ import jax.numpy as jnp
 from einops import rearrange
 from flax import nnx
 import optax
-import wandb
 import time
 
 from dreamer.generation import DenoiseSchedule
@@ -617,14 +616,15 @@ def run_evaluation(
     val_actions: jnp.ndarray,
     vis_dir: Path,
     rng: jax.Array,
+    logger,
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
-    
+
     This function can be used in both dynamics pretraining and agent finetuning.
-    
+
     Args:
-        cfg: Training config (must have use_wandb attribute)
+        cfg: Training config
         tokenizer_cfg: Tokenizer config (for dataset stats)
         step: Current training step
         tokenizer: Tokenizer NNX model instance
@@ -633,8 +633,9 @@ def run_evaluation(
         val_actions: (B, T) Validation actions
         vis_dir: Directory to save visualizations
         rng: Random key
+        logger: Logger instance for logging metrics and videos
     """
-    k_max = dynamics.config.k_max
+    k_max = dynamics.cfg.k_max
     schedule_shortcut = DenoiseSchedule.init(4, k_max)
     schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
 
@@ -683,15 +684,13 @@ def run_evaluation(
         except Exception as e:
             print(f"[eval:{tag}] MP4 write failed: {e}")
 
-        # Log to wandb
-        if cfg.use_wandb and wandb.run is not None:
-            wandb.log({
-                f"eval/{tag}/mse": mse,
-                f"eval/{tag}/psnr": psnr,
-                f"eval/{tag}/horizon": horizon,
-                f"eval/{tag}/eval_time": dt,
-            }, step=step)
-            if videos is not None:
-                wandb.log({
-                    f"eval/{tag}/video": wandb.Video(str(mp4_path), format="mp4"),
-                }, step=step)
+        # Log metrics and video
+        logger.log_metrics(step, {
+            f"{tag}/mse": mse,
+            f"{tag}/psnr": psnr,
+            f"{tag}/horizon": horizon,
+            f"{tag}/eval_time": dt,
+        }, prefix="eval/")
+
+        if videos is not None:
+            logger.log_video(step, f"eval/{tag}/video", mp4_path)

@@ -15,14 +15,6 @@ class MeshRules:
     return tuple(getattr(self, key) for key in keys)
 
 
-# mesh_rules = MeshRules(
-#   embed=None,  # Replicated
-#   mlp='model',  # Model-parallel
-#   attn='model',  # Model-parallel
-#   data='data',  # Data-parallel
-# )
-
-
 def create_data_model_parallel(
     data_shards: int = 1,
     model_shards: int = 1
@@ -48,3 +40,46 @@ def create_data_model_parallel(
     print(f"[parallel] Mesh axis shapes: {axis_shapes}, axis names: {axis_names}")
     
     return mesh, data_sharding
+
+
+def build_parallel(strategy: str) -> tuple[Mesh, NamedSharding, MeshRules]:
+    """
+    Build parallelization setup (mesh, data_sharding, mesh_rules).
+    
+    Args:
+        cfg: BaseExperimentConfig instance with parallel_strategy field
+    
+    Returns:
+        Tuple of (mesh, data_sharding, mesh_rules)
+    """
+    devices = jax.devices()
+    device_count = len(devices)
+        
+    if strategy == "data":
+        # Pure data parallelism: all devices for data, model replicated
+        data_shards = device_count
+        model_shards = 1
+        mesh, data_sharding = create_data_model_parallel(data_shards, model_shards)
+        mesh_rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
+        
+    elif strategy == "fsdp":
+        # Fully Sharded Data Parallel: model sharded across data dimension
+        data_shards = device_count
+        model_shards = 1
+        mesh, data_sharding = create_data_model_parallel(data_shards, model_shards)
+        mesh_rules = MeshRules(embed='data', mlp='data', attn='data', data='data')
+        
+    elif strategy == "tp":
+        # Tensor Parallel: model sharded across model dimension
+        data_shards = 1
+        model_shards = device_count
+        mesh, data_sharding = create_data_model_parallel(data_shards, model_shards)
+        mesh_rules = MeshRules(embed='model', mlp='model', attn='model', data=None)
+        
+    else:
+        raise ValueError(
+            f"Unsupported parallel_strategy: {strategy}. "
+            f"Supported strategies: 'data', 'fsdp', 'tp'"
+        )
+        
+    return mesh, data_sharding, mesh_rules
