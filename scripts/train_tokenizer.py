@@ -48,7 +48,7 @@ OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').red
 
 def recon_loss_from_mae(pred, target, mae_mask):
     sq_err = (pred - target) ** 2
-    masked_sq_err = jnp.where(mae_mask, sq_err, 0.0)
+    masked_sq_err = jnp.asarray(jnp.where(mae_mask, sq_err, 0.0))
     total_sse = jnp.sum(masked_sq_err)
     count = jnp.maximum(mae_mask.sum(), 1.0)
     return total_sse / count
@@ -201,7 +201,7 @@ def run(cfg: TokenizerConfig):
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
-        with build_checkpoint_manager(ckpt_dir, cfg.ckpt, cfg.max_steps) as checkpoint_manager:
+        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
             # Resume from checkpoint
             start_step, tokenizer, optimizer, train_iterator, rng = try_restore(
                 checkpoint_manager, tokenizer, optimizer, train_iterator, rng

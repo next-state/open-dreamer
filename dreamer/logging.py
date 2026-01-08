@@ -102,7 +102,7 @@ class WandbLogger(Logger):
     def __init__(
         self,
         logger_cfg: LoggerConfig,
-        config: Optional[Dict[str, Any]] = None,
+        config: Any = None,
         dir: Optional[str] = None,
     ):
         super().__init__(logger_cfg=logger_cfg)
@@ -151,7 +151,7 @@ class WandbLogger(Logger):
 
 def build_logger(
     logger_cfg: LoggerConfig,
-    config: Optional[Dict[str, Any]] = None,
+    config: Any = None,
     dir: Optional[str] = None,
 ) -> Logger:
     if logger_cfg.use_wandb:

@@ -144,7 +144,7 @@ def run(cfg: DynamicsConfig):
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
-        with build_checkpoint_manager(ckpt_dir, cfg.ckpt, cfg.max_steps) as checkpoint_manager:
+        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
             # Resume from checkpoint
             start_step, dynamics, optimizer, train_iterator, rng = try_restore(
                 checkpoint_manager, dynamics, optimizer, train_iterator, rng

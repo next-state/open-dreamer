@@ -220,15 +220,14 @@ def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
 # ============================================================================
 
 def build_checkpoint_manager(
-        ckpt_dir: Path,
         ckpt_cfg: CheckpointConfig,
-        max_steps: int,
+        ckpt_dir: Path,
         item_names=("model_state", "optimizer_state", "train_dataloader_state", "rngs", "meta"),
     ) -> ocp.CheckpointManager:
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=ckpt_cfg.max_to_keep,
         save_interval_steps=ckpt_cfg.save_interval_steps,
-        save_on_steps=[max_steps - 1],  # always save at the end
+        save_on_steps=[ckpt_cfg.max_steps - 1],  # always save at the end
     )
 
     return ocp.CheckpointManager(ckpt_dir, options=checkpoint_options, item_names=item_names)
