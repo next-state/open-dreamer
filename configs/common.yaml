@@ -25,6 +25,13 @@ logger:
 dtype: bfloat16
 param_dtype: float32
 
+# Mu-Parameterization (muP)
+# Enable for hyperparameter transfer across model widths
+mup:
+  enabled: false
+  base_width: 256  # Reference width for LR scaling
+  attn_scale_type: mup  # mup = 1/d_head, standard = 1/sqrt(d_head)
+
 # Parallel
 parallel_strategy: data  # data | fsdp | tp
 

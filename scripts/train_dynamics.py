@@ -129,16 +129,19 @@ def run(cfg: DynamicsConfig):
         tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
         tokenizer_cfg = tokenizer.cfg
 
-        # Initialize dynamics
-        dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        # Initialize dynamics (with optional μP)
+        dynamics = Dynamics(cfg.dynamics, mup_config=cfg.mup, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(dynamics)
         print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
 
         # Build learning rate schedule
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
-        # Build optimizer
-        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule)
+        # Build optimizer (with optional μP-aware LR scaling)
+        optimizer = build_optimizer(
+            cfg.optimizer, dynamics, lr_schedule,
+            mup_config=cfg.mup, d_model=cfg.dynamics.d_model
+        )
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)

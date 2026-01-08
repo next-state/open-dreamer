@@ -186,16 +186,20 @@ def run(cfg: TokenizerConfig):
         key = jax.random.key(cfg.seed)
         rng, init_key = jax.random.split(key)
 
-        # Initialize tokenizer
-        tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        # Initialize tokenizer (with optional μP)
+        tokenizer = Tokenizer(cfg, mup_config=cfg.mup, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(tokenizer)
         print(f"Parameter counts: {param_counts}")
 
         # Build learning rate schedule
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
-        # Build optimizer
-        optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule)
+        # Build optimizer (with optional μP-aware LR scaling)
+        # Use encoder d_model as the reference width for μP
+        optimizer = build_optimizer(
+            cfg.optimizer, tokenizer, lr_schedule,
+            mup_config=cfg.mup, d_model=cfg.encoder.d_model
+        )
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)

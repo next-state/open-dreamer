@@ -15,8 +15,9 @@ from .utils import (
     from_dict,
     patchify, unpatchify
 )
-from .configs import TokenizerConfig, DynamicsModelConfig, DynamicsConfig, EncoderModelConfig, DecoderModelConfig
+from .configs import TokenizerConfig, DynamicsModelConfig, DynamicsConfig, EncoderModelConfig, DecoderModelConfig, MuPConfig
 from .parallel import MeshRules
+from .mup import mup_attention_scale, mup_output_init
 
 
 # ============================================================================
@@ -262,7 +263,8 @@ class MLP(nnx.Module):
 
     def __init__(self, d_model: int, mlp_ratio: float = 4.0, dropout_rate: float = 0.0,
                  swiglu: bool = True, parity_2over3: bool = False, use_norm: bool = True,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
+                 mup_config: Optional[MuPConfig] = None, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
         self.mlp_ratio = mlp_ratio
@@ -279,7 +281,7 @@ class MLP(nnx.Module):
             mult = self.mlp_ratio * (2.0 / 3.0)  # param parity with GELU MLP
 
         hidden = int(self.d_model * mult)
-        
+
         if self.use_norm:
             self.norm = nnx.RMSNorm(d_model, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
 
@@ -288,7 +290,12 @@ class MLP(nnx.Module):
         else:
             self.fc_in = nnx.Linear(d_model, hidden, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
 
-        self.fc_out = nnx.Linear(hidden, d_model, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        # μP: Output layer uses scaled init
+        if mup_config is not None and mup_config.enabled:
+            fc_out_init = mup_output_init(d_model, mup_config.base_width)
+        else:
+            fc_out_init = nnx.initializers.lecun_normal()
+        self.fc_out = nnx.Linear(hidden, d_model, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(fc_out_init, mesh_rules('mlp')), rngs=rngs)
         self.dropout = nnx.Dropout(dropout_rate)
 
     def __call__(self, x: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> jnp.ndarray:
@@ -314,10 +321,11 @@ class MLP(nnx.Module):
 class GroupedQueryAttention(nnx.Module):
     """Grouped Query Attention with optional QK normalization and RoPE."""
 
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, 
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  is_causal: bool = False, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
+                 mup_config: Optional[MuPConfig] = None, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.dim = dim
         self.num_heads = num_heads
@@ -328,16 +336,26 @@ class GroupedQueryAttention(nnx.Module):
         self.rope_theta = rope_theta
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
-        
+
         assert self.dim % self.num_heads == 0
         assert self.num_heads % self.num_kv_heads == 0
 
         head_dim = self.dim // self.num_heads
         kv_dim = self.num_kv_heads * head_dim
 
+        # μP: Store attention scale (1/d_head for μP, 1/√d_head for standard)
+        mup_enabled = mup_config is not None and mup_config.enabled
+        self.attn_scale = mup_attention_scale(head_dim, mup_enabled)
+
         self.to_q = nnx.Linear(dim, dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
         self.to_kv = nnx.Linear(dim, 2 * kv_dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
-        self.to_out = nnx.Linear(dim, dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
+
+        # μP: Output projection uses scaled init
+        if mup_enabled:
+            to_out_init = mup_output_init(dim, mup_config.base_width)
+        else:
+            to_out_init = nnx.initializers.lecun_normal()
+        self.to_out = nnx.Linear(dim, dim, use_bias=False, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(to_out_init, mesh_rules('attn')), rngs=rngs)
         self.dropout = nnx.Dropout(dropout_rate)
 
         if self.qk_norm_type == 'qknorm':
@@ -362,14 +380,15 @@ class GroupedQueryAttention(nnx.Module):
         kv = self.to_kv(x)
         k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
 
-        scale = q.shape[-1] ** -0.5
+        # μP: Use stored attention scale (1/d_head for μP, 1/√d_head for standard)
+        scale = self.attn_scale
         if self.qk_norm_type == 'qknorm':
             q = self.q_ln(q)
             k = self.k_ln(k)
         elif self.qk_norm_type == 'quest':
             # claims to beat qknorm https://openreview.net/pdf?id=HkztQWZfl2
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
-            scale = 1.0
+            scale = 1.0  # Quest overrides scale
 
         # RoPE
         start_pos = cache.index if cache is not None else 0
@@ -414,13 +433,15 @@ class SpaceSelfAttention(nnx.Module):
 
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
+                 mup_config: Optional[MuPConfig] = None, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
             rope_theta=rope_theta, is_causal=False,
-            dtype=dtype, param_dtype=param_dtype, 
+            dtype=dtype, param_dtype=param_dtype,
+            mup_config=mup_config,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -439,13 +460,15 @@ class TimeSelfAttention(nnx.Module):
 
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
+                 mup_config: Optional[MuPConfig] = None, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
             rope_theta=rope_theta, is_causal=True,
-            dtype=dtype, param_dtype=param_dtype, 
+            dtype=dtype, param_dtype=param_dtype,
+            mup_config=mup_config,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -463,12 +486,12 @@ class TimeSelfAttention(nnx.Module):
 class BlockCausalLayer(nnx.Module):
     """Single block-causal transformer layer (alternating space/time attention)."""
 
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, 
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4,
-                 rope_theta: float = 10000.0, dtype: Any = jnp.float32, 
-                 param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs,
-                 mesh_rules: MeshRules):
+                 rope_theta: float = 10000.0, dtype: Any = jnp.float32,
+                 param_dtype: Any = jnp.float32, mup_config: Optional[MuPConfig] = None, *,
+                 rngs: nnx.Rngs, mesh_rules: MeshRules):
         self.layer_index = layer_index
         self.time_every = time_every
         param_dtype = to_jnp_dtype(param_dtype)
@@ -481,19 +504,21 @@ class BlockCausalLayer(nnx.Module):
             self.attn = TimeSelfAttention(
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
-                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype,
+                mup_config=mup_config,
                 mesh_rules=mesh_rules, rngs=rngs
             )
         else:
             self.attn = SpaceSelfAttention(
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
-                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype,
+                mup_config=mup_config,
                 mesh_rules=mesh_rules, rngs=rngs
             )
 
         # MLP
-        self.mlp = MLP(dim, mlp_ratio, dropout_rate, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
+        self.mlp = MLP(dim, mlp_ratio, dropout_rate, dtype=dtype, param_dtype=param_dtype, mup_config=mup_config, mesh_rules=mesh_rules, rngs=rngs)
 
     def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None, rngs: Optional[nnx.Rngs] = None):
         # Attention (time or space, depending on layer_index)
@@ -512,7 +537,8 @@ class BlockCausalTransformer(nnx.Module):
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, depth: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
+                 mup_config: Optional[MuPConfig] = None, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.depth = depth
         self.time_every = time_every
@@ -523,7 +549,8 @@ class BlockCausalTransformer(nnx.Module):
                 dim=d_model, num_heads=n_heads, num_kv_heads=n_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every,
-                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype,
+                mup_config=mup_config,
                 mesh_rules=mesh_rules, rngs=rngs
             ) for i in range(depth)
         ])
@@ -561,7 +588,7 @@ class BlockCausalTransformer(nnx.Module):
 class Encoder(nnx.Module):
     """Vision encoder with MAE masking."""
 
-    def __init__(self, cfg: EncoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: EncoderModelConfig, mup_config: Optional[MuPConfig] = None, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
         self.dataset_mean = cfg.dataset_mean
@@ -570,12 +597,20 @@ class Encoder(nnx.Module):
         param_dtype = to_jnp_dtype(cfg.param_dtype)
 
         self.patch_proj = nnx.Linear(cfg.patch_size * cfg.patch_size * 3, cfg.d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
-        self.bottleneck_proj = nnx.Linear(cfg.d_model, cfg.d_bottleneck, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+
+        # μP: bottleneck_proj is an output layer
+        mup_enabled = mup_config is not None and mup_config.enabled
+        if mup_enabled:
+            bottleneck_init = mup_output_init(cfg.d_model, mup_config.base_width)
+        else:
+            bottleneck_init = nnx.initializers.lecun_normal()
+        self.bottleneck_proj = nnx.Linear(cfg.d_model, cfg.d_bottleneck, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(bottleneck_init, mesh_rules('mlp')), rngs=rngs)
 
         self.transformer = BlockCausalTransformer(
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
             dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
             time_every=cfg.time_every, rope_theta=cfg.rope_theta, dtype=dtype, param_dtype=param_dtype,
+            mup_config=mup_config,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -632,7 +667,7 @@ class Decoder(nnx.Module):
     reconstructions at per-patch query tokens.
     """
 
-    def __init__(self, cfg: DecoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: DecoderModelConfig, mup_config: Optional[MuPConfig] = None, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
         self.H = cfg.H
@@ -644,12 +679,20 @@ class Decoder(nnx.Module):
 
         self.n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
         self.up_proj = nnx.Linear(cfg.d_bottleneck, cfg.d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
-        self.patch_head = nnx.Linear(cfg.d_model, cfg.d_patch, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+
+        # μP: patch_head is an output layer
+        mup_enabled = mup_config is not None and mup_config.enabled
+        if mup_enabled:
+            patch_head_init = mup_output_init(cfg.d_model, mup_config.base_width)
+        else:
+            patch_head_init = nnx.initializers.lecun_normal()
+        self.patch_head = nnx.Linear(cfg.d_model, cfg.d_patch, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(patch_head_init, mesh_rules('mlp')), rngs=rngs)
 
         self.transformer = BlockCausalTransformer(
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
             dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
             time_every=cfg.time_every, rope_theta=cfg.rope_theta, dtype=dtype, param_dtype=param_dtype,
+            mup_config=mup_config,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -691,12 +734,12 @@ class Decoder(nnx.Module):
 class Tokenizer(nnx.Module):
     """Complete tokenizer (encoder + decoder)."""
 
-    def __init__(self, cfg: TokenizerConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: TokenizerConfig, mup_config: Optional[MuPConfig] = None, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.cfg = cfg
 
         # Create encoder and decoder
-        self.encoder = Encoder(cfg.encoder, mesh_rules=mesh_rules, rngs=rngs)
-        self.decoder = Decoder(cfg.decoder, mesh_rules=mesh_rules, rngs=rngs)
+        self.encoder = Encoder(cfg.encoder, mup_config=mup_config, mesh_rules=mesh_rules, rngs=rngs)
+        self.decoder = Decoder(cfg.decoder, mup_config=mup_config, mesh_rules=mesh_rules, rngs=rngs)
 
     def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs = None):
         z, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs)
@@ -802,7 +845,7 @@ class ActionEncoder(nnx.Module):
 class Dynamics(nnx.Module):
     """Dynamics model (world model)."""
 
-    def __init__(self, cfg: DynamicsModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: DynamicsModelConfig, mup_config: Optional[MuPConfig] = None, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.cfg = cfg
         self.dtype = to_jnp_dtype(cfg.dtype)
         self.param_dtype = to_jnp_dtype(cfg.param_dtype)
@@ -829,7 +872,9 @@ class Dynamics(nnx.Module):
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads,
             depth=cfg.depth, dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type,
             mlp_ratio=cfg.mlp_ratio, time_every=cfg.time_every, rope_theta=cfg.rope_theta,
-            dtype=self.dtype, param_dtype=self.param_dtype, mesh_rules=mesh_rules, rngs=rngs
+            dtype=self.dtype, param_dtype=self.param_dtype,
+            mup_config=mup_config,
+            mesh_rules=mesh_rules, rngs=rngs
         )
 
         # Discrete embeddings for shortcut conditioning
@@ -837,7 +882,7 @@ class Dynamics(nnx.Module):
         # We index steps by: step_idx = log2(1/d) ∈ {0, 1, 2, ..., log2(k_max)}
         self.num_step_bins = int(math.log2(cfg.k_max)) + 1
         self.step_embed = nnx.Embed(
-            self.num_step_bins, cfg.d_model, 
+            self.num_step_bins, cfg.d_model,
             dtype=self.dtype, param_dtype=self.param_dtype,
             embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
             rngs=rngs
@@ -852,7 +897,7 @@ class Dynamics(nnx.Module):
             rngs=rngs
         )
 
-        # Output head (zero-init)
+        # Output head (zero-init for shortcut forcing - keep zero even with μP)
         self.flow_x_head = nnx.Linear(
             cfg.d_model, cfg.d_bottleneck * cfg.packing_factor,
             kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
@@ -1028,8 +1073,10 @@ class PolicyHeadMTP(nnx.Module):
 
     def __init__(self, d_model: int, action_dim: int, L: int = 8, kind: str = "categorical",
                  mlp_ratio: float = 2.0, dropout_rate: float = 0.0, swiglu: bool = True,
-                 parity_2over3: bool = False, dtype: Any = jnp.float32, 
-                 param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs):
+                 parity_2over3: bool = False, dtype: Any = jnp.float32,
+                 param_dtype: Any = jnp.float32,
+                 mup_config: Optional[MuPConfig] = None, *,
+                 mesh_rules: Optional[MeshRules] = None, rngs: nnx.Rngs):
         self.d_model = d_model
         self.action_dim = action_dim
         self.L = L
@@ -1040,12 +1087,19 @@ class PolicyHeadMTP(nnx.Module):
         # Feature projector (D -> D) using your MLP
         self.projector = MLP(
             d_model=d_model, mlp_ratio=mlp_ratio, dropout_rate=dropout_rate,
-            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype, 
-            param_dtype=param_dtype, rngs=rngs
+            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype,
+            param_dtype=param_dtype, mup_config=mup_config,
+            mesh_rules=mesh_rules if mesh_rules else MeshRules(), rngs=rngs
         )
 
         # Single matmul that produces all L offsets at once: (… , D) -> (…, L, A)
-        self.out = nnx.Linear(d_model, L * action_dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        # μP: output layer uses scaled init
+        mup_enabled = mup_config is not None and mup_config.enabled
+        if mup_enabled:
+            out_init = mup_output_init(d_model, mup_config.base_width)
+        else:
+            out_init = nnx.initializers.lecun_normal()
+        self.out = nnx.Linear(d_model, L * action_dim, dtype=dtype, param_dtype=param_dtype, kernel_init=out_init, rngs=rngs)
 
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> jnp.ndarray:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
@@ -1061,7 +1115,9 @@ class RewardHeadMTP(nnx.Module):
     def __init__(self, d_model: int, L: int = 8, num_bins: int = 101, mlp_ratio: float = 2.0,
                  dropout_rate: float = 0.0, swiglu: bool = True, parity_2over3: bool = False,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
-                 log_low: float = -8.0, log_high: float = 8.0, *, rngs: nnx.Rngs):
+                 log_low: float = -8.0, log_high: float = 8.0,
+                 mup_config: Optional[MuPConfig] = None, *,
+                 mesh_rules: Optional[MeshRules] = None, rngs: nnx.Rngs):
         self.d_model = d_model
         self.L = L
         self.num_bins = num_bins
@@ -1072,10 +1128,18 @@ class RewardHeadMTP(nnx.Module):
 
         self.projector = MLP(
             d_model=d_model, mlp_ratio=mlp_ratio, dropout_rate=dropout_rate,
-            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype, 
-            param_dtype=param_dtype, rngs=rngs
+            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype,
+            param_dtype=param_dtype, mup_config=mup_config,
+            mesh_rules=mesh_rules if mesh_rules else MeshRules(), rngs=rngs
         )
-        self.out = nnx.Linear(d_model, L * num_bins, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+
+        # μP: output layer uses scaled init
+        mup_enabled = mup_config is not None and mup_config.enabled
+        if mup_enabled:
+            out_init = mup_output_init(d_model, mup_config.base_width)
+        else:
+            out_init = nnx.initializers.lecun_normal()
+        self.out = nnx.Linear(d_model, L * num_bins, dtype=dtype, param_dtype=param_dtype, kernel_init=out_init, rngs=rngs)
 
         # Precompute bin centers as a constant
         self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
@@ -1094,7 +1158,9 @@ class ValueHead(nnx.Module):
     def __init__(self, d_model: int, num_bins: int = 101, mlp_ratio: float = 2.0,
                  dropout_rate: float = 0.0, swiglu: bool = True, parity_2over3: bool = False,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
-                 log_low: float = -8.0, log_high: float = 8.0, *, rngs: nnx.Rngs):
+                 log_low: float = -8.0, log_high: float = 8.0,
+                 mup_config: Optional[MuPConfig] = None, *,
+                 mesh_rules: Optional[MeshRules] = None, rngs: nnx.Rngs):
         self.d_model = d_model
         self.num_bins = num_bins
         self.log_low = log_low
@@ -1104,10 +1170,18 @@ class ValueHead(nnx.Module):
 
         self.projector = MLP(
             d_model=d_model, mlp_ratio=mlp_ratio, dropout_rate=dropout_rate,
-            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype, 
-            param_dtype=param_dtype, rngs=rngs
+            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype,
+            param_dtype=param_dtype, mup_config=mup_config,
+            mesh_rules=mesh_rules if mesh_rules else MeshRules(), rngs=rngs
         )
-        self.out = nnx.Linear(d_model, num_bins, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+
+        # μP: output layer uses scaled init
+        mup_enabled = mup_config is not None and mup_config.enabled
+        if mup_enabled:
+            out_init = mup_output_init(d_model, mup_config.base_width)
+        else:
+            out_init = nnx.initializers.lecun_normal()
+        self.out = nnx.Linear(d_model, num_bins, dtype=dtype, param_dtype=param_dtype, kernel_init=out_init, rngs=rngs)
 
         # Precompute bin centers as a constant
         self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)

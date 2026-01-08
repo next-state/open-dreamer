@@ -1,6 +1,26 @@
 from dataclasses import dataclass, field
 
 
+# ---- Mu-Parameterization Config ----
+
+@dataclass(frozen=False)
+class MuPConfig:
+    """Configuration for mu-Parameterization.
+
+    μP ensures optimal hyperparameters transfer across model widths by controlling
+    the magnitude of activations, gradients, and weight updates.
+
+    Attributes:
+        enabled: Whether to use μP scaling. If False, standard parameterization is used.
+        base_width: Reference width for computing m_d = d_model / base_width.
+                   Set this to the width at which you tune hyperparameters.
+        attn_scale_type: "mup" for 1/d_head scaling, "standard" for 1/√d_head.
+    """
+    enabled: bool = False
+    base_width: int = 256
+    attn_scale_type: str = "mup"  # "mup" or "standard"
+
+
 # ---- Dataset Configs ----
 
 @dataclass(frozen=False, unsafe_hash=True)
@@ -157,7 +177,7 @@ class BaseExperimentConfig:
     run_name: str
     use_wandb: bool = False
 
-    # Checkpoint 
+    # Checkpoint
     ckpt: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     # Logger
@@ -165,13 +185,16 @@ class BaseExperimentConfig:
 
     # Dataset
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    
+
+    # Mu-Parameterization
+    mup: MuPConfig = field(default_factory=MuPConfig)
+
     # Training
     max_steps: int = 1_000_000_000
     log_every: int = 100
     seed: int = 0  # Random seed
     parallel_strategy: str = "data"  # Parallelization strategy: "data", "fsdp", or "tp"
-    
+
     # Precision
     dtype: str = "bfloat16"
     param_dtype: str = "float32"

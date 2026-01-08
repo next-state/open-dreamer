@@ -12,7 +12,8 @@ from typing import Tuple, TypeVar
 import numpy as np
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
-from dreamer.configs import CheckpointConfig, LRScheduleConfig, OptimizerConfig
+from dreamer.configs import CheckpointConfig, LRScheduleConfig, OptimizerConfig, MuPConfig
+from dreamer.mup import create_mup_optimizer
 
 
 
@@ -436,19 +437,40 @@ def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
         )
 
 
-def build_optimizer(optimizer_cfg: OptimizerConfig, model: nnx.Module, lr_schedule: optax.Schedule) -> nnx.Optimizer:
+def build_optimizer(
+    optimizer_cfg: OptimizerConfig,
+    model: nnx.Module,
+    lr_schedule: optax.Schedule,
+    mup_config: MuPConfig | None = None,
+    d_model: int | None = None,
+) -> nnx.Optimizer:
     """
     Build optimizer with given learning rate schedule.
-    
+
     Args:
         optimizer_cfg: OptimizerConfig instance
         model: nnx.Module to optimize
         lr_schedule: optax.Schedule instance
+        mup_config: Optional MuPConfig for μP-aware optimization
+        d_model: Model hidden dimension (required if mup_config is enabled)
 
     Returns:
         nnx.Optimizer instance
     """
-    if optimizer_cfg.optimizer_type == "adamw":
+    if mup_config is not None and mup_config.enabled:
+        if d_model is None:
+            raise ValueError("d_model must be provided when mup is enabled")
+        # Use μP-aware optimizer with per-layer learning rate scaling
+        tx = create_mup_optimizer(
+            base_lr=1.0,  # Will be scaled by schedule
+            d_model=d_model,
+            mup_config=mup_config,
+            weight_decay=optimizer_cfg.weight_decay,
+            b1=optimizer_cfg.b1,
+            b2=optimizer_cfg.b2,
+            schedule_fn=lr_schedule,
+        )
+    elif optimizer_cfg.optimizer_type == "adamw":
         tx = optax.adamw(
             lr_schedule,
             b1=optimizer_cfg.b1,
@@ -457,6 +479,6 @@ def build_optimizer(optimizer_cfg: OptimizerConfig, model: nnx.Module, lr_schedu
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_cfg.optimizer_type}")
-    
+
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     return optimizer
