@@ -62,6 +62,7 @@ class EncoderModelConfig:
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
+
 @dataclass(frozen=False)
 class DecoderModelConfig:
     d_bottleneck: int = 32  # Must match encoder's d_bottleneck

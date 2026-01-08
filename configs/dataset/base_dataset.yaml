@@ -1,3 +1,0 @@
-# Dataset normalization statistics (pixel values in [0, 1])
-dataset_mean: ???  # TODO: compute from dataset, store in .npy file
-dataset_std: ???   # TODO: compute from dataset, store in .npy file
