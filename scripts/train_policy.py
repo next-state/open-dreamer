@@ -43,7 +43,6 @@ from einops import rearrange
 from flax import struct
 import imageio.v2 as imageio
 import matplotlib.pyplot as plt
-import wandb
 
 from dreamer.models import (
     Encoder,
@@ -77,15 +76,7 @@ from dreamer.imagination import (
     _build_static_schedule,
     imagine_rollouts,
 )
-from dreamer.logging import MetricLogger
-
-
-# ---------------------------
-# Config
-# ---------------------------
-
-
-
+from dreamer.logging import build_logger
 
 
 # ---------------------------
@@ -1496,332 +1487,315 @@ def run(cfg: RLConfig):
     # Setup
     run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
 
-    # Initialize wandb if enabled
-    if cfg.use_wandb:
-        wandb_project = cfg.wandb_project or cfg.run_name
-        wandb.init(
-            entity=cfg.wandb_entity,
-            project=wandb_project,
-            name=cfg.run_name,
-            config=asdict(cfg),
-            dir=str(run_dir),
-        )
-
-    # Create parallel context for data parallelism
-    ctx = ParallelContext.create(batch_size=cfg.dataset.B)
-
-    # Data iterator
-    next_batch = make_iterator(cfg.dataset)
-
-    # Initialize models and load checkpoints
-    init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init, rewards_init) = next_batch(init_rng)
-    del rewards_init
-
-    train_state = initialize_models(cfg, frames_init, actions_init, ctx)
-
-    patch = cfg.patch
-    k_max = cfg.k_max
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
-
-    # Imagination schedule (static)
-    imag_cfg = ImaginationConfig(
-        k_max=k_max,
-        horizon=cfg.horizon,
-        context_length=cfg.context_length,
-        n_spatial=n_spatial,
-        d=cfg.imagination_d,
-        start_mode="pure",
-        tau0_fixed=0.0,
-    )
-    schedule = _build_static_schedule(imag_cfg)
-
-    # Real-environment evaluation env fns.
-    env_reset_fn = make_env_reset_fn(
-        batch_size=cfg.eval_batch_size,
-        height=cfg.dataset.H,
-        width=cfg.dataset.W,
-        channels=cfg.dataset.C,
-        pixels_per_step=cfg.dataset.pixels_per_step,
-        size_min=cfg.dataset.size_min,
-        size_max=cfg.dataset.size_max,
-        fg_min_color=0 if cfg.dataset.diversify_data else 128,
-        fg_max_color=255 if cfg.dataset.diversify_data else 128,
-        bg_min_color=0 if cfg.dataset.diversify_data else 255,
-        bg_max_color=255 if cfg.dataset.diversify_data else 255,
-    )
-    env_step_fn = make_env_step_fn(
-        height=cfg.dataset.H,
-        width=cfg.dataset.W,
-        channels=cfg.dataset.C,
-    )
-
-    # Checkpoint manager and optional restore
-    mngr = make_manager(
-        ckpt_dir,
-        max_to_keep=cfg.ckpt_max_to_keep,
-        save_interval_steps=cfg.ckpt_save_every,
-    )
-    meta = make_rl_meta(
-        enc_kwargs=train_state.enc_kwargs,
-        dec_kwargs=train_state.dec_kwargs,
-        dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.dataset.H,
-        W=cfg.dataset.W,
-        C=cfg.dataset.C,
-        patch=patch,
-        k_max=k_max,
-        packing_factor=cfg.packing_factor,
-        n_spatial=n_spatial,
-        bc_rew_ckpt_dir=cfg.bc_rew_ckpt,
-        cfg=asdict(cfg),
-    )
-
-    rng = jax.random.PRNGKey(0)
-    state_example = make_state(train_state.params, train_state.opt_state, rng, step=0)
-    restored = try_restore(mngr, state_example, ctx, meta)
-
-    start_step = 0
-    if restored is not None:
-        # Restored state is already sharded/replicated on GPUs via ctx
-        latest_step, r = restored
-        train_state.params = r.state["params"]
-        train_state.opt_state = r.state["opt_state"]
-        rng = r.state["rng"]
-        start_step = int(r.state["step"]) + 1
-        train_state.pi_vars = {
-            **train_state.pi_vars,
-            "params": train_state.params["pi"],
-        }
-        train_state.val_vars = {
-            **train_state.val_vars,
-            "params": train_state.params["val"],
-        }
-        print(f"[restore] Resumed from {ckpt_dir} at step={latest_step} (loaded directly to GPU)")
-    else:
-        # No checkpoint - replicate initial state to GPUs
-        train_state.params = ctx.replicate(train_state.params)
-        train_state.opt_state = ctx.replicate(train_state.opt_state)
-        print("[parallel] Replicated initial state to GPUs")
-    
-    # Always replicate non-checkpointed vars
-    train_state.enc_vars = ctx.replicate(train_state.enc_vars)
-    train_state.dyn_vars = ctx.replicate(train_state.dyn_vars)
-    train_state.task_vars = ctx.replicate(train_state.task_vars)
-    train_state.rew_vars = ctx.replicate(train_state.rew_vars)
-    train_state.val_vars = ctx.replicate(train_state.val_vars)
-    train_state.pi_vars = ctx.replicate(train_state.pi_vars)
-    train_state.pi_bc_vars = ctx.replicate(train_state.pi_bc_vars)
-
-    # Training loop
-    train_rng = jax.random.PRNGKey(2025)
-    data_rng = jax.random.PRNGKey(12345)
-    eval_rng = jax.random.PRNGKey(98765)
-
-    logger = MetricLogger(
+    # Logging
+    logger = build_logger(
         use_wandb=cfg.use_wandb,
         log_every=cfg.log_every,
         max_steps=cfg.max_steps,
-        wandb_obj=wandb,
+        entity=cfg.wandb_entity,
+        project=cfg.wandb_project or cfg.run_name,
+        name=cfg.run_name,
+        config=asdict(cfg),
+        dir=str(run_dir),
     )
 
-    pbar = tqdm(range(start_step, cfg.max_steps + 1), 
-                initial=start_step, 
-                total=cfg.max_steps,
-                desc="Training Policy",
-                dynamic_ncols=True)
+    with logger:
+        # Create parallel context for data parallelism
+        ctx = ParallelContext.create(batch_size=cfg.dataset.B)
 
-    for step in pbar:
-        # Sample batch
-        data_start_t = time.perf_counter()
-        data_rng, batch_key = jax.random.split(data_rng)
-        _, (videos, actions_full, rewards_full) = next_batch(batch_key)
-        data_t = time.perf_counter() - data_start_t
+        # Data iterator
+        next_batch = make_iterator(cfg.dataset)
 
-        # Task IDs (currently dummy zeros)
-        task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
+        # Initialize models and load checkpoints
+        init_rng = jax.random.PRNGKey(0)
+        _, (frames_init, actions_init, rewards_init) = next_batch(init_rng)
+        del rewards_init
 
-        # Shard batch data
-        train_rng, step_key = jax.random.split(train_rng)
-        videos = ctx.shard_data(videos)
-        actions_full = ctx.shard_data(actions_full)
-        rewards_full = ctx.shard_data(rewards_full)
-        task_ids = ctx.shard_data(task_ids)
-        
-        # Generate keys matching batch size (one per sample)
-        step_key = ctx.split_keys(step_key, count=videos.shape[0])
-        train_start_t = time.perf_counter()
-        (
-            new_params,
-            new_opt_state,
-            new_val_vars,
-            new_pi_vars,
-            aux,
-            train_rng,
-        ) = train_step(
-            encoder=train_state.encoder,
-            dynamics=train_state.dynamics,
-            task_embedder=train_state.task_embedder,
-            reward_head=train_state.reward_head,
-            value_head=train_state.value_head,
-            policy_head=train_state.policy_head,
-            policy_head_bc=train_state.policy_head_bc,
-            tx=train_state.tx,
-            params=train_state.params,
-            opt_state=train_state.opt_state,
-            enc_vars=train_state.enc_vars,
-            dyn_vars=train_state.dyn_vars,
-            task_vars=train_state.task_vars,
-            rew_vars=train_state.rew_vars,
-            val_vars=train_state.val_vars,
-            pi_vars=train_state.pi_vars,
-            pi_bc_vars=train_state.pi_bc_vars,
-            mae_eval_key=train_state.mae_eval_key,
-            schedule=schedule,
-            videos=videos,
-            actions_full=actions_full,
-            rewards_full=rewards_full,
-            task_ids=task_ids,
+        train_state = initialize_models(cfg, frames_init, actions_init, ctx)
+
+        patch = cfg.patch
+        k_max = cfg.k_max
+        n_spatial = cfg.enc_n_latents // cfg.packing_factor
+
+        # Imagination schedule (static)
+        imag_cfg = ImaginationConfig(
+            k_max=k_max,
             horizon=cfg.horizon,
-            gamma=cfg.gamma,
-            lambda_=cfg.lambda_,
-            alpha=cfg.alpha,
-            beta=cfg.beta,
             context_length=cfg.context_length,
-            patch=patch,
             n_spatial=n_spatial,
-            packing_factor=cfg.packing_factor,
-            dataset_mean=cfg.dataset.dataset_mean,
-            dataset_std=cfg.dataset.dataset_std,
-            rng_key=step_key,
+            d=cfg.imagination_d,
+            start_mode="pure",
+            tau0_fixed=0.0,
         )
-        train_t = time.perf_counter() - train_start_t
-        total_t = data_t + train_t
-        train_state.params = new_params
-        train_state.opt_state = new_opt_state
-        train_state.val_vars = new_val_vars
-        train_state.pi_vars = new_pi_vars
+        schedule = _build_static_schedule(imag_cfg)
 
-        # Periodically evaluate the policy in the real environment.
-        if cfg.eval_every > 0 and (step % cfg.eval_every == 0):
-            metrics_eval, media_eval, eval_rng = evaluate_policy_real_env(
-                train_state,
-                cfg,
-                env_reset_fn,
-                env_step_fn,
-                schedule_step_idx=schedule.step_idx,
-                k_max=k_max,
-                rng_key=eval_rng,
+        # Real-environment evaluation env fns.
+        env_reset_fn = make_env_reset_fn(
+            batch_size=cfg.eval_batch_size,
+            height=cfg.dataset.H,
+            width=cfg.dataset.W,
+            channels=cfg.dataset.C,
+            pixels_per_step=cfg.dataset.pixels_per_step,
+            size_min=cfg.dataset.size_min,
+            size_max=cfg.dataset.size_max,
+            fg_min_color=0 if cfg.dataset.diversify_data else 128,
+            fg_max_color=255 if cfg.dataset.diversify_data else 128,
+            bg_min_color=0 if cfg.dataset.diversify_data else 255,
+            bg_max_color=255 if cfg.dataset.diversify_data else 255,
+        )
+        env_step_fn = make_env_step_fn(
+            height=cfg.dataset.H,
+            width=cfg.dataset.W,
+            channels=cfg.dataset.C,
+        )
+
+        # Checkpoint manager and optional restore
+        mngr = make_manager(
+            ckpt_dir,
+            max_to_keep=cfg.ckpt_max_to_keep,
+            save_interval_steps=cfg.ckpt_save_every,
+        )
+        meta = make_rl_meta(
+            enc_kwargs=train_state.enc_kwargs,
+            dec_kwargs=train_state.dec_kwargs,
+            dynamics_kwargs=train_state.dyn_kwargs,
+            H=cfg.dataset.H,
+            W=cfg.dataset.W,
+            C=cfg.dataset.C,
+            patch=patch,
+            k_max=k_max,
+            packing_factor=cfg.packing_factor,
+            n_spatial=n_spatial,
+            bc_rew_ckpt_dir=cfg.bc_rew_ckpt,
+            cfg=asdict(cfg),
+        )
+
+        rng = jax.random.PRNGKey(0)
+        state_example = make_state(train_state.params, train_state.opt_state, rng, step=0)
+        restored = try_restore(mngr, state_example, ctx, meta)
+
+        start_step = 0
+        if restored is not None:
+            # Restored state is already sharded/replicated on GPUs via ctx
+            latest_step, r = restored
+            train_state.params = r.state["params"]
+            train_state.opt_state = r.state["opt_state"]
+            rng = r.state["rng"]
+            start_step = int(r.state["step"]) + 1
+            train_state.pi_vars = {
+                **train_state.pi_vars,
+                "params": train_state.params["pi"],
+            }
+            train_state.val_vars = {
+                **train_state.val_vars,
+                "params": train_state.params["val"],
+            }
+            print(f"[restore] Resumed from {ckpt_dir} at step={latest_step} (loaded directly to GPU)")
+        else:
+            # No checkpoint - replicate initial state to GPUs
+            train_state.params = ctx.replicate(train_state.params)
+            train_state.opt_state = ctx.replicate(train_state.opt_state)
+            print("[parallel] Replicated initial state to GPUs")
+        
+        # Always replicate non-checkpointed vars
+        train_state.enc_vars = ctx.replicate(train_state.enc_vars)
+        train_state.dyn_vars = ctx.replicate(train_state.dyn_vars)
+        train_state.task_vars = ctx.replicate(train_state.task_vars)
+        train_state.rew_vars = ctx.replicate(train_state.rew_vars)
+        train_state.val_vars = ctx.replicate(train_state.val_vars)
+        train_state.pi_vars = ctx.replicate(train_state.pi_vars)
+        train_state.pi_bc_vars = ctx.replicate(train_state.pi_bc_vars)
+
+        # Training loop
+        train_rng = jax.random.PRNGKey(2025)
+        data_rng = jax.random.PRNGKey(12345)
+        eval_rng = jax.random.PRNGKey(98765)
+
+        pbar = tqdm(range(start_step, cfg.max_steps + 1),
+                    initial=start_step,
+                    total=cfg.max_steps,
+                    desc="Training Policy",
+                    dynamic_ncols=True)
+
+        for step in pbar:
+            # Sample batch
+            data_start_t = time.perf_counter()
+            data_rng, batch_key = jax.random.split(data_rng)
+            _, (videos, actions_full, rewards_full) = next_batch(batch_key)
+            data_t = time.perf_counter() - data_start_t
+
+            # Task IDs (currently dummy zeros)
+            task_ids = jnp.zeros((cfg.dataset.B,), dtype=jnp.int32)
+
+            # Shard batch data
+            train_rng, step_key = jax.random.split(train_rng)
+            videos = ctx.shard_data(videos)
+            actions_full = ctx.shard_data(actions_full)
+            rewards_full = ctx.shard_data(rewards_full)
+            task_ids = ctx.shard_data(task_ids)
+            
+            # Generate keys matching batch size (one per sample)
+            step_key = ctx.split_keys(step_key, count=videos.shape[0])
+            train_start_t = time.perf_counter()
+            (
+                new_params,
+                new_opt_state,
+                new_val_vars,
+                new_pi_vars,
+                aux,
+                train_rng,
+            ) = train_step(
+                encoder=train_state.encoder,
+                dynamics=train_state.dynamics,
+                task_embedder=train_state.task_embedder,
+                reward_head=train_state.reward_head,
+                value_head=train_state.value_head,
+                policy_head=train_state.policy_head,
+                policy_head_bc=train_state.policy_head_bc,
+                tx=train_state.tx,
+                params=train_state.params,
+                opt_state=train_state.opt_state,
+                enc_vars=train_state.enc_vars,
+                dyn_vars=train_state.dyn_vars,
+                task_vars=train_state.task_vars,
+                rew_vars=train_state.rew_vars,
+                val_vars=train_state.val_vars,
+                pi_vars=train_state.pi_vars,
+                pi_bc_vars=train_state.pi_bc_vars,
+                mae_eval_key=train_state.mae_eval_key,
+                schedule=schedule,
+                videos=videos,
+                actions_full=actions_full,
+                rewards_full=rewards_full,
+                task_ids=task_ids,
+                horizon=cfg.horizon,
+                gamma=cfg.gamma,
+                lambda_=cfg.lambda_,
+                alpha=cfg.alpha,
+                beta=cfg.beta,
+                context_length=cfg.context_length,
+                patch=patch,
+                n_spatial=n_spatial,
+                packing_factor=cfg.packing_factor,
+                dataset_mean=cfg.dataset.dataset_mean,
+                dataset_std=cfg.dataset.dataset_std,
+                rng_key=step_key,
             )
+            train_t = time.perf_counter() - train_start_t
+            total_t = data_t + train_t
+            train_state.params = new_params
+            train_state.opt_state = new_opt_state
+            train_state.val_vars = new_val_vars
+            train_state.pi_vars = new_pi_vars
 
-            print(
-                f"[eval] step={step:06d} | "
-                f"return_mean={metrics_eval['eval/return_mean']:.4f} | "
-                f"return_std={metrics_eval['eval/return_std']:.4f} | "
-                f"return_min={metrics_eval['eval/return_min']:.4f} | "
-                f"return_max={metrics_eval['eval/return_max']:.4f}"
-            )
+            # Periodically evaluate the policy in the real environment.
+            if cfg.eval_every > 0 and (step % cfg.eval_every == 0):
+                metrics_eval, media_eval, eval_rng = evaluate_policy_real_env(
+                    train_state,
+                    cfg,
+                    env_reset_fn,
+                    env_step_fn,
+                    schedule_step_idx=schedule.step_idx,
+                    k_max=k_max,
+                    rng_key=eval_rng,
+                )
 
-            # Optional visualization: write MP4 + strip plots at a lower frequency.
-            video_path: Path | None = None
-            strip0_path: Path | None = None
-            if (
-                cfg.write_video_every > 0
-                and step % cfg.write_video_every == 0
-                and media_eval
-            ):
-                frames = media_eval.get("frames")
-                actions = media_eval.get("actions")
-                rewards = media_eval.get("rewards")
+                print(
+                    f"[eval] step={step:06d} | "
+                    f"return_mean={metrics_eval['eval/return_mean']:.4f} | "
+                    f"return_std={metrics_eval['eval/return_std']:.4f} | "
+                    f"return_min={metrics_eval['eval/return_min']:.4f} | "
+                    f"return_max={metrics_eval['eval/return_max']:.4f}"
+                )
 
-                if frames is not None and actions is not None and rewards is not None:
-                    frames_np = np.asarray(frames)
-                    actions_np = np.asarray(actions)
-                    rewards_np = np.asarray(rewards)
+                # Optional visualization: write MP4 + strip plots at a lower frequency.
+                video_path: Path | None = None
+                strip0_path: Path | None = None
+                if (
+                    cfg.write_video_every > 0
+                    and step % cfg.write_video_every == 0
+                    and media_eval
+                ):
+                    frames = media_eval.get("frames")
+                    actions = media_eval.get("actions")
+                    rewards = media_eval.get("rewards")
 
-                    # Defensive shape checks.
-                    if frames_np.ndim == 5 and actions_np.ndim == 2 and rewards_np.ndim == 2:
-                        B, T = frames_np.shape[:2]
+                    if frames is not None and actions is not None and rewards is not None:
+                        frames_np = np.asarray(frames)
+                        actions_np = np.asarray(actions)
+                        rewards_np = np.asarray(rewards)
 
-                        # Grid video over all eval episodes.
-                        video_path = vis_dir / f"real_env_eval_step{step:06d}.mp4"
-                        _save_real_env_grid_video(video_path, frames_np)
+                        # Defensive shape checks.
+                        if frames_np.ndim == 5 and actions_np.ndim == 2 and rewards_np.ndim == 2:
+                            B, T = frames_np.shape[:2]
 
-                        # Strip plots for a few episodes.
-                        num_examples = min(cfg.max_eval_examples_to_plot, B)
-                        for b_idx in range(num_examples):
-                            fig_path = (
-                                vis_dir
-                                / f"real_env_eval_strip_step{step:06d}_b{b_idx}.png"
+                            # Grid video over all eval episodes.
+                            video_path = vis_dir / f"real_env_eval_step{step:06d}.mp4"
+                            _save_real_env_grid_video(video_path, frames_np)
+
+                            # Strip plots for a few episodes.
+                            num_examples = min(cfg.max_eval_examples_to_plot, B)
+                            for b_idx in range(num_examples):
+                                fig_path = (
+                                    vis_dir
+                                    / f"real_env_eval_strip_step{step:06d}_b{b_idx}.png"
+                                )
+                                _save_real_env_strip(
+                                    fig_path,
+                                    frames_np,
+                                    actions_np,
+                                    rewards_np,
+                                    title=f"Real Env Eval (step={step}, b={b_idx})",
+                                    b_index=b_idx,
+                                    max_steps=cfg.eval_horizon,
+                                )
+                                if b_idx == 0:
+                                    strip0_path = fig_path
+
+                            print(
+                                f"[viz:eval] Saved real-env eval video/strips to {vis_dir}"
                             )
-                            _save_real_env_strip(
-                                fig_path,
-                                frames_np,
-                                actions_np,
-                                rewards_np,
-                                title=f"Real Env Eval (step={step}, b={b_idx})",
-                                b_index=b_idx,
-                                max_steps=cfg.eval_horizon,
-                            )
-                            if b_idx == 0:
-                                strip0_path = fig_path
 
-                        print(
-                            f"[viz:eval] Saved real-env eval video/strips to {vis_dir}"
-                        )
+                # Log eval metrics and media
+                logger.log_metrics(step, {
+                    "return_mean": metrics_eval["eval/return_mean"],
+                    "return_std": metrics_eval["eval/return_std"],
+                    "return_min": metrics_eval["eval/return_min"],
+                    "return_max": metrics_eval["eval/return_max"],
+                }, prefix="eval/")
 
-            if cfg.use_wandb and wandb.run is not None:
-                log_payload: Dict[str, Any] = {
-                    "eval/return_mean": metrics_eval["eval/return_mean"],
-                    "eval/return_std": metrics_eval["eval/return_std"],
-                    "eval/return_min": metrics_eval["eval/return_min"],
-                    "eval/return_max": metrics_eval["eval/return_max"],
-                }
-
-                # Attach media if just written this step.
+                # Log media if generated
                 if video_path is not None:
-                    log_payload["eval/video_real_env"] = wandb.Video(
-                        str(video_path),
-                        fps=25,
-                        format="mp4",
-                    )
+                    logger.log_video(step, "eval/video_real_env", video_path)
                 if strip0_path is not None:
-                    log_payload["eval/strip_real_env_b0"] = wandb.Image(
-                        str(strip0_path)
-                    )
+                    logger.log_image(step, "eval/strip_real_env_b0", str(strip0_path))
 
-                wandb.log(log_payload, step=step)
+            if logger.should_log(step):
+                metrics_cpu = jax.device_get(aux)
+                logger.log(
+                    step,
+                    metrics={
+                        "val_loss": metrics_cpu["val_loss"],
+                        "pi_loss": metrics_cpu["pi_loss"],
+                        "pi_neg": metrics_cpu["pi_loss_negative"],
+                        "pi_pos": metrics_cpu["pi_loss_positive"],
+                        "pi_kl": metrics_cpu["pi_kl_loss"],
+                        "mean_adv": metrics_cpu["mean_advantage"],
+                        "mean_td": metrics_cpu["mean_td_return"],
+                        "n_pos": metrics_cpu["n_positive"],
+                        "n_neg": metrics_cpu["n_negative"],
+                        "time/data": data_t,
+                        "time/train": train_t,
+                        "time/total": total_t,
+                    },
+                    pbar=pbar,
+                )
 
-        if logger.should_log(step):
-            metrics_cpu = jax.device_get(aux)
-            logger.log(
-                step,
-                metrics={
-                    "val_loss": metrics_cpu["val_loss"],
-                    "pi_loss": metrics_cpu["pi_loss"],
-                    "pi_neg": metrics_cpu["pi_loss_negative"],
-                    "pi_pos": metrics_cpu["pi_loss_positive"],
-                    "pi_kl": metrics_cpu["pi_kl_loss"],
-                    "mean_adv": metrics_cpu["mean_advantage"],
-                    "mean_td": metrics_cpu["mean_td_return"],
-                    "n_pos": metrics_cpu["n_positive"],
-                    "n_neg": metrics_cpu["n_negative"],
-                    "time/data": data_t,
-                    "time/train": train_t,
-                    "time/total": total_t,
-                },
-                pbar=pbar,
-            )
+            # Save sharded arrays directly
+            state = make_state(train_state.params, train_state.opt_state, train_rng, step)
+            maybe_save(mngr, step, state, meta)
 
-        # Save sharded arrays directly
-        state = make_state(train_state.params, train_state.opt_state, train_rng, step)
-        maybe_save(mngr, step, state, meta)
-
-    mngr.wait_until_finished()
-
-    if cfg.use_wandb and wandb.run is not None:
-        wandb.finish()
-        print("[wandb] Finished logging.")
+        mngr.wait_until_finished()
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="policy")

@@ -1,18 +1,15 @@
-from __future__ import annotations
-
 import logging
 
 import hydra
 import jax
 import jax.numpy as jnp
-import wandb
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator
-from dreamer.logging import MetricLogger
+from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.parallel import build_parallel
 from dreamer.training import run_evaluation, shortcut_forcing_step
@@ -112,31 +109,25 @@ def run(cfg: DynamicsConfig):
     run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
 
     # Logging
-    if cfg.use_wandb:
-        wandb.init(
-            entity=cfg.wandb_entity,
-            project=cfg.wandb_project or cfg.run_name,
-            name=cfg.run_name,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            dir=str(run_dir)
-        )
-    logger = MetricLogger(
-        use_wandb=cfg.use_wandb, 
-        log_every=cfg.log_every, 
-        max_steps=cfg.max_steps, 
-        wandb_obj=wandb
+    logger = build_logger(
+        logger_cfg=cfg.logger,
+        config=OmegaConf.to_container(cfg, resolve=True),
+        dir=str(run_dir),
     )
 
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
-    with jax.set_mesh(mesh):
+    with (
+        logger,
+        jax.set_mesh(mesh),
+    ):
         key = jax.random.PRNGKey(cfg.seed)
         rng, init_key = jax.random.split(key)
-    
+
         # Load pretrained tokenizer
         tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
-        tokenizer_cfg = tokenizer.config
+        tokenizer_cfg = tokenizer.cfg
 
         # Initialize dynamics
         dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
@@ -144,10 +135,10 @@ def run(cfg: DynamicsConfig):
         print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
 
         # Build learning rate schedule
-        lr_schedule = build_lr_schedule(cfg.schedule, cfg.max_steps)
-        
+        lr_schedule = build_lr_schedule(cfg.lr_schedule)
+
         # Build optimizer
-        optimizer = build_optimizer(dynamics, lr_schedule, cfg.optimizer)
+        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule)
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
@@ -164,7 +155,7 @@ def run(cfg: DynamicsConfig):
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
-                
+
                 # Shard batch data
                 rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
                 videos = jax.device_put(batch["videos"], data_sharding)
@@ -207,12 +198,8 @@ def run(cfg: DynamicsConfig):
 
                     run_evaluation(
                         cfg, tokenizer_cfg, step, tokenizer, dynamics,
-                        val_videos, jnp.asarray(val_actions), vis_dir, rng
+                        val_videos, jnp.asarray(val_actions), vis_dir, rng, logger
                     )
-
-    # Finish wandb run
-    if cfg.use_wandb and wandb.run is not None:
-        wandb.finish()
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")

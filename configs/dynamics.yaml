@@ -35,15 +35,15 @@ bootstrap_start: 5_000
 self_fraction: 0.25
 
 max_steps: 300_000
-log_every: 100
 
-schedule:
+lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
   lr: 3e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_steps: 50_000
   wsd_decay_steps: 20_000
+  max_steps: ${max_steps}
 
 optimizer:
   optimizer_type: adamw
@@ -51,4 +51,4 @@ optimizer:
   b2: 0.9
   weight_decay: 1e-4
 
-write_video_every: 5_000
+write_video_every: 1_000

@@ -13,7 +13,7 @@ from typing import Tuple, TypeVar
 import numpy as np
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
-from dreamer.configs import CheckpointConfig, ScheduleConfig, OptimizerConfig
+from dreamer.configs import CheckpointConfig, LRScheduleConfig, OptimizerConfig
 
 
 # --- dtype helpers ---
@@ -375,17 +375,17 @@ def count_parameters_by_component(model):
     return counts
 
 
-def build_lr_schedule(schedule_cfg: ScheduleConfig, max_steps: int) -> optax.Schedule:
+def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
     """
     Build learning rate schedule.
     
     Args:
         schedule_cfg: ScheduleConfig instance
-        max_steps: Maximum training steps
     
     Returns:
         optax.Schedule instance
     """
+    max_steps = schedule_cfg.max_steps
     if schedule_cfg.schedule_type == "constant":
         return optax.constant_schedule(value=schedule_cfg.lr)
     elif schedule_cfg.schedule_type == "cos":
@@ -419,14 +419,14 @@ def build_lr_schedule(schedule_cfg: ScheduleConfig, max_steps: int) -> optax.Sch
         )
 
 
-def build_optimizer(model: nnx.Module, lr_schedule: optax.Schedule, optimizer_cfg: OptimizerConfig) -> nnx.Optimizer:
+def build_optimizer(optimizer_cfg: OptimizerConfig, model: nnx.Module, lr_schedule: optax.Schedule) -> nnx.Optimizer:
     """
     Build optimizer with given learning rate schedule.
     
     Args:
+        optimizer_cfg: OptimizerConfig instance
         model: nnx.Module to optimize
         lr_schedule: optax.Schedule instance
-        optimizer_cfg: OptimizerConfig instance
 
     Returns:
         nnx.Optimizer instance

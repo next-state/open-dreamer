@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import wandb
 from flax import nnx
 from jaxlpips import LPIPS
 from omegaconf import OmegaConf
@@ -18,7 +17,7 @@ from tqdm import tqdm
 from dreamer.configs import TokenizerConfig
 from dreamer.training import compute_psnr
 from dreamer.data import make_iterator
-from dreamer.logging import MetricLogger
+from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
 from dreamer.parallel import build_parallel
 from dreamer.utils import (
@@ -151,7 +150,7 @@ def viz_step_jit(model: Tokenizer, videos, *, mae_key, drop_key):
     grid = einops.rearrange(grid[:, 0], "b h w c -> h (b w) c")
     return grid.clip(0, 255).astype(jnp.uint8)
 
-def viz_step(model: Tokenizer, videos, rng, step, vis_dir, use_wandb=False):
+def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger):
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
@@ -160,8 +159,7 @@ def viz_step(model: Tokenizer, videos, rng, step, vis_dir, use_wandb=False):
 
     imageio.imwrite(vis_dir / f"step_{step:06d}.png", grid)
 
-    if use_wandb:
-        wandb.log({"reconstruction": wandb.Image(np.array(grid), caption=f"Step {step}")}, step=step)
+    logger.log_image(step, "reconstruction", np.array(grid), caption=f"Step {step}")
 
 # ------------------------
 # Run
@@ -172,25 +170,19 @@ def run(cfg: TokenizerConfig):
     run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
 
     # Logging
-    if cfg.use_wandb:
-        wandb.init(
-            entity=cfg.wandb_entity,
-            project=cfg.wandb_project or cfg.run_name,
-            name=cfg.run_name,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            dir=str(run_dir),
-        )
-    logger = MetricLogger(
-        use_wandb=cfg.use_wandb,
-        log_every=cfg.log_every,
-        max_steps=cfg.max_steps,
-        wandb_obj=wandb,
+    logger = build_logger(
+        logger_cfg=cfg.logger,
+        config=OmegaConf.to_container(cfg, resolve=True),
+        dir=str(run_dir),
     )
 
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
-    with jax.set_mesh(mesh):
+    with (
+        logger,
+        jax.set_mesh(mesh),
+    ):
         key = jax.random.key(cfg.seed)
         rng, init_key = jax.random.split(key)
 
@@ -200,10 +192,10 @@ def run(cfg: TokenizerConfig):
         print(f"Parameter counts: {param_counts}")
 
         # Build learning rate schedule
-        lr_schedule = build_lr_schedule(cfg.schedule, cfg.max_steps)
-        
+        lr_schedule = build_lr_schedule(cfg.lr_schedule)
+
         # Build optimizer
-        optimizer = build_optimizer(tokenizer, lr_schedule, cfg.optimizer)
+        optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule)
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
@@ -224,17 +216,17 @@ def run(cfg: TokenizerConfig):
                 # Create fresh RNG state for this step by folding in step number
                 step_rng = jax.random.fold_in(rng, step)
                 mae_key, dropout_key = jax.random.split(step_rng)
-                
+
                 # Shard batch data
                 videos = jax.device_put(batch["videos"], data_sharding)
-                
+
                 aux = train_step(
                     tokenizer, optimizer, videos,
                     mae_key=mae_key, dropout_key=dropout_key, step=step,
                     lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
-                    dataset_mean=tuple(cfg.dataset.dataset_mean), 
-                    dataset_std=tuple(cfg.dataset.dataset_std), 
-                    log_gradients=cfg.log_gradients, 
+                    dataset_mean=tuple(cfg.dataset.dataset_mean),
+                    dataset_std=tuple(cfg.dataset.dataset_std),
+                    log_gradients=cfg.logger.log_gradients,
                     tokenizer_loss_type=cfg.tokenizer_loss_type
                 )
 
@@ -252,7 +244,7 @@ def run(cfg: TokenizerConfig):
                             "lpips": metrics_cpu["loss_lpips"],
                             "psnr": psnr,
                             "lr": lr_value,
-                            **({} if not cfg.log_gradients else {
+                            **({} if not cfg.logger.log_gradients else {
                                 "grad/global_norm": metrics_cpu["grad/global_norm"],
                                 "grad/encoder_norm": metrics_cpu["grad/encoder_norm"],
                                 "grad/decoder_norm": metrics_cpu["grad/decoder_norm"],
@@ -263,17 +255,14 @@ def run(cfg: TokenizerConfig):
                         pbar=pbar,
                         pbar_filter=r"^(loss|mse|lpips|psnr|lr)$",
                     )
-                
+
                 # Checkpointing
                 maybe_save(checkpoint_manager, step, tokenizer, optimizer, train_iterator, rng, meta)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
-                    viz_step(tokenizer, viz_videos, step_rng, step, vis_dir, use_wandb=cfg.use_wandb)
-
-    if cfg.use_wandb and wandb.run is not None:
-        wandb.finish()
+                    viz_step(tokenizer, viz_videos, step_rng, step, vis_dir, logger)
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")

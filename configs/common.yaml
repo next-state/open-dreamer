@@ -1,18 +1,25 @@
 defaults:
   - _self_
 
-# Random seed
-seed: 0
+run_name: ???
+use_wandb: false
+dataset: ???
 
 # Checkpointing
 ckpt:
   max_to_keep: 2
   save_interval_steps: 10_000
+  max_steps: ${max_steps}
 
-# WandB
-use_wandb: False
-wandb_entity: Null
-wandb_project: tiny_dreamer_4
+# Logging
+logger:
+  run_name: ${run_name}
+  use_wandb: ${use_wandb}
+  wandb_entity: Null
+  wandb_project: tiny_dreamer_4
+  log_every: 100
+  max_steps: ${max_steps}
+  log_gradients: false
 
 # Precision
 dtype: bfloat16
@@ -20,6 +27,9 @@ param_dtype: float32
 
 # Parallel
 parallel_strategy: data  # data | fsdp | tp
+
+# Random seed
+seed: 0
 
 # Hydra
 hydra:

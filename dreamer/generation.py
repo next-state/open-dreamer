@@ -228,7 +228,7 @@ def next_frame(
     # Decoder call
     frame, tokenizer_cache_updated = tokenizer.decode(
         latent,
-        packing_factor=dynamics.config.packing_factor,
+        packing_factor=dynamics.cfg.packing_factor,
         caches=tokenizer_cache,
         deterministic=True,
     )
@@ -321,8 +321,8 @@ def latent_rollout(
     
     # Unpack results
     rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
-    rollout_actions = einops.rearrange(rollout_actions, 't b ... -> b t ...')
-    rollout_hidden = einops.rearrange(rollout_hidden, 't b n d -> b t n d')
+    rollout_actions = einops.rearrange(rollout_actions, 't b -> b t')
+    rollout_hidden = einops.rearrange(rollout_hidden, 't b n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
     
     out_latents = jnp.concatenate((latents_ctx, rollout_latents), axis=1)
     
@@ -369,14 +369,14 @@ def video_rollout(
     
     latents_ctx, _ = tokenizer.encode(
         frames_ctx, 
-        packing_factor=dynamics.config.packing_factor, 
+        packing_factor=dynamics.cfg.packing_factor, 
         deterministic=True,
         rngs=rngs
     ) # Encode returns (B, T, L, D)
         
     # Latent Rollout
-    # Returns (B, T_ctx + num_steps, n_spatial, D_s)
-    rollout_latents = latent_rollout(
+    # Returns dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
+    rollout_result = latent_rollout(
         dynamics,
         policy,
         schedule,
@@ -386,11 +386,11 @@ def video_rollout(
         rng,
         initial_agent_tokens
     )
-    
+
     # Decode
     pred_frames, _ = tokenizer.decode(
-        rollout_latents,
-        packing_factor=dynamics.config.packing_factor,
+        rollout_result['latents'],
+        packing_factor=dynamics.cfg.packing_factor,
         deterministic=True
     )
         

@@ -145,8 +145,8 @@ class DreamerVideoModel(VideoModel):
         mesh, data_sharding = create_data_model_parallel(1, 1)
         with jax.set_mesh(mesh):
             self.dynamics, self.tokenizer = Dynamics.from_pretrained(cfg.dynamics_ckpt, self.ctx)
-            self.dynamics_cfg = self.dynamics.config
-            self.tokenizer_cfg = self.tokenizer.config
+            self.dynamics_cfg = self.dynamics.cfg
+            self.tokenizer_cfg = self.tokenizer.cfg
             
             # Load policy if checkpoint provided
             self.policy = None
@@ -161,7 +161,7 @@ class DreamerVideoModel(VideoModel):
             
             # Compute latent shape from dynamics config
             H, W = self.size
-            packing_factor = self.dynamics.config.packing_factor
+            packing_factor = self.dynamics.cfg.packing_factor
             n_latents = self.tokenizer_cfg.decoder.n_latents
             
             # Calculate number of spatial tokens
@@ -253,7 +253,7 @@ class DreamerVideoModel(VideoModel):
         init_latents, _ = self.tokenizer.encode(
             init_frames_jax,
             deterministic=True,
-            packing_factor=self.dynamics.config.packing_factor,
+            packing_factor=self.dynamics.cfg.packing_factor,
         )  # Shape: (1, T//packing, n_spatial, D_s*packing)
         
         # Warm up dynamics cache by processing context latents
@@ -284,7 +284,7 @@ class DreamerVideoModel(VideoModel):
         logger.info("Warming up tokenizer cache...")
         _, self.tokenizer_cache = self.tokenizer.decode(
             init_latents,
-            packing_factor=self.dynamics.config.packing_factor,
+            packing_factor=self.dynamics.cfg.packing_factor,
             caches=self.tokenizer_cache,
             deterministic=True,
         )

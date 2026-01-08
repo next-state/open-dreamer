@@ -106,7 +106,7 @@ class DynamicsModelConfig:
 # ---- Experiment Configs ----
 
 @dataclass(frozen=False)
-class ScheduleConfig:
+class LRScheduleConfig:
     """Configuration for learning rate schedule."""
     # Schedule type
     # - "constant": constant learning rate (uses lr)
@@ -118,6 +118,7 @@ class ScheduleConfig:
     lr_end: float = 0.0  # Ending LR for decay schedules
     warmup_steps: int = 10_000
     wsd_decay_steps: int = 30_000
+    max_steps: int = 1_000_000_000
 
 
 @dataclass(frozen=False)
@@ -125,6 +126,7 @@ class CheckpointConfig:
     """Configuration for checkpointing."""
     max_to_keep: int = 5  # Maximum number of checkpoints to keep
     save_interval_steps: int = 10_000  # Save checkpoint every N steps
+    max_steps: int = 1_000_000_000  # Maximum number of training steps
 
 
 @dataclass(frozen=False)
@@ -132,36 +134,50 @@ class OptimizerConfig:
     """Configuration for optimizer."""
     # Optimizer type
     optimizer_type: str = "adamw"  # Currently only "adamw" supported
-    
+
     # Optimizer hyperparameters (AdamW)
     b1: float = 0.9
     b2: float = 0.9
     weight_decay: float = 1e-4
+
+
+@dataclass(frozen=False)
+class LoggerConfig:
+    """Configuration for experiment logging."""
+    run_name: str = ""
+
+    use_wandb: bool = False
+    wandb_entity: str | None = None
+    wandb_project: str | None = None
+
+    log_every: int = 100
+    max_steps: int = 1_000_000_000
+    log_gradients:  bool = False
+
 
 @dataclass(frozen=False)
 class BaseExperimentConfig:
     """Base configuration shared across all experiment types."""
     # IO
     run_name: str
-    
-    # checkpoint configuration
-    ckpt: CheckpointConfig = field(default_factory=CheckpointConfig)
-    
-    # wandb config
     use_wandb: bool = False
-    wandb_entity: str | None = None
-    wandb_project: str | None = None
-    
-    # dataset config
+
+    # Checkpoint 
+    ckpt: CheckpointConfig = field(default_factory=CheckpointConfig)
+
+    # Logger
+    logger: LoggerConfig = field(default_factory=LoggerConfig)
+
+    # Dataset
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     
-    # training
+    # Training
     max_steps: int = 1_000_000_000
     log_every: int = 100
     seed: int = 0  # Random seed
     parallel_strategy: str = "data"  # Parallelization strategy: "data", "fsdp", or "tp"
     
-    # precision
+    # Precision
     dtype: str = "bfloat16"
     param_dtype: str = "float32"
 
@@ -170,24 +186,82 @@ class BaseExperimentConfig:
 class TokenizerConfig(BaseExperimentConfig):
     patch_size: int = 4
 
-    # model parameters
+    # Model
     encoder: EncoderModelConfig = field(default_factory=EncoderModelConfig)
     decoder: DecoderModelConfig = field(default_factory=DecoderModelConfig)
 
-    # training
+    # Training
     lpips_weight: float = 0.2
     lpips_frac: float = 0.5
     visualize_every: int = 10_000
     tokenizer_loss_type: str = "mae" # "mse" | "mae"
 
-    # schedule configuration
-    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    # LR schedule
+    lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
     
-    # optimizer configuration
+    # Optimizer 
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
-    # logging
-    log_gradients: bool = False
+
+@dataclass(frozen=False)
+class DynamicsConfig(BaseExperimentConfig):
+    tokenizer_ckpt: str = ""  # checkpoint from train_tokenizer.py
+
+    # Model
+    dynamics: DynamicsModelConfig = field(default_factory=DynamicsModelConfig)
+
+    # Training
+    max_steps: int = 50_000
+    bootstrap_start: int = 5_000
+    self_fraction: float = 0.25
+    batch_size: int = 16
+
+    # LR schedule
+    lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
+    
+    # Optimizer
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+
+    # Eval media toggle
+    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
+
+
+@dataclass(frozen=False)
+class BCRewConfig(BaseExperimentConfig):
+    tokenizer_ckpt: str = ""  # checkpoint from train_tokenizer.py
+    dynamics_ckpt: str = ""  # checkpoint from train_dynamics.py
+    action_dim: int = 4  # number of categorical actions
+    n_agent: int = 1  # number of agent tokens for dynamics
+
+    # Training hyperparameters
+    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
+    self_fraction: float = 0.25   # used once we pass bootstrap_start
+
+    # Train
+    log_every: int = 5_000
+    
+    # Learning rates
+    lr_policy: float = 1e-4
+    lr_reward: float = 1e-4
+    lr_dynamics: float = 1e-5
+    dynamics_loss_weight: float = 0.1
+
+    # Eval media toggle
+    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
+
+    # Multi-token prediction (MTP) settings
+    L: int = 2                      # predict next L actions/rewards
+    num_reward_bins: int = 101      # twohot bins for symexp rewards
+    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
+    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
+    n_tasks: int = 128              # task-ID space for TaskEmbedder
+    use_task_ids: bool = True       # True: discrete task IDs; False: vector embed
+    
+    # Loss weighting (to balance scales across different loss components)
+    loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
+    loss_weight_policy: float = 0.3      # weight for policy CE loss (nats)
+    loss_weight_reward: float = 0.3      # weight for reward CE loss (nats)
+
 
 @dataclass(frozen=False)
 class RLConfig(BaseExperimentConfig):
@@ -247,64 +321,3 @@ class RLConfig(BaseExperimentConfig):
     eval_horizon: int = 32
     eval_batch_size: int = 4
     max_eval_examples_to_plot: int = 4
-
-@dataclass(frozen=False)
-class DynamicsConfig(BaseExperimentConfig):
-    tokenizer_ckpt: str = ""  # checkpoint from train_tokenizer.py
-
-    # Nested
-    dynamics: DynamicsModelConfig = field(default_factory=DynamicsModelConfig)
-
-    # train
-    max_steps: int = 50_000
-    log_every: int = 5_000
-
-    # schedule configuration
-    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
-    
-    # optimizer configuration
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-
-    # schedule
-    bootstrap_start: int = 5_000
-    self_fraction: float = 0.25
-    batch_size: int = 16
-
-    # eval media toggle
-    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
-
-@dataclass(frozen=False)
-class BCRewConfig(BaseExperimentConfig):
-    tokenizer_ckpt: str = ""  # checkpoint from train_tokenizer.py
-    dynamics_ckpt: str = ""  # checkpoint from train_dynamics.py
-    action_dim: int = 4  # number of categorical actions
-    n_agent: int = 1  # number of agent tokens for dynamics
-
-    # Training hyperparameters
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
-    self_fraction: float = 0.25   # used once we pass bootstrap_start
-
-    # Train
-    log_every: int = 5_000
-    
-    # Learning rates
-    lr_policy: float = 1e-4
-    lr_reward: float = 1e-4
-    lr_dynamics: float = 1e-5
-    dynamics_loss_weight: float = 0.1
-
-    # Eval media toggle
-    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
-
-    # Multi-token prediction (MTP) settings
-    L: int = 2                      # predict next L actions/rewards
-    num_reward_bins: int = 101      # twohot bins for symexp rewards
-    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
-    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
-    n_tasks: int = 128              # task-ID space for TaskEmbedder
-    use_task_ids: bool = True       # True: discrete task IDs; False: vector embed
-    
-    # Loss weighting (to balance scales across different loss components)
-    loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
-    loss_weight_policy: float = 0.3      # weight for policy CE loss (nats)
-    loss_weight_reward: float = 0.3      # weight for reward CE loss (nats)

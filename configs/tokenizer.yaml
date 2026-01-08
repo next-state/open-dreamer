@@ -53,17 +53,16 @@ decoder:
   dataset_std: ${dataset.dataset_std}
 
 max_steps: 300_000
-log_every: 100
 tokenizer_loss_type: mse  # mse | mae
-log_gradients: false
 
-schedule:
+lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
   lr: 6e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_steps: 10_000
   wsd_decay_steps: 30_000
+  max_steps: ${max_steps}
 
 optimizer:
   optimizer_type: adamw
