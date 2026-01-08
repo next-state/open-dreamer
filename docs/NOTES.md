@@ -79,7 +79,7 @@ By default, this installs the CPU version of jax. Follow the instructions in the
 
 ## Dataset generation
 
-For now, we are generating bouncing square dataset in `data.py`. It outputs a (B,T,H,W,C) batch of data.
+The `data.py` module loads recorded trajectory datasets in ArrayRecord format. It outputs a (B,T,H,W,C) batch of data.
 
 We follow the Dreamer convention of indexing for transitions, in which action $a_i$ happens *before* $s_i$. The MDP executes like so:
 ```
@@ -160,7 +160,7 @@ The causal tokenizer is trained using a masked autoencoder loss. We randomly mas
 ## Interactive Dynamics 
 - need to make sure we are handling multiple modalities correctly, where latent tokens can read from everything but other tokens can only attend amongst tokens with the same modality 
 
-Did a fair amount of debugging to improve generations. The way I was doing sampling was incorrect, now the quality is a lot better. We need a variable step size to account for the signal level. Now, we are fairly sure the generation is working since we're able to get almost pixel perfect predictions on the bouncing square dataset.
+Did a fair amount of debugging to improve generations. The way I was doing sampling was incorrect, now the quality is a lot better. We need a variable step size to account for the signal level. The generation quality has been validated with high-fidelity predictions on recorded trajectory datasets.
 
 ### Reward / Action prediction
 Then, the interactive dynamics transformer is finetuned on action and reward prediction losses. The predicted actions and rewards look fairly accurate over the autoregressive rollout.

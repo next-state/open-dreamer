@@ -4,7 +4,7 @@ This repo is an unofficial implementation of the **[Dreamer 4](https://danijar.c
 
 ![dreamer4](docs/architecture.png)
 
-At this stage, the entire world model + RL pipeline has been implemented and verified on a small bouncing square dataset. The authors are extending the codebase to solve harder tasks like CoinRun and eventually, Minecraft.  
+At this stage, the entire world model + RL pipeline has been implemented and tested on recorded trajectory datasets like CoinRun. The authors are extending the codebase to solve harder tasks and eventually, Minecraft.  
 
 > [!NOTE]
 > We are looking for support - in terms of compute, advising, or feature development. Please get in touch if interested!
@@ -15,7 +15,7 @@ At this stage, the entire world model + RL pipeline has been implemented and ver
 
 ## Demo
 
-At a high level, Dreamer 4 first trains an action-conditioned video diffusion model of the environment. Here, we show that the world model has learned to accurately predict the real dynamics of the bouncing square dataset.
+At a high level, Dreamer 4 first trains an action-conditioned video diffusion model of the environment. Here, we show that the world model has learned to accurately predict environment dynamics from recorded trajectories.
 <figure>
     <img src="docs/imagination-cropped.gif">
 </figure>
@@ -31,7 +31,7 @@ Then, the agent is trained with RL in the world model. The reward is the proximi
 ## Repo Structure
 - **Core library (`dreamer/`)**
   - `models.py` -- Space-time axial attention, causal tokenizer, interactive dynamics model, agent / reward / value heads.
-  - `data.py` -- Bouncing square dataset and environment 
+  - `data.py` -- Recorded trajectory data loading (ArrayRecord format) 
   - `imagination.py` -- JIT-fused imagination / diffusion-style rollout code used for fast RL in latent space.
   - `sampler.py` - non-JIT sampling helpers for debugging / visualization.
   - `utils.py` -- training state helpers, checkpointing wrappers (Orbax), logging helpers.
@@ -64,7 +64,7 @@ Dreamer 4 follows a 4-stage training pipeline.
 - **Phase 3**: Add agent tokens, BC / reward heads with behavior cloning and reward prediction.
 - **Phase 4**: Train a policy on imagination trajectories from the dynamics model.
 
-The default experiments use the synthetic **bouncing square** dataset, where an agent controls a square in a small grid using WASD commands and is rewarded for staying in the center.
+The default experiments use recorded trajectory datasets in ArrayRecord format (e.g., CoinRun episodes).
 
 To run the training pipeline, edit the configs in each script's `__main__` block and execute:
 

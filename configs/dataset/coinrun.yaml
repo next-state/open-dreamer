@@ -3,7 +3,6 @@ defaults:
 
 name: coinrun
 
-source: custom
 array_record_path: datasets/coinrun_hard_agent_episodes/train
 
 B: 128

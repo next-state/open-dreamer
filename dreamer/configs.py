@@ -10,7 +10,7 @@ class DatasetConfig:
     This config is shared across all experiments (tokenizer, dynamics, policy)
     to ensure consistent data loading.
     """
-    name: str = "bouncing_square"
+    name: str = "coinrun"
 
     # Batch and sequence dimensions
     B: int = 32  # batch size
@@ -19,24 +19,15 @@ class DatasetConfig:
     W: int = 64  # width
     C: int = 3   # channels
 
-    # Bouncing square specific parameters
-    pixels_per_step: int = 2
-    size_min: int = 6
-    size_max: int = 14
-    hold_min: int = 4
-    hold_max: int = 9
-    diversify_data: bool = True
-
-    # Dataset selection
-    source: str = "custom"  # "bouncing_square" or "custom"
-    action_dim: int = 1  # For bouncing square it's discrete (1 dim), for others might be >1 or continuous
+    # Dataset path and action space
+    action_dim: int = 1
     array_record_path: str = "datasets/coinrun_episodes/train"
 
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
-    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
+    dataset_std: tuple[float, ...] = (0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
-    # reward-biased slicing probability (0.0 = disabled, 0.8 = 80% chance to include windows with nonzero reward)
+    # Reward-biased slicing probability (0.0 = disabled, 0.8 = 80% chance to include windows with nonzero reward)
     p_include_reward: float = 0.0
 
 # ---- Model Configs ----

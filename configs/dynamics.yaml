@@ -51,4 +51,4 @@ optimizer:
   b2: 0.9
   weight_decay: 1e-4
 
-write_video_every: 1_000
+write_video_every: 5_000

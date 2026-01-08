@@ -12,9 +12,9 @@ from .utils import (
     normalize_with_dataset_stats,
     unnormalize_with_dataset_stats,
     to_jnp_dtype,
-    from_dict
+    from_dict,
+    patchify, unpatchify
 )
-from .data import patchify, unpatchify
 from .configs import TokenizerConfig, DynamicsModelConfig, DynamicsConfig, EncoderModelConfig, DecoderModelConfig
 from .parallel import MeshRules
 
