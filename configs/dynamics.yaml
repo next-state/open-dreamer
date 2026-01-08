@@ -1,20 +1,18 @@
 defaults:
-    - common
-    - _self_
+  - common
+  - _self_
+  - dataset: coinrun
 
 run_name: dynamics
 tokenizer_ckpt: logs/tokenizer/checkpoints/
-ckpt_save_every: 10_000
+
+ckpt:
+  max_to_keep: 2
+  save_interval_steps: 10_000
 
 dataset:
-  array_record_path: datasets/coinrun_hard_agent_episodes/train
   B: 256
-  T: 64
-  H: 64
-  W: 64
-  C: 3
 
-#Dynamics specific
 dynamics:
     d_model: 1024
     d_bottleneck: 16
@@ -37,15 +35,20 @@ bootstrap_start: 5_000
 self_fraction: 0.25
 
 max_steps: 300_000
-log_every: 100
-lr: 1e-4
 
-# learning rate schedule
-lr_schedule: wsd  # constant | wsd | cos
-init_lr: 0.0
-max_lr: 3e-4
-lr_end: 0
-warmup_steps: 50000
-wsd_decay_steps: 20000
+lr_schedule:
+  schedule_type: wsd  # constant | wsd | cos
+  lr: 3e-4  # constant LR or peak LR for schedules
+  init_lr: 0.0
+  lr_end: 0.0
+  warmup_steps: 50_000
+  wsd_decay_steps: 20_000
+  max_steps: ${max_steps}
+
+optimizer:
+  optimizer_type: adamw
+  b1: 0.9
+  b2: 0.9
+  weight_decay: 1e-4
 
 write_video_every: 5_000

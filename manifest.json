@@ -1,7 +1,7 @@
 {
     "reactor-runtime": "0.0.4",
-    "class": "dreamer.model_procgen:ProcgenVideoModel",
-    "model_name": "procgen-coinrun",
+    "class": "reactor.reactor_hybrid:HybridVideoModel",
+    "model_name": "hybrid-coinrun",
     "model_version": "1.0.0",
     "args": {
         "fps": 15,

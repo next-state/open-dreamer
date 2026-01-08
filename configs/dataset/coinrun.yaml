@@ -1,0 +1,17 @@
+defaults:
+  - _self_
+
+name: coinrun
+
+array_record_path: datasets/coinrun_hard_agent_episodes/train
+
+B: 128
+T: 64
+H: 64
+W: 64
+C: 3
+
+dataset_mean: [0.5, 0.5, 0.5]
+dataset_std: [0.288675, 0.288675, 0.288675]
+
+p_include_reward: 0.0

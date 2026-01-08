@@ -34,7 +34,6 @@ agent_space_mode: wm_agent
 k_max: 8
 
 max_steps: 100_000
-log_every: 100
 lr: 1e-4
 
 write_video_every: 1

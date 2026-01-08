@@ -32,7 +32,7 @@ User Input → input_to_action() → Action Array
 @dataclass
 class ReactorConfig:
     """Configuration for Dreamer reactor runtime."""
-    dynamics_ckpt: str = 'logs/ed/checkpoints'
+    dynamics_ckpt: str = 'logs/dynamics/checkpoints'
     policy_ckpt: Optional[str] = None
     
     # Denoising schedule
@@ -151,8 +151,8 @@ class DreamerVideoModel(VideoModel):
                 mesh_rules=mesh_rules,
                 rngs=nnx.Rngs(0)
             )
-            self.dynamics_cfg = self.dynamics.config
-            self.tokenizer_cfg = self.tokenizer.config
+            self.dynamics_cfg = self.dynamics.cfg
+            self.tokenizer_cfg = self.tokenizer.cfg
             
             # Load policy if checkpoint provided
             self.policy = None
@@ -167,7 +167,7 @@ class DreamerVideoModel(VideoModel):
             
             # Compute latent shape from dynamics config
             H, W = self.size
-            packing_factor = self.dynamics.config.packing_factor
+            packing_factor = self.dynamics.cfg.packing_factor
             n_latents = self.tokenizer_cfg.decoder.n_latents
             
             # Calculate number of spatial tokens
@@ -259,7 +259,7 @@ class DreamerVideoModel(VideoModel):
         init_latents, _ = self.tokenizer.encode(
             init_frames_jax,
             deterministic=True,
-            packing_factor=self.dynamics.config.packing_factor,
+            packing_factor=self.dynamics.cfg.packing_factor,
             rngs=nnx.Rngs(mae=rng_encoder),
         )  # Shape: (1, T//packing, n_spatial, D_s*packing)
         
@@ -291,7 +291,7 @@ class DreamerVideoModel(VideoModel):
         logger.info("Warming up tokenizer cache...")
         _, self.tokenizer_cache = self.tokenizer.decode(
             init_latents,
-            packing_factor=self.dynamics.config.packing_factor,
+            packing_factor=self.dynamics.cfg.packing_factor,
             caches=self.tokenizer_cache,
             deterministic=True,
             rngs=None,

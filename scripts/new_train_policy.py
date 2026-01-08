@@ -169,7 +169,7 @@ def initialize_rl_training(cfg: RLConfig, ctx):
     # Per models.py: Dynamics.from_pretrained returns (dynamics, tokenizer)
     # Both are NNX modules with parameters already loaded
     dynamics, tokenizer = Dynamics.from_pretrained(cfg.bc_rew_ckpt, ctx)
-    dynamics_cfg = dynamics.config
+    dynamics_cfg = dynamics.cfg
     
     # Load pretrained heads (task_embedder, policy_bc, reward_head)
     task_embedder, policy_bc, reward_head = load_pretrained_heads(cfg, dynamics_cfg)
@@ -273,7 +273,7 @@ def train_step(
     horizon = cfg.horizon
     
     # Get packing factor from dynamics config
-    packing_factor = dynamics.config.packing_factor
+    packing_factor = dynamics.cfg.packing_factor
     
     # Encode context frames
     z_ctx, _ = tokenizer.encode(

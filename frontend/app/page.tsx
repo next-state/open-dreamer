@@ -7,6 +7,7 @@ import { ReactorStatus } from "@/components/ReactorStatus";
 import { GameView } from "@/components/GameView";
 import { KeyboardController } from "@/components/KeyboardController";
 import { AgentToggle } from "@/components/AgentToggle";
+import { ImaginationToggle } from "@/components/ImaginationToggle";
 import { useReactor } from "@reactor-team/js-sdk";
 
 function GameInterface() {
@@ -20,6 +21,7 @@ function GameInterface() {
     <div className="flex flex-col gap-3">
       <GameView className="w-full aspect-video bg-gradient-to-br from-gray-800 to-gray-900 rounded-xl border border-gray-700/50 shadow-xl overflow-hidden" />
       <ReactorStatus />
+      <ImaginationToggle />
       <AgentToggle />
       <KeyboardController enabled={isConnected && status === "ready"} />
     </div>

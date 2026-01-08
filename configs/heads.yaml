@@ -22,7 +22,6 @@ bootstrap_start: 5000
 self_fraction: 0.25
 
 max_steps: 1_000_000_000
-log_every: 10
 write_video_every: 500
 
 # Learning rates

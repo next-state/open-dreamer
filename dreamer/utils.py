@@ -8,8 +8,11 @@ import grain
 import operator
 from einops import rearrange
 from enum import IntEnum
-from typing import Tuple, TypeVar, cast
+from typing import Tuple, TypeVar
 import numpy as np
+from hydra.core.hydra_config import HydraConfig
+from omegaconf import OmegaConf
+from dreamer.configs import CheckpointConfig, LRScheduleConfig, OptimizerConfig
 
 
 
@@ -235,21 +238,15 @@ def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
 # ============================================================================
 
 def build_checkpoint_manager(
+        ckpt_cfg: CheckpointConfig,
         ckpt_dir: Path,
-        max_to_keep: int,
-        save_interval_steps: int,
-        max_steps: int,
         item_names=("model_state", "optimizer_state", "train_dataloader_state", "rngs", "meta"),
     ) -> ocp.CheckpointManager:
-
     checkpoint_options = ocp.CheckpointManagerOptions(
-        max_to_keep=max_to_keep,
-        save_interval_steps=save_interval_steps,
-        save_on_steps=[max_steps - 1],  # always save at the end
+        max_to_keep=ckpt_cfg.max_to_keep,
+        save_interval_steps=ckpt_cfg.save_interval_steps,
+        save_on_steps=[ckpt_cfg.max_steps - 1],  # always save at the end
     )
-
-    # TODO: check if Checkpointer can manage grain.Dataloader itself without an explicit ocp.handlers.DefaultCheckpointHandlerRegistry
-    # handler_registry and item_names are mutually exclusive
 
     return ocp.CheckpointManager(ckpt_dir, options=checkpoint_options, item_names=item_names)
 
@@ -324,6 +321,15 @@ def _ensure_dir(p: Path) -> Path:
     return p
 
 
+def setup_training_directories(cfg) -> tuple[Path, Path, Path, dict]:
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
+    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
+    vis_dir = _ensure_dir(run_dir / "viz")
+    meta = {"cfg": OmegaConf.to_container(cfg, resolve=True)}
+    print(f"[setup] output dir: {run_dir.resolve()}")
+    return run_dir, ckpt_dir, vis_dir, meta
+
+
 def _to_uint8(img_f32):
     """Convert float32 image to uint8."""
     return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
@@ -386,49 +392,71 @@ def count_parameters_by_component(model):
     return counts
 
 
-def get_lr_schedule(
-    lr_schedule: str,
-    init_lr: float,
-    max_lr: float,
-    decay_end: float,
-    total_steps: int,
-    warmup_steps: int,
-    wsd_decay_steps: int,
-) -> optax.Schedule:
+def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
     """
-    Learning-rate schedule helper, mirrored from Jasmine.
-
-    Supported schedules:
-      - "cos": warmup cosine decay
-      - "wsd": warmup -> hold -> decay (linear warmup, constant hold, linear decay)
+    Build learning rate schedule.
+    
+    Args:
+        schedule_cfg: ScheduleConfig instance
+    
+    Returns:
+        optax.Schedule instance
     """
-    supported_schedules = ["wsd", "cos"]
-    if lr_schedule == "cos":
-        assert warmup_steps <= total_steps, "Warmup steps can't be greater than total steps."
+    max_steps = schedule_cfg.max_steps
+    if schedule_cfg.schedule_type == "constant":
+        return optax.constant_schedule(value=schedule_cfg.lr)
+    elif schedule_cfg.schedule_type == "cos":
+        assert schedule_cfg.warmup_steps <= max_steps, "Warmup steps can't be greater than total steps."
         return optax.warmup_cosine_decay_schedule(
-            init_value=init_lr,
-            peak_value=max_lr,
-            warmup_steps=warmup_steps,
+            init_value=schedule_cfg.init_lr,
+            peak_value=schedule_cfg.lr,
+            warmup_steps=schedule_cfg.warmup_steps,
             # Note: decay_steps includes the warmup steps, so pass the total value.
-            decay_steps=total_steps,
-            end_value=decay_end,
+            decay_steps=max_steps,
+            end_value=schedule_cfg.lr_end,
         )
-    elif lr_schedule == "wsd":
+    elif schedule_cfg.schedule_type == "wsd":
         assert (
-            warmup_steps + wsd_decay_steps <= total_steps
+            schedule_cfg.warmup_steps + schedule_cfg.wsd_decay_steps <= max_steps
         ), "Warmup and decay period is longer than total steps."
         schedules = [
             optax.linear_schedule(
-                init_value=init_lr, end_value=max_lr, transition_steps=warmup_steps
+                init_value=schedule_cfg.init_lr, end_value=schedule_cfg.lr, transition_steps=schedule_cfg.warmup_steps
             ),
-            optax.constant_schedule(value=max_lr),
+            optax.constant_schedule(value=schedule_cfg.lr),
             optax.linear_schedule(
-                init_value=max_lr, end_value=decay_end, transition_steps=wsd_decay_steps
+                init_value=schedule_cfg.lr, end_value=schedule_cfg.lr_end, transition_steps=schedule_cfg.wsd_decay_steps
             ),
         ]
-        boundaries = [warmup_steps, total_steps - wsd_decay_steps]
+        boundaries = [schedule_cfg.warmup_steps, max_steps - schedule_cfg.wsd_decay_steps]
         return optax.join_schedules(schedules, boundaries)
     else:
         raise ValueError(
-            f"Learning rate schedule not supported. Please use one of {supported_schedules}"
+            f"Unsupported learning rate schedule: {schedule_cfg.schedule_type}"
         )
+
+
+def build_optimizer(optimizer_cfg: OptimizerConfig, model: nnx.Module, lr_schedule: optax.Schedule) -> nnx.Optimizer:
+    """
+    Build optimizer with given learning rate schedule.
+    
+    Args:
+        optimizer_cfg: OptimizerConfig instance
+        model: nnx.Module to optimize
+        lr_schedule: optax.Schedule instance
+
+    Returns:
+        nnx.Optimizer instance
+    """
+    if optimizer_cfg.optimizer_type == "adamw":
+        tx = optax.adamw(
+            lr_schedule,
+            b1=optimizer_cfg.b1,
+            b2=optimizer_cfg.b2,
+            weight_decay=optimizer_cfg.weight_decay,
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer type: {optimizer_cfg.optimizer_type}")
+    
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    return optimizer
