@@ -73,6 +73,24 @@ class OptimizerContainer:
     policy: optax.GradientTransformationExtraArgs
     value: optax.GradientTransformationExtraArgs
 
+
+def train_step(
+    frames: jnp.ndarray,
+    actions: jnp.ndarray,
+    rng: jnp.ndarray,
+):
+    """
+    Single training step:
+      - encode frames to latents
+      - run JIT-friendly imagination rollouts in latent space
+      - compute TD-λ value targets and PMPO policy loss
+      - update policy/value head params.
+    """
+    pass
+
+
+
+
 # ---------------------------
 # Main
 # ---------------------------
