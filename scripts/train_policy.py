@@ -67,6 +67,12 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+@dataclass(frozen=True)
+class OptimizerContainer:
+    """Hashable container for optimizers to pass as static argument to JIT."""
+    policy: optax.GradientTransformationExtraArgs
+    value: optax.GradientTransformationExtraArgs
+
 # ---------------------------
 # Main
 # ---------------------------
@@ -142,13 +148,17 @@ def run(cfg: RLConfig):
     dummy_task = jnp.zeros((1,), dtype=jnp.int32) if bc_rew_cfg.use_task_ids else jnp.zeros((1, bc_rew_cfg.n_tasks))
     task_embedder_params = task_embedder.init(task_key, task=dummy_task, B=1, T=4)["params"]
     bc_policy_params = bc_policy_head.init(bc_key, dummy_h, deterministic=True)["params"]
-    reward_vars = reward_head.init(rew_key, dummy_h, deterministic=True)
-    reward_params = reward_vars["params"]
-    reward_constants = reward_vars.get("constants", FrozenDict())
+    reward_params = reward_head.init(rew_key, dummy_h, deterministic=True)["params"]
     
     # 5. Restore parameters from bc_rew checkpoint
-    # Create dummy optimizer states for checkpoint restoration (we only need params)
-    dummy_opt_state = {}
+    # Create dummy optimizer states for checkpoint restoration (we only need shapes)
+    dummy_optimizer = optax.adamw(1e-4)
+    opt_states = {
+        "task_embedder": dummy_optimizer.init(task_embedder_params),
+        "policy": dummy_optimizer.init(bc_policy_params),
+        "reward": dummy_optimizer.init(reward_params),
+        "dynamics": dummy_optimizer.init(dynamics_params),
+    }
     state_example = make_state(
         {
             "task_embedder": task_embedder_params,
@@ -157,14 +167,15 @@ def run(cfg: RLConfig):
             "dynamics": dynamics_params,
         },
         {
-            "task_embedder": dummy_opt_state,
-            "policy": dummy_opt_state,
-            "reward": dummy_opt_state,
-            "dynamics": dummy_opt_state,
+            "task_embedder": opt_states["task_embedder"],
+            "policy": opt_states["policy"],
+            "reward": opt_states["reward"],
+            "dynamics": opt_states["dynamics"],
         },
         rng,
         step=0
     )
+    del opt_states
     
     restored = try_restore(bc_rew_mngr, state_example, meta=None)
     if restored is None:
@@ -186,26 +197,79 @@ def run(cfg: RLConfig):
     policy_head = PolicyHeadMTP(
         d_model=dynamics.config.d_model,
         action_dim=dynamics.config.action_dim,
-        L=bc_rew_cfg.L # TODO: we only need to set L=1 here.
+        L=1
     )
     value_head = ValueHead(
         d_model=dynamics.config.d_model,
-        num_bins=bc_rew_cfg.num_value_bins,
+        num_bins=cfg.num_value_bins,
     )
-    policy_vars = policy_head.init(bc_key, dummy_h, deterministic=True)
+    policy_vars = policy_head.init(pol_key, dummy_h, deterministic=True)
     value_vars = value_head.init(val_key, dummy_h, deterministic=True)
-    import ipdb; ipdb.set_trace()
-    
-    
-    # Log parameter counts
-    params = {
-        "policy": policy_vars["params"],
-        "value": value_vars["params"],
+    # Optimizers 
+    adamw = partial(optax.adamw, b1=0.9, b2=0.9, weight_decay=1e-4)
+    optimizers = OptimizerContainer(
+        policy=adamw(cfg.lr_policy),
+        value=adamw(cfg.lr_value),
+    )
+    opt_states = {
+        "policy": optimizers.policy.init(policy_vars["params"]),
+        "value": optimizers.value.init(value_vars["params"]),
     }
+
+    # Logging & checkpointing
+    logger = MetricLogger(
+        use_wandb=cfg.use_wandb,
+        log_every=cfg.log_every,
+        max_steps=cfg.max_steps,
+        wandb_obj=wandb,
+    )
+    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
+    # Try to restore checkpoint
+    state_example = make_state(
+        {
+            "policy": policy_vars["params"],
+            "value": value_vars["params"],
+        },
+        {
+            "policy": opt_states["policy"],
+            "value": opt_states["value"],
+        },
+        rng,
+        step=0
+    )
+    meta = {"cfg": asdict(cfg)}
+    restored = try_restore(mngr, state_example, meta)
+    start_step = 0
+    if restored is not None:
+        latest_step, r = restored
+        params = r.state["params"]
+        opt_states = r.state["opt_state"]
+        rng = r.state["rng"]
+        start_step = int(r.state["step"])
+        print(f"[ckpt] Restored step {latest_step}")
+    else:
+        params = {
+            "policy": policy_vars["params"],
+            "value": value_vars["params"],
+        }
     param_counts = count_parameters_by_component(params)
     print(f"Parameter counts: {param_counts}")
-
     import ipdb; ipdb.set_trace()
+    tokenizer_cfg.dataset.p_include_reward = 0
+    dataset = make_iterator(tokenizer_cfg.dataset)
+
+    # Training loop
+    pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
+    for step, batch in pbar:
+        if step >= cfg.max_steps:
+            break
+        
+        rng, step_key = jax.random.split(rng, 2)
+        
+        # Get videos and compute batch size
+        videos = batch["videos"]
+        actions = batch["actions"]
+
     
 
 
