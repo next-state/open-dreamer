@@ -146,7 +146,7 @@ def encode_and_train_step(
     # Phase 1: Encode (tokenizer frozen)
     rngs = nnx.Rngs(mae=tokenizer_key)
     latents, _ = tokenizer.encode(videos, packing_factor=packing_factor,
-                                   deterministic=True, rngs=rngs)
+                                  deterministic=True, rngs=rngs)
 
     # Phase 2: Train
     metrics = train_step(
@@ -214,7 +214,8 @@ def train_step(
         )
         dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
 
-        # Policy and reward losses (models called inside these functions)
+        # TODO: See if we should compute the losses and the gradients sequentially (see figure 2 of https://arxiv.org/pdf/2404.19737 and comment in pull request #16)
+        # TODO: put gather_future_rewards and gather_future_actions inside of the compute_policy_loss function and compute_future_actions functions
         policy_loss = compute_policy_loss(pol, h_states, actions_btL, actions_valid)
         reward_loss = compute_reward_loss(rew, h_states, rewards_btL, rewards_valid)
 
@@ -306,7 +307,7 @@ def run(cfg: HeadsConfig):
         lr_schedule_dynamics = build_lr_schedule(cfg.lr_schedule_dynamics)
 
         # Build optimizers
-        task_embedder_optimizer = build_optimizer(cfg.optimizer, task_embedder, lr_schedule_policy)
+        task_embedder_optimizer = build_optimizer(cfg.optimizer, task_embedder, lr_schedule_policy)  # Use same LR as policy
         policy_optimizer = build_optimizer(cfg.optimizer, policy_head, lr_schedule_policy)
         reward_optimizer = build_optimizer(cfg.optimizer, reward_head, lr_schedule_reward)
         dynamics_optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule_dynamics)
