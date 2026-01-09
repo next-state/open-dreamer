@@ -989,7 +989,7 @@ class TaskEmbedder(nnx.Module):
 
     def __init__(self, d_model: int, n_agent: int = 1, use_ids: bool = True, 
                  n_tasks: int = 128, d_task: int = 64, dtype: Any = jnp.float32,
-                 param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs):
+                 param_dtype: Any = jnp.float32, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
         self.n_agent = n_agent
         self.use_ids = use_ids
@@ -999,11 +999,11 @@ class TaskEmbedder(nnx.Module):
         param_dtype = to_jnp_dtype(param_dtype)
 
         if use_ids:
-            self.emb = nnx.Embed(n_tasks, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+            self.emb = nnx.Embed(n_tasks, d_model, dtype=dtype, param_dtype=param_dtype, embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')), rngs=rngs)
         else:
-            self.emb = nnx.Linear(d_task, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+            self.emb = nnx.Linear(d_task, d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
 
-        self.agent_base = nnx.Param(jax.random.normal(rngs.params(), (d_model,), dtype=param_dtype) * 0.02)
+        self.agent_base = nnx.Param(jax.random.normal(rngs.params(), (d_model,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
     def __call__(self, task, B: int, T: int):
         """
@@ -1029,7 +1029,7 @@ class PolicyHeadMTP(nnx.Module):
     def __init__(self, d_model: int, action_dim: int, L: int = 8, kind: str = "categorical",
                  mlp_ratio: float = 2.0, dropout_rate: float = 0.0, swiglu: bool = True,
                  parity_2over3: bool = False, dtype: Any = jnp.float32, 
-                 param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs):
+                 param_dtype: Any = jnp.float32, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
         self.action_dim = action_dim
         self.L = L
@@ -1037,15 +1037,16 @@ class PolicyHeadMTP(nnx.Module):
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
 
-        # Feature projector (D -> D) using your MLP
+        # Feature projector: operates on flattened agent tokens (L*d_model)
+        d_flat = d_model * L
         self.projector = MLP(
-            d_model=d_model, mlp_ratio=mlp_ratio, dropout_rate=dropout_rate,
-            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype, 
-            param_dtype=param_dtype, rngs=rngs
+            d_model=d_flat, mlp_ratio=mlp_ratio, dropout_rate=dropout_rate,
+            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype,
+            param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs
         )
 
-        # Single matmul that produces all L offsets at once: (… , D) -> (…, L, A)
-        self.out = nnx.Linear(d_model, L * action_dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        # Single matmul that produces all L offsets at once: (… , d_flat) -> (…, L, A)
+        self.out = nnx.Linear(d_flat, L * action_dim, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
 
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> jnp.ndarray:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
@@ -1061,7 +1062,7 @@ class RewardHeadMTP(nnx.Module):
     def __init__(self, d_model: int, L: int = 8, num_bins: int = 101, mlp_ratio: float = 2.0,
                  dropout_rate: float = 0.0, swiglu: bool = True, parity_2over3: bool = False,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
-                 log_low: float = -8.0, log_high: float = 8.0, *, rngs: nnx.Rngs):
+                 log_low: float = -8.0, log_high: float = 8.0, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
         self.L = L
         self.num_bins = num_bins
@@ -1070,12 +1071,13 @@ class RewardHeadMTP(nnx.Module):
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
 
+        d_flat = d_model * L
         self.projector = MLP(
-            d_model=d_model, mlp_ratio=mlp_ratio, dropout_rate=dropout_rate,
-            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype, 
-            param_dtype=param_dtype, rngs=rngs
+            d_model=d_flat, mlp_ratio=mlp_ratio, dropout_rate=dropout_rate,
+            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype,
+            param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs
         )
-        self.out = nnx.Linear(d_model, L * num_bins, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.out = nnx.Linear(d_flat, L * num_bins, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
 
         # Precompute bin centers as a constant
         self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
@@ -1085,29 +1087,31 @@ class RewardHeadMTP(nnx.Module):
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L*K)
         logits = rearrange(logits, '... (l k) -> ... l k', l=self.L, k=self.num_bins)
-        return logits 
+        return logits, self.symexp_centers_log 
 
 
 class ValueHead(nnx.Module):
     """Value prediction with symexp twohot bins."""
 
-    def __init__(self, d_model: int, num_bins: int = 101, mlp_ratio: float = 2.0,
+    def __init__(self, d_model: int, num_bins: int = 101, L: int = 1, mlp_ratio: float = 2.0,
                  dropout_rate: float = 0.0, swiglu: bool = True, parity_2over3: bool = False,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
-                 log_low: float = -8.0, log_high: float = 8.0, *, rngs: nnx.Rngs):
+                 log_low: float = -8.0, log_high: float = 8.0, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
+        self.L = L
         self.num_bins = num_bins
         self.log_low = log_low
         self.log_high = log_high
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
 
+        d_flat = d_model * L
         self.projector = MLP(
-            d_model=d_model, mlp_ratio=mlp_ratio, dropout_rate=dropout_rate,
-            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype, 
-            param_dtype=param_dtype, rngs=rngs
+            d_model=d_flat, mlp_ratio=mlp_ratio, dropout_rate=dropout_rate,
+            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype,
+            param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs
         )
-        self.out = nnx.Linear(d_model, num_bins, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.out = nnx.Linear(d_flat, num_bins, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
 
         # Precompute bin centers as a constant
         self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
@@ -1116,4 +1120,4 @@ class ValueHead(nnx.Module):
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, K)
-        return logits
+        return logits, self.symexp_centers_log

@@ -1,14 +1,14 @@
 defaults:
   - common
   - _self_
+  - dataset: coinrun
 
-run_name: bc_rew
+run_name: heads
 tokenizer_ckpt: "logs/tokenizer/checkpoints"
 dynamics_ckpt: "logs/dynamics/checkpoints"
-ckpt_save_every: 100_000
 
-dtype: ${dtype}
-param_dtype: ${param_dtype}
+ckpt:
+  save_interval_steps: 100_000
 
 dataset:
   B: 64
@@ -24,16 +24,35 @@ self_fraction: 0.25
 max_steps: 1_000_000_000
 write_video_every: 500
 
-# Learning rates
-lr_policy: ${lr_dynamics}
-lr_reward: ${lr_dynamics}
-lr_dynamics: 1e-4
+# Learning rate schedules
+lr_schedule_policy:
+  schedule_type: constant
+  lr: ${lr_schedule_dynamics.lr}
+  max_steps: ${max_steps}
+
+lr_schedule_reward:
+  schedule_type: constant
+  lr: ${lr_schedule_dynamics.lr}
+  max_steps: ${max_steps}
+
+lr_schedule_dynamics:
+  schedule_type: constant
+  lr: 1e-4
+  max_steps: ${max_steps}
+
+# Optimizer config (shared across all components)
+optimizer:
+  optimizer_type: adamw
+  b1: 0.9
+  b2: 0.9
+  weight_decay: 1e-4
+
 dynamics_loss_weight: 0.1
 
 # Multi-token prediction settings
 L: ${n_agent}
 num_reward_bins: 101
-reward_log_low: -5.0  
+reward_log_low: -5.0
 reward_log_high: 3.0
 n_tasks: 128
 use_task_ids: true

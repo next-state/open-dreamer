@@ -222,7 +222,7 @@ class DynamicsConfig(BaseExperimentConfig):
 
 
 @dataclass(frozen=False)
-class BCRewConfig(BaseExperimentConfig):
+class HeadsConfig(BaseExperimentConfig):
     tokenizer_ckpt: str = ""  # checkpoint from train_tokenizer.py
     dynamics_ckpt: str = ""  # checkpoint from train_dynamics.py
     action_dim: int = 4  # number of categorical actions
@@ -232,13 +232,14 @@ class BCRewConfig(BaseExperimentConfig):
     bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
     self_fraction: float = 0.25   # used once we pass bootstrap_start
 
-    # Train
-    log_every: int = 5_000
-    
-    # Learning rates
-    lr_policy: float = 1e-4
-    lr_reward: float = 1e-4
-    lr_dynamics: float = 1e-5
+    # Learning rate schedules (one per component)
+    lr_schedule_policy: LRScheduleConfig = field(default_factory=lambda: LRScheduleConfig(lr=1e-4))
+    lr_schedule_reward: LRScheduleConfig = field(default_factory=lambda: LRScheduleConfig(lr=1e-4))
+    lr_schedule_dynamics: LRScheduleConfig = field(default_factory=lambda: LRScheduleConfig(lr=1e-5))
+
+    # Optimizer config (shared across all components)
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+
     dynamics_loss_weight: float = 0.1
 
     # Eval media toggle
@@ -260,7 +261,7 @@ class BCRewConfig(BaseExperimentConfig):
 
 @dataclass(frozen=False)
 class RLConfig(BaseExperimentConfig):
-    bc_rew_ckpt: str = ""  # checkpoint from train_bc_rew_heads.py
+    heads_ckpt: str = ""  # checkpoint from train_heads.py
     action_dim: int = 4
 
     # tokenizer / dynamics config

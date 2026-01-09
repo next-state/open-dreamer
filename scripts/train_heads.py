@@ -15,27 +15,21 @@ Architecture:
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, dataclass
-from functools import partial
-from pathlib import Path
-from typing import Dict
 
-from flax.typing import VariableDict
+import grain.checkpoint
 import hydra
 import jax
 import jax.numpy as jnp
-import optax
-from flax.core import FrozenDict
+import orbax.checkpoint as ocp
 from flax import nnx
-from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from dreamer.configs import BCRewConfig
+from dreamer.configs import HeadsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
-from dreamer.parallel import ParallelContext
+from dreamer.parallel import build_parallel
 from dreamer.training import (
     compute_policy_loss,
     compute_reward_loss,
@@ -43,29 +37,15 @@ from dreamer.training import (
     shortcut_forcing_step,
 )
 from dreamer.utils import (
+    build_checkpoint_manager,
+    build_lr_schedule,
+    build_optimizer,
     setup_training_directories,
-    make_manager,
-    make_state,
-    maybe_save,
-    try_restore,
-    to_jnp_dtype,
 )
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
 
-# ---------------------------
-# Hashable optimizer container
-# ---------------------------
-
-@dataclass(frozen=True)
-class OptimizerContainer:
-    """Hashable container for optimizers to pass as static argument to JIT."""
-    task_embedder: optax.GradientTransformationExtraArgs
-    policy: optax.GradientTransformationExtraArgs
-    reward: optax.GradientTransformationExtraArgs
-    dynamics: optax.GradientTransformationExtraArgs
-    
 
 # ---------------------------
 # Multi-token prediction (MTP) helpers
@@ -134,303 +114,347 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
 # Training step
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("dynamics", "task_embedder", "policy_head", "reward_head", "optimizers", "k_max", "L_mtp", "B_self"))
+@nnx.jit(static_argnames=("packing_factor", "k_max", "L_mtp", "B_self"))
+def encode_and_train_step(
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
+    task_embedder: TaskEmbedder,
+    policy_head: PolicyHeadMTP,
+    reward_head: RewardHeadMTP,
+    dynamics_optimizer: nnx.Optimizer,
+    task_embedder_optimizer: nnx.Optimizer,
+    policy_optimizer: nnx.Optimizer,
+    reward_optimizer: nnx.Optimizer,
+    videos: jax.Array,
+    actions: jax.Array,
+    rewards: jax.Array,
+    *,
+    tokenizer_key: jax.Array,
+    master_key: jax.Array,
+    step: int,
+    packing_factor: int,
+    k_max: int,
+    L_mtp: int,
+    B_self: int,
+    dynamics_loss_weight: float,
+) -> dict:
+    """
+    Encode videos and run training step.
+
+    Combines frozen tokenizer encoding with agent finetuning in a single JIT.
+    """
+    # Phase 1: Encode (tokenizer frozen)
+    rngs = nnx.Rngs(mae=tokenizer_key)
+    latents, _ = tokenizer.encode(videos, packing_factor=packing_factor,
+                                   deterministic=True, rngs=rngs)
+
+    # Phase 2: Train
+    metrics = train_step(
+        dynamics, task_embedder, policy_head, reward_head,
+        dynamics_optimizer, task_embedder_optimizer,
+        policy_optimizer, reward_optimizer,
+        latents, actions, rewards,
+        master_key=master_key, step=step,
+        k_max=k_max, L_mtp=L_mtp, B_self=B_self,
+        dynamics_loss_weight=dynamics_loss_weight
+    )
+    return metrics
+
+
+@nnx.jit(static_argnames=("k_max", "L_mtp", "B_self"))
 def train_step(
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
     policy_head: PolicyHeadMTP,
     reward_head: RewardHeadMTP,
-    optimizers: OptimizerContainer,
-    # State
-    dynamics_params: VariableDict,
-    dynamics_constants: VariableDict,
-    task_embedder_params: VariableDict,
-    policy_params: VariableDict,
-    reward_params: VariableDict,
-    reward_constants: VariableDict,
-    opt_states,
-    # Data
+    dynamics_optimizer: nnx.Optimizer,
+    task_embedder_optimizer: nnx.Optimizer,
+    policy_optimizer: nnx.Optimizer,
+    reward_optimizer: nnx.Optimizer,
     latents: jax.Array,
-    batch,
-    rng: jax.Array,
+    actions: jax.Array,
+    rewards: jax.Array,
+    *,
+    master_key: jax.Array,
     step: int,
-    # Config
     k_max: int,
     L_mtp: int,
     B_self: int,
     dynamics_loss_weight: float,
-):
+) -> dict:
     """
     Agent finetuning step with BC + reward prediction + optional dynamics loss.
-    
-    Args:
-        Models: dynamics, task_embedder, policy_head, reward_head
-        tx_dict: Dict of optimizers for each component
-        State: parameters and optimizer states
-        latents: Precomputed latents from tokenizer
-        batch: Data batch with actions, tasks, rewards
-        rng: Random key
-        step: Training step number
-        Config: hyperparameters
-        
+
+    Models are updated in place by their respective optimizers.
+
     Returns:
-        new_params, new_opt_states, metrics
+        metrics: Dict of scalar metrics for logging
     """
+    # Generate step-specific key
+    step_key = jax.random.fold_in(master_key, step)
     B, T_video, _, _ = latents.shape
-    
-    # Split RNG
-    rng, dyn_key = jax.random.split(rng, 2)
-    
-    # 1. Create task-conditioned agent tokens
+
+    # Create task-conditioned agent tokens
     # For now, pass task ID 0 for all samples in batch
     task = jnp.zeros((B,), dtype=jnp.int32)
-    agent_tokens_bt = task_embedder.apply({"params": task_embedder_params}, task=task, B=B, T=T_video)
-    
-    # 3. Gather future actions and rewards for MTP
-    actions_btL, actions_valid = gather_future_actions(batch["actions"], L_mtp)
-    rewards_btL, rewards_valid = gather_future_rewards(batch["rewards"], L_mtp)
-    
-    # 4. Define combined loss
-    def loss_fn(pol_p, rew_p, dyn_p):
+    agent_tokens_bt = task_embedder(task=task, B=B, T=T_video)
+
+    # Gather future actions and rewards for MTP
+    actions_btL, actions_valid = gather_future_actions(actions, L_mtp)
+    rewards_btL, rewards_valid = gather_future_rewards(rewards, L_mtp)
+
+    # Define combined loss
+    # Takes all models as a tuple to enable differentiation w.r.t. all of them
+    def loss_fn(models):
+        dyn, task, pol, rew = models
         # Dynamics loss (also returns hidden states for BC/reward training)
-        dyn_vars = {"params": dyn_p, "constants": dynamics_constants}
-        
-        dyn_losses, dyn_aux = shortcut_forcing_step(dynamics.apply, dyn_vars, batch["actions"], latents, dyn_key, k_max, B_self=B_self, agent_tokens=agent_tokens_bt)
+        dyn_losses, dyn_aux = shortcut_forcing_step(
+            dyn, actions, latents, step_key, k_max,
+            B_self=B_self, agent_tokens=agent_tokens_bt
+        )
         dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
-        
-        # TODO: See if we should compute the losses and the gradients sequentially (see figure 2 of https://arxiv.org/pdf/2404.19737 and comment in pull request #16)
-        # TODO: put gather_future_rewards and gather_future_actions inside of the compute_policy_loss function and compute_future_actions functions
-        policy_loss = compute_policy_loss(policy_head, pol_p, h_states, actions_btL, actions_valid)
-        reward_loss = compute_reward_loss(reward_head, {"params": rew_p, "constants": reward_constants}, h_states, rewards_btL, rewards_valid)
-        
+
+        # Policy and reward losses (models called inside these functions)
+        policy_loss = compute_policy_loss(pol, h_states, actions_btL, actions_valid)
+        reward_loss = compute_reward_loss(rew, h_states, rewards_btL, rewards_valid)
+
         # Combine losses
         total_loss = policy_loss + reward_loss + dynamics_loss_weight * dynamics_loss
-        
-        # Filter out non-scalar metrics (h_states is used above but shouldn't be logged)
-        aux = {"policy_loss": policy_loss, "reward_loss": reward_loss, "dynamics_loss": dynamics_loss, 
-               "flow_mse": dyn_aux["flow_mse"], "bootstrap_mse": dyn_aux["bootstrap_mse"]}
-        
+
+        aux = {
+            "policy_loss": policy_loss,
+            "reward_loss": reward_loss,
+            "dynamics_loss": dynamics_loss,
+            "flow_mse": dyn_aux["flow_mse"],
+            "bootstrap_mse": dyn_aux["bootstrap_mse"]
+        }
+
         return total_loss, aux
-    
-    # 5. Compute gradients
-    # Only update policy and reward params (dynamics can be frozen or finetuned)
-    grad_fn = jax.value_and_grad(loss_fn, argnums=(0, 1, 2), has_aux=True)
-    (loss_val, metrics), (pol_grads, rew_grads, dyn_grads) = grad_fn(
-        policy_params, reward_params, dynamics_params
+
+    # Compute gradients (pass all models as a tuple)
+    (loss_val, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
+        (dynamics, task_embedder, policy_head, reward_head)
     )
-    
-    # 6. Apply updates
-    pol_updates, new_pol_opt = optimizers.policy.update(pol_grads, opt_states["policy"], policy_params)
-    new_policy_params = optax.apply_updates(policy_params, pol_updates)
-    
-    rew_updates, new_rew_opt = optimizers.reward.update(rew_grads, opt_states["reward"], reward_params)
-    new_reward_params = optax.apply_updates(reward_params, rew_updates)
-    
-    # Dynamics update (always compute, but optimizer is set_to_zero if not continuing)
-    dyn_updates, new_dyn_opt = optimizers.dynamics.update(dyn_grads, opt_states["dynamics"], dynamics_params)
-    new_dynamics_params = optax.apply_updates(dynamics_params, dyn_updates)
-    
-    new_params = {"task_embedder": task_embedder_params, "dynamics": new_dynamics_params, "policy": new_policy_params, "reward": new_reward_params}
-    new_opt_states = {"task_embedder": opt_states["task_embedder"], "dynamics": new_dyn_opt, "policy": new_pol_opt, "reward": new_rew_opt}
-    
-    return new_params, new_opt_states, metrics
+
+    # Update all models with their respective optimizers
+    dynamics_optimizer.update(dynamics, grads[0])
+    task_embedder_optimizer.update(task_embedder, grads[1])
+    policy_optimizer.update(policy_head, grads[2])
+    reward_optimizer.update(reward_head, grads[3])
+
+    return metrics
 
 
 # ---------------------------
 # Main
 # ---------------------------
 
-def run(cfg: BCRewConfig):
+def run(cfg: HeadsConfig):
     """Main training loop for agent finetuning."""
     # Setup
     run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
     
     # Logging
     logger = build_logger(
-        use_wandb=cfg.use_wandb,
-        log_every=cfg.log_every,
-        max_steps=cfg.max_steps,
-        entity=cfg.wandb_entity,
-        project=cfg.wandb_project or cfg.run_name,
-        name=cfg.run_name,
-        config=asdict(cfg),
+        logger_cfg=cfg.logger,
+        config=OmegaConf.to_container(cfg, resolve=True),
         dir=str(run_dir),
     )
 
-    with logger:
-        # Create parallel context for data parallelism
-        ctx = ParallelContext.create(batch_size=cfg.dataset.B)
+    # Parallelism
+    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
+
+    with (
+        logger,
+        jax.set_mesh(mesh),
+    ):
         
         # Load pretrained tokenizer and dynamics
-        rng = jax.random.PRNGKey(0)
+        key = jax.random.key(cfg.seed)
+        rng, init_key = jax.random.split(key)
+
         print(f"[setup] Loading pretrained dynamics and tokenizer from {cfg.dynamics_ckpt}")
-        dynamics, tokenizer = Dynamics.from_pretrained(cfg.dynamics_ckpt, ctx)
+        dynamics, tokenizer = Dynamics.from_pretrained(cfg.dynamics_ckpt, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         dynamics_cfg = dynamics.cfg
-        tokenizer_cfg = tokenizer.config
-        # nnx.split with multiple filters returns (graphdef, state1, state2, ...)
-        _, *dynamics_states = nnx.split(dynamics, nnx.Param, nnx.BatchStat, ...)
-        dynamics_state = nnx.State.merge(*dynamics_states)
-        dynamics_params = dynamics_state
-        dynamics_vars = {"params": dynamics_params}
-        dynamics_constants = FrozenDict()
-        
-        # For tokenizer, create similar compatibility wrappers
-        _, *tokenizer_states = nnx.split(tokenizer, nnx.Param, nnx.BatchStat, ...)
-        tokenizer_state = nnx.State.merge(*tokenizer_states)
-        tokenizer_vars = {"params": tokenizer_state}
-        
+        tokenizer_cfg = tokenizer.cfg
+
         # Initialize task embedder, policy, and reward heads
         print("[setup] Initializing agent components")
-        task_embedder = TaskEmbedder(d_model=dynamics.cfg.d_model, n_agent=cfg.n_agent, use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks, dtype=cfg.dtype, param_dtype=cfg.param_dtype)
-        policy_head = PolicyHeadMTP(d_model=dynamics.cfg.d_model, action_dim=dynamics.cfg.action_dim, L=cfg.L, dtype=cfg.dtype, param_dtype=cfg.param_dtype)
-        reward_head = RewardHeadMTP(d_model=dynamics.cfg.d_model, L=cfg.L, num_bins=cfg.num_reward_bins, log_low=cfg.reward_log_low, log_high=cfg.reward_log_high, dtype=cfg.dtype, param_dtype=cfg.param_dtype)
-        
-        # Initialize parameters
         rng, task_key, pol_key, rew_key = jax.random.split(rng, 4)
-        
-        # Dummy inputs for initialization
-        dummy_h = jnp.zeros((1, 4, cfg.L, dynamics.cfg.d_model), dtype=to_jnp_dtype(cfg.dtype))  # (B, T, D) for heads (agent dim already pooled)
-        dummy_task = jnp.zeros((1,), dtype=jnp.int32) if cfg.use_task_ids else jnp.zeros((1, cfg.n_tasks))
-        task_embedder_params = task_embedder.init(task_key, task=dummy_task, B=1, T=4)["params"]
-        policy_params = policy_head.init(pol_key, dummy_h, deterministic=True)["params"]
-        reward_vars = reward_head.init(rew_key, dummy_h, deterministic=True)
-        reward_params = reward_vars["params"]
-        reward_constants = reward_vars.get("constants", FrozenDict())
-        
-        # Optimizers
-        optimizers = OptimizerContainer(
-            task_embedder=optax.adamw(cfg.lr_policy),  # Use same LR as policy
-            policy=optax.adamw(cfg.lr_policy),
-            reward=optax.adamw(cfg.lr_reward),
-            dynamics=optax.adamw(cfg.lr_dynamics)
+
+        task_embedder = TaskEmbedder(
+            d_model=dynamics.cfg.d_model, n_agent=cfg.n_agent,
+            use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks,
+            dtype=cfg.dtype, param_dtype=cfg.param_dtype,
+            mesh_rules=mesh_rules, rngs=nnx.Rngs(task_key)
         )
-        opt_states = {
-            "task_embedder": optimizers.task_embedder.init(task_embedder_params),
-            "policy": optimizers.policy.init(policy_params),
-            "reward": optimizers.reward.init(reward_params),
-            "dynamics": optimizers.dynamics.init(dynamics_params),
-        }
-        
+        policy_head = PolicyHeadMTP(
+            d_model=dynamics.cfg.d_model, action_dim=dynamics.cfg.action_dim,
+            L=cfg.L, dtype=cfg.dtype, param_dtype=cfg.param_dtype,
+            mesh_rules=mesh_rules, rngs=nnx.Rngs(pol_key)
+        )
+        reward_head = RewardHeadMTP(
+            d_model=dynamics.cfg.d_model, L=cfg.L, num_bins=cfg.num_reward_bins,
+            log_low=cfg.reward_log_low, log_high=cfg.reward_log_high,
+            dtype=cfg.dtype, param_dtype=cfg.param_dtype,
+            mesh_rules=mesh_rules, rngs=nnx.Rngs(rew_key)
+        )
+
+        # Build learning rate schedules
+        lr_schedule_policy = build_lr_schedule(cfg.lr_schedule_policy)
+        lr_schedule_reward = build_lr_schedule(cfg.lr_schedule_reward)
+        lr_schedule_dynamics = build_lr_schedule(cfg.lr_schedule_dynamics)
+
+        # Build optimizers
+        task_embedder_optimizer = build_optimizer(cfg.optimizer, task_embedder, lr_schedule_policy)
+        policy_optimizer = build_optimizer(cfg.optimizer, policy_head, lr_schedule_policy)
+        reward_optimizer = build_optimizer(cfg.optimizer, reward_head, lr_schedule_reward)
+        dynamics_optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule_dynamics)
+
+        # Data iterator
+        train_dataloader = make_iterator(cfg.dataset)
+        train_iterator = iter(train_dataloader)  # type: ignore
+
         # Checkpointing
-        mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
-        
-        # Try to restore checkpoint
-        state_example = make_state(
-            {"task_embedder": task_embedder_params, "policy": policy_params, "reward": reward_params, "dynamics": dynamics_params},
-            {"task_embedder": opt_states["task_embedder"], "policy": opt_states["policy"], "reward": opt_states["reward"], "dynamics": opt_states["dynamics"]},
-            rng,
-            step=0
-        )
-        meta = {"cfg": asdict(cfg)}
-        
-        restored = try_restore(mngr, state_example, ctx, meta)
-        start_step = 0
-        if restored is not None:
-            # Restored state is already sharded/replicated on GPUs via ctx
-            latest_step, r = restored
-            task_embedder_params = r.state["params"]["task_embedder"]
-            policy_params = r.state["params"]["policy"]
-            reward_params = r.state["params"]["reward"]
-            dynamics_params = r.state["params"]["dynamics"]
-            opt_states = r.state["opt_state"]
-            rng = r.state["rng"]
-            start_step = int(r.state["step"])
-            print(f"[ckpt] Restored step {latest_step} (loaded directly to GPU)")
-        else:
-            # No checkpoint - replicate initial state to GPUs
-            task_embedder_params = ctx.replicate(task_embedder_params)
-            policy_params = ctx.replicate(policy_params)
-            reward_params = ctx.replicate(reward_params)
-            opt_states = ctx.replicate(opt_states)
-            print("[parallel] Replicated initial state to GPUs")
-        
-        # Replicate reward constants
-        reward_constants = ctx.replicate(reward_constants)
-        
-        # Dataset
-        dataset = make_iterator(cfg.dataset)
-        
-        # Training loop
-        pbar = tqdm(enumerate(dataset, start=start_step), total=cfg.max_steps)
-        for step, batch in pbar:
-            if step >= cfg.max_steps:
-                break
-            
-            rng, tokenizer_key, step_key = jax.random.split(rng, 3)
-            
-            # Shard batch data
-            videos = ctx.shard_data(batch["videos"])
-            actions = ctx.shard_data(batch["actions"])
-            rewards = ctx.shard_data(batch["rewards"])
-            
-            # Generate keys matching batch size (one per sample)
-            tokenizer_key = ctx.split_keys(tokenizer_key, count=videos.shape[0])
-            step_key = ctx.split_keys(step_key, count=videos.shape[0])
-            
-            # Encode videos to latents (frozen tokenizer - outside train_step)
-            B, T, H, W, C = videos.shape
-            # shift the actions by one and put the "first action token" = 15 at the beginning 
-            actions = jnp.concatenate((jnp.full_like(actions[:,0:1], fill_value = 15), actions[:,:-1]), axis=1) # TODO: pass this to the train step!
-            latents, _ = tokenizer.apply(tokenizer_vars, videos, packing_factor=dynamics_cfg.packing_factor, rngs={"mae": tokenizer_key}, method=tokenizer.encode)
-            
-            # Create batch dict with sharded data
-            batch_sharded = {"actions": actions, "rewards": rewards}
-            
-            # Training step
-            new_params, opt_states, metrics = train_step(
-                dynamics=dynamics,
-                task_embedder=task_embedder,
-                policy_head=policy_head,
-                reward_head=reward_head,
-                optimizers=optimizers,
-                dynamics_params=new_params.get("dynamics", dynamics_params) if step > start_step else dynamics_params,
-                dynamics_constants=dynamics_constants,
-                task_embedder_params=new_params.get("task_embedder", task_embedder_params) if step > start_step else task_embedder_params,
-                policy_params=new_params.get("policy", policy_params) if step > start_step else policy_params,
-                reward_params=new_params.get("reward", reward_params) if step > start_step else reward_params,
-                reward_constants=reward_constants,
-                opt_states=opt_states,
-                latents=latents,
-                batch=batch_sharded,
-                rng=step_key,
-                step=step,
-                k_max=dynamics.cfg.k_max,
-                L_mtp=cfg.L,
-                B_self=(B // 2)*(step >= cfg.bootstrap_start), # This will make the function compile twice. TODO: see if it's worth fixing this
-                dynamics_loss_weight=cfg.dynamics_loss_weight,
+        with build_checkpoint_manager(
+            cfg.ckpt, ckpt_dir,
+            item_names=(
+                "dynamics_state", "dynamics_optimizer_state",
+                "task_embedder_state", "task_embedder_optimizer_state",
+                "policy_state", "policy_optimizer_state",
+                "reward_state", "reward_optimizer_state",
+                "train_dataloader_state", "rngs", "meta"
             )
-            
-            # Update params
-            dynamics_params = new_params["dynamics"]
-            policy_params = new_params["policy"]
-            reward_params = new_params["reward"]
-            
-            # Logging
-            if logger.should_log(step):
-                metrics_cpu = jax.device_get(metrics)
-                logger.log(step, metrics=metrics_cpu, pbar=pbar)
-            
-            # Save sharded arrays directly
-            state = make_state(new_params, opt_states, rng, step)
-            maybe_save(mngr, step, state, meta)
-            
-            # Periodic lightweight AR eval
-            if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
-                # Use current batch as validation data (simplest approach) - move to host
-                val_videos = jax.device_get(batch["videos"][:4])
-                val_actions = jax.device_get(actions[:4])
-                run_evaluation(
-                    cfg, tokenizer_cfg, step,
-                    tokenizer,
-                    dynamics,
-                    val_videos, val_actions, vis_dir, rng, logger
+        ) as checkpoint_manager:
+            # Restore from checkpoint
+            step = checkpoint_manager.latest_step()
+            if step is not None:
+                # Extract states from all models/optimizers
+                dynamics_state = nnx.state(dynamics)
+                task_embedder_state = nnx.state(task_embedder)
+                policy_state = nnx.state(policy_head)
+                reward_state = nnx.state(reward_head)
+
+                dynamics_opt_state = nnx.state(dynamics_optimizer)
+                task_embedder_opt_state = nnx.state(task_embedder_optimizer)
+                policy_opt_state = nnx.state(policy_optimizer)
+                reward_opt_state = nnx.state(reward_optimizer)
+
+                # Create restore args composite
+                restore_args = ocp.args.Composite(
+                    dynamics_state=ocp.args.StandardRestore(dynamics_state),  # type: ignore
+                    task_embedder_state=ocp.args.StandardRestore(task_embedder_state),  # type: ignore
+                    policy_state=ocp.args.StandardRestore(policy_state),  # type: ignore
+                    reward_state=ocp.args.StandardRestore(reward_state),  # type: ignore
+                    dynamics_optimizer_state=ocp.args.StandardRestore(dynamics_opt_state),  # type: ignore
+                    task_embedder_optimizer_state=ocp.args.StandardRestore(task_embedder_opt_state),  # type: ignore
+                    policy_optimizer_state=ocp.args.StandardRestore(policy_opt_state),  # type: ignore
+                    reward_optimizer_state=ocp.args.StandardRestore(reward_opt_state),  # type: ignore
+                    train_dataloader_state=grain.checkpoint.CheckpointRestore(train_iterator),  # type: ignore
+                    rngs=ocp.args.StandardRestore({"key": rng}),  # type: ignore
                 )
+
+                # Restore and update all models
+                restored = checkpoint_manager.restore(step, args=restore_args)
+                nnx.update(dynamics, restored["dynamics_state"])
+                nnx.update(task_embedder, restored["task_embedder_state"])
+                nnx.update(policy_head, restored["policy_state"])
+                nnx.update(reward_head, restored["reward_state"])
+                nnx.update(dynamics_optimizer, restored["dynamics_optimizer_state"])
+                nnx.update(task_embedder_optimizer, restored["task_embedder_optimizer_state"])
+                nnx.update(policy_optimizer, restored["policy_optimizer_state"])
+                nnx.update(reward_optimizer, restored["reward_optimizer_state"])
+                train_iterator = restored["train_dataloader_state"]
+                rng = restored["rngs"]["key"]
+                start_step = step + 1
+                print(f"[ckpt] Restored step {step}")
+            else:
+                start_step = 0
+                print("[ckpt] No checkpoint found, starting from scratch")
+
+            # Training loop
+            pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step, total=cfg.max_steps)
+            for step, batch in pbar:
+                if step >= cfg.max_steps:
+                    break
+
+                # Split RNG
+                rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
+
+                # Shard batch data
+                videos = jax.device_put(batch["videos"], data_sharding)
+                actions = jax.device_put(batch["actions"], data_sharding)
+                rewards = jax.device_put(batch["rewards"], data_sharding)
+
+                # Action shifting: prepend "first action token" = 15
+                B, T = actions.shape
+                actions = jnp.concatenate((jnp.full_like(actions[:, 0:1], fill_value=15), actions[:, :-1]), axis=1)
+
+                # Training step (encodes videos and trains)
+                metrics = encode_and_train_step(
+                    tokenizer, dynamics, task_embedder, policy_head, reward_head,
+                    dynamics_optimizer, task_embedder_optimizer,
+                    policy_optimizer, reward_optimizer,
+                    videos, actions, rewards,
+                    tokenizer_key=tokenizer_key,
+                    master_key=master_key,
+                    step=step,
+                    packing_factor=dynamics_cfg.packing_factor,
+                    k_max=dynamics.cfg.k_max,
+                    L_mtp=cfg.L,
+                    B_self=(B // 2) * (step >= cfg.bootstrap_start),  # This will make the function compile twice. TODO: see if it's worth fixing this
+                    dynamics_loss_weight=cfg.dynamics_loss_weight,
+                )
+
+                # Logging
+                if logger.should_log(step):
+                    metrics_cpu = jax.device_get(metrics)
+                    logger.log(step, metrics=metrics_cpu, pbar=pbar)
+
+                # Checkpointing (inline save)
+                if checkpoint_manager.should_save(step):
+                    # Extract states
+                    dynamics_state = nnx.state(dynamics)
+                    task_embedder_state = nnx.state(task_embedder)
+                    policy_state = nnx.state(policy_head)
+                    reward_state = nnx.state(reward_head)
+                    dynamics_opt_state = nnx.state(dynamics_optimizer)
+                    task_embedder_opt_state = nnx.state(task_embedder_optimizer)
+                    policy_opt_state = nnx.state(policy_optimizer)
+                    reward_opt_state = nnx.state(reward_optimizer)
+
+                    # Create save args composite
+                    save_args = ocp.args.Composite(
+                        dynamics_state=ocp.args.StandardSave(dynamics_state),  # type: ignore
+                        task_embedder_state=ocp.args.StandardSave(task_embedder_state),  # type: ignore
+                        policy_state=ocp.args.StandardSave(policy_state),  # type: ignore
+                        reward_state=ocp.args.StandardSave(reward_state),  # type: ignore
+                        dynamics_optimizer_state=ocp.args.StandardSave(dynamics_opt_state),  # type: ignore
+                        task_embedder_optimizer_state=ocp.args.StandardSave(task_embedder_opt_state),  # type: ignore
+                        policy_optimizer_state=ocp.args.StandardSave(policy_opt_state),  # type: ignore
+                        reward_optimizer_state=ocp.args.StandardSave(reward_opt_state),  # type: ignore
+                        train_dataloader_state=grain.checkpoint.CheckpointSave(train_iterator),  # type: ignore
+                        rngs=ocp.args.StandardSave({'key': rng}),  # type: ignore
+                        meta=ocp.args.JsonSave(meta)  # type: ignore
+                    )
+                    checkpoint_manager.save(step, args=save_args)
+
+                # Periodic lightweight AR eval
+                if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
+                    # Use current batch as validation data
+                    val_videos = batch["videos"][:4]
+                    val_actions = actions[:4]
+                    run_evaluation(
+                        cfg, tokenizer_cfg, step,
+                        tokenizer, dynamics,
+                        val_videos, val_actions, vis_dir, rng, logger
+                    )
 
     print("[done] Agent finetuning complete!")
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="bc_rew")
-def main(cfg: BCRewConfig):
+@hydra.main(version_base=None, config_path="../configs", config_name="heads")
+def main(cfg: HeadsConfig):
     run(cfg)
 
 

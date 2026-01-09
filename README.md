@@ -38,7 +38,7 @@ Then, the agent is trained with RL in the world model. The reward is the proximi
 - **Training & evaluation scripts (`scripts/`)**
   - `train_tokenizer.py` -- Trains the causal tokenizer (masked autoencoder over video).
   - `train_dynamics.py` -- Trains the interactive dynamics model on top of the frozen tokenizer.
-  - `train_bc_rew_heads.py` -- Adds behavior cloning and reward prediction heads on the world model (agent tokens + reward head).
+  - `train_heads.py` -- Adds behavior cloning and reward prediction heads on the world model (agent tokens + reward head).
   - `train_policy.py` -- Runs Dreamer‑style RL purely in imagination using the learned world model and heads (PMPO-style update).
 - **Docs & logs**
   - `docs/` -- Figures, videos, and notes from development (e.g., reconstructions, imagination rollouts).
@@ -76,10 +76,10 @@ python scripts/train_tokenizer.py
 python scripts/train_dynamics.py tokenizer_ckpt=./logs/tokenizer/checkpoints
 
 # Phase 3: Train BC/reward heads (requires tokenizer + dynamics checkpoints)
-python scripts/train_bc_rew_heads.py tokenizer_ckpt=./logs/tokenizer/checkpoints dynamics_ckpt=./logs/train_dynamics/checkpoints
+python scripts/train_heads.py tokenizer_ckpt=./logs/tokenizer/checkpoints dynamics_ckpt=./logs/train_dynamics/checkpoints
 
 # Phase 4: Train policy in imagination (requires BC/reward checkpoint)
-python scripts/train_policy.py bc_rew_ckpt=./logs/bc_rew/checkpoints
+python scripts/train_policy.py heads_ckpt=./logs/heads/checkpoints
 ```
 
 All scripts save checkpoints under `logs/{run_name}/checkpoints/` by default. You can also enable wandb logging by adding `use_wandb=True` to the launch command. We use hydra to manage the configurations in `/configs`.

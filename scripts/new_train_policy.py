@@ -82,11 +82,11 @@ def load_pretrained_heads(cfg: RLConfig, dynamics_cfg) -> Tuple[TaskEmbedder, Po
     Returns:
         Tuple of (task_embedder, policy_bc, reward_head) as NNX modules
     """
-    mngr = make_manager(cfg.bc_rew_ckpt, item_names=("meta", "task_embedder", "policy_head", "reward_head"))
+    mngr = make_manager(cfg.heads_ckpt, item_names=("meta", "task_embedder", "policy_head", "reward_head"))
     latest = mngr.latest_step()
     if latest is None:
-        raise FileNotFoundError(f"No checkpoint found in {cfg.bc_rew_ckpt}")
-    
+        raise FileNotFoundError(f"No checkpoint found in {cfg.heads_ckpt}")
+
     # Initialize NNX modules
     task_embedder = TaskEmbedder(
         d_model=dynamics_cfg.d_model,
@@ -164,11 +164,11 @@ def initialize_rl_training(cfg: RLConfig, ctx):
     # 1. Load pretrained models (returns NNX modules)
     # ---------------------------
     
-    print(f"Loading pretrained models from {cfg.bc_rew_ckpt}...")
+    print(f"Loading pretrained models from {cfg.heads_ckpt}...")
     
     # Per models.py: Dynamics.from_pretrained returns (dynamics, tokenizer)
     # Both are NNX modules with parameters already loaded
-    dynamics, tokenizer = Dynamics.from_pretrained(cfg.bc_rew_ckpt, ctx)
+    dynamics, tokenizer = Dynamics.from_pretrained(cfg.heads_ckpt, ctx)
     dynamics_cfg = dynamics.cfg
     
     # Load pretrained heads (task_embedder, policy_bc, reward_head)
@@ -187,9 +187,11 @@ def initialize_rl_training(cfg: RLConfig, ctx):
     
     value_head = ValueHead(
         d_model=dynamics_cfg.d_model,
+        L=cfg.n_agent,
         num_bins=cfg.num_value_bins,
         dtype=cfg.dtype,
         param_dtype=cfg.param_dtype,
+        mesh_rules=mesh_rules,
         rngs=nnx.Rngs(101),
     )
     
@@ -334,20 +336,22 @@ def train_step(
         # ---------------------------
         # Predict rewards from rollout hidden states only
         # Rewards r_{t+1} are predicted from state s_t
-        rew_logits = reward_head(rollout_hidden, deterministic=True)[:,:,0] # with [:,:,0] we only take the first head
+        rew_logits, rew_centers = reward_head(rollout_hidden, deterministic=True)
+        rew_logits = rew_logits[:,:,0]  # with [:,:,0] we only take the first head
         # Convert to scalar rewards
         probs_rew = jax.nn.softmax(rew_logits, axis=-1)
-        rewards = jnp.sum(probs_rew * symexp(reward_head.symexp_centers_log), axis=-1)
+        rewards = jnp.sum(probs_rew * symexp(rew_centers), axis=-1)
         rewards = jax.lax.stop_gradient(rewards)
         # rewards is now (B, H) corresponding to r_{T_ctx+1}...r_{T_ctx+H}
         
         # ---------------------------
-        # 3. Compute values 
+        # 3. Compute values
         # ---------------------------
-        val_logits = value_head(h_sg, deterministic=False, rngs=rngs)[:,:,0] # with [:,:,0] we only take the first head
+        val_logits, val_centers = value_head(h_sg, deterministic=False, rngs=rngs)
+        val_logits = val_logits[:,:,0]  # with [:,:,0] we only take the first head
         # Convert to scalar values
         probs_val = jax.nn.softmax(val_logits, axis=-1)
-        values = jnp.sum(probs_val * symexp(value_head.symexp_centers_log), axis=-1)
+        values = jnp.sum(probs_val * symexp(val_centers), axis=-1)
         values = values[:, -horizon-1:]  # (B, H+1)
         
         # 4. Compute TD-lambda returns
