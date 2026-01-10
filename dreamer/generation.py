@@ -357,18 +357,18 @@ def video_rollout(
         pred_frames: (B, T_ctx + num_steps, H, W, C)
     """
     from flax import nnx
-    
+
     # Tokenize
     rng, mae_key = jax.random.split(rng)
     rngs = nnx.Rngs(mae=mae_key)
-    
+
     latents_ctx, _ = tokenizer.encode(
-        frames_ctx, 
-        packing_factor=dynamics.cfg.packing_factor, 
+        frames_ctx,
+        packing_factor=dynamics.cfg.packing_factor,
         deterministic=True,
         rngs=rngs
     ) # Encode returns (B, T, L, D)
-        
+
     # Latent Rollout
     # Returns dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
     rollout_result = latent_rollout(
@@ -388,5 +388,330 @@ def video_rollout(
         packing_factor=dynamics.cfg.packing_factor,
         deterministic=True
     )
-        
+
+    return jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
+
+
+# ---------------------------
+# Mean Flow Sampling (for meanflow-trained models)
+# ---------------------------
+
+def next_latent_meanflow(
+    dynamics: Dynamics,
+    num_steps: int,
+    action: jax.Array,
+    latent_shape: Tuple,
+    rng: jax.Array,
+    tau_ctx: float = 0.9,
+    prefill_length: int | None = None,
+    agent_tokens: jax.Array | None = None,
+    caches: KVCache | None = None,
+    latents_ctx: jax.Array | None = None,
+    actions_ctx: jax.Array | None = None,
+) -> Tuple[jax.Array, jax.Array | None, KVCache | None, jax.Array]:
+    """
+    Mean flow denoiser for a single future latent using continuous conditioning.
+
+    This function generates latents using meanflow models that predict average
+    velocities u(z_t, r, t) over intervals [r, t]. The generation process refines
+    a noisy latent by repeatedly calling the model with different (r, t) pairs.
+
+    Args:
+        dynamics: Dynamics NNX model trained with meanflow forcing
+        num_steps: Number of refinement steps (1 for direct generation, >1 for multi-step)
+        action: (B, 1) action for current step
+        latent_shape: Tuple representing the shape of the latent (B, 1, n_spatial, D_s)
+        rng: Random number generator key
+        tau_ctx: Signal level for context frames (default 0.9)
+        prefill_length: Number of ground truth latents passed during prefill
+        agent_tokens: Optional agent tokens (B, T_ctx+1, n_agent, d_model)
+        caches: KV cache for context frames (from previous finalized frames)
+        latents_ctx: Optional context latents (B, T_ctx, n_spatial, D_s) for non-cached mode
+        actions_ctx: Optional context actions (B, T_ctx) for non-cached mode
+
+    Returns:
+        Tuple containing:
+        - latent_t_final: The denoised latent (B, 1, n_spatial, D_s)
+        - h_last: The final hidden state from dynamics (B, n_agent, d_model)
+        - caches_new: The updated KV cache
+        - rng: Updated random key
+    """
+    rng, rng_latent, rng_ctx = jax.random.split(rng, 3)
+    noisy_latent = jax.random.normal(rng_latent, latent_shape)
+    B = latent_shape[0]
+
+    # Prepare noised context if not using caches
+    latents_ctx_noised = None
+    if latents_ctx is not None and caches is None:
+        noise_prefill = jnp.zeros(latents_ctx[:, :prefill_length].shape)
+        noise_decode = jax.random.normal(rng_ctx, latents_ctx[:, prefill_length:].shape)
+        noise_ctx = jnp.concatenate([noise_prefill, noise_decode], axis=1)
+        latents_ctx_noised = tau_ctx * latents_ctx + (1 - tau_ctx) * noise_ctx
+
+    action = action[:, None] if action.ndim == 1 else action
+
+    # Create refinement schedule: t values from 0 to 1
+    t_values = jnp.linspace(0.0, 1.0, num_steps + 1)
+
+    def refinement_step(latent_t, s):
+        """Single refinement step using mean flow prediction."""
+        r_val = t_values[s]     # Current signal level
+        t_val = t_values[s + 1]  # Target signal level
+        delta = t_val - r_val    # Interval size
+
+        # Prepare inputs based on whether we're using caches
+        if caches is not None:
+            latent_input = latent_t
+            actions_input = action
+
+            # Continuous signal levels for meanflow
+            r_continuous = jnp.full((B, 1), r_val, dtype=jnp.float32)
+            t_continuous = jnp.full((B, 1), t_val, dtype=jnp.float32)
+
+            # Dummy discrete indices (not used in meanflow mode)
+            step_indices = jnp.zeros((B, 1), dtype=jnp.int32)
+            tau_indices = jnp.zeros((B, 1), dtype=jnp.int32)
+
+        else:
+            # Non-cached mode: concatenate context
+            assert latents_ctx_noised is not None and actions_ctx is not None
+            latent_input = jnp.concatenate([latents_ctx_noised, latent_t], axis=1)
+            actions_input = jnp.concatenate([actions_ctx, action], axis=1)
+
+            decode_length = latents_ctx_noised.shape[1] - prefill_length
+
+            # For context: use clean signal (r=1, t=1) for prefill, noised for decode
+            r_prefill = jnp.ones((B, prefill_length), dtype=jnp.float32)
+            t_prefill = jnp.ones((B, prefill_length), dtype=jnp.float32)
+            r_decode = jnp.full((B, decode_length), tau_ctx, dtype=jnp.float32)
+            t_decode = jnp.ones((B, decode_length), dtype=jnp.float32)
+            r_curr = jnp.full((B, 1), r_val, dtype=jnp.float32)
+            t_curr = jnp.full((B, 1), t_val, dtype=jnp.float32)
+
+            r_continuous = jnp.concatenate([r_prefill, r_decode, r_curr], axis=1)
+            t_continuous = jnp.concatenate([t_prefill, t_decode, t_curr], axis=1)
+
+            # Dummy discrete indices
+            step_indices = jnp.zeros_like(actions_input, dtype=jnp.int32)
+            tau_indices = jnp.zeros_like(actions_input, dtype=jnp.int32)
+
+        # Call dynamics model with continuous conditioning
+        u_pred, (h_seq, _) = dynamics(
+            actions_input, step_indices, tau_indices, latent_input,
+            r_continuous=r_continuous,
+            t_continuous=t_continuous,
+            agent_tokens=agent_tokens,
+            deterministic=True,
+            caches=caches
+        )
+
+        # Extract prediction for current timestep
+        u_current = u_pred[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
+        h_last = h_seq[:, -1, :, :] if isinstance(h_seq, jax.Array) else h_seq
+
+        # Meanflow update: z_{t+delta} = z_t + delta * u(z_t, t, t+delta)
+        latent_t_new = latent_t + delta * u_current
+
+        return latent_t_new, h_last
+
+    # Run refinement steps
+    latent_t_final, h_history = jax.lax.scan(
+        refinement_step,
+        noisy_latent,
+        jnp.arange(num_steps),
+    )
+
+    # Update caches if using cached mode
+    if caches is not None:
+        # Add noised version to cache for next step
+        r_continuous = jnp.full((B, 1), tau_ctx, dtype=jnp.float32)
+        t_continuous = jnp.ones((B, 1), dtype=jnp.float32)
+        step_indices = jnp.zeros((B, 1), dtype=jnp.int32)
+        tau_indices = jnp.zeros((B, 1), dtype=jnp.int32)
+
+        rng, new_random_key = jax.random.split(rng)
+        latent_noised_caching = tau_ctx * latent_t_final + (1 - tau_ctx) * jax.random.normal(
+            new_random_key, shape=latent_t_final.shape, dtype=latent_t_final.dtype
+        )
+
+        _, (h_seq_final, caches_new) = dynamics(
+            action, step_indices, tau_indices, latent_noised_caching,
+            r_continuous=r_continuous,
+            t_continuous=t_continuous,
+            agent_tokens=agent_tokens,
+            deterministic=True,
+            caches=caches
+        )
+        h_last = h_seq_final[:, -1, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
+    else:
+        h_last = h_history[-1] if h_history is not None else None
+        caches_new = None
+
+    return latent_t_final, h_last, caches_new, rng
+
+
+def latent_rollout_meanflow(
+    dynamics: Dynamics,
+    policy: PolicyHeadMTP | jax.Array,
+    num_steps: int,
+    latents_ctx: jax.Array,
+    actions_ctx: jax.Array,
+    num_rollout_steps: int,
+    rng: jax.Array,
+    tau_ctx: float = 0.9,
+    initial_agent_tokens: jax.Array | None = None,
+):
+    """
+    Autoregressive rollout in latent space using meanflow generation.
+
+    Args:
+        dynamics: Dynamics NNX model trained with meanflow forcing
+        policy: Policy NNX model or array of fixed actions (B, num_rollout_steps, ...)
+        num_steps: Number of refinement steps for each latent (1 for direct, >1 for multi-step)
+        latents_ctx: (B, T_ctx, n_spatial, D_s) Context latents
+        actions_ctx: (B, T_ctx, ...) Context actions
+        num_rollout_steps: Number of future steps to generate
+        rng: Random number generator key
+        tau_ctx: Signal level for context frames (default 0.9)
+        initial_agent_tokens: Optional (B, T_ctx, n_agent, D) agent tokens for context
+
+    Returns:
+        Dict with keys:
+        - 'latents': (B, T_ctx + num_rollout_steps, n_spatial, D_s)
+        - 'actions': (B, num_rollout_steps)
+        - 'hidden_states': (B, num_rollout_steps, n_agent, D)
+        - 'context_hidden': (B, T_ctx, n_agent, D)
+    """
+    B, T_ctx, n_spatial, D_s = latents_ctx.shape
+    latent_shape = (B, 1, n_spatial, D_s)
+
+    # Initialize caches and process context
+    window_size = T_ctx + num_rollout_steps
+    caches = dynamics.create_static_caches(
+        batch_size=B, n_spatial=n_spatial, window_size=window_size, dtype=latents_ctx.dtype
+    )
+
+    # Prefill caches with clean context
+    r_continuous = jnp.ones((B, T_ctx), dtype=jnp.float32)
+    t_continuous = jnp.ones((B, T_ctx), dtype=jnp.float32)
+    step_indices = jnp.zeros((B, T_ctx), dtype=jnp.int32)
+    tau_indices = jnp.zeros((B, T_ctx), dtype=jnp.int32)
+
+    _, (h_seq, caches) = dynamics(
+        actions_ctx, step_indices, tau_indices, latents_ctx,
+        r_continuous=r_continuous,
+        t_continuous=t_continuous,
+        agent_tokens=initial_agent_tokens,
+        caches=caches,
+        deterministic=True
+    )
+
+    h_last = h_seq[:, -1] if isinstance(h_seq, jax.Array) else None
+
+    # Scan loop for rollout
+    def scan_step(carry, step_idx):
+        h_t, caches_t, rng = carry
+
+        # Sample action
+        rng, rng_action = jax.random.split(rng)
+
+        if isinstance(policy, jax.Array):
+            action = policy[:, step_idx]
+        else:
+            logits = policy(h_t, deterministic=False)
+            action = jax.random.categorical(rng_action, logits)
+
+        # Generate next latent using meanflow
+        latent_next, h_next, caches_next, rng = next_latent_meanflow(
+            dynamics, num_steps, action, latent_shape, rng,
+            tau_ctx=tau_ctx, caches=caches_t
+        )
+
+        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next)
+
+    # Run scan
+    _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
+        scan_step,
+        (h_last, caches, rng),
+        jnp.arange(num_rollout_steps)
+    )
+
+    # Unpack results
+    rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
+    rollout_actions = einops.rearrange(rollout_actions, 't b -> b t')
+    rollout_hidden = einops.rearrange(rollout_hidden, 't b n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
+
+    out_latents = jnp.concatenate((latents_ctx, rollout_latents), axis=1)
+
+    return {
+        'latents': out_latents,
+        'actions': rollout_actions,
+        'hidden_states': rollout_hidden,
+        'context_hidden': h_seq,
+    }
+
+
+def video_rollout_meanflow(
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
+    policy: PolicyHeadMTP | jax.Array,
+    num_steps: int,
+    frames_ctx: jax.Array,
+    actions_ctx: jax.Array,
+    num_rollout_steps: int,
+    rng: jax.Array,
+    tau_ctx: float = 0.9,
+    initial_agent_tokens: jax.Array | None = None,
+):
+    """
+    End-to-end video generation rollout using meanflow sampling.
+
+    Args:
+        tokenizer: Tokenizer NNX model
+        dynamics: Dynamics NNX model trained with meanflow forcing
+        policy: Policy NNX model or array of fixed actions
+        num_steps: Number of refinement steps (1 for direct, 4+ for multi-step)
+        frames_ctx: (B, T_ctx, H, W, C) context frames (0-255 range)
+        actions_ctx: (B, T_ctx, ...) Context actions
+        num_rollout_steps: Number of future frames to generate
+        rng: Random number generator key
+        tau_ctx: Signal level for context frames (default 0.9)
+        initial_agent_tokens: Optional agent tokens
+
+    Returns:
+        pred_frames: (B, T_ctx + num_rollout_steps, H, W, C)
+    """
+    from flax import nnx
+
+    # Tokenize
+    rng, mae_key = jax.random.split(rng)
+    rngs = nnx.Rngs(mae=mae_key)
+
+    latents_ctx, _ = tokenizer.encode(
+        frames_ctx,
+        packing_factor=dynamics.cfg.packing_factor,
+        deterministic=True,
+        rngs=rngs
+    )
+
+    # Latent rollout using meanflow
+    rollout_result = latent_rollout_meanflow(
+        dynamics,
+        policy,
+        num_steps,
+        latents_ctx,
+        actions_ctx,
+        num_rollout_steps,
+        rng,
+        tau_ctx,
+        initial_agent_tokens
+    )
+
+    # Decode
+    pred_frames, _ = tokenizer.decode(
+        rollout_result['latents'],
+        packing_factor=dynamics.cfg.packing_factor,
+        deterministic=True
+    )
+
     return jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)

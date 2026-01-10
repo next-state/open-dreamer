@@ -28,6 +28,7 @@ dynamics:
     mlp_ratio: 4
     dropout_rate: 0.05
     k_max: 128
+    forcing_type: shortcut
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 

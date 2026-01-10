@@ -78,20 +78,20 @@ def sample_step_excluding_dmin(
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Sample step indices excluding the finest level (for bootstrap loss).
-    
+
     The bootstrap loss requires coarser step sizes (d > d_min) to distill
     two half-steps into a full step.
-    
+
     Args:
         rng: JAX random key
         shape_bt: Tuple of (batch_size, sequence_length)
         k_max: Maximum noise resolution
         dtype: Data type for computation
-        
+
     Returns:
         d: (B, T) Step sizes (e.g., 1/128, 1/64, ..., 1/2, 1)
         step_idx: (B, T) Step indices in [0, log2(k_max) - 1]
-        
+
     Example:
         If k_max = 256, emax = 8, samples step_idx from {0, 1, ..., 7}
         Step idx 7 gives d = 1/2, idx 0 gives d = 1/256 (but excludes d_min = 1/256)
@@ -102,6 +102,65 @@ def sample_step_excluding_dmin(
     step_idx = jax.random.randint(rng, (B_, T_), 0, emax, dtype=jnp.int32)
     d = 1.0 / (1 << step_idx).astype(dtype)
     return d, step_idx
+
+
+@partial(jax.jit, static_argnames=("shape_bt", "k_max", "dtype"))
+def sample_r_t_for_meanflow(
+    rng: jax.Array,
+    shape_bt: Tuple[int, int],
+    k_max: int,
+    *,
+    dtype=jnp.float32
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Sample (r, t) pairs for mean flow training with variable interval sizes.
+
+    This function samples time intervals for mean flow forcing, similar to how
+    shortcut models sample variable step sizes. The interval sizes are sampled
+    as powers of 2 to train the model on different time horizons.
+
+    Strategy:
+        1. Sample interval size delta ∈ {1, 1/2, 1/4, ..., 1/k_max} (uniform log scale)
+        2. Sample start point r ~ U[0, 1 - delta]
+        3. Set t = r + delta
+
+    This ensures r < t and samples various time horizons, allowing the model
+    to learn both coarse (large delta) and fine (small delta) average velocities.
+
+    Args:
+        rng: JAX random key
+        shape_bt: Tuple of (batch_size, sequence_length)
+        k_max: Maximum noise resolution (defines finest interval = 1/k_max)
+        dtype: Data type for computation
+
+    Returns:
+        r: (B, T) Start signal levels in [0, 1)
+        t: (B, T) End signal levels in (0, 1]
+        delta: (B, T) Interval sizes (t - r)
+
+    Example:
+        If k_max = 8, possible delta values are {1, 1/2, 1/4, 1/8}
+        For delta = 1/4, r is sampled uniformly from [0, 3/4]
+        Then t = r + 1/4, ensuring t ∈ (1/4, 1]
+    """
+    B_, T_ = shape_bt
+    key_delta, key_r = jax.random.split(rng)
+
+    # Sample interval size as power of 2: delta = 1 / 2^step_idx
+    # step_idx in [0, log2(k_max)], giving delta in {1, 1/2, 1/4, ..., 1/k_max}
+    emax = jnp.log2(k_max).astype(jnp.int32) + 1  # +1 to include delta=1
+    step_idx = jax.random.randint(key_delta, (B_, T_), 0, emax, dtype=jnp.int32)
+    delta = 1.0 / (1 << step_idx).astype(dtype)  # 2^(-step_idx)
+
+    # Sample start point r uniformly in [0, 1 - delta]
+    # This ensures t = r + delta stays in (0, 1]
+    u = jax.random.uniform(key_r, (B_, T_), dtype=dtype)
+    r = u * (1.0 - delta)
+
+    # Compute end point
+    t = r + delta
+
+    return r, t, delta
 
 
 # Loss weighting
@@ -168,37 +227,131 @@ def compute_bootstrap_loss(
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Bootstrap self-consistency loss for shortcut forcing.
-    
+
     Trains the model to predict the same endpoint whether taking one large step
     or two smaller steps. Loss is computed in v-space but scaled to x-space.
-    
+
     Args:
         z_pred: (B, T, S, D) Predicted latent from full step
         z_tilde: (B, T, S, D) Initial noisy latent
         b_prime: (B, T, S, D) Velocity from first half-step
         b_doubleprime: (B, T, S, D) Velocity from second half-step
         sigma: (B, T) Signal levels
-        
+
     Returns:
         loss: Tuple[jnp.float32, jnp.float32]
             mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
-            mse_per_token: tuple of scalars. MSE loss 
+            mse_per_token: tuple of scalars. MSE loss
     """
     # Convert full-step prediction to velocity
     v_hat = (z_pred - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
-    
+
     # Target velocity is average of two half-steps (stop gradient)
     v_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-    
+
     # MSE in v-space, scaled to x-space
     v_diff = (v_hat - v_target) ** 2
     boot_per_token = (1.0 - sigma[..., None, None]) ** 2 * v_diff
     boot_per_step = jnp.mean(boot_per_token, axis=(2, 3))  # (B, T)
-    
-    
+
+
     # Apply ramp weighting and reduce
     weights = ramp_weight(sigma)
     return jnp.mean(boot_per_step * weights), jnp.mean(boot_per_step)
+
+
+def compute_meanflow_loss(
+    u_pred: jnp.ndarray,
+    z_t: jnp.ndarray,
+    v_target: jnp.ndarray,
+    r: jnp.ndarray,
+    t: jnp.ndarray,
+    delta: jnp.ndarray,
+    dynamics_model,
+    actions: jnp.ndarray,
+    agent_tokens: jnp.ndarray | None,
+    rngs: nnx.Rngs,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Compute mean flow loss using the MeanFlow identity with JVP.
+
+    The MeanFlow identity relates the average velocity u(z_t, r, t) over an
+    interval [r, t] to the instantaneous velocity v(z_t, t) at the endpoint:
+
+        v(z_t, t) = u(z_t, r, t) + (t - r) * (∂u/∂t + ∇_z u · v)
+
+    We use this identity to reconstruct the instantaneous velocity from the
+    predicted average velocity and compare it to the target velocity.
+
+    Args:
+        u_pred: (B, T, S, D) Predicted average velocity from model
+        z_t: (B, T, S, D) Noisy latents at signal level t
+        v_target: (B, T, S, D) Target velocity (x1 - x0)
+        r: (B, T) Start signal levels
+        t: (B, T) End signal levels
+        delta: (B, T) Interval sizes (t - r)
+        dynamics_model: NNX Dynamics model for recomputing u in JVP
+        actions: (B, T) Action sequence
+        agent_tokens: Optional (B, T, n_agent, d_model) agent tokens
+        rngs: RNG state for model forward pass
+
+    Returns:
+        loss_weighted: Scalar MSE loss with ramp weighting
+        loss_unweighted: Scalar MSE loss for logging
+
+    Implementation:
+        1. Define u_fn(z, r, t) that calls the dynamics model
+        2. Compute ∂u/∂t using JVP with tangent (0, 0, 1)
+        3. Compute ∇_z u · v_target using JVP with tangent (v_target, 0, 0)
+        4. Reconstruct V_θ = u + delta * (∂u/∂t + ∇_z u · v_target)
+        5. Compute MSE(V_θ, v_target) with ramp weighting
+    """
+    # Define function that computes u given (z, r, t)
+    def u_fn(z: jnp.ndarray, r_val: jnp.ndarray, t_val: jnp.ndarray) -> jnp.ndarray:
+        """Forward pass through dynamics model to get average velocity u."""
+        # Dummy values for discrete conditioning (not used in meanflow mode)
+        dummy_step = jnp.zeros_like(actions, dtype=jnp.int32)
+        dummy_tau = jnp.zeros_like(actions, dtype=jnp.int32)
+
+        u_out, _ = dynamics_model(
+            actions, dummy_step, dummy_tau, z,
+            r_continuous=r_val,
+            t_continuous=t_val,
+            agent_tokens=agent_tokens,
+            deterministic=True,  # MUST be True to avoid RNG issues inside JVP trace
+            rngs=None  # No RNG needed when deterministic=True
+        )
+        return u_out
+
+    # Compute spatial JVP: ∇_z u · v_target
+    # Tangent vector: (v_target, 0, 0) for (z, r, t)
+    primals = (z_t, r, t)
+    tangents_spatial = (v_target, jnp.zeros_like(r), jnp.zeros_like(t))
+    _, u_jvp_spatial = jax.jvp(u_fn, primals, tangents_spatial)
+    # u_jvp_spatial = ∇_z u · v_target (shape: B, T, S, D)
+
+    # Compute time derivative: ∂u/∂t
+    # Tangent vector: (0, 0, 1) for (z, r, t)
+    tangents_time = (jnp.zeros_like(z_t), jnp.zeros_like(r), jnp.ones_like(t))
+    _, u_jvp_time = jax.jvp(u_fn, primals, tangents_time)
+    # u_jvp_time = ∂u/∂t (shape: B, T, S, D)
+
+    # Reconstruct instantaneous velocity using MeanFlow identity
+    # V_θ = u + delta * (∂u/∂t + ∇_z u · v_target)
+    delta_expanded = delta[..., None, None]  # (B, T, 1, 1)
+    V_reconstructed = u_pred + delta_expanded * (u_jvp_time + u_jvp_spatial)
+
+    # Compute MSE
+    mse_per_token = (V_reconstructed - v_target) ** 2  # (B, T, S, D)
+    mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
+
+    # Apply ramp weighting based on t (end signal level)
+    # Higher signal levels (cleaner data) get more weight
+    weights = ramp_weight(t)
+    loss_weighted = jnp.mean(mse_per_step * weights)
+    loss_unweighted = jnp.mean(mse_per_step)
+
+    return loss_weighted, loss_unweighted
 
 
 # ---------------------------
@@ -321,6 +474,97 @@ def shortcut_forcing_step(
     aux = {'flow_mse': flow_mse_unweighted, 'bootstrap_mse': boot_mse_unweighted, 'h_states': h_states}
     
     
+    return losses, aux
+
+
+def meanflow_forcing_step(
+    dynamics_model,
+    actions: jnp.ndarray,
+    latents: jnp.ndarray,
+    rng: jax.Array,
+    k_max: int,
+    *,
+    agent_tokens: jnp.ndarray | None = None,
+) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
+    """
+    Compute mean flow forcing loss for a batch.
+
+    This is an alternative to shortcut_forcing_step() that uses the MeanFlow
+    identity instead of flow + bootstrap losses. It trains the model to predict
+    average velocities u(z_t, r, t) over time intervals [r, t], which can then
+    be used for efficient 1-step generation at inference time.
+
+    Args:
+        dynamics_model: NNX Dynamics model instance
+        actions: (B, T) Action sequence
+        latents: (B, T, S, D) Latent sequence (ground truth clean latents)
+        rng: Random key
+        k_max: Maximum noise resolution (for interval sampling)
+        agent_tokens: Optional (B, T, n_agent, d_model) agent tokens
+
+    Returns:
+        losses: Dict with 'total' and 'meanflow' keys
+        aux: Dict with auxiliary metrics for logging:
+            - 'meanflow_mse': Unweighted MSE for logging
+            - 'h_states': Hidden states from agent tokens (if provided)
+
+    Note:
+        The model is called in "continuous mode" by providing r_continuous and
+        t_continuous parameters, which triggers sinusoidal embedding instead of
+        discrete embedding lookup.
+    """
+    B, T, S, D = latents.shape
+
+    # Split RNG for different random operations
+    key_rt, key_noise, key_dropout = jax.random.split(rng, 3)
+
+    # Sample (r, t) pairs with variable interval sizes
+    # This ensures the model learns to predict average velocities over
+    # different time horizons (coarse and fine)
+    r, t, delta = sample_r_t_for_meanflow(key_rt, (B, T), k_max, dtype=latents.dtype)
+
+    # Corrupt latents using linear interpolation: z_t = (1 - t) * z0 + t * z1
+    # This is the standard flow matching corruption scheme
+    z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
+    z_t = (1.0 - t[..., None, None]) * z0 + t[..., None, None] * latents
+
+    # Target velocity for flow matching
+    v_target = latents - z0  # x1 - x0
+
+    # Forward pass to get u prediction (average velocity)
+    # The model interprets its output as u(z_t, r, t) when in meanflow mode
+    rngs = nnx.Rngs(dropout=key_dropout)
+    u_pred, (h_states, _) = dynamics_model(
+        actions,
+        jnp.zeros((B, T), dtype=jnp.int32),  # dummy step_indices (not used in meanflow mode)
+        jnp.zeros((B, T), dtype=jnp.int32),  # dummy tau_indices (not used in meanflow mode)
+        z_t,
+        r_continuous=r,  # Start signal level (triggers continuous mode)
+        t_continuous=t,  # End signal level (triggers continuous mode)
+        agent_tokens=agent_tokens,
+        deterministic=False,
+        rngs=rngs
+    )
+
+    # Compute mean flow loss using JVP to evaluate the MeanFlow identity
+    # This involves computing ∂u/∂t and ∇_z u · v_target
+    loss_meanflow, meanflow_mse_unweighted = compute_meanflow_loss(
+        u_pred=u_pred,
+        z_t=z_t,
+        v_target=v_target,
+        r=r,
+        t=t,
+        delta=delta,
+        dynamics_model=dynamics_model,
+        actions=actions,
+        agent_tokens=agent_tokens,
+        rngs=rngs
+    )
+
+    # Return losses and auxiliary info
+    losses = {'total': loss_meanflow, 'meanflow': loss_meanflow}
+    aux = {'meanflow_mse': meanflow_mse_unweighted, 'h_states': h_states}
+
     return losses, aux
 
 
@@ -622,6 +866,8 @@ def run_evaluation(
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
 
     This function can be used in both dynamics pretraining and agent finetuning.
+    Automatically detects the forcing type from the dynamics config and uses
+    the appropriate sampler (shortcut or meanflow).
 
     Args:
         cfg: Training config
@@ -636,12 +882,29 @@ def run_evaluation(
         logger: Logger instance for logging metrics and videos
     """
     k_max = dynamics.cfg.k_max
-    schedule_shortcut = DenoiseSchedule.init(4, k_max)
-    schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
+    forcing_type = dynamics.cfg.forcing_type
 
-    evaluation_schedules = {"shortcut": schedule_shortcut, "diffusion": schedule_diffusion}
+    # Define evaluation schedules based on forcing type
+    if forcing_type == "shortcut":
+        # Shortcut forcing: use τ-ladder with different step counts
+        schedule_shortcut = DenoiseSchedule.init(4, k_max)
+        schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
+        evaluation_schedules = {
+            "shortcut": (schedule_shortcut, None),
+            "diffusion": (schedule_diffusion, None)
+        }
+    elif forcing_type == "meanflow":
+        # Meanflow forcing: use different numbers of refinement steps
+        # 1-step = direct generation (main advantage of meanflow)
+        # 4-step = multi-step refinement for comparison
+        evaluation_schedules = {
+            "meanflow_1step": (None, 1),
+            "meanflow_4step": (None, 4)
+        }
+    else:
+        raise ValueError(f"Unknown forcing_type: {forcing_type}")
 
-    for tag, schedule_config in evaluation_schedules.items():
+    for tag, (schedule_config, num_meanflow_steps) in evaluation_schedules.items():
         t0 = time.time()
         # FIXME: only temporary for debugging
         assert val_videos.shape[1] > 5
@@ -649,8 +912,10 @@ def run_evaluation(
         horizon = val_videos.shape[1] - ctx_length
 
         pred_frames, floor_frames, gt_frames = sample_video(
-            tokenizer, dynamics, 
-            val_videos, val_actions, horizon, schedule_config, rng
+            tokenizer, dynamics,
+            val_videos, val_actions, horizon, schedule_config, rng,
+            forcing_type=forcing_type,
+            num_meanflow_steps=num_meanflow_steps or 1
         )
 
         # Compute metrics

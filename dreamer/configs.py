@@ -98,6 +98,9 @@ class DynamicsModelConfig:
     # schedule
     k_max: int = 8
 
+    # forcing type: "shortcut" for shortcut forcing, "meanflow" for mean flow forcing
+    forcing_type: str = "shortcut"
+
 # ---- Experiment Configs ----
 
 @dataclass(frozen=False)

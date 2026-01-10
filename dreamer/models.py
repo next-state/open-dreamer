@@ -226,6 +226,51 @@ class RotaryEmbedding1D(nnx.Module):
         return xq_out, xk_out
 
 
+class SinusoidalEmbedding(nnx.Module):
+    """Sinusoidal positional embedding for continuous values.
+
+    This module encodes continuous scalar values (e.g., signal levels r, t ∈ [0, 1])
+    into high-dimensional sinusoidal features, similar to the positional encoding
+    used in transformers but for arbitrary continuous inputs.
+
+    The encoding uses multiple frequency bands to capture both coarse and fine
+    variations in the input values, enabling the model to interpolate smoothly
+    between different signal levels.
+    """
+
+    def __init__(self, d_model: int, max_freq: float = 10000.0, dtype: Any = jnp.float32):
+        """
+        Args:
+            d_model: Embedding dimension (must be even)
+            max_freq: Maximum frequency for sinusoidal encoding
+            dtype: Data type for computations
+        """
+        assert d_model % 2 == 0, "d_model must be even for sinusoidal embedding"
+        self.d_model = d_model
+        self.max_freq = max_freq
+        self.dtype = to_jnp_dtype(dtype)
+
+        # Precompute frequency bands
+        half_dim = d_model // 2
+        freqs = jnp.exp(
+            -jnp.log(max_freq) * jnp.arange(half_dim, dtype=jnp.float32) / (half_dim - 1)
+        )
+        self.freqs = nnx.Variable(freqs)
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Encode continuous values into sinusoidal features.
+
+        Args:
+            x: (B, T) or (...,) continuous values (typically in [0, 1])
+
+        Returns:
+            embeddings: (..., d_model) sinusoidal features
+        """
+        x = x[..., None] * self.freqs  # (..., half_dim)
+        emb = jnp.concatenate([jnp.sin(x), jnp.cos(x)], axis=-1)  # (..., d_model)
+        return emb.astype(self.dtype)
+
+
 class MAEReplacer(nnx.Module):
     """Masked Autoencoder token replacer for training."""
 
@@ -852,6 +897,26 @@ class Dynamics(nnx.Module):
             rngs=rngs
         )
 
+        # Continuous signal embeddings for mean flow forcing
+        # These use sinusoidal encoding for smooth interpolation between signal levels
+        self.signal_r_sinusoidal = SinusoidalEmbedding(cfg.d_model, dtype=self.dtype)
+        self.signal_t_sinusoidal = SinusoidalEmbedding(cfg.d_model, dtype=self.dtype)
+
+        # Project sinusoidal features to model dimension
+        # These allow the model to learn task-specific transformations of the embeddings
+        self.signal_r_proj = nnx.Linear(
+            cfg.d_model, cfg.d_model,
+            dtype=self.dtype, param_dtype=self.param_dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')),
+            rngs=rngs
+        )
+        self.signal_t_proj = nnx.Linear(
+            cfg.d_model, cfg.d_model,
+            dtype=self.dtype, param_dtype=self.param_dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')),
+            rngs=rngs
+        )
+
         # Output head (zero-init)
         self.flow_x_head = nnx.Linear(
             cfg.d_model, cfg.d_bottleneck * cfg.packing_factor,
@@ -888,21 +953,37 @@ class Dynamics(nnx.Module):
         )
 
     def __call__(self, actions, step_indices, tau_indices, packed_enc_tokens, *,
+                r_continuous: Optional[jnp.ndarray] = None,
+                t_continuous: Optional[jnp.ndarray] = None,
                 agent_tokens: Optional[jnp.ndarray] = None, deterministic: bool = True,
                 caches: Optional[Dict[int, KVCache]] = None, rngs: Optional[nnx.Rngs] = None):
         """
+        Forward pass for dynamics model supporting both discrete and continuous conditioning.
+
+        The model supports two conditioning modes:
+        1. Shortcut forcing (discrete): Uses step_indices and tau_indices for embedding lookup
+        2. Mean flow forcing (continuous): Uses r_continuous and t_continuous with sinusoidal encoding
+
         Args:
           packed_enc_tokens:      (B, T, n_spatial, d_spatial) packed encoder tokens
           actions:       (B, T) int32 in [0, n_keyboard) raw action tokens
-          step_indices:  (B, T) int32 — step indices for embedding lookup
-          tau_indices:   (B, T) int32 - signal indices for embedding lookup
-          caches:     optional dict of KVCache for each layer
+          step_indices:  (B, T) int32 — step indices for embedding lookup (shortcut mode)
+          tau_indices:   (B, T) int32 - signal indices for embedding lookup (shortcut mode)
+          r_continuous:  (B, T) float32 - start signal level in [0, 1] (meanflow mode)
+          t_continuous:  (B, T) float32 - end signal level in [0, 1] (meanflow mode)
+          agent_tokens:  Optional (B, T, n_agent, d_model) agent tokens
+          deterministic: Whether to use deterministic mode (no dropout)
+          caches:        Optional dict of KVCache for each layer
+          rngs:          Optional RNG state for dropout
 
         Shapes produced:
           spatial_tokens: (B, T, n_spatial, d_model)
-          action_tokens:  (B, T, 1, d_model)  # if your ActionEncoder emits one token
-          signal_token:   (B, T, 1, d_model)
-          step_token:     (B, T, 1, d_model)
+          action_tokens:  (B, T, 1, d_model)
+          signal_tokens:  (B, T, 2, d_model) - two tokens for signal/step or r/t
+
+        Returns:
+          x1_hat: (B, T, n_spatial, d_bottleneck * packing_factor) Predicted output
+          (h_t, new_caches): Tuple of agent hidden states and updated caches
         """
         # --- 1) Project spatial tokens to model dimension
         spatial_tokens = self.spatial_proj(packed_enc_tokens) # (B, T, n_spatial, d_model)
@@ -917,15 +998,30 @@ class Dynamics(nnx.Module):
             (B, T, self.n_register, self.d_model),
         )
 
-        # --- 4) Shortcut embeddings (discrete lookup)
-        step_tok   = self.step_embed(step_indices)[:, :, None, :]         # (B, T, 1, d_model)
-        signal_tok = self.signal_embed(tau_indices)[:, :, None, :]     # (B, T, 1, d_model)
-
-        # --- 5) Concatenate in your declared layout order
-        if agent_tokens is not None:
-            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, agent_tokens]
+        # --- 4) Signal conditioning: discrete (shortcut) or continuous (meanflow)
+        if r_continuous is None and t_continuous is None:
+            # Shortcut forcing mode: use discrete embeddings
+            step_tok   = self.step_embed(step_indices)[:, :, None, :]         # (B, T, 1, d_model)
+            signal_tok = self.signal_embed(tau_indices)[:, :, None, :]     # (B, T, 1, d_model)
+            signal_tokens = [signal_tok, step_tok]
         else:
-            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
+            # Mean flow forcing mode: use continuous sinusoidal embeddings
+            assert r_continuous is not None and t_continuous is not None, \
+                "Both r_continuous and t_continuous must be provided for meanflow mode"
+
+            # Encode continuous values with sinusoidal features
+            r_emb = self.signal_r_sinusoidal(r_continuous)  # (B, T, d_model)
+            t_emb = self.signal_t_sinusoidal(t_continuous)  # (B, T, d_model)
+
+            # Project to model dimension and add token dimension
+            r_tok = self.signal_r_proj(r_emb)[:, :, None, :]  # (B, T, 1, d_model)
+            t_tok = self.signal_t_proj(t_emb)[:, :, None, :]  # (B, T, 1, d_model)
+            signal_tokens = [r_tok, t_tok]
+
+        # --- 5) Concatenate in declared layout order
+        toks = [action_tokens] + signal_tokens + [spatial_tokens, register_tokens]
+        if agent_tokens is not None:
+            toks.append(agent_tokens)
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
         # make the layout for masking

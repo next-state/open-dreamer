@@ -12,7 +12,7 @@ from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.parallel import build_parallel
-from dreamer.training import run_evaluation, shortcut_forcing_step
+from dreamer.training import run_evaluation, shortcut_forcing_step, meanflow_forcing_step
 from dreamer.utils import (
     build_checkpoint_manager,
     count_parameters_by_component,
@@ -31,7 +31,7 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Training Step
 # ---------------------------
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "B_self"))
+@nnx.jit(static_argnames=("packing_factor", "k_max", "B_self", "forcing_type"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -45,7 +45,7 @@ def encode_and_train_step(
     packing_factor:int,
     B_self:int,
     k_max:int,
-
+    forcing_type: str = "shortcut",
 ):
     # Phase 1: Encode videos to latents
     rngs = nnx.Rngs(mae=tokenizer_key)
@@ -59,13 +59,14 @@ def encode_and_train_step(
     # Phase 2: Training step
     metrics = train_step(
         dynamics, optimizer, latents, actions,
-        B_self=B_self, k_max=k_max, master_key=master_key, step=step
+        B_self=B_self, k_max=k_max, master_key=master_key, step=step,
+        forcing_type=forcing_type
     )
 
     return metrics
 
 
-@nnx.jit(static_argnames=("k_max", "B_self"))
+@nnx.jit(static_argnames=("k_max", "B_self", "forcing_type"))
 def train_step(
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
@@ -75,27 +76,40 @@ def train_step(
     B_self: int,
     k_max: int,
     master_key: jax.Array,
-    step: int
+    step: int,
+    forcing_type: str = "shortcut",
 ):
     # Generate step-specific key
     step_key = jax.random.fold_in(master_key, step)
 
     def loss_and_aux(dynamics_model: Dynamics):
         """Loss function that takes the model and returns (loss, aux)."""
-        losses, aux = shortcut_forcing_step(
-            dynamics_model=dynamics_model,
-            actions=actions,
-            latents=latents,
-            rng=step_key,
-            k_max=k_max,
-            B_self=B_self,
-            agent_tokens=None,  # Not used in dynamics pretraining
-        )
+        if forcing_type == "shortcut":
+            losses, aux = shortcut_forcing_step(
+                dynamics_model=dynamics_model,
+                actions=actions,
+                latents=latents,
+                rng=step_key,
+                k_max=k_max,
+                B_self=B_self,
+                agent_tokens=None,  # Not used in dynamics pretraining
+            )
+        elif forcing_type == "meanflow":
+            losses, aux = meanflow_forcing_step(
+                dynamics_model=dynamics_model,
+                actions=actions,
+                latents=latents,
+                rng=step_key,
+                k_max=k_max,
+                agent_tokens=None,  # Not used in dynamics pretraining
+            )
+        else:
+            raise ValueError(f"Unknown forcing_type: {forcing_type}. Must be 'shortcut' or 'meanflow'.")
         return losses['total'], aux
 
     (loss_val, metrics), grads = nnx.value_and_grad(loss_and_aux, has_aux=True)(dynamics)
 
-    # Update model with optimizer 
+    # Update model with optimizer
     optimizer.update(dynamics, grads)
 
     return metrics
@@ -161,6 +175,13 @@ def run(cfg: DynamicsConfig):
                 videos = jax.device_put(batch["videos"], data_sharding)
                 actions = jax.device_put(batch["actions"], data_sharding)
 
+                # Compute B_self for bootstrap (only used in shortcut forcing)
+                # For meanflow forcing, B_self is ignored
+                if cfg.dynamics.forcing_type == "shortcut":
+                    B_self = 0 if step < cfg.bootstrap_start else cfg.dataset.B // 2
+                else:
+                    B_self = 0  # Not used in meanflow forcing
+
                 # Training step
                 aux = encode_and_train_step(
                     tokenizer, dynamics, optimizer,
@@ -169,23 +190,36 @@ def run(cfg: DynamicsConfig):
                     master_key=master_key,
                     step=step,
                     packing_factor=cfg.dynamics.packing_factor,
-                    B_self=cfg.dataset.B//2,
+                    B_self=B_self,
                     k_max=cfg.dynamics.k_max,
+                    forcing_type=cfg.dynamics.forcing_type,
                 )
 
                 # Logging
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(aux)
                     lr_value = lr_schedule(step)
-                    logger.log(
-                        step,
-                        metrics={
-                            "flow_mse": metrics_cpu["flow_mse"],
-                            "boot_mse": metrics_cpu["bootstrap_mse"],
-                            "lr": lr_value,
-                        },
-                        pbar=pbar,
-                    )
+
+                    # Log metrics based on forcing type
+                    if cfg.dynamics.forcing_type == "shortcut":
+                        logger.log(
+                            step,
+                            metrics={
+                                "flow_mse": metrics_cpu["flow_mse"],
+                                "boot_mse": metrics_cpu["bootstrap_mse"],
+                                "lr": lr_value,
+                            },
+                            pbar=pbar,
+                        )
+                    elif cfg.dynamics.forcing_type == "meanflow":
+                        logger.log(
+                            step,
+                            metrics={
+                                "meanflow_mse": metrics_cpu["meanflow_mse"],
+                                "lr": lr_value,
+                            },
+                            pbar=pbar,
+                        )
 
                 # Checkpointing
                 maybe_save(checkpoint_manager, step, dynamics, optimizer, train_iterator, rng, meta)
