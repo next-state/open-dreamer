@@ -5,20 +5,45 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=False)
 class MuPConfig:
-    """Configuration for mu-Parameterization.
+    """Configuration for Complete(d)-Parameterization.
 
-    μP ensures optimal hyperparameters transfer across model widths by controlling
-    the magnitude of activations, gradients, and weight updates.
+    Extends μP with depth scaling, batch-size transfer, and training duration transfer.
+    Reference: "Completed Hyperparameter Transfer Across Modules, Width, Depth, Batch & Duration"
 
     Attributes:
-        enabled: Whether to use μP scaling. If False, standard parameterization is used.
-        base_width: Reference width for computing m_d = d_model / base_width.
+        enabled: Whether to use Complete(d)P scaling. If False, standard parameterization is used.
+
+        # Width scaling
+        base_width: Reference width for computing m_N = d_model / base_width.
                    Set this to the width at which you tune hyperparameters.
         attn_scale_type: "mup" for 1/d_head scaling, "standard" for 1/√d_head.
+
+        # Depth scaling
+        base_depth: Reference depth for computing m_L = depth / base_depth.
+        depth_alpha: Scaling exponent α ∈ [0.5, 1.0]. Controls residual dampening.
+                    α=0.5 recommended for better asymptotic performance.
+
+        # Batch size transfer
+        base_batch_size: Reference batch size for SDE-based transfer.
+
+        # Token horizon transfer
+        base_tokens: Reference training tokens for duration transfer.
     """
     enabled: bool = False
+
+    # Width scaling (existing μP)
     base_width: int = 256
     attn_scale_type: str = "mup"  # "mup" or "standard"
+
+    # Depth scaling (NEW - Complete(d)P)
+    base_depth: int = 12
+    depth_alpha: float = 0.5  # α ∈ [0.5, 1.0]
+
+    # Batch size transfer (NEW - Complete(d)P)
+    base_batch_size: int = 32
+
+    # Token horizon transfer (NEW - Complete(d)P)
+    base_tokens: int = 1_000_000_000  # 1B tokens
 
 
 # ---- Dataset Configs ----

@@ -194,11 +194,16 @@ def run(cfg: TokenizerConfig):
         # Build learning rate schedule
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
-        # Build optimizer (with optional μP-aware LR scaling)
-        # Use encoder d_model as the reference width for μP
+        # Build optimizer (with optional Complete(d)P-aware LR scaling)
+        # Compute total tokens for duration transfer scaling
+        total_tokens = cfg.max_steps * cfg.dataset.B * cfg.dataset.T
         optimizer = build_optimizer(
             cfg.optimizer, tokenizer, lr_schedule,
-            mup_config=cfg.mup, d_model=cfg.encoder.d_model
+            mup_config=cfg.mup,
+            d_model=cfg.encoder.d_model,
+            depth=cfg.encoder.depth,
+            batch_size=cfg.dataset.B,
+            total_tokens=total_tokens,
         )
 
         # Data iterator

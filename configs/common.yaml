@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 run_name: ???
-use_wandb: false
+use_wandb: False
 dataset: ???
 
 # Checkpointing
@@ -25,12 +25,21 @@ logger:
 dtype: bfloat16
 param_dtype: float32
 
-# Mu-Parameterization (muP)
-# Enable for hyperparameter transfer across model widths
+# Complete(d)-Parameterization
+# Extends μP with depth, batch-size, and training duration transfer
+# Reference: "Completed Hyperparameter Transfer Across Modules, Width, Depth, Batch & Duration"
 mup:
-  enabled: false
+  enabled: True
+  # Width scaling
   base_width: 256  # Reference width for LR scaling
   attn_scale_type: mup  # mup = 1/d_head, standard = 1/sqrt(d_head)
+  # Depth scaling (Complete(d)P)
+  base_depth: 12  # Reference depth for residual/LR scaling
+  depth_alpha: 0.5  # α ∈ [0.5, 1.0], controls residual dampening
+  # Batch size transfer (Complete(d)P)
+  base_batch_size: 32  # Reference batch size for SDE-based transfer
+  # Token horizon transfer (Complete(d)P)
+  base_tokens: 1_000_000_000  # Reference training tokens (1B)
 
 # Parallel
 parallel_strategy: data  # data | fsdp | tp

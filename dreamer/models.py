@@ -17,7 +17,7 @@ from .utils import (
 )
 from .configs import TokenizerConfig, DynamicsModelConfig, DynamicsConfig, EncoderModelConfig, DecoderModelConfig, MuPConfig
 from .parallel import MeshRules
-from .mup import mup_output_init
+from .mup import mup_output_init, compute_residual_multiplier
 
 
 # ============================================================================
@@ -495,11 +495,19 @@ class BlockCausalLayer(nnx.Module):
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4,
                  rope_theta: float = 10000.0, dtype: Any = jnp.float32,
-                 param_dtype: Any = jnp.float32, mup_config: Optional[MuPConfig] = None, *,
+                 param_dtype: Any = jnp.float32, mup_config: Optional[MuPConfig] = None,
+                 depth: Optional[int] = None, *,
                  rngs: nnx.Rngs, mesh_rules: MeshRules):
         self.layer_index = layer_index
         self.time_every = time_every
         param_dtype = to_jnp_dtype(param_dtype)
+
+        # Complete(d)P: Compute residual multiplier for depth scaling
+        # residual_mult = m_L^(-α) where m_L = depth / base_depth
+        if mup_config is not None and mup_config.enabled and depth is not None:
+            self.residual_mult = compute_residual_multiplier(depth, mup_config)
+        else:
+            self.residual_mult = 1.0
 
         self.norm = nnx.RMSNorm(dim, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
 
@@ -529,11 +537,11 @@ class BlockCausalLayer(nnx.Module):
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
         y, new_cache = self.attn(y, mask=mask, deterministic=deterministic, cache=cache, rngs=rngs)
-        x = x + y
+        x = x + self.residual_mult * y  # Complete(d)P: scaled residual
 
         # MLP
         y = self.mlp(x, deterministic=deterministic, rngs=rngs)
-        x = x + y
+        x = x + self.residual_mult * y  # Complete(d)P: scaled residual
         return x, new_cache
 
 class BlockCausalTransformer(nnx.Module):
@@ -548,14 +556,14 @@ class BlockCausalTransformer(nnx.Module):
         self.depth = depth
         self.time_every = time_every
 
-        # Create layers
+        # Create layers - pass total depth for Complete(d)P residual scaling
         self.layers = nnx.List([
             BlockCausalLayer(
                 dim=d_model, num_heads=n_heads, num_kv_heads=n_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every,
                 rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype,
-                mup_config=mup_config,
+                mup_config=mup_config, depth=depth,
                 mesh_rules=mesh_rules, rngs=rngs
             ) for i in range(depth)
         ])

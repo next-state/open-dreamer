@@ -443,6 +443,9 @@ def build_optimizer(
     lr_schedule: optax.Schedule,
     mup_config: MuPConfig | None = None,
     d_model: int | None = None,
+    depth: int | None = None,
+    batch_size: int | None = None,
+    total_tokens: int | None = None,
 ) -> nnx.Optimizer:
     """
     Build optimizer with given learning rate schedule.
@@ -451,8 +454,11 @@ def build_optimizer(
         optimizer_cfg: OptimizerConfig instance
         model: nnx.Module to optimize
         lr_schedule: optax.Schedule instance
-        mup_config: Optional MuPConfig for μP-aware optimization
+        mup_config: Optional MuPConfig for Complete(d)P-aware optimization
         d_model: Model hidden dimension (required if mup_config is enabled)
+        depth: Model depth (required for Complete(d)P depth scaling)
+        batch_size: Actual batch size (for batch transfer scaling)
+        total_tokens: Total training tokens (for duration transfer scaling)
 
     Returns:
         nnx.Optimizer instance
@@ -460,7 +466,10 @@ def build_optimizer(
     if mup_config is not None and mup_config.enabled:
         if d_model is None:
             raise ValueError("d_model must be provided when mup is enabled")
-        # Use μP-aware optimizer with per-layer learning rate scaling
+        if depth is None:
+            raise ValueError("depth must be provided when mup is enabled")
+        # Use Complete(d)P-aware optimizer with per-layer learning rate scaling
+        # Default batch_size and total_tokens to base values for backward compat
         tx = create_mup_optimizer(
             base_lr=1.0,  # Will be scaled by schedule
             d_model=d_model,
@@ -469,6 +478,9 @@ def build_optimizer(
             b1=optimizer_cfg.b1,
             b2=optimizer_cfg.b2,
             schedule_fn=lr_schedule,
+            depth=depth,
+            batch_size=batch_size,
+            total_tokens=total_tokens,
         )
     elif optimizer_cfg.optimizer_type == "adamw":
         tx = optax.adamw(

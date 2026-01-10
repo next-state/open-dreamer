@@ -137,10 +137,16 @@ def run(cfg: DynamicsConfig):
         # Build learning rate schedule
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
-        # Build optimizer (with optional μP-aware LR scaling)
+        # Build optimizer (with optional Complete(d)P-aware LR scaling)
+        # Compute total tokens for duration transfer scaling
+        total_tokens = cfg.max_steps * cfg.dataset.B * cfg.dataset.T
         optimizer = build_optimizer(
             cfg.optimizer, dynamics, lr_schedule,
-            mup_config=cfg.mup, d_model=cfg.dynamics.d_model
+            mup_config=cfg.mup,
+            d_model=cfg.dynamics.d_model,
+            depth=cfg.dynamics.depth,
+            batch_size=cfg.dataset.B,
+            total_tokens=total_tokens,
         )
 
         # Data iterator

@@ -4,14 +4,14 @@ defaults:
   - dataset: coinrun
 
 run_name: dynamics
-tokenizer_ckpt: logs/tokenizer/checkpoints/
+tokenizer_ckpt: logs/adam3/checkpoints/
 
 ckpt:
   max_to_keep: 2
   save_interval_steps: 10_000
 
 dataset:
-  B: 256
+  B: 128
 
 dynamics:
     d_model: 1024
