@@ -1,11 +1,10 @@
 defaults:
   - common
-  - _self_
   - dataset: coinrun
+  - _self_
 
 run_name: heads
-tokenizer_ckpt: "logs/tokenizer/checkpoints"
-dynamics_ckpt: "logs/dynamics/checkpoints"
+dynamics_ckpt: "logs/dynamics_140M/checkpoints"
 
 ckpt:
   save_interval_steps: 100_000
@@ -22,7 +21,7 @@ bootstrap_start: 5000
 self_fraction: 0.25
 
 max_steps: 1_000_000_000
-write_video_every: 500
+write_video_every: 5000
 
 # Learning rate schedules
 lr_schedule_policy:
