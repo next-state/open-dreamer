@@ -111,9 +111,9 @@ class LRScheduleConfig:
     lr: float = 1e-4  # Used for constant schedule, or as peak/max_lr for other schedules
     init_lr: float = 0.0  # Starting LR for warmup schedules
     lr_end: float = 0.0  # Ending LR for decay schedules
-    warmup_steps: int = 10_000
-    wsd_decay_steps: int = 30_000
     max_steps: int = 1_000_000_000
+    warmup_ratio: float = 0.0  # e.g., 0.1 = 10% warmup
+    decay_ratio: float = 0.0   # e.g., 0.2 = 20% decay (for wsd)
 
 
 @dataclass(frozen=False)
@@ -157,7 +157,7 @@ class BaseExperimentConfig:
     run_name: str
     use_wandb: bool = False
 
-    # Checkpoint 
+    # Checkpoint
     ckpt: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     # Logger
@@ -165,16 +165,20 @@ class BaseExperimentConfig:
 
     # Dataset
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    
+
     # Training
     max_steps: int = 1_000_000_000
     log_every: int = 100
     seed: int = 0  # Random seed
     parallel_strategy: str = "data"  # Parallelization strategy: "data", "fsdp", or "tp"
-    
+
     # Precision
     dtype: str = "bfloat16"
     param_dtype: str = "float32"
+
+    # Scaling laws (set > 0 to enable auto-computed max_steps)
+    scaling_tokens_per_param: float = 0.0  # e.g., 8.0 for compute-optimal training
+    scaling_flops_budget: float = 0.0  # e.g., 1e17 for iso-FLOPs experiments
 
 
 @dataclass(frozen=False)
@@ -190,6 +194,7 @@ class TokenizerConfig(BaseExperimentConfig):
     lpips_frac: float = 0.5
     visualize_every: int = 10_000
     tokenizer_loss_type: str = "mae" # "mse" | "mae"
+    n_minibatches: int = 1  # Number of minibatches for gradient accumulation
 
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)

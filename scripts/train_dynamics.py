@@ -1,8 +1,11 @@
+import json
 import logging
+import time
 
 import hydra
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -22,6 +25,7 @@ from dreamer.utils import (
     build_lr_schedule,
     build_optimizer,
 )
+from dreamer.scaling import estimate_dynamics_flops, compute_max_steps, compute_steps_for_flops_budget
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
@@ -134,6 +138,45 @@ def run(cfg: DynamicsConfig):
         param_counts = count_parameters_by_component(dynamics)
         print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
 
+        # Scaling laws: compute FLOPs and max_steps from param count if enabled
+        n_spatial = tokenizer_cfg.encoder.n_latents // cfg.dynamics.packing_factor
+        flops_per_step = estimate_dynamics_flops(
+            nparams=param_counts["total"],
+            depth=cfg.dynamics.depth,
+            d_model=cfg.dynamics.d_model,
+            batch_size=cfg.dataset.B,
+            seq_length=cfg.dataset.T,
+            n_spatial=n_spatial,
+            n_register=cfg.dynamics.n_register,
+            time_every=cfg.dynamics.time_every,
+        )
+
+        if cfg.scaling_flops_budget > 0:
+            # Iso-FLOPs mode: fixed compute budget, steps computed from FLOPs
+            computed_steps = compute_steps_for_flops_budget(
+                total_flops=cfg.scaling_flops_budget,
+                flops_per_step=flops_per_step,
+            )
+            cfg.max_steps = computed_steps
+            cfg.lr_schedule.max_steps = computed_steps
+            cfg.ckpt.max_steps = computed_steps
+            logger.max_steps = computed_steps
+            print(f"[IsoFLOPs] {cfg.scaling_flops_budget:.2e} FLOPs / {flops_per_step:.2e} per step = {computed_steps:,} steps")
+        elif cfg.scaling_tokens_per_param > 0:
+            # Compute-optimal mode: fixed tokens per param ratio
+            tokens_per_step = cfg.dataset.B * cfg.dataset.T
+            computed_steps = compute_max_steps(
+                param_count=param_counts["total"],
+                tokens_per_param=cfg.scaling_tokens_per_param,
+                tokens_per_step=tokens_per_step,
+            )
+            cfg.max_steps = computed_steps
+            cfg.lr_schedule.max_steps = computed_steps
+            cfg.ckpt.max_steps = computed_steps
+            logger.max_steps = computed_steps
+            total_tokens = param_counts["total"] * cfg.scaling_tokens_per_param
+            print(f"[Scaling] {param_counts['total']:,} params × {cfg.scaling_tokens_per_param} = {total_tokens:,.0f} tokens -> {computed_steps:,} steps")
+
         # Build learning rate schedule
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
@@ -149,6 +192,23 @@ def run(cfg: DynamicsConfig):
             start_step, dynamics, optimizer, train_iterator, rng = try_restore(
                 checkpoint_manager, dynamics, optimizer, train_iterator, rng
             )
+
+            # Log scaling metadata to wandb config (if enabled)
+            if cfg.use_wandb and logger._run is not None:
+                import wandb
+                scaling_meta = {
+                    "scaling/depth": cfg.dynamics.depth,
+                    "scaling/d_model": cfg.dynamics.d_model,
+                    "scaling/total_params": param_counts["total"],
+                    "scaling/tokens_per_param": cfg.scaling_tokens_per_param,
+                    "scaling/flops_budget": cfg.scaling_flops_budget,
+                    "scaling/flops_per_step": flops_per_step,
+                }
+                wandb.config.update(scaling_meta, allow_val_change=True)
+
+            # Track training time for scaling analysis
+            train_start_time = time.time()
+            final_metrics = []  # Keep last 5 logged metrics
 
             # Training loop
             pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step, total=cfg.max_steps)
@@ -177,6 +237,20 @@ def run(cfg: DynamicsConfig):
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(aux)
                     lr_value = lr_schedule(step)
+                    # Keep last 5 metrics (convert arrays to scalars)
+                    metric_dict = {}
+                    for k, v in metrics_cpu.items():
+                        if isinstance(v, (np.ndarray, jnp.ndarray)):
+                            if v.size == 1:
+                                metric_dict[k] = float(v.item())
+                            else:
+                                # Skip multi-element arrays
+                                continue
+                        else:
+                            metric_dict[k] = float(v)
+                    final_metrics.append(metric_dict)
+                    if len(final_metrics) > 5:
+                        final_metrics.pop(0)
                     logger.log(
                         step,
                         metrics={
@@ -200,6 +274,23 @@ def run(cfg: DynamicsConfig):
                         cfg, tokenizer_cfg, step, tokenizer, dynamics,
                         val_videos, jnp.asarray(val_actions), vis_dir, rng, logger
                     )
+
+            # Log final scaling metrics
+            train_elapsed = time.time() - train_start_time
+            final_step = min(step, cfg.max_steps - 1)
+            
+            # Write structured metrics file for analysis
+            metrics_file = run_dir / f"{cfg.run_name}_metrics.json"
+            metrics_data = {
+                "total_params": param_counts["total"],
+                "flops_per_step": float(flops_per_step),
+                "total_steps": int(final_step),
+                "train_elapsed_hours": train_elapsed / 3600,
+                "flops_budget": float(cfg.scaling_flops_budget) if cfg.scaling_flops_budget > 0 else None,
+                "final_metrics": final_metrics,  # Last 5 logged metrics
+            }
+            with open(metrics_file, "w") as f:
+                json.dump(metrics_data, f, indent=2)
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")

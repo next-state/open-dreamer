@@ -5,7 +5,7 @@ name: coinrun
 
 array_record_path: datasets/coinrun_hard_agent_episodes/train
 
-B: 128
+B: 256
 T: 64
 H: 64
 W: 64

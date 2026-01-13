@@ -395,40 +395,45 @@ def count_parameters_by_component(model):
 def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
     """
     Build learning rate schedule.
-    
+
     Args:
         schedule_cfg: ScheduleConfig instance
-    
+
     Returns:
         optax.Schedule instance
     """
     max_steps = schedule_cfg.max_steps
+
+    # Compute warmup/decay steps from ratios
+    warmup_steps = int(max_steps * schedule_cfg.warmup_ratio)
+    decay_steps = int(max_steps * schedule_cfg.decay_ratio)
+
     if schedule_cfg.schedule_type == "constant":
         return optax.constant_schedule(value=schedule_cfg.lr)
     elif schedule_cfg.schedule_type == "cos":
-        assert schedule_cfg.warmup_steps <= max_steps, "Warmup steps can't be greater than total steps."
+        assert warmup_steps <= max_steps, "Warmup steps can't be greater than total steps."
         return optax.warmup_cosine_decay_schedule(
             init_value=schedule_cfg.init_lr,
             peak_value=schedule_cfg.lr,
-            warmup_steps=schedule_cfg.warmup_steps,
+            warmup_steps=warmup_steps,
             # Note: decay_steps includes the warmup steps, so pass the total value.
             decay_steps=max_steps,
             end_value=schedule_cfg.lr_end,
         )
     elif schedule_cfg.schedule_type == "wsd":
         assert (
-            schedule_cfg.warmup_steps + schedule_cfg.wsd_decay_steps <= max_steps
-        ), "Warmup and decay period is longer than total steps."
+            warmup_steps + decay_steps <= max_steps
+        ), f"Warmup ({warmup_steps}) + decay ({decay_steps}) > max_steps ({max_steps})."
         schedules = [
             optax.linear_schedule(
-                init_value=schedule_cfg.init_lr, end_value=schedule_cfg.lr, transition_steps=schedule_cfg.warmup_steps
+                init_value=schedule_cfg.init_lr, end_value=schedule_cfg.lr, transition_steps=warmup_steps
             ),
             optax.constant_schedule(value=schedule_cfg.lr),
             optax.linear_schedule(
-                init_value=schedule_cfg.lr, end_value=schedule_cfg.lr_end, transition_steps=schedule_cfg.wsd_decay_steps
+                init_value=schedule_cfg.lr, end_value=schedule_cfg.lr_end, transition_steps=decay_steps
             ),
         ]
-        boundaries = [schedule_cfg.warmup_steps, max_steps - schedule_cfg.wsd_decay_steps]
+        boundaries = [warmup_steps, max_steps - decay_steps]
         return optax.join_schedules(schedules, boundaries)
     else:
         raise ValueError(

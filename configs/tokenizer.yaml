@@ -54,14 +54,15 @@ decoder:
 
 max_steps: 300_000
 tokenizer_loss_type: mse  # mse | mae
+n_minibatches: 1  # Number of minibatches for gradient accumulation (1 = no accumulation)
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
   lr: 6e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
-  warmup_steps: 10_000
-  wsd_decay_steps: 30_000
+  warmup_ratio: 0.033
+  decay_ratio: 0.1
   max_steps: ${max_steps}
 
 optimizer:

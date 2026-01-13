@@ -1,5 +1,7 @@
+import json
 import logging
 import os
+import time
 from functools import partial
 
 import einops
@@ -30,6 +32,7 @@ from dreamer.utils import (
     build_lr_schedule,
     build_optimizer,
 )
+from dreamer.scaling import estimate_tokenizer_flops, compute_max_steps, compute_steps_for_flops_budget
 
 # disable preallocation completely
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -79,18 +82,17 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
 # Train step
 # ------------------------
 
-@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"))
-def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, dropout_key, step, 
-               lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
+@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type", "n_minibatches"))
+def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, dropout_key, step,
+               lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str,
+               n_minibatches: int = 1):
 
-    def loss_fn(model: Tokenizer):
-        # Create RNG inside the loss function to avoid trace level issues with grad
-        rngs = nnx.Rngs(mae=mae_key, dropout=dropout_key)
-        pred, (mae_mask, keep_prob) = model(videos, deterministic=False, rngs=rngs)
+    def loss_fn(model: Tokenizer, minibatch_videos, minibatch_mae_key, minibatch_dropout_key):
+        rngs = nnx.Rngs(mae=minibatch_mae_key, dropout=minibatch_dropout_key)
+        pred, (mae_mask, keep_prob) = model(minibatch_videos, deterministic=False, rngs=rngs)
 
-        # For MSE: use standardized values (matches old gradient dynamics)
         pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
-        target_norm = normalize_with_dataset_stats(videos, mean=dataset_mean, std=dataset_std)
+        target_norm = normalize_with_dataset_stats(minibatch_videos, mean=dataset_mean, std=dataset_std)
         if tokenizer_loss_type == "mae":
             mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
         elif tokenizer_loss_type == "mse":
@@ -98,20 +100,46 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, d
         else:
             raise ValueError(f"Invalid loss type: {tokenizer_loss_type}")
 
-        # for psnr: use [0, 1] normalized pixel range.
-        psnr = compute_psnr(pred / 255.0, videos / 255.0)
-        
-        # For LPIPS: use [0, 1] range
+        psnr = compute_psnr(pred / 255.0, minibatch_videos / 255.0)
+
         lp = jnp.array(0.0)
         if lpips_weight > 0:
-            lp = lpips_on_mae_recon(pred / 255.0, videos / 255.0, lpips_frac)
-        
+            lp = lpips_on_mae_recon(pred / 255.0, minibatch_videos / 255.0, lpips_frac)
+
         total = mse + lpips_weight * lp
 
         aux = {"loss_total": total, "loss_mse": mse, "loss_lpips": lp, "keep_prob": keep_prob, "psnr": psnr}
         return total, aux
 
-    (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+    # Gradient accumulation
+    batch_size = videos.shape[0]
+    minibatch_size = batch_size // n_minibatches
+
+    accumulated_grads = None
+    accumulated_aux = {}
+
+    for i in range(n_minibatches):
+        start_idx = i * minibatch_size
+        end_idx = start_idx + minibatch_size
+        minibatch = videos[start_idx:end_idx]
+
+        # Split RNG for each minibatch
+        minibatch_rng = jax.random.fold_in(mae_key, i)
+        minibatch_mae_key, minibatch_dropout_key = jax.random.split(minibatch_rng)
+
+        (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model, minibatch, minibatch_mae_key, minibatch_dropout_key)
+
+        # Accumulate gradients
+        if accumulated_grads is None:
+            accumulated_grads = grads
+            accumulated_aux = aux
+        else:
+            accumulated_grads = jax.tree_util.tree_map(lambda a, b: a + b, accumulated_grads, grads)
+            accumulated_aux = jax.tree_util.tree_map(lambda a, b: a + b, accumulated_aux, aux)
+
+    # Average gradients and aux
+    accumulated_grads = jax.tree_util.tree_map(lambda x: x / n_minibatches, accumulated_grads)
+    accumulated_aux = jax.tree_util.tree_map(lambda x: x / n_minibatches, accumulated_aux)
 
     if log_gradients:
         def _tree_std_mean(tree):
@@ -121,17 +149,16 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, d
                 return jnp.array(0.0, dtype=jnp.float32)
             return jnp.mean(jnp.stack([jnp.asarray(x, dtype=jnp.float32) for x in leaves]))
 
-        aux["grad/global_norm"] = optax.global_norm(grads)
-        graphdef, grad_state = nnx.split(grads)
-        aux["grad/encoder_norm"] = optax.global_norm(grad_state.get("encoder", {}))
-        aux["grad/decoder_norm"] = optax.global_norm(grad_state.get("decoder", {}))
-        aux["grad/encoder_std_mean"] = _tree_std_mean(grad_state.get("encoder", {}))
-        aux["grad/decoder_std_mean"] = _tree_std_mean(grad_state.get("decoder", {}))
+        accumulated_aux["grad/global_norm"] = optax.global_norm(accumulated_grads)
+        graphdef, grad_state = nnx.split(accumulated_grads)
+        accumulated_aux["grad/encoder_norm"] = optax.global_norm(grad_state.get("encoder", {}))
+        accumulated_aux["grad/decoder_norm"] = optax.global_norm(grad_state.get("decoder", {}))
+        accumulated_aux["grad/encoder_std_mean"] = _tree_std_mean(grad_state.get("encoder", {}))
+        accumulated_aux["grad/decoder_std_mean"] = _tree_std_mean(grad_state.get("decoder", {}))
 
-    # Update model with optimizer 
-    optimizer.update(model, grads)
+    optimizer.update(model, accumulated_grads)
 
-    return aux
+    return accumulated_aux
 
 # ------------------------
 # Visualization
@@ -191,6 +218,46 @@ def run(cfg: TokenizerConfig):
         param_counts = count_parameters_by_component(tokenizer)
         print(f"Parameter counts: {param_counts}")
 
+        # Scaling laws: compute max_steps from param count if enabled
+        n_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
+        flops_per_step = estimate_tokenizer_flops(
+            nparams=param_counts["total"],
+            encoder_depth=cfg.encoder.depth,
+            decoder_depth=cfg.decoder.depth,
+            d_model=cfg.encoder.d_model,
+            batch_size=cfg.dataset.B,
+            seq_length=cfg.dataset.T,
+            n_patches=n_patches,
+            n_latents=cfg.encoder.n_latents,
+            time_every=cfg.encoder.time_every,
+        )
+
+        if cfg.scaling_flops_budget > 0:
+            # Iso-FLOPs mode: fixed compute budget, steps computed from FLOPs
+            computed_steps = compute_steps_for_flops_budget(
+                total_flops=cfg.scaling_flops_budget,
+                flops_per_step=flops_per_step,
+            )
+            cfg.max_steps = computed_steps
+            cfg.lr_schedule.max_steps = computed_steps
+            cfg.ckpt.max_steps = computed_steps
+            logger.max_steps = computed_steps
+            print(f"[IsoFLOPs] {cfg.scaling_flops_budget:.2e} FLOPs / {flops_per_step:.2e} per step = {computed_steps:,} steps")
+        elif cfg.scaling_tokens_per_param > 0:
+            # Compute-optimal mode: fixed tokens per param ratio
+            tokens_per_step = cfg.dataset.B * cfg.dataset.T
+            computed_steps = compute_max_steps(
+                param_count=param_counts["total"],
+                tokens_per_param=cfg.scaling_tokens_per_param,
+                tokens_per_step=tokens_per_step,
+            )
+            cfg.max_steps = computed_steps
+            cfg.lr_schedule.max_steps = computed_steps
+            cfg.ckpt.max_steps = computed_steps
+            logger.max_steps = computed_steps
+            total_tokens = param_counts["total"] * cfg.scaling_tokens_per_param
+            print(f"[Scaling] {param_counts['total']:,} params × {cfg.scaling_tokens_per_param} = {total_tokens:,.0f} tokens -> {computed_steps:,} steps")
+
         # Build learning rate schedule
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
@@ -206,6 +273,23 @@ def run(cfg: TokenizerConfig):
             start_step, tokenizer, optimizer, train_iterator, rng = try_restore(
                 checkpoint_manager, tokenizer, optimizer, train_iterator, rng
             )
+
+            # Log scaling metadata to wandb config (if enabled)
+            if cfg.use_wandb and logger._run is not None:
+                import wandb
+                scaling_meta = {
+                    "scaling/depth": cfg.encoder.depth,
+                    "scaling/d_model": cfg.encoder.d_model,
+                    "scaling/total_params": param_counts["total"],
+                    "scaling/tokens_per_param": cfg.scaling_tokens_per_param,
+                    "scaling/flops_budget": cfg.scaling_flops_budget,
+                    "scaling/flops_per_step": flops_per_step,
+                }
+                wandb.config.update(scaling_meta, allow_val_change=True)
+
+            # Track training time for scaling analysis
+            train_start_time = time.time()
+            final_metrics = []  # Keep last 5 logged metrics
 
             # Training loop
             pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step,total=cfg.max_steps)
@@ -227,7 +311,8 @@ def run(cfg: TokenizerConfig):
                     dataset_mean=tuple(cfg.dataset.dataset_mean),
                     dataset_std=tuple(cfg.dataset.dataset_std),
                     log_gradients=cfg.logger.log_gradients,
-                    tokenizer_loss_type=cfg.tokenizer_loss_type
+                    tokenizer_loss_type=cfg.tokenizer_loss_type,
+                    n_minibatches=cfg.n_minibatches
                 )
 
                 if logger.should_log(step):
@@ -235,6 +320,20 @@ def run(cfg: TokenizerConfig):
                     lr_value = lr_schedule(step)
                     mse = metrics_cpu["loss_mse"]
                     psnr = metrics_cpu["psnr"]
+                    # Keep last 5 metrics (convert arrays to scalars)
+                    metric_dict = {}
+                    for k, v in metrics_cpu.items():
+                        if isinstance(v, (np.ndarray, jnp.ndarray)):
+                            if v.size == 1:
+                                metric_dict[k] = float(v.item())
+                            else:
+                                # Skip multi-element arrays
+                                continue
+                        else:
+                            metric_dict[k] = float(v)
+                    final_metrics.append(metric_dict)
+                    if len(final_metrics) > 5:
+                        final_metrics.pop(0)
                     logger.log(
                         step,
                         {
@@ -263,6 +362,27 @@ def run(cfg: TokenizerConfig):
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
                     viz_step(tokenizer, viz_videos, step_rng, step, vis_dir, logger)
+
+            # Log final scaling metrics
+            train_elapsed = time.time() - train_start_time
+            final_step = min(step, cfg.max_steps - 1)
+            
+            n_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
+            tokens_trained = cfg.dataset.B * cfg.dataset.T * n_patches * final_step
+            
+            # Write structured metrics file for analysis
+            metrics_file = run_dir / f"{cfg.run_name}_metrics.json"
+            metrics_data = {
+                "total_params": param_counts["total"],
+                "flops_per_step": float(flops_per_step),
+                "total_steps": int(final_step),
+                "tokens_trained": int(tokens_trained),
+                "train_elapsed_hours": train_elapsed / 3600,
+                "flops_budget": float(cfg.scaling_flops_budget) if cfg.scaling_flops_budget > 0 else None,
+                "final_metrics": final_metrics,  # Last 5 logged metrics
+            }
+            with open(metrics_file, "w") as f:
+                json.dump(metrics_data, f, indent=2)
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
