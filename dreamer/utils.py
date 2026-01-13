@@ -10,6 +10,7 @@ from einops import rearrange
 from enum import IntEnum
 from typing import Tuple, TypeVar
 import numpy as np
+from dataclasses import fields, is_dataclass
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 from dreamer.configs import CheckpointConfig, LRScheduleConfig, OptimizerConfig
@@ -313,6 +314,173 @@ def maybe_save(
     )
     checkpoint_manager.save(step, args=checkpoint_manager_args)
 
+
+BundleT = TypeVar('BundleT')
+
+
+def get_bundle_item_names(bundle: BundleT) -> tuple[str, ...]:
+    """Get checkpoint item names from a bundle dataclass.
+    
+    Introspects the bundle to generate the list of item names needed for
+    build_checkpoint_manager.
+    
+    Args:
+        bundle: Dataclass containing models and optimizers
+        
+    Returns:
+        Tuple of item names for checkpoint manager
+        
+    Example:
+        @dataclass
+        class MyBundle:
+            model: MyModel
+            optimizer: nnx.Optimizer
+            
+        bundle = MyBundle(model=model, optimizer=optimizer)
+        item_names = get_bundle_item_names(bundle)
+        # Returns: ("model_state", "optimizer_state", "train_dataloader_state", "rngs", "meta")
+    """
+    if not is_dataclass(bundle):
+        raise TypeError(f"bundle must be a dataclass, got {type(bundle)}")
+    
+    item_names = []
+    for field in fields(bundle):
+        field_value = getattr(bundle, field.name)
+        if isinstance(field_value, nnx.Module):
+            item_names.append(f"{field.name}_state")
+    
+    # Add standard items
+    item_names.extend(["train_dataloader_state", "rngs", "meta"])
+    
+    return tuple(item_names)
+
+
+def try_restore_bundle(
+    checkpoint_manager: ocp.CheckpointManager,
+    bundle: BundleT,
+    train_iterator: grain.DataLoaderIterator,
+    rng: jax.Array,
+) -> tuple[int, BundleT, grain.DataLoaderIterator, jax.Array]:
+    """Restore checkpoint bundle (generic for any dataclass).
+    
+    This function introspects the bundle dataclass to automatically save/restore
+    all fields that are nnx.Module or nnx.Optimizer instances.
+    
+    Args:
+        checkpoint_manager: Checkpoint manager
+        bundle: Dataclass containing models and optimizers to restore
+        train_iterator: Data iterator
+        rng: Random number generator state
+        
+    Returns:
+        Tuple of (start_step, bundle, train_iterator, rng)
+        
+    Example:
+        @dataclass
+        class MyBundle:
+            model: MyModel
+            optimizer: nnx.Optimizer
+            
+        bundle = MyBundle(model=model, optimizer=optimizer)
+        start_step, bundle, iterator, rng = try_restore_bundle(
+            checkpoint_manager, bundle, iterator, rng
+        )
+    """
+    if not is_dataclass(bundle):
+        raise TypeError(f"bundle must be a dataclass, got {type(bundle)}")
+    
+    step = checkpoint_manager.latest_step()
+    if step is None:
+        print("No checkpoint found, starting from scratch.")
+        return 0, bundle, train_iterator, rng
+    
+    # Build restore args dynamically by introspecting bundle fields
+    restore_kwargs = {}
+    
+    for field in fields(bundle):
+        field_value = getattr(bundle, field.name)
+        
+        # Detect if field is a model or optimizer
+        if isinstance(field_value, nnx.Module):
+            state_key = f"{field.name}_state"
+            restore_kwargs[state_key] = ocp.args.StandardRestore(nnx.state(field_value))  # type: ignore
+    
+    # Add iterator and rngs
+    restore_kwargs["train_dataloader_state"] = grain.checkpoint.CheckpointRestore(train_iterator)  # type: ignore
+    restore_kwargs["rngs"] = ocp.args.StandardRestore({"key": rng})  # type: ignore
+    
+    restore_args = ocp.args.Composite(**restore_kwargs)
+    restored = checkpoint_manager.restore(step, args=restore_args)
+    
+    # Update bundle fields in-place
+    for field in fields(bundle):
+        field_value = getattr(bundle, field.name)
+        if isinstance(field_value, nnx.Module):
+            state_key = f"{field.name}_state"
+            nnx.update(field_value, restored[state_key])
+    
+    train_iterator = restored["train_dataloader_state"]
+    rng = restored["rngs"]["key"]
+    print(f"Restored checkpoint from step {step}.")
+    
+    return step + 1, bundle, train_iterator, rng
+
+
+def maybe_save_bundle(
+    checkpoint_manager: ocp.CheckpointManager,
+    step: int,
+    bundle: BundleT,
+    train_iterator: grain.DataLoaderIterator,
+    rng: jax.Array,
+    meta: dict,
+) -> None:
+    """Save checkpoint bundle (generic for any dataclass).
+    
+    This function introspects the bundle dataclass to automatically save/restore
+    all fields that are nnx.Module or nnx.Optimizer instances.
+    
+    Args:
+        checkpoint_manager: Checkpoint manager
+        step: Current training step
+        bundle: Dataclass containing models and optimizers to save
+        train_iterator: Data iterator
+        rng: Random number generator state
+        meta: Metadata dictionary
+        
+    Example:
+        @dataclass
+        class MyBundle:
+            model: MyModel
+            optimizer: nnx.Optimizer
+            
+        bundle = MyBundle(model=model, optimizer=optimizer)
+        maybe_save_bundle(checkpoint_manager, step, bundle, iterator, rng, meta)
+    """
+    if not is_dataclass(bundle):
+        raise TypeError(f"bundle must be a dataclass, got {type(bundle)}")
+    
+    if not checkpoint_manager.should_save(step):
+        return
+    
+    # Build save args dynamically by introspecting bundle fields
+    save_kwargs = {}
+    
+    for field in fields(bundle):
+        field_value = getattr(bundle, field.name)
+        
+        # Detect if field is a model or optimizer
+        if isinstance(field_value, nnx.Module):
+            state_key = f"{field.name}_state"
+            save_kwargs[state_key] = ocp.args.StandardSave(nnx.state(field_value))  # type: ignore
+    
+    # Add iterator, rngs, and meta
+    save_kwargs["train_dataloader_state"] = grain.checkpoint.CheckpointSave(train_iterator)  # type: ignore
+    save_kwargs["rngs"] = ocp.args.StandardSave({'key': rng})  # type: ignore
+    save_kwargs["meta"] = ocp.args.JsonSave(meta)  # type: ignore
+    
+    save_args = ocp.args.Composite(**save_kwargs)
+    checkpoint_manager.save(step, args=save_args)
+
 # -------- Training utilities (shared across scripts) --------
 
 def _ensure_dir(p: Path) -> Path:
@@ -329,10 +497,6 @@ def setup_training_directories(cfg) -> tuple[Path, Path, Path, dict]:
     print(f"[setup] output dir: {run_dir.resolve()}")
     return run_dir, ckpt_dir, vis_dir, meta
 
-
-def _to_uint8(img_f32):
-    """Convert float32 image to uint8."""
-    return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
 
 
 def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jnp.ndarray:

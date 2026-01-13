@@ -548,7 +548,7 @@ def compute_reward_loss(
     h_states: jnp.ndarray,
     rewards_btL: jnp.ndarray,
     rewards_valid: jnp.ndarray,
-) -> jnp.ndarray:
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
     Compute reward prediction loss with symexp twohot encoding.
     
@@ -560,6 +560,7 @@ def compute_reward_loss(
         
     Returns:
         reward_loss: Scalar categorical cross-entropy loss
+        metrics: Dict with breakdown metrics
     """
     # Forward pass
     reward_logits, centers_log = reward_head(h_states, deterministic=True) 
@@ -568,8 +569,19 @@ def compute_reward_loss(
     reward_targets = twohot_symlog_targets(rewards_btL, centers_log)  # (B, T, L, K)
     reward_loss_per = optax.safe_softmax_cross_entropy(logits=reward_logits, labels=reward_targets)  # (B, T, L)
     reward_loss = jnp.sum(reward_loss_per * rewards_valid) / jnp.maximum(rewards_valid.sum(), 1.0)
-    
-    return reward_loss
+    # add metrics on loss over when reward is nonzero and when it is zero.
+    reward_nonzero = (rewards_btL > 0) * rewards_valid
+    reward_zero = (rewards_btL == 0) * rewards_valid
+    reward_nonzero_count = reward_nonzero.sum()
+    reward_zero_count = reward_zero.sum()
+    metrics = {
+        "reward_nonzero_count": reward_nonzero_count,
+        "reward_zero_count": reward_zero_count,
+        "reward_loss_nonzero": jnp.sum(reward_loss_per * reward_nonzero) / jnp.maximum(reward_nonzero_count, 1.0),
+        "reward_loss_zero": jnp.sum(reward_loss_per * reward_zero) / jnp.maximum(reward_zero_count, 1.0),
+    }
+    return reward_loss, metrics
+
 
 
 def compute_policy_loss(

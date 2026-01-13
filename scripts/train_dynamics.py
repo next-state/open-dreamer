@@ -118,10 +118,7 @@ def run(cfg: DynamicsConfig):
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
-    with (
-        logger,
-        jax.set_mesh(mesh),
-    ):
+    with (logger, jax.set_mesh(mesh)):
         key = jax.random.PRNGKey(cfg.seed)
         rng, init_key = jax.random.split(key)
 

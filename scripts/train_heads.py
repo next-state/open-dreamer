@@ -15,12 +15,11 @@ Architecture:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
-import grain.checkpoint
 import hydra
 import jax
 import jax.numpy as jnp
-import orbax.checkpoint as ocp
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -40,11 +39,31 @@ from dreamer.utils import (
     build_checkpoint_manager,
     build_lr_schedule,
     build_optimizer,
+    get_bundle_item_names,
+    maybe_save_bundle,
     setup_training_directories,
+    try_restore_bundle,
 )
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
+
+
+# ---------------------------
+# Checkpoint Bundle
+# ---------------------------
+
+@dataclass
+class HeadsCheckpointBundle:
+    """Bundle of all models and optimizers for checkpoint save/restore."""
+    dynamics: Dynamics
+    task_embedder: TaskEmbedder
+    policy_head: PolicyHeadMTP
+    reward_head: RewardHeadMTP
+    dynamics_optimizer: nnx.Optimizer
+    task_embedder_optimizer: nnx.Optimizer
+    policy_optimizer: nnx.Optimizer
+    reward_optimizer: nnx.Optimizer
 
 
 # ---------------------------
@@ -217,18 +236,12 @@ def train_step(
         # TODO: See if we should compute the losses and the gradients sequentially (see figure 2 of https://arxiv.org/pdf/2404.19737 and comment in pull request #16)
         # TODO: put gather_future_rewards and gather_future_actions inside of the compute_policy_loss function and compute_future_actions functions
         policy_loss = compute_policy_loss(pol, h_states, actions_btL, actions_valid)
-        reward_loss = compute_reward_loss(rew, h_states, rewards_btL, rewards_valid)
+        reward_loss, reward_metrics = compute_reward_loss(rew, h_states, rewards_btL, rewards_valid)
 
         # Combine losses
         total_loss = policy_loss + reward_loss + dynamics_loss_weight * dynamics_loss
 
-        aux = {
-            "policy_loss": policy_loss,
-            "reward_loss": reward_loss,
-            "dynamics_loss": dynamics_loss,
-            "flow_mse": dyn_aux["flow_mse"],
-            "bootstrap_mse": dyn_aux["bootstrap_mse"]
-        }
+        aux = {"policy_loss": policy_loss, "reward_loss": reward_loss, "dynamics_loss": dynamics_loss, "flow_mse": dyn_aux["flow_mse"], "bootstrap_mse": dyn_aux["bootstrap_mse"], **reward_metrics}
 
         return total_loss, aux
 
@@ -265,10 +278,7 @@ def run(cfg: HeadsConfig):
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
-    with (
-        logger,
-        jax.set_mesh(mesh),
-    ):
+    with (logger,jax.set_mesh(mesh)):
         
         # Load pretrained tokenizer and dynamics
         key = jax.random.key(cfg.seed)
@@ -316,62 +326,28 @@ def run(cfg: HeadsConfig):
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
+        # Create checkpoint bundle
+        bundle = HeadsCheckpointBundle(
+            dynamics=dynamics,
+            task_embedder=task_embedder,
+            policy_head=policy_head,
+            reward_head=reward_head,
+            dynamics_optimizer=dynamics_optimizer,
+            task_embedder_optimizer=task_embedder_optimizer,
+            policy_optimizer=policy_optimizer,
+            reward_optimizer=reward_optimizer,
+        )
+
         # Checkpointing
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
-            item_names=(
-                "dynamics_state", "dynamics_optimizer_state",
-                "task_embedder_state", "task_embedder_optimizer_state",
-                "policy_state", "policy_optimizer_state",
-                "reward_state", "reward_optimizer_state",
-                "train_dataloader_state", "rngs", "meta"
-            )
+            item_names=get_bundle_item_names(bundle)
         ) as checkpoint_manager:
+            
             # Restore from checkpoint
-            step = checkpoint_manager.latest_step()
-            if step is not None:
-                # Extract states from all models/optimizers
-                dynamics_state = nnx.state(dynamics)
-                task_embedder_state = nnx.state(task_embedder)
-                policy_state = nnx.state(policy_head)
-                reward_state = nnx.state(reward_head)
-
-                dynamics_opt_state = nnx.state(dynamics_optimizer)
-                task_embedder_opt_state = nnx.state(task_embedder_optimizer)
-                policy_opt_state = nnx.state(policy_optimizer)
-                reward_opt_state = nnx.state(reward_optimizer)
-
-                # Create restore args composite
-                restore_args = ocp.args.Composite(
-                    dynamics_state=ocp.args.StandardRestore(dynamics_state),  # type: ignore
-                    task_embedder_state=ocp.args.StandardRestore(task_embedder_state),  # type: ignore
-                    policy_state=ocp.args.StandardRestore(policy_state),  # type: ignore
-                    reward_state=ocp.args.StandardRestore(reward_state),  # type: ignore
-                    dynamics_optimizer_state=ocp.args.StandardRestore(dynamics_opt_state),  # type: ignore
-                    task_embedder_optimizer_state=ocp.args.StandardRestore(task_embedder_opt_state),  # type: ignore
-                    policy_optimizer_state=ocp.args.StandardRestore(policy_opt_state),  # type: ignore
-                    reward_optimizer_state=ocp.args.StandardRestore(reward_opt_state),  # type: ignore
-                    train_dataloader_state=grain.checkpoint.CheckpointRestore(train_iterator),  # type: ignore
-                    rngs=ocp.args.StandardRestore({"key": rng}),  # type: ignore
-                )
-
-                # Restore and update all models
-                restored = checkpoint_manager.restore(step, args=restore_args)
-                nnx.update(dynamics, restored["dynamics_state"])
-                nnx.update(task_embedder, restored["task_embedder_state"])
-                nnx.update(policy_head, restored["policy_state"])
-                nnx.update(reward_head, restored["reward_state"])
-                nnx.update(dynamics_optimizer, restored["dynamics_optimizer_state"])
-                nnx.update(task_embedder_optimizer, restored["task_embedder_optimizer_state"])
-                nnx.update(policy_optimizer, restored["policy_optimizer_state"])
-                nnx.update(reward_optimizer, restored["reward_optimizer_state"])
-                train_iterator = restored["train_dataloader_state"]
-                rng = restored["rngs"]["key"]
-                start_step = step + 1
-                print(f"[ckpt] Restored step {step}")
-            else:
-                start_step = 0
-                print("[ckpt] No checkpoint found, starting from scratch")
+            start_step, bundle, train_iterator, rng = try_restore_bundle(
+                checkpoint_manager, bundle, train_iterator, rng
+            )
 
             # Training loop
             pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step, total=cfg.max_steps)
@@ -393,15 +369,15 @@ def run(cfg: HeadsConfig):
 
                 # Training step (encodes videos and trains)
                 metrics = encode_and_train_step(
-                    tokenizer, dynamics, task_embedder, policy_head, reward_head,
-                    dynamics_optimizer, task_embedder_optimizer,
-                    policy_optimizer, reward_optimizer,
+                    tokenizer, bundle.dynamics, bundle.task_embedder, bundle.policy_head, bundle.reward_head,
+                    bundle.dynamics_optimizer, bundle.task_embedder_optimizer,
+                    bundle.policy_optimizer, bundle.reward_optimizer,
                     videos, actions, rewards,
                     tokenizer_key=tokenizer_key,
                     master_key=master_key,
                     step=step,
                     packing_factor=dynamics_cfg.packing_factor,
-                    k_max=dynamics.cfg.k_max,
+                    k_max=bundle.dynamics.cfg.k_max,
                     L_mtp=cfg.L,
                     B_self=(B // 2) * (step >= cfg.bootstrap_start),  # This will make the function compile twice. TODO: see if it's worth fixing this
                     dynamics_loss_weight=cfg.dynamics_loss_weight,
@@ -412,33 +388,10 @@ def run(cfg: HeadsConfig):
                     metrics_cpu = jax.device_get(metrics)
                     logger.log(step, metrics=metrics_cpu, pbar=pbar)
 
-                # Checkpointing (inline save)
-                if checkpoint_manager.should_save(step):
-                    # Extract states
-                    dynamics_state = nnx.state(dynamics)
-                    task_embedder_state = nnx.state(task_embedder)
-                    policy_state = nnx.state(policy_head)
-                    reward_state = nnx.state(reward_head)
-                    dynamics_opt_state = nnx.state(dynamics_optimizer)
-                    task_embedder_opt_state = nnx.state(task_embedder_optimizer)
-                    policy_opt_state = nnx.state(policy_optimizer)
-                    reward_opt_state = nnx.state(reward_optimizer)
-
-                    # Create save args composite
-                    save_args = ocp.args.Composite(
-                        dynamics_state=ocp.args.StandardSave(dynamics_state),  # type: ignore
-                        task_embedder_state=ocp.args.StandardSave(task_embedder_state),  # type: ignore
-                        policy_state=ocp.args.StandardSave(policy_state),  # type: ignore
-                        reward_state=ocp.args.StandardSave(reward_state),  # type: ignore
-                        dynamics_optimizer_state=ocp.args.StandardSave(dynamics_opt_state),  # type: ignore
-                        task_embedder_optimizer_state=ocp.args.StandardSave(task_embedder_opt_state),  # type: ignore
-                        policy_optimizer_state=ocp.args.StandardSave(policy_opt_state),  # type: ignore
-                        reward_optimizer_state=ocp.args.StandardSave(reward_opt_state),  # type: ignore
-                        train_dataloader_state=grain.checkpoint.CheckpointSave(train_iterator),  # type: ignore
-                        rngs=ocp.args.StandardSave({'key': rng}),  # type: ignore
-                        meta=ocp.args.JsonSave(meta)  # type: ignore
-                    )
-                    checkpoint_manager.save(step, args=save_args)
+                # Checkpointing
+                maybe_save_bundle(
+                    checkpoint_manager, step, bundle, train_iterator, rng, meta
+                )
 
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
@@ -447,7 +400,7 @@ def run(cfg: HeadsConfig):
                     val_actions = actions[:4]
                     run_evaluation(
                         cfg, tokenizer_cfg, step,
-                        tokenizer, dynamics,
+                        tokenizer, bundle.dynamics,
                         val_videos, val_actions, vis_dir, rng, logger
                     )
 
