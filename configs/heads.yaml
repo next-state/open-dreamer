@@ -4,13 +4,13 @@ defaults:
   - _self_
 
 run_name: heads
-dynamics_ckpt: "logs/dynamics_140M/checkpoints"
+dynamics_ckpt: "logs/dynamics/checkpoints"
 
 ckpt:
   save_interval_steps: 100_000
 
 dataset:
-  B: 64
+  B: 32
   T: 32
 
 action_dim: 16
@@ -21,7 +21,7 @@ bootstrap_start: 5000
 self_fraction: 0.25
 
 max_steps: 1_000_000_000
-write_video_every: 5000
+write_video_every: 500
 
 # Learning rate schedules
 lr_schedule_policy:

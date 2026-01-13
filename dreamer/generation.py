@@ -125,7 +125,7 @@ def next_latent(
             step_indices= jnp.full((B, 1), step_idx,    dtype=jnp.int32)
             tau_indices = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
 
-            assert agent_tokens is None or agent_tokens.shape[1] == noisy_latent.shape[1] 
+            assert agent_tokens is None or agent_tokens.shape[1] == noisy_latent.shape[1], f"agent_tokens.shape = {agent_tokens.shape}, noisy_latent.shape = {noisy_latent.shape}"
         
         else: # Used only for debugging.
             assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None
@@ -150,7 +150,7 @@ def next_latent(
         )
 
         latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
-        h_last = h_seq[:, -1, :, :] if isinstance(h_seq, jax.Array) else h_seq # (B, n_agent, d_model)
+        h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq # (B, n_agent, d_model)
 
         # Per-step mixing toward clean latent
         latent_t_new = (1.0 - alpha) * latent_t + alpha * latent_clean_pred
@@ -177,7 +177,7 @@ def next_latent(
             action, step_indices, tau_indices, latent_noised_caching,
             agent_tokens=agent_tokens, deterministic=True, caches=caches
         )
-        h_last = h_seq_final[:, -1, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
+        h_last = h_seq_final[:, -1:, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
     else:
         h_last = h_history[-1] if h_history is not None else None  # (B, n_agent, d_model)
         caches_new = None
@@ -247,7 +247,7 @@ def latent_rollout(
     actions_ctx: jax.Array,
     num_steps: int,
     rng: jax.Array,
-    initial_agent_latents: jax.Array | None = None,
+    initial_agent_tokens: jax.Array | None = None,
 ):
     """
     Autoregressive rollout in latent space.
@@ -259,7 +259,7 @@ def latent_rollout(
         latents_ctx: (B, T_ctx, n_spatial, D_s) Context latents.
         actions_ctx: (B, T_ctx, ...) Context actions.
         num_steps: Number of steps to unroll.
-        rng: Random number generator key.
+        rng: Random number generator key
         initial_agent_tokens: Optional (B, T_ctx, n_agent, D) agent tokens for context.
         
     Returns:
@@ -270,8 +270,8 @@ def latent_rollout(
     # 1. Initialize caches and process context
     # We need to compute the max window size needed: context + rollout
     window_size = T_ctx + num_steps
-    n_agent = policy.L if isinstance(policy, PolicyHeadMTP) else 0
-    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size, n_agent=n_agent, dtype=latents_ctx.dtype)
+    n_agents = policy.L if isinstance(policy, PolicyHeadMTP) else 0
+    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
     
     # Run dynamics on context to prefill caches and get last hidden state
     # Use clean signal for ground truth context 
@@ -281,13 +281,16 @@ def latent_rollout(
     # Dynamics call
     _, (h_seq, caches) = dynamics(
         actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx,
-        agent_tokens=initial_agent_latents, caches=caches, deterministic=True
+        agent_tokens=initial_agent_tokens, caches=caches, deterministic=True
     )
 
-    initial_agent_latents = initial_agent_latents[:, -1:] if isinstance(initial_agent_latents, jax.Array) else None
+    # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
+    agent_tokens = initial_agent_tokens[:,-1:] if isinstance(initial_agent_tokens, jax.Array) else None
+    h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None # (B, n_agent, D)
+    
     # 2. Scan loop for rollout
     def scan_step(carry, step_idx):
-        caches_t, rng = carry
+        h_t, caches_t, rng = carry
         
         # Sample action
         rng, rng_action = jax.random.split(rng)
@@ -295,31 +298,34 @@ def latent_rollout(
         if isinstance(policy, jax.Array):
             action = policy[:, step_idx]
         else:
-            # Policy call - h_t needs shape (B, T, n_agent, D) but we have (B, n_agent, D)
-            assert isinstance(initial_agent_latents, jax.Array), "the agent tokens are required to be provided if using a policy model"
-            logits = policy(initial_agent_latents, deterministic=False)  # (B, 1, L, A)
-            logits = logits[:, 0, 0, :]  # Take first timestep, first MTP offset -> (B, A)
-            action = jax.random.categorical(rng_action, logits)  # (B,)
+            # Policy call - returns (B, T, L, A) logits for L future actions
+            logits = policy(h_t, deterministic=False)
+            assert isinstance(logits, jax.Array), "Logits should be a JAX array"
+            # Sample from all L action heads, but only use the first one for this step
+            all_actions = jax.random.categorical(rng_action, logits)  # (B, T, L)
+            action = all_actions[:, :, 0]  # (B, T) - use first predicted action
         
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng = next_latent(
-            dynamics, schedule, action, latent_shape, rng, caches=caches_t,
-            agent_tokens=initial_agent_latents
+            dynamics, schedule, action, latent_shape, rng, caches=caches_t, agent_tokens = agent_tokens
         )
         
-        return (caches_next, rng), (latent_next[:,0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
+        # Squeeze action to (B,) for consistent output shape
+        action_out = action[:, 0] if action.ndim == 2 else action
+        return (h_next, caches_next, rng), (latent_next[:,0], action_out, h_next) # latent_next is (B, 1, n_spatial, D_s) 
 
     # Run scan
     _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
         scan_step,
-        (caches, rng),
+        (h_last, caches, rng),
         jnp.arange(num_steps)
     )
     
     # Unpack results
     rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
     rollout_actions = einops.rearrange(rollout_actions, 't b -> b t')
-    rollout_hidden = einops.rearrange(rollout_hidden, 't b n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
+    # h_next has shape (B, 1, n_agent, d_model), so scan output is (t, B, 1, n_agent, d_model)
+    rollout_hidden = einops.rearrange(rollout_hidden, 't b 1 n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
     
     out_latents = jnp.concatenate((latents_ctx, rollout_latents), axis=1)
 
