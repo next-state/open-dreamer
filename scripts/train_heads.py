@@ -401,7 +401,8 @@ def run(cfg: HeadsConfig):
                     run_evaluation(
                         cfg, tokenizer_cfg, step,
                         tokenizer, bundle.dynamics,
-                        val_videos, val_actions, vis_dir, rng, logger
+                        val_videos, val_actions, vis_dir, rng, logger, bundle.policy_head,
+                        bundle.task_embedder
                     )
 
     print("[done] Agent finetuning complete!")

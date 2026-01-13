@@ -21,6 +21,7 @@ import optax
 import time
 
 from dreamer.generation import DenoiseSchedule
+from dreamer.models import PolicyHeadMTP, TaskEmbedder
 from dreamer.sampler import sample_video
 from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border
 
@@ -629,6 +630,8 @@ def run_evaluation(
     vis_dir: Path,
     rng: jax.Array,
     logger,
+    policy: PolicyHeadMTP | None = None,
+    task_embedder: TaskEmbedder | None = None,
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
@@ -661,8 +664,8 @@ def run_evaluation(
         horizon = val_videos.shape[1] - ctx_length
 
         pred_frames, floor_frames, gt_frames = sample_video(
-            tokenizer, dynamics, 
-            val_videos, val_actions, horizon, schedule_config, rng
+            tokenizer, dynamics, val_videos, 
+            val_actions, horizon, schedule_config, rng, policy, task_embedder
         )
 
         # Compute metrics

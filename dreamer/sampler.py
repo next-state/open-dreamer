@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from dreamer.models import Tokenizer, Dynamics
+from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from .generation import DenoiseSchedule, video_rollout
 
 
@@ -22,6 +22,8 @@ def sample_video(
     horizon: int,
     schedule_config: DenoiseSchedule,
     rng: jax.Array,
+    policy: PolicyHeadMTP | None = None,
+    task_embedder: TaskEmbedder | None = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """
     Sample video predictions using Tokenizer and Dynamics.
@@ -34,6 +36,10 @@ def sample_video(
         horizon: Number of future frames to predict
         schedule_config: DenoiseSchedule with rollout parameters
         rng: Random key
+        policy: Optional policy model. If provided, actions are sampled from the policy
+                during rollout instead of using ground truth future actions.
+        task_embedder: Optional task embedder. Required when policy is provided to generate
+                agent tokens for the dynamics model.
     
     Returns:
         pred_frames: (B, ctx+horizon, H, W, C) predicted frames [0, 255] uint8
@@ -78,17 +84,26 @@ def sample_video(
     tokenized_frames = jnp.clip(tokenized_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
-    actions_future = jnp.array(actions_future)
+    # Use policy if provided, otherwise use ground truth future actions
+    # When using a policy, we need agent tokens for the dynamics model to produce hidden states
+    T_ctx = frames_ctx.shape[1]
+    if policy is not None:
+        assert task_embedder is not None, "task_embedder is required when policy is provided"
+        task = jnp.zeros((B,), dtype=jnp.int32)  # Use task ID 0 for all samples
+        initial_agent_tokens = task_embedder(task=task, B=B, T=T_ctx)
+    else:
+        initial_agent_tokens = None
+    
     pred_frames = video_rollout(
         tokenizer,
         dynamics,
-        policy=actions_future,
+        policy = actions_future if policy is None else policy,
         schedule=schedule_config,
         frames_ctx=frames_ctx,
         actions_ctx=actions_ctx,
         num_steps=horizon,
         rng=rng,
-        initial_agent_tokens=None
+        initial_agent_tokens=initial_agent_tokens,
     )
 
     frames = jnp.clip(frames, 0, 255).astype(jnp.uint8)

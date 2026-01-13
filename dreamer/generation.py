@@ -5,7 +5,7 @@ import numpy as np
 import jax.numpy as jnp
 from typing import Any, Dict, Tuple 
 
-from .models import Dynamics, KVCache, PolicyHeadMTP, Tokenizer
+from .models import Dynamics, KVCache, PolicyHeadMTP, TaskEmbedder, Tokenizer
 
 
 from flax.struct import dataclass
@@ -247,7 +247,7 @@ def latent_rollout(
     actions_ctx: jax.Array,
     num_steps: int,
     rng: jax.Array,
-    initial_agent_tokens: jax.Array | None = None,
+    initial_agent_latents: jax.Array | None = None,
 ):
     """
     Autoregressive rollout in latent space.
@@ -270,7 +270,8 @@ def latent_rollout(
     # 1. Initialize caches and process context
     # We need to compute the max window size needed: context + rollout
     window_size = T_ctx + num_steps
-    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size, dtype=latents_ctx.dtype)
+    n_agent = policy.L if isinstance(policy, PolicyHeadMTP) else 0
+    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size, n_agent=n_agent, dtype=latents_ctx.dtype)
     
     # Run dynamics on context to prefill caches and get last hidden state
     # Use clean signal for ground truth context 
@@ -280,15 +281,13 @@ def latent_rollout(
     # Dynamics call
     _, (h_seq, caches) = dynamics(
         actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx,
-        agent_tokens=initial_agent_tokens, caches=caches, deterministic=True
+        agent_tokens=initial_agent_latents, caches=caches, deterministic=True
     )
 
-    # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
-    h_last = h_seq[:, -1] if isinstance(h_seq, jax.Array) else None # (B, n_agent, D)
-    
+    initial_agent_latents = initial_agent_latents[:, -1:] if isinstance(initial_agent_latents, jax.Array) else None
     # 2. Scan loop for rollout
     def scan_step(carry, step_idx):
-        h_t, caches_t, rng = carry
+        caches_t, rng = carry
         
         # Sample action
         rng, rng_action = jax.random.split(rng)
@@ -296,22 +295,24 @@ def latent_rollout(
         if isinstance(policy, jax.Array):
             action = policy[:, step_idx]
         else:
-            # Policy call
-            logits = policy(h_t, deterministic=False)
-            assert isinstance(logits, jax.Array), "Logits should be a JAX array"
-            action = jax.random.categorical(rng_action, logits) # (B, L)
+            # Policy call - h_t needs shape (B, T, n_agent, D) but we have (B, n_agent, D)
+            assert isinstance(initial_agent_latents, jax.Array), "the agent tokens are required to be provided if using a policy model"
+            logits = policy(initial_agent_latents, deterministic=False)  # (B, 1, L, A)
+            logits = logits[:, 0, 0, :]  # Take first timestep, first MTP offset -> (B, A)
+            action = jax.random.categorical(rng_action, logits)  # (B,)
         
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng = next_latent(
-            dynamics, schedule, action, latent_shape, rng, caches=caches_t
+            dynamics, schedule, action, latent_shape, rng, caches=caches_t,
+            agent_tokens=initial_agent_latents
         )
         
-        return (h_next, caches_next, rng), (latent_next[:,0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
+        return (caches_next, rng), (latent_next[:,0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
 
     # Run scan
     _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
         scan_step,
-        (h_last, caches, rng),
+        (caches, rng),
         jnp.arange(num_steps)
     )
     
@@ -352,7 +353,7 @@ def video_rollout(
         actions_ctx: (B, T_ctx, ...) Context actions.
         num_steps: Number of steps to unroll.
         rng: Random number generator key.
-        initial_agent_tokens: Optional agent tokens.
+        initial_agent_tokens: Optional agent tokens for context.
     Returns:
         pred_frames: (B, T_ctx + num_steps, H, W, C)
     """
@@ -379,7 +380,7 @@ def video_rollout(
         actions_ctx,
         num_steps,
         rng,
-        initial_agent_tokens
+        initial_agent_tokens,
     )
 
     # Decode
