@@ -220,6 +220,7 @@ def run(cfg: TokenizerConfig):
 
         # Scaling laws: compute max_steps from param count if enabled
         n_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
+        tokens_per_step = cfg.dataset.B * cfg.dataset.T * n_patches
         flops_per_step = estimate_tokenizer_flops(
             nparams=param_counts["total"],
             encoder_depth=cfg.encoder.depth,
@@ -245,7 +246,6 @@ def run(cfg: TokenizerConfig):
             print(f"[IsoFLOPs] {cfg.scaling_flops_budget:.2e} FLOPs / {flops_per_step:.2e} per step = {computed_steps:,} steps")
         elif cfg.scaling_tokens_per_param > 0:
             # Compute-optimal mode: fixed tokens per param ratio
-            tokens_per_step = cfg.dataset.B * cfg.dataset.T
             computed_steps = compute_max_steps(
                 param_count=param_counts["total"],
                 tokens_per_param=cfg.scaling_tokens_per_param,
@@ -366,9 +366,7 @@ def run(cfg: TokenizerConfig):
             # Log final scaling metrics
             train_elapsed = time.time() - train_start_time
             final_step = min(step, cfg.max_steps - 1)
-            
-            n_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
-            tokens_trained = cfg.dataset.B * cfg.dataset.T * n_patches * final_step
+            tokens_trained = tokens_per_step * final_step
             
             # Write structured metrics file for analysis
             metrics_file = run_dir / f"{cfg.run_name}_metrics.json"
