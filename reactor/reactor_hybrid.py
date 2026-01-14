@@ -20,7 +20,7 @@ IMAGINATION MODE:
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
+from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder, Tokenizer
 from dreamer.generation import DenoiseSchedule, next_frame
 from dreamer.parallel import create_data_model_parallel, MeshRules
 from dataclasses import dataclass
@@ -103,7 +103,7 @@ def input_to_action(controller_state: Dict[str, Any]) -> jax.Array:
     return jnp.full((1, 1), action_idx, dtype=jnp.int32)
 
 
-def create_update_caches_fn(tokenizer, dynamics, schedule):
+def create_update_caches_fn(tokenizer:Tokenizer, dynamics: Dynamics, schedule:DenoiseSchedule, task_embeddings: None | jax.Array):
     """
     Create a function that updates KV caches by processing a frame through the model.
     
@@ -111,7 +111,7 @@ def create_update_caches_fn(tokenizer, dynamics, schedule):
     and decodes to update both caches. This keeps the world model synchronized
     with the procgen environment frames.
     """
-    packing_factor = dynamics.config.packing_factor
+    packing_factor = dynamics.cfg.packing_factor
     step_idx_ctx = schedule.step_idx_ctx
     tau_idx_ctx = schedule.tau_idx_ctx
     tau_ctx = schedule.tau_ctx
@@ -141,12 +141,12 @@ def create_update_caches_fn(tokenizer, dynamics, schedule):
         step_indices = jnp.full((1, 1), step_idx_ctx, dtype=jnp.int32)
         tau_indices = jnp.full((1, 1), tau_idx_ctx, dtype=jnp.int32)
         
-        _, (_, dynamics_cache_new) = dynamics(
+        _, (h_new, dynamics_cache_new) = dynamics(
             action,
             step_indices,
             tau_indices,
             latent_noised,
-            agent_tokens=None,
+            task_embeddings=task_embeddings,
             deterministic=True,
             caches=dynamics_cache,
         )
@@ -160,7 +160,7 @@ def create_update_caches_fn(tokenizer, dynamics, schedule):
             rngs=None,
         )
         
-        return dynamics_cache_new, tokenizer_cache_new, rng
+        return h_new, dynamics_cache_new, tokenizer_cache_new, rng
     
     return update_caches
 
@@ -304,25 +304,6 @@ class HybridVideoModel(VideoModel):
             # Random key
             self.rng = jax.random.PRNGKey(0)
             
-            
-            # JIT compile cache update function
-            logger.info("Compiling update_caches function...")
-            update_caches_fn = create_update_caches_fn(
-                self.tokenizer, self.dynamics, self.schedule
-            )
-            self.update_caches_compiled = jax.jit(update_caches_fn)
-            
-            # JIT compile next_frame function for imagination mode
-            logger.info("Compiling next_frame function...")
-            next_frame_partial = Partial(
-                next_frame,
-                tokenizer=self.tokenizer,
-                dynamics=self.dynamics,
-                schedule=self.schedule,
-                latent_shape=self.latent_shape,
-            )
-            self.next_frame_compiled = jax.jit(next_frame_partial)
-
             # Load agent components if use_agent=True
             self.task_embedder = None
             self.policy_head = None
@@ -345,6 +326,23 @@ class HybridVideoModel(VideoModel):
                 task = jnp.full((1,), self.task_id, dtype=jnp.int32)
                 self.task_embeddings = self.task_embedder(task=task, B=1, T=1)
 
+
+            # JIT compile next_frame function for imagination mode
+            logger.info("Compiling next_frame function...")
+            self.next_frame_partial = jax.jit(Partial(
+                next_frame,
+                tokenizer=self.tokenizer,
+                dynamics=self.dynamics,
+                schedule=self.schedule,
+                latent_shape=self.latent_shape,
+            ))
+
+            # JIT compile cache update function
+            logger.info("Compiling update_caches function...")
+            update_caches_fn = create_update_caches_fn(
+                self.tokenizer, self.dynamics, self.schedule, self.task_embeddings
+            )
+            self.update_caches_compiled = jax.jit(update_caches_fn)
 
             # Initialize KV caches (with n_agent if using policy)
             logger.info("Initializing KV caches...")
@@ -395,7 +393,7 @@ class HybridVideoModel(VideoModel):
         action_jax = jnp.array([[action]], dtype=jnp.int32)
         
         self.rng, key = jax.random.split(self.rng)
-        self.dynamics_cache, self.tokenizer_cache, self.rng = self.update_caches_compiled(
+        self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = self.update_caches_compiled(
             frame_jax,
             action_jax,
             self.dynamics_cache,
@@ -507,7 +505,7 @@ class HybridVideoModel(VideoModel):
                     frame_jax = jnp.array(frame)[None, None]  # (1, 1, H, W, C)
                     action_jax = jnp.array([[action_int]], dtype=jnp.int32)
                     
-                    self.dynamics_cache, self.tokenizer_cache, self.rng = self.update_caches_compiled(
+                    self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = self.update_caches_compiled(
                         frame_jax,
                         action_jax,
                         self.dynamics_cache,
@@ -519,7 +517,6 @@ class HybridVideoModel(VideoModel):
                     
                 else:
                     # === IMAGINATION MODE ===
-                        
                     frame_jax, self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = \
                         self.next_frame_compiled(
                             action=action,

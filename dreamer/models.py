@@ -891,7 +891,7 @@ class Dynamics(nnx.Module):
         )
 
     def __call__(self, actions, step_indices, tau_indices, packed_enc_tokens, *,
-                task_emeddings: Optional[jnp.ndarray] = None, deterministic: bool = True,
+                task_embeddings: Optional[jnp.ndarray] = None, deterministic: bool = True,
                 caches: Optional[KVCache | None] = None, rngs: Optional[nnx.Rngs] = None
     )->Tuple[jax.Array, Tuple[jax.Array|None, KVCache|None]]:
         """
@@ -926,14 +926,14 @@ class Dynamics(nnx.Module):
         signal_tok = self.signal_embed(tau_indices)[:, :, None, :]     # (B, T, 1, d_model)
 
         # --- 5) Concatenate in your declared layout order
-        if task_emeddings is not None:
-            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, task_emeddings]
+        if task_embeddings is not None:
+            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, task_embeddings]
         else:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
         # make the layout for masking
-        n_agent = task_emeddings.shape[2] if task_emeddings is not None else 0
+        n_agent = task_embeddings.shape[2] if task_embeddings is not None else 0
         layout = self.get_token_layout(n_spatial=spatial_tokens.shape[2], n_agent=n_agent)
         mask = layout.make_mask("wm_agent")
 
@@ -941,7 +941,7 @@ class Dynamics(nnx.Module):
 
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
         x1_hat = self.flow_x_head(spatial_tokens)
-        h_t = x[:, :, layout.slices()[Modality.AGENT], :] if task_emeddings is not None else None  # (B,T,n_agent,D) or None
+        h_t = x[:, :, layout.slices()[Modality.AGENT], :] if task_embeddings is not None else None  # (B,T,n_agent,D) or None
         return x1_hat, (h_t, new_caches)
 
     @classmethod
@@ -1026,7 +1026,7 @@ class TaskEmbedder(nnx.Module):
         nnx.update(instance, restored["task_embedder_state"])
         return instance
 
-    def __call__(self, task, B: int, T: int):
+    def __call__(self, task, B: int, T: int) -> jax.Array:
         """
         If use_ids=True:
             task: (B,) int32 ids in [0, n_tasks)
