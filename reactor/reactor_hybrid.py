@@ -20,7 +20,7 @@ IMAGINATION MODE:
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from dreamer.models import Dynamics, PolicyHeadMTP
+from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.generation import DenoiseSchedule, next_frame
 from dreamer.parallel import create_data_model_parallel, MeshRules
 from dataclasses import dataclass
@@ -31,6 +31,7 @@ import logging
 import time
 from procgen import ProcgenEnv
 from reactor_runtime import VideoModel, command, get_ctx
+from jax.tree_util import Partial
 
 # Configure logging
 logging.basicConfig(
@@ -39,10 +40,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class Mode(Enum):
-    """Operating mode for the hybrid reactor."""
+class FrameGenMode(Enum):
+    """Operating mode for the frame generation reactor."""
     REALITY = "reality"          # Procgen provides frames
     IMAGINATION = "imagination"  # World model generates frames
+
+class ActionGenMode(Enum):
+    USER_INPUT = "user_input"
+    POLICY = "policy"
 
 
 @dataclass
@@ -51,17 +56,20 @@ class HybridReactorConfig:
     # Dynamics model checkpoint
     dynamics_ckpt: str = 'logs/dynamics/checkpoints'
     policy_ckpt: Optional[str] = None
-    
+
+    # Agent settings (other params loaded from checkpoint)
+    task_id: int = 0
+
     # Denoising schedule
     num_steps: int = 4  # Number of denoising steps per frame
     tau_ctx: float = 0.9
-    
+
     # Environment configuration
     env_name: str = "coinrun"
     num_levels: int = 0  # 0 = infinite procedural levels
     start_level: int = 0
     distribution_mode: str = "hard"
-    
+
     # Batch size (always 1 for interactive)
     batch_size: int = 1
 
@@ -183,11 +191,11 @@ class HybridVideoModel(VideoModel):
         When enabled, switches from procgen frames to world model generation.
         The world model continues from the current cache state (built from procgen frames).
         """
-        if enable and self.mode == Mode.REALITY:
+        if enable and self.framegen_mode == FrameGenMode.REALITY:
             logger.info("Switching to IMAGINATION mode...")
             print("DEBUG: Switching to IMAGINATION mode...", flush=True)
-            self.mode = Mode.IMAGINATION
-        elif not enable and self.mode == Mode.IMAGINATION:
+            self.framegen_mode = FrameGenMode.IMAGINATION
+        elif not enable and self.framegen_mode == FrameGenMode.IMAGINATION:
             logger.info("Switching to REALITY mode...")
             print("DEBUG: Switching to REALITY mode...", flush=True)
             # Reset caches and environment when returning to reality
@@ -195,7 +203,30 @@ class HybridVideoModel(VideoModel):
             obs = self.env.reset()
             self.current_procgen_frame = obs["rgb"][0]
             self._warmup_with_frame(self.current_procgen_frame, 4)
-            self.mode = Mode.REALITY
+            self.framegen_mode = FrameGenMode.REALITY
+
+    @command("switch_to_policy", description="Switch between user input and policy control")
+    def switch_to_policy(self, enable: bool = True):
+        """
+        Toggle policy mode.
+        
+        When enabled, the policy (if loaded) will take control of the agent.
+        When disabled, control returns to user input.
+        """
+        if enable and self.actiongen_mode == ActionGenMode.USER_INPUT:
+            if self.policy_head is None:
+                logger.warning("No policy loaded. Cannot switch to policy mode.")
+                print("DEBUG: No policy loaded. Cannot switch to policy mode.", flush=True)
+                return
+
+            logger.info("Switching to POLICY mode...")
+            print("DEBUG: Switching to POLICY mode...", flush=True)
+            self.actiongen_mode = ActionGenMode.POLICY
+            
+        elif not enable and self.actiongen_mode == ActionGenMode.POLICY:
+            logger.info("Switching to USER_INPUT mode...")
+            print("DEBUG: Switching to USER_INPUT mode...", flush=True)
+            self.actiongen_mode = ActionGenMode.USER_INPUT
 
     @command("reset_env", description="Reset environment and caches")
     def reset_environment(self):
@@ -205,7 +236,7 @@ class HybridVideoModel(VideoModel):
         obs = self.env.reset()
         self.current_procgen_frame = obs["rgb"][0]
         self._warmup_with_frame(self.current_procgen_frame, 4)
-        self.mode = Mode.REALITY
+        self.framegen_mode = FrameGenMode.REALITY
 
     def __init__(self, fps: int = 15, size: Tuple[int, int] = (64, 64),
                  cfg: Optional[HybridReactorConfig] = None):
@@ -251,8 +282,8 @@ class HybridVideoModel(VideoModel):
                 mesh_rules=mesh_rules,
                 rngs=nnx.Rngs(0)
             )
-            self.dynamics_cfg = self.dynamics.config
-            self.tokenizer_cfg = self.tokenizer.config
+            self.dynamics_cfg = self.dynamics.cfg
+            self.tokenizer_cfg = self.tokenizer.cfg
             
             # Initialize denoising schedule
             self.schedule = DenoiseSchedule.init(
@@ -262,7 +293,7 @@ class HybridVideoModel(VideoModel):
             )
             
             # Compute latent shape from configs
-            packing_factor = self.dynamics.config.packing_factor
+            packing_factor = self.dynamics.cfg.packing_factor
             n_latents = self.tokenizer_cfg.decoder.n_latents
             D_s = self.tokenizer_cfg.encoder.d_bottleneck
             
@@ -273,12 +304,56 @@ class HybridVideoModel(VideoModel):
             # Random key
             self.rng = jax.random.PRNGKey(0)
             
-            # Initialize KV caches
+            
+            # JIT compile cache update function
+            logger.info("Compiling update_caches function...")
+            update_caches_fn = create_update_caches_fn(
+                self.tokenizer, self.dynamics, self.schedule
+            )
+            self.update_caches_compiled = jax.jit(update_caches_fn)
+            
+            # JIT compile next_frame function for imagination mode
+            logger.info("Compiling next_frame function...")
+            next_frame_partial = Partial(
+                next_frame,
+                tokenizer=self.tokenizer,
+                dynamics=self.dynamics,
+                schedule=self.schedule,
+                latent_shape=self.latent_shape,
+            )
+            self.next_frame_compiled = jax.jit(next_frame_partial)
+
+            # Load agent components if use_agent=True
+            self.task_embedder = None
+            self.policy_head = None
+            self.task_embeddings = None
+
+            if cfg.policy_ckpt is not None:
+
+                logger.info(f"Loading agent from {cfg.policy_ckpt}")
+                rng_key, task_key, pol_key = jax.random.split(jax.random.PRNGKey(42), 3)
+
+                self.task_embedder = TaskEmbedder.from_pretrained(cfg.policy_ckpt, mesh_rules, nnx.Rngs(task_key))
+                self.policy_head = PolicyHeadMTP.from_pretrained(cfg.policy_ckpt, mesh_rules, nnx.Rngs(pol_key))
+                logger.info("Agent loaded successfully")
+
+                self.task_id = cfg.task_id
+                self.n_agent = self.task_embedder.n_agent
+            
+            
+                # Create agent tokens
+                task = jnp.full((1,), self.task_id, dtype=jnp.int32)
+                self.task_embeddings = self.task_embedder(task=task, B=1, T=1)
+
+
+            # Initialize KV caches (with n_agent if using policy)
             logger.info("Initializing KV caches...")
+            n_agent = 0 if self.policy_head is None else self.policy_head.L
             self.initial_dynamics_cache = self.dynamics.create_static_caches(
                 batch_size=1,
                 n_spatial=self.n_spatial,
                 window_size=self.window_size,
+                n_agent=n_agent,
                 dtype=self.dynamics_cfg.dtype,
             )
             
@@ -292,31 +367,13 @@ class HybridVideoModel(VideoModel):
             self.dynamics_cache = None
             self.tokenizer_cache = None
             
-            # JIT compile cache update function
-            logger.info("Compiling update_caches function...")
-            update_caches_fn = create_update_caches_fn(
-                self.tokenizer, self.dynamics, self.schedule
-            )
-            self.update_caches_compiled = jax.jit(update_caches_fn)
-            
-            # JIT compile next_frame function for imagination mode
-            logger.info("Compiling next_frame function...")
-            from jax.tree_util import Partial
-            next_frame_partial = Partial(
-                next_frame,
-                tokenizer=self.tokenizer,
-                dynamics=self.dynamics,
-                schedule=self.schedule,
-                latent_shape=self.latent_shape,
-            )
-            self.next_frame_compiled = jax.jit(next_frame_partial)
-        
         # Mode and state
-        self.mode = Mode.REALITY
+        self.framegen_mode = FrameGenMode.REALITY
         self.current_action = jnp.full((1, 1), 4, dtype=jnp.int32)  # No movement
         self.controller_state = {}
         self.current_procgen_frame = None
-        
+        self.h_last = None  # Hidden state for policy
+
         logger.info("Hybrid Reactor initialization complete")
         print("DEBUG: Hybrid Reactor initialization complete", flush=True)
 
@@ -324,6 +381,7 @@ class HybridVideoModel(VideoModel):
         """Reset KV caches to initial empty state."""
         self.dynamics_cache = self.initial_dynamics_cache
         self.tokenizer_cache = self.initial_tokenizer_cache
+        self.h_last = None
 
     def _warmup_with_frame(self, frame: np.ndarray, action: int):
         """
@@ -365,7 +423,8 @@ class HybridVideoModel(VideoModel):
         print("DEBUG: Starting Hybrid session...", flush=True)
         
         # Reset state
-        self.mode = Mode.REALITY
+        self.framegen_mode = FrameGenMode.REALITY
+        self.actiongen_mode = ActionGenMode.USER_INPUT
         self.current_action = jnp.full((1, 1), 4, dtype=jnp.int32)
         self.controller_state = {}
         
@@ -403,8 +462,8 @@ class HybridVideoModel(VideoModel):
         # Emit initial frame
         get_ctx().emit_block(self.current_procgen_frame)
         
-        logger.info(f"Session initialized. Mode: {self.mode.value}")
-        print(f"DEBUG: Session initialized. Mode: {self.mode.value}", flush=True)
+        logger.info(f"Session initialized. Mode: {self.framegen_mode.value}")
+        print(f"DEBUG: Session initialized. Mode: {self.framegen_mode.value}", flush=True)
         
         # Calculate frame time based on FPS
         frame_time = 1.0 / self.fps
@@ -415,7 +474,14 @@ class HybridVideoModel(VideoModel):
             while get_ctx()._stop_evt.is_set() is False:
                 self.rng, key = jax.random.split(self.rng)
                 
-                if self.mode == Mode.REALITY:
+                if self.actiongen_mode == ActionGenMode.POLICY and isinstance(self.policy_head, PolicyHeadMTP) and self.h_last is not None:
+                    logits = self.policy_head(self.h_last, deterministic=True)  # (1, 1, L, A)
+                    action = jax.random.categorical(key, logits[:, 0, 0, :])  # (1,)
+                    action = action[:, None].astype(jnp.int32)  # (1, 1)
+                else:
+                    action = self.current_action
+                    
+                if self.framegen_mode == FrameGenMode.REALITY:
                     # === REALITY MODE ===
                     # 1. Step procgen environment
                     action_int = self.current_action_int
@@ -453,16 +519,17 @@ class HybridVideoModel(VideoModel):
                     
                 else:
                     # === IMAGINATION MODE ===
-                    # Generate frame using world model
-                    frame_jax, h, self.dynamics_cache, self.tokenizer_cache, self.rng = \
+                        
+                    frame_jax, self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = \
                         self.next_frame_compiled(
-                            action=self.current_action,
+                            action=action,
                             dynamics_cache=self.dynamics_cache,
                             tokenizer_cache=self.tokenizer_cache,
                             rng=key,
                             task=None,
+                            agent_tokens = self.task_embeddings
                         )
-                    
+
                     frame = np.array(frame_jax[0, 0])  # (H, W, C)
                     get_ctx().emit_block(frame)
                 

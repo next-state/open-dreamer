@@ -103,7 +103,7 @@ def sample_video(
         actions_ctx=actions_ctx,
         num_steps=horizon,
         rng=rng,
-        initial_agent_tokens=initial_agent_tokens,
+        initial_task_embedding=initial_agent_tokens,
     )
 
     frames = jnp.clip(frames, 0, 255).astype(jnp.uint8)

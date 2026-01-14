@@ -73,7 +73,7 @@ def next_latent(
     latent_shape: Tuple,                   # (B, 1, n_spatial, D_s)
     rng: jax.Array,
     prefill_length: int | None = None,
-    agent_tokens: jax.Array | None = None,  # (B, T_ctx+1, n_agent, d_model)
+    task_embedding: jax.Array | None = None,  # (B, T_ctx+1, n_agent, d_model)
     caches: KVCache | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: jax.Array | None = None,                 # (B, T_ctx)
@@ -125,7 +125,7 @@ def next_latent(
             step_indices= jnp.full((B, 1), step_idx,    dtype=jnp.int32)
             tau_indices = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
 
-            assert agent_tokens is None or agent_tokens.shape[1] == noisy_latent.shape[1], f"agent_tokens.shape = {agent_tokens.shape}, noisy_latent.shape = {noisy_latent.shape}"
+            assert task_embedding is None or task_embedding.shape[1] == noisy_latent.shape[1], f"agent_tokens.shape = {task_embedding.shape}, noisy_latent.shape = {noisy_latent.shape}"
         
         else: # Used only for debugging.
             assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None
@@ -146,7 +146,7 @@ def next_latent(
         # Dynamics call
         latent_clean_pred_seq, (h_seq, _) = dynamics(
             actions_input, step_indices, tau_indices, latent_input,
-            agent_tokens=agent_tokens, deterministic=True, caches=caches
+            task_emeddings=task_embedding, deterministic=True, caches=caches
         )
 
         latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
@@ -175,7 +175,7 @@ def next_latent(
         # Dynamics call
         _, (h_seq_final, caches_new) = dynamics(
             action, step_indices, tau_indices, latent_noised_caching,
-            agent_tokens=agent_tokens, deterministic=True, caches=caches
+            task_emeddings=task_embedding, deterministic=True, caches=caches
         )
         h_last = h_seq_final[:, -1:, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
     else:
@@ -195,8 +195,8 @@ def next_frame(
     dynamics_cache: Any,
     tokenizer_cache: Any,
     rng: jax.Array,
-    task: jax.Array | None,
-) -> Tuple[np.ndarray, Any, Any, Any, jax.Array]:
+    task_embedding: jax.Array | None = None,
+) -> Tuple[jax.Array, jax.Array | None, KVCache | None, Any, jax.Array]:
     """
     Generate next frame using dynamics model and decode to pixels.
     
@@ -209,9 +209,10 @@ def next_frame(
         dynamics_cache: KV cache for dynamics model from previous steps
         tokenizer_cache: KV cache for tokenizer decoder from previous steps
         rng: Random key
+        task: Optional task embedding (currently unused)
         
     Returns:
-        Tuple of (frame as numpy array, updated dynamics cache, updated tokenizer cache, updated rng)
+        Tuple of (frame as jax.Array, h_last, updated dynamics cache, updated tokenizer cache, updated rng)
     """
     # Generate next latent using τ-ladder denoising
     latent, h_last, dynamics_cache_updated, rng = next_latent(
@@ -221,7 +222,7 @@ def next_frame(
         latent_shape=latent_shape,
         rng=rng,
         prefill_length=None,  # No prefill for interactive generation
-        agent_tokens=None,  # Not using agent tokens in reactor mode
+        task_embedding=task_embedding,
         caches=dynamics_cache,
     )
     
@@ -247,7 +248,7 @@ def latent_rollout(
     actions_ctx: jax.Array,
     num_steps: int,
     rng: jax.Array,
-    initial_agent_tokens: jax.Array | None = None,
+    initial_task_embedding: jax.Array | None = None,
 ):
     """
     Autoregressive rollout in latent space.
@@ -281,11 +282,11 @@ def latent_rollout(
     # Dynamics call
     _, (h_seq, caches) = dynamics(
         actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx,
-        agent_tokens=initial_agent_tokens, caches=caches, deterministic=True
+        task_emeddings=initial_task_embedding, caches=caches, deterministic=True
     )
 
     # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
-    agent_tokens = initial_agent_tokens[:,-1:] if isinstance(initial_agent_tokens, jax.Array) else None
+    task_embedding = initial_task_embedding[:,-1:] if isinstance(initial_task_embedding, jax.Array) else None
     h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None # (B, n_agent, D)
     
     # 2. Scan loop for rollout
@@ -307,7 +308,7 @@ def latent_rollout(
         
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng = next_latent(
-            dynamics, schedule, action, latent_shape, rng, caches=caches_t, agent_tokens = agent_tokens
+            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding = task_embedding
         )
         
         # Squeeze action to (B,) for consistent output shape
@@ -345,7 +346,7 @@ def video_rollout(
     actions_ctx: jax.Array,
     num_steps: int,
     rng: jax.Array,
-    initial_agent_tokens: jax.Array | None = None,
+    initial_task_embedding: jax.Array | None = None,
 ):
     """
     End-to-end video generation rollout.
@@ -386,7 +387,7 @@ def video_rollout(
         actions_ctx,
         num_steps,
         rng,
-        initial_agent_tokens,
+        initial_task_embedding,
     )
 
     # Decode

@@ -15,7 +15,10 @@ from .utils import (
     from_dict,
     patchify, unpatchify
 )
-from .configs import TokenizerConfig, DynamicsModelConfig, DynamicsConfig, EncoderModelConfig, DecoderModelConfig
+from .configs import (
+    TokenizerConfig, DynamicsModelConfig, DynamicsConfig, EncoderModelConfig, DecoderModelConfig,
+    TaskEmbedderConfig, PolicyHeadConfig, RewardHeadConfig, ValueHeadConfig,
+)
 from .parallel import MeshRules
 
 
@@ -528,7 +531,7 @@ class BlockCausalTransformer(nnx.Module):
             ) for i in range(depth)
         ])
 
-    def __call__(self, x, mask, *, deterministic: bool = True, caches: Optional[Dict[int, KVCache]] = None, rngs: Optional[nnx.Rngs] = None):
+    def __call__(self, x, mask, *, deterministic: bool = True, caches: Optional[Dict[int, KVCache]] = None, rngs: Optional[nnx.Rngs] = None) ->Tuple[jax.Array, KVCache | None]:
         """
         Args:
             x: input tensor
@@ -888,8 +891,9 @@ class Dynamics(nnx.Module):
         )
 
     def __call__(self, actions, step_indices, tau_indices, packed_enc_tokens, *,
-                agent_tokens: Optional[jnp.ndarray] = None, deterministic: bool = True,
-                caches: Optional[Dict[int, KVCache]] = None, rngs: Optional[nnx.Rngs] = None):
+                task_emeddings: Optional[jnp.ndarray] = None, deterministic: bool = True,
+                caches: Optional[KVCache | None] = None, rngs: Optional[nnx.Rngs] = None
+    )->Tuple[jax.Array, Tuple[jax.Array|None, KVCache|None]]:
         """
         Args:
           packed_enc_tokens:      (B, T, n_spatial, d_spatial) packed encoder tokens
@@ -922,14 +926,14 @@ class Dynamics(nnx.Module):
         signal_tok = self.signal_embed(tau_indices)[:, :, None, :]     # (B, T, 1, d_model)
 
         # --- 5) Concatenate in your declared layout order
-        if agent_tokens is not None:
-            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, agent_tokens]
+        if task_emeddings is not None:
+            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, task_emeddings]
         else:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
         tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
 
         # make the layout for masking
-        n_agent = agent_tokens.shape[2] if agent_tokens is not None else 0
+        n_agent = task_emeddings.shape[2] if task_emeddings is not None else 0
         layout = self.get_token_layout(n_spatial=spatial_tokens.shape[2], n_agent=n_agent)
         mask = layout.make_mask("wm_agent")
 
@@ -937,7 +941,7 @@ class Dynamics(nnx.Module):
 
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
         x1_hat = self.flow_x_head(spatial_tokens)
-        h_t = x[:, :, layout.slices()[Modality.AGENT], :] if agent_tokens is not None else None  # (B,T,n_agent,D) or None
+        h_t = x[:, :, layout.slices()[Modality.AGENT], :] if task_emeddings is not None else None  # (B,T,n_agent,D) or None
         return x1_hat, (h_t, new_caches)
 
     @classmethod
@@ -987,7 +991,7 @@ class Dynamics(nnx.Module):
 class TaskEmbedder(nnx.Module):
     """Task embedder for agent conditioning."""
 
-    def __init__(self, d_model: int, n_agent: int = 1, use_ids: bool = True, 
+    def __init__(self, d_model: int, n_agent: int = 1, use_ids: bool = True,
                  n_tasks: int = 128, d_task: int = 64, dtype: Any = jnp.float32,
                  param_dtype: Any = jnp.float32, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
@@ -1004,6 +1008,23 @@ class TaskEmbedder(nnx.Module):
             self.emb = nnx.Linear(d_task, d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
 
         self.agent_base = nnx.Param(jax.random.normal(rngs.params(), (d_model,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
+
+    @classmethod
+    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: nnx.Rngs) -> "TaskEmbedder":
+        """Load TaskEmbedder from checkpoint."""
+        cfg = from_dict(TaskEmbedderConfig, Path(checkpoint_path) / "config.json", key="task_embedder")
+        instance = cls(
+            d_model=cfg.d_model, n_agent=cfg.n_agent, use_ids=cfg.use_ids,
+            n_tasks=cfg.n_tasks, dtype=cfg.dtype, param_dtype=cfg.param_dtype,
+            mesh_rules=mesh_rules, rngs=rngs,
+        )
+        ckpt_manager = ocp.CheckpointManager(checkpoint_path, options=ocp.CheckpointManagerOptions(create=False))
+        step = ckpt_manager.latest_step()
+        restored = ckpt_manager.restore(step, args=ocp.args.Composite(
+            task_embedder_state=ocp.args.StandardRestore(nnx.state(instance)),
+        ))
+        nnx.update(instance, restored["task_embedder_state"])
+        return instance
 
     def __call__(self, task, B: int, T: int):
         """
@@ -1028,7 +1049,7 @@ class PolicyHeadMTP(nnx.Module):
 
     def __init__(self, d_model: int, action_dim: int, L: int = 8, kind: str = "categorical",
                  mlp_ratio: float = 2.0, dropout_rate: float = 0.0, swiglu: bool = True,
-                 parity_2over3: bool = False, dtype: Any = jnp.float32, 
+                 parity_2over3: bool = False, dtype: Any = jnp.float32,
                  param_dtype: Any = jnp.float32, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
         self.action_dim = action_dim
@@ -1047,6 +1068,23 @@ class PolicyHeadMTP(nnx.Module):
 
         # Single matmul that produces all L offsets at once: (… , d_flat) -> (…, L, A)
         self.out = nnx.Linear(d_flat, L * action_dim, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
+
+    @classmethod
+    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: nnx.Rngs) -> "PolicyHeadMTP":
+        """Load PolicyHeadMTP from checkpoint."""
+        cfg = from_dict(PolicyHeadConfig, Path(checkpoint_path) / "config.json", key="policy_head")
+        instance = cls(
+            d_model=cfg.d_model, action_dim=cfg.action_dim, L=cfg.L,
+            dtype=cfg.dtype, param_dtype=cfg.param_dtype,
+            mesh_rules=mesh_rules, rngs=rngs,
+        )
+        ckpt_manager = ocp.CheckpointManager(checkpoint_path, options=ocp.CheckpointManagerOptions(create=False))
+        step = ckpt_manager.latest_step()
+        restored = ckpt_manager.restore(step, args=ocp.args.Composite(
+            policy_head_state=ocp.args.StandardRestore(nnx.state(instance)),
+        ))
+        nnx.update(instance, restored["policy_head_state"])
+        return instance
 
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> jnp.ndarray:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
@@ -1082,6 +1120,24 @@ class RewardHeadMTP(nnx.Module):
         # Precompute bin centers as a constant
         self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
 
+    @classmethod
+    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: nnx.Rngs) -> "RewardHeadMTP":
+        """Load RewardHeadMTP from checkpoint."""
+        cfg = from_dict(RewardHeadConfig, Path(checkpoint_path) / "config.json", key="reward_head")
+        instance = cls(
+            d_model=cfg.d_model, L=cfg.L, num_bins=cfg.num_bins,
+            log_low=cfg.log_low, log_high=cfg.log_high,
+            dtype=cfg.dtype, param_dtype=cfg.param_dtype,
+            mesh_rules=mesh_rules, rngs=rngs,
+        )
+        ckpt_manager = ocp.CheckpointManager(checkpoint_path, options=ocp.CheckpointManagerOptions(create=False))
+        step = ckpt_manager.latest_step()
+        restored = ckpt_manager.restore(step, args=ocp.args.Composite(
+            reward_head_state=ocp.args.StandardRestore(nnx.state(instance)),
+        ))
+        nnx.update(instance, restored["reward_head_state"])
+        return instance
+
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, '... n c -> ... (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
@@ -1115,6 +1171,24 @@ class ValueHead(nnx.Module):
 
         # Precompute bin centers as a constant
         self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
+
+    @classmethod
+    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: nnx.Rngs) -> "ValueHead":
+        """Load ValueHead from checkpoint."""
+        cfg = from_dict(ValueHeadConfig, Path(checkpoint_path) / "config.json", key="value_head")
+        instance = cls(
+            d_model=cfg.d_model, L=cfg.L, num_bins=cfg.num_bins,
+            log_low=cfg.log_low, log_high=cfg.log_high,
+            dtype=cfg.dtype, param_dtype=cfg.param_dtype,
+            mesh_rules=mesh_rules, rngs=rngs,
+        )
+        ckpt_manager = ocp.CheckpointManager(checkpoint_path, options=ocp.CheckpointManagerOptions(create=False))
+        step = ckpt_manager.latest_step()
+        restored = ckpt_manager.restore(step, args=ocp.args.Composite(
+            value_head_state=ocp.args.StandardRestore(nnx.state(instance)),
+        ))
+        nnx.update(instance, restored["value_head_state"])
+        return instance
 
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
