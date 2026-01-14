@@ -56,7 +56,8 @@ def fit_isoflop_curves(df: pd.DataFrame, metric: str = "final_loss") -> pd.DataF
         log_n = np.log10(group["params"].values)
         metric_vals = group[metric].values
         metric_vals = -metric_vals if is_higher_better(metric) else metric_vals
-        tokens = group["tokens_trained"].values
+        # Use total_tokens_trained for compute consistency (so N and D exponents sum to ~1)
+        tokens = group["total_tokens_trained"].values
 
         # Quadratic fit: metric = a*x^2 + b*x + c
         try:

@@ -151,7 +151,8 @@ def run(cfg: DynamicsConfig):
         )
 
         # Tokens per step (for scaling analysis)
-        tokens_per_step = cfg.dataset.B * cfg.dataset.T * (n_spatial + 1)  # +1 for the action
+        data_tokens_per_step = cfg.dataset.B * cfg.dataset.T * (n_spatial + 1) # spatial + action (both from dataloader)
+        total_tokens_per_step = cfg.dataset.B * cfg.dataset.T * (3 + n_spatial + cfg.dynamics.n_register)  # (action + signal + step + spatial + register)q
 
         if cfg.scaling_flops_budget > 0:
             # Iso-FLOPs mode: fixed compute budget, steps computed from FLOPs
@@ -169,7 +170,7 @@ def run(cfg: DynamicsConfig):
             computed_steps = compute_max_steps(
                 param_count=param_counts["total"],
                 tokens_per_param=cfg.scaling_tokens_per_param,
-                tokens_per_step=tokens_per_step,
+                tokens_per_step=total_tokens_per_step,
             )
             cfg.max_steps = computed_steps
             cfg.lr_schedule.max_steps = computed_steps
@@ -234,7 +235,8 @@ def run(cfg: DynamicsConfig):
                             "boot_mse": metrics_cpu["bootstrap_mse"],
                             "lr": lr_value,
                             # Cumulative metrics for W&B x-axis flexibility
-                            "tokens_seen": tokens_per_step * step,
+                            "data_tokens_seen": data_tokens_per_step * step,
+                            "total_tokens_seen": total_tokens_per_step * step,
                             "flops_spent": flops_per_step * step,
                         },
                         pbar=pbar,
@@ -257,11 +259,12 @@ def run(cfg: DynamicsConfig):
             # Log final scaling metrics to CSV
             train_elapsed = time.time() - train_start_time
             final_step = min(step, cfg.max_steps - 1)
-            tokens_trained = tokens_per_step * final_step
+            data_tokens_trained = data_tokens_per_step * final_step
+            total_tokens_trained = total_tokens_per_step * final_step
 
             # Append one line to parent directory's results.csv (for scaling analysis)
             results_csv = run_dir.parent / "results.csv"
-            csv_line = f"{cfg.run_name},{param_counts['total']},{tokens_per_step},{flops_per_step:.6e},{cfg.scaling_flops_budget or 0},{final_step},{tokens_trained},{train_elapsed/3600:.4f},{final_loss:.6f},\n"
+            csv_line = f"{cfg.run_name},{param_counts['total']},{data_tokens_per_step},{total_tokens_per_step},{flops_per_step:.6e},{cfg.scaling_flops_budget or 0},{final_step},{data_tokens_trained},{total_tokens_trained},{train_elapsed/3600:.4f},{final_loss:.6f},\n"
             with open(results_csv, "a") as f:
                 f.write(csv_line)
 

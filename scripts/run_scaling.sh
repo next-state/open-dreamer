@@ -47,7 +47,7 @@ OUT_DIR="logs/scaling_${MODE}_${MODEL}_${TIMESTAMP}"
 mkdir -p "$OUT_DIR"
 
 # CSV header (training script appends rows)
-echo "run_name,params,tokens_per_step,flops_per_step,flops_budget,total_steps,tokens_trained,hours,final_loss,final_psnr" > "$OUT_DIR/results.csv"
+echo "run_name,params,data_tokens_per_step,total_tokens_per_step,flops_per_step,flops_budget,total_steps,data_tokens_trained,total_tokens_trained,hours,final_loss,final_psnr" > "$OUT_DIR/results.csv"
 
 # Log experiment config
 echo "========================================"

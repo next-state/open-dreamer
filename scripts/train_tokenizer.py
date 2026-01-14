@@ -220,8 +220,8 @@ def run(cfg: TokenizerConfig):
 
         # Scaling laws: compute max_steps from param count if enabled
         n_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
-        # Data tokens = patches (the actual image data being reconstructed)
-        tokens_per_step = cfg.dataset.B * cfg.dataset.T * n_patches
+        data_tokens_per_step = cfg.dataset.B * cfg.dataset.T * n_patches
+        total_tokens_per_step = cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.encoder.n_latents)
         flops_per_step = estimate_tokenizer_flops(
             nparams=param_counts["total"],
             encoder_depth=cfg.encoder.depth,
@@ -250,7 +250,7 @@ def run(cfg: TokenizerConfig):
             computed_steps = compute_max_steps(
                 param_count=param_counts["total"],
                 tokens_per_param=cfg.scaling_tokens_per_param,
-                tokens_per_step=tokens_per_step,
+                tokens_per_step=total_tokens_per_step,
             )
             cfg.max_steps = computed_steps
             cfg.lr_schedule.max_steps = computed_steps
@@ -320,8 +320,8 @@ def run(cfg: TokenizerConfig):
                             "lpips": metrics_cpu["loss_lpips"],
                             "psnr": psnr,
                             "lr": lr_value,
-                            # Cumulative metrics for W&B x-axis flexibility
-                            "tokens_seen": tokens_per_step * step,
+                            "data_tokens_seen": data_tokens_per_step * step,
+                            "total_tokens_seen": total_tokens_per_step * step,
                             "flops_spent": flops_per_step * step,
                             **({} if not cfg.logger.log_gradients else {
                                 "grad/global_norm": metrics_cpu["grad/global_norm"],
@@ -346,11 +346,12 @@ def run(cfg: TokenizerConfig):
             # Log final scaling metrics to CSV
             train_elapsed = time.time() - train_start_time
             final_step = min(step, cfg.max_steps - 1)
-            tokens_trained = tokens_per_step * final_step
+            data_tokens_trained = data_tokens_per_step * final_step
+            total_tokens_trained = total_tokens_per_step * final_step
 
             # Append one line to parent directory's results.csv (for scaling analysis)
             results_csv = run_dir.parent / "results.csv"
-            csv_line = f"{cfg.run_name},{param_counts['total']},{tokens_per_step},{flops_per_step:.6e},{cfg.scaling_flops_budget or 0},{final_step},{tokens_trained},{train_elapsed/3600:.4f},{final_loss:.6f},{final_psnr:.4f}\n"
+            csv_line = f"{cfg.run_name},{param_counts['total']},{data_tokens_per_step},{total_tokens_per_step},{flops_per_step:.6e},{cfg.scaling_flops_budget or 0},{final_step},{data_tokens_trained},{total_tokens_trained},{train_elapsed/3600:.4f},{final_loss:.6f},{final_psnr:.4f}\n"
             with open(results_csv, "a") as f:
                 f.write(csv_line)
 
