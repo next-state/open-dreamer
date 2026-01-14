@@ -1,4 +1,3 @@
-import json
 import logging
 import time
 
@@ -136,7 +135,7 @@ def run(cfg: DynamicsConfig):
         # Initialize dynamics
         dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(dynamics)
-        print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
+        print(f"Parameter counts: {param_counts.get('transformer', 0):,}")
 
         # Scaling laws: compute FLOPs and max_steps from param count if enabled
         n_spatial = tokenizer_cfg.encoder.n_latents // cfg.dynamics.packing_factor
@@ -151,6 +150,9 @@ def run(cfg: DynamicsConfig):
             time_every=cfg.dynamics.time_every,
         )
 
+        # Tokens per step (for scaling analysis)
+        tokens_per_step = cfg.dataset.B * cfg.dataset.T * (n_spatial + 1)  # +1 for the action
+
         if cfg.scaling_flops_budget > 0:
             # Iso-FLOPs mode: fixed compute budget, steps computed from FLOPs
             computed_steps = compute_steps_for_flops_budget(
@@ -164,7 +166,6 @@ def run(cfg: DynamicsConfig):
             print(f"[IsoFLOPs] {cfg.scaling_flops_budget:.2e} FLOPs / {flops_per_step:.2e} per step = {computed_steps:,} steps")
         elif cfg.scaling_tokens_per_param > 0:
             # Compute-optimal mode: fixed tokens per param ratio
-            tokens_per_step = cfg.dataset.B * cfg.dataset.T
             computed_steps = compute_max_steps(
                 param_count=param_counts["total"],
                 tokens_per_param=cfg.scaling_tokens_per_param,
@@ -193,22 +194,9 @@ def run(cfg: DynamicsConfig):
                 checkpoint_manager, dynamics, optimizer, train_iterator, rng
             )
 
-            # Log scaling metadata to wandb config (if enabled)
-            if cfg.use_wandb and logger._run is not None:
-                import wandb
-                scaling_meta = {
-                    "scaling/depth": cfg.dynamics.depth,
-                    "scaling/d_model": cfg.dynamics.d_model,
-                    "scaling/total_params": param_counts["total"],
-                    "scaling/tokens_per_param": cfg.scaling_tokens_per_param,
-                    "scaling/flops_budget": cfg.scaling_flops_budget,
-                    "scaling/flops_per_step": flops_per_step,
-                }
-                wandb.config.update(scaling_meta, allow_val_change=True)
-
-            # Track training time for scaling analysis
+            # Track training time and final metrics for scaling analysis
             train_start_time = time.time()
-            final_metrics = []  # Keep last 5 logged metrics
+            final_loss = 0.0
 
             # Training loop
             pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step, total=cfg.max_steps)
@@ -237,26 +225,17 @@ def run(cfg: DynamicsConfig):
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(aux)
                     lr_value = lr_schedule(step)
-                    # Keep last 5 metrics (convert arrays to scalars)
-                    metric_dict = {}
-                    for k, v in metrics_cpu.items():
-                        if isinstance(v, (np.ndarray, jnp.ndarray)):
-                            if v.size == 1:
-                                metric_dict[k] = float(v.item())
-                            else:
-                                # Skip multi-element arrays
-                                continue
-                        else:
-                            metric_dict[k] = float(v)
-                    final_metrics.append(metric_dict)
-                    if len(final_metrics) > 5:
-                        final_metrics.pop(0)
+                    flow_mse = float(metrics_cpu["flow_mse"])
+                    final_loss = flow_mse  # Track for CSV output
                     logger.log(
                         step,
                         metrics={
-                            "flow_mse": metrics_cpu["flow_mse"],
+                            "flow_mse": flow_mse,
                             "boot_mse": metrics_cpu["bootstrap_mse"],
                             "lr": lr_value,
+                            # Cumulative metrics for W&B x-axis flexibility
+                            "tokens_seen": tokens_per_step * step,
+                            "flops_spent": flops_per_step * step,
                         },
                         pbar=pbar,
                     )
@@ -275,22 +254,16 @@ def run(cfg: DynamicsConfig):
                         val_videos, jnp.asarray(val_actions), vis_dir, rng, logger
                     )
 
-            # Log final scaling metrics
+            # Log final scaling metrics to CSV
             train_elapsed = time.time() - train_start_time
             final_step = min(step, cfg.max_steps - 1)
-            
-            # Write structured metrics file for analysis
-            metrics_file = run_dir / f"{cfg.run_name}_metrics.json"
-            metrics_data = {
-                "total_params": param_counts["total"],
-                "flops_per_step": float(flops_per_step),
-                "total_steps": int(final_step),
-                "train_elapsed_hours": train_elapsed / 3600,
-                "flops_budget": float(cfg.scaling_flops_budget) if cfg.scaling_flops_budget > 0 else None,
-                "final_metrics": final_metrics,  # Last 5 logged metrics
-            }
-            with open(metrics_file, "w") as f:
-                json.dump(metrics_data, f, indent=2)
+            tokens_trained = tokens_per_step * final_step
+
+            # Append one line to parent directory's results.csv (for scaling analysis)
+            results_csv = run_dir.parent / "results.csv"
+            csv_line = f"{cfg.run_name},{param_counts['total']},{tokens_per_step},{flops_per_step:.6e},{cfg.scaling_flops_budget or 0},{final_step},{tokens_trained},{train_elapsed/3600:.4f},{final_loss:.6f},\n"
+            with open(results_csv, "a") as f:
+                f.write(csv_line)
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")

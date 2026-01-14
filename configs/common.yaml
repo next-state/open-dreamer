@@ -9,7 +9,7 @@ scaling_flops_budget: 0.0
 
 # Checkpointing
 ckpt:
-  max_to_keep: 0
+  max_to_keep: 1
   save_interval_steps: 10_000
   max_steps: ${max_steps}
 

@@ -1,120 +1,138 @@
 #!/bin/bash
-# Scaling Laws Experiment Runner
-# Usage: ./scripts/run_scaling.sh [tokenizer|dynamics] [--dry-run]
-#        CUDA_DEVICES=0,1 ./scripts/run_scaling.sh tokenizer
+# Unified Scaling Experiment Runner
+# Based on Karpathy's nanochat methodology
 #
-# Trains a family of models at varying depths to study scaling laws.
-# Based on nanochat methodology: https://github.com/karpathy/nanochat/discussions/420
+# Stage 1 (Iso-FLOPs): Find optimal tokens_per_param ratio
+#   ./scripts/run_scaling.sh isoflop tokenizer
+#
+# Stage 2 (Compute-Optimal): Train at discovered ratio
+#   TOKENS_PER_PARAM=20 ./scripts/run_scaling.sh optimal tokenizer
+#
+# Options:
+#   --dry-run    Print commands without executing
+#   CUDA_DEVICES=0,1 ./scripts/run_scaling.sh ...  # GPU selection
 
 set -e
 
-MODEL_TYPE=${1:-tokenizer}
-DRY_RUN=${2:-}
+MODE=${1:-isoflop}
+MODEL=${2:-tokenizer}
+DRY_RUN=""
+[[ "$3" == "--dry-run" || "$4" == "--dry-run" ]] && DRY_RUN=1
 
-# GPU selection (set CUDA_DEVICES env var to override, e.g., CUDA_DEVICES=0,1)
-export CUDA_VISIBLE_DEVICES=${CUDA_DEVICES:-${CUDA_VISIBLE_DEVICES}}
+# GPU selection (only set if explicitly provided, otherwise use system default)
+if [ -n "$CUDA_DEVICES" ]; then
+    export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
+fi
 
-# Scaling configurations
-DEPTHS=(1 2 3 4 5 6)
+# Architecture scaling: d_model = depth × 64
 D_MODEL_MULT=64
-TOKENS_PER_PARAM=4063.7
+
+# Configuration by mode
+if [ "$MODE" == "isoflop" ]; then
+    # Iso-FLOPs: multiple depths × multiple FLOPs budgets
+    DEPTHS=(6 5 4 3 2 1)
+    FLOPS_BUDGETS=(1e16 3e16 6e16 1e17 3e17 6e17)
+elif [ "$MODE" == "optimal" ]; then
+    # Compute-optimal: multiple depths × fixed tokens_per_param
+    DEPTHS=(7)
+    TOKENS_PER_PARAM=${TOKENS_PER_PARAM:-20}
+else
+    echo "Unknown mode: $MODE. Use 'isoflop' or 'optimal'."
+    exit 1
+fi
 
 # Output directory
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-SCALING_DIR="logs/scaling_${MODEL_TYPE}_${TIMESTAMP}"
-mkdir -p "$SCALING_DIR"
+OUT_DIR="logs/scaling_${MODE}_${MODEL}_${TIMESTAMP}"
+mkdir -p "$OUT_DIR"
 
-# Log file
-LOG_FILE="${SCALING_DIR}/experiment.log"
-echo "========================================" | tee "$LOG_FILE"
-echo "Scaling Laws Experiment" | tee -a "$LOG_FILE"
-echo "========================================" | tee -a "$LOG_FILE"
-echo "Started at: $(date)" | tee -a "$LOG_FILE"
-echo "Model type: ${MODEL_TYPE}" | tee -a "$LOG_FILE"
-echo "Depths: ${DEPTHS[*]}" | tee -a "$LOG_FILE"
-echo "d_model multiplier: ${D_MODEL_MULT}" | tee -a "$LOG_FILE"
-echo "Tokens per param: ${TOKENS_PER_PARAM}" | tee -a "$LOG_FILE"
-echo "Output dir: ${SCALING_DIR}" | tee -a "$LOG_FILE"
-echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}" | tee -a "$LOG_FILE"
-echo "========================================" | tee -a "$LOG_FILE"
+# CSV header (training script appends rows)
+echo "run_name,params,tokens_per_step,flops_per_step,flops_budget,total_steps,tokens_trained,hours,final_loss,final_psnr" > "$OUT_DIR/results.csv"
 
-# Results CSV
-RESULTS_FILE="${SCALING_DIR}/results.csv"
-echo "depth,d_model,n_heads,status,duration_sec" > "$RESULTS_FILE"
+# Log experiment config
+echo "========================================"
+echo "Scaling Experiment: $MODE"
+echo "========================================"
+echo "Model: $MODEL"
+echo "Depths: ${DEPTHS[*]}"
+[ "$MODE" == "isoflop" ] && echo "FLOPs budgets: ${FLOPS_BUDGETS[*]}"
+[ "$MODE" == "optimal" ] && echo "Tokens per param: $TOKENS_PER_PARAM"
+echo "Output: $OUT_DIR"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<not set, using all>}"
+echo "========================================"
 
-# Run experiments
+# Count total runs
+if [ "$MODE" == "isoflop" ]; then
+    TOTAL=$((${#DEPTHS[@]} * ${#FLOPS_BUDGETS[@]}))
+else
+    TOTAL=${#DEPTHS[@]}
+fi
+RUN=0
+
+# Main loop
 for DEPTH in "${DEPTHS[@]}"; do
     D_MODEL=$((DEPTH * D_MODEL_MULT))
     N_HEADS=$((D_MODEL / 64))
 
-    RUN_NAME="scaling_${MODEL_TYPE}_d${DEPTH}"
+    if [ "$MODE" == "isoflop" ]; then
+        for FLOPS in "${FLOPS_BUDGETS[@]}"; do
+            RUN=$((RUN + 1))
+            RUN_NAME="${MODE}_${MODEL}_F${FLOPS}_d${DEPTH}"
 
-    echo "" | tee -a "$LOG_FILE"
-    echo "==================================================" | tee -a "$LOG_FILE"
-    echo "Running: depth=${DEPTH}, d_model=${D_MODEL}, n_heads=${N_HEADS}" | tee -a "$LOG_FILE"
-    echo "Run name: ${RUN_NAME}" | tee -a "$LOG_FILE"
-    echo "==================================================" | tee -a "$LOG_FILE"
+            echo ""
+            echo "[$RUN/$TOTAL] $RUN_NAME (depth=$DEPTH, FLOPs=$FLOPS)"
 
-    if [ "$MODEL_TYPE" == "tokenizer" ]; then
-        CMD="uv run scripts/train_tokenizer.py \
+            CMD="uv run scripts/train_${MODEL}.py \
+                run_name=${RUN_NAME} \
+                use_wandb=true \
+                ckpt.max_to_keep=null \
+                encoder.depth=${DEPTH} encoder.d_model=${D_MODEL} \
+                encoder.n_heads=${N_HEADS} encoder.n_kv_heads=${N_HEADS} \
+                decoder.depth=${DEPTH} decoder.d_model=${D_MODEL} \
+                decoder.n_heads=${N_HEADS} decoder.n_kv_heads=${N_HEADS} \
+                scaling_flops_budget=${FLOPS} \
+                hydra.run.dir=${OUT_DIR}/${RUN_NAME}"
+
+            if [ "$DRY_RUN" ]; then
+                echo "[DRY] $CMD"
+            else
+                eval "$CMD" || echo "FAILED: $RUN_NAME"
+            fi
+        done
+    else
+        RUN=$((RUN + 1))
+        RUN_NAME="${MODE}_${MODEL}_d${DEPTH}"
+
+        echo ""
+        echo "[$RUN/$TOTAL] $RUN_NAME (depth=$DEPTH)"
+
+        CMD="uv run scripts/train_${MODEL}.py \
             run_name=${RUN_NAME} \
             use_wandb=true \
-            encoder.depth=${DEPTH} \
-            encoder.d_model=${D_MODEL} \
-            encoder.n_heads=${N_HEADS} \
-            encoder.n_kv_heads=${N_HEADS} \
-            decoder.depth=${DEPTH} \
-            decoder.d_model=${D_MODEL} \
-            decoder.n_heads=${N_HEADS} \
-            decoder.n_kv_heads=${N_HEADS} \
+            ckpt.max_to_keep=null \
+            encoder.depth=${DEPTH} encoder.d_model=${D_MODEL} \
+            encoder.n_heads=${N_HEADS} encoder.n_kv_heads=${N_HEADS} \
+            decoder.depth=${DEPTH} decoder.d_model=${D_MODEL} \
+            decoder.n_heads=${N_HEADS} decoder.n_kv_heads=${N_HEADS} \
             scaling_tokens_per_param=${TOKENS_PER_PARAM} \
-            hydra.run.dir=${SCALING_DIR}/${RUN_NAME}"
-    elif [ "$MODEL_TYPE" == "dynamics" ]; then
-        CMD="uv run scripts/train_dynamics.py \
-            run_name=${RUN_NAME} \
-            use_wandb=true \
-            dynamics.depth=${DEPTH} \
-            dynamics.d_model=${D_MODEL} \
-            dynamics.n_heads=${N_HEADS} \
-            dynamics.n_kv_heads=${N_HEADS} \
-            scaling_tokens_per_param=${TOKENS_PER_PARAM} \
-            hydra.run.dir=${SCALING_DIR}/${RUN_NAME}"
-    else
-        echo "Unknown model type: ${MODEL_TYPE}. Use 'tokenizer' or 'dynamics'." | tee -a "$LOG_FILE"
-        exit 1
-    fi
+            hydra.run.dir=${OUT_DIR}/${RUN_NAME}"
 
-    if [ "$DRY_RUN" == "--dry-run" ]; then
-        echo "[DRY RUN] Would execute:" | tee -a "$LOG_FILE"
-        echo "$CMD" | tee -a "$LOG_FILE"
-        echo "${DEPTH},${D_MODEL},${N_HEADS},dry_run,0" >> "$RESULTS_FILE"
-    else
-        echo "Executing command..." | tee -a "$LOG_FILE"
-        START_TIME=$(date +%s)
-
-        # Run with error handling
-        if eval "$CMD" 2>&1 | tee -a "${SCALING_DIR}/${RUN_NAME}.log"; then
-            END_TIME=$(date +%s)
-            DURATION=$((END_TIME - START_TIME))
-            echo "Completed d${DEPTH} in ${DURATION}s" | tee -a "$LOG_FILE"
-            echo "${DEPTH},${D_MODEL},${N_HEADS},success,${DURATION}" >> "$RESULTS_FILE"
+        if [ "$DRY_RUN" ]; then
+            echo "[DRY] $CMD"
         else
-            END_TIME=$(date +%s)
-            DURATION=$((END_TIME - START_TIME))
-            echo "FAILED: d${DEPTH} after ${DURATION}s" | tee -a "$LOG_FILE"
-            echo "${DEPTH},${D_MODEL},${N_HEADS},failed,${DURATION}" >> "$RESULTS_FILE"
+            eval "$CMD" || echo "FAILED: $RUN_NAME"
         fi
     fi
 done
 
-echo "" | tee -a "$LOG_FILE"
-echo "========================================" | tee -a "$LOG_FILE"
-echo "All experiments completed at $(date)" | tee -a "$LOG_FILE"
-echo "Results saved to: ${RESULTS_FILE}" | tee -a "$LOG_FILE"
-echo "Full logs in: ${SCALING_DIR}" | tee -a "$LOG_FILE"
-echo "========================================" | tee -a "$LOG_FILE"
-
-# Print summary
 echo ""
-echo "Results summary:"
-cat "$RESULTS_FILE"
+echo "========================================"
+echo "Completed $RUN runs"
+echo "Results: $OUT_DIR/results.csv"
+echo ""
+if [ "$MODE" == "isoflop" ]; then
+    echo "Next: python scripts/analyze_isoflop.py $OUT_DIR"
+else
+    echo "Next: python scripts/analyze_scaling.py $OUT_DIR"
+fi
+echo "========================================"

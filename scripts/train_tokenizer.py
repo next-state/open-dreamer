@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import time
@@ -216,10 +215,12 @@ def run(cfg: TokenizerConfig):
         # Initialize tokenizer
         tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(tokenizer)
-        print(f"Parameter counts: {param_counts}")
+        param_counts_formatted = {k: f"{v:,}" for k, v in param_counts.items()}
+        print(f"Parameter counts: {param_counts_formatted}")
 
         # Scaling laws: compute max_steps from param count if enabled
         n_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
+        # Data tokens = patches (the actual image data being reconstructed)
         tokens_per_step = cfg.dataset.B * cfg.dataset.T * n_patches
         flops_per_step = estimate_tokenizer_flops(
             nparams=param_counts["total"],
@@ -274,22 +275,9 @@ def run(cfg: TokenizerConfig):
                 checkpoint_manager, tokenizer, optimizer, train_iterator, rng
             )
 
-            # Log scaling metadata to wandb config (if enabled)
-            if cfg.use_wandb and logger._run is not None:
-                import wandb
-                scaling_meta = {
-                    "scaling/depth": cfg.encoder.depth,
-                    "scaling/d_model": cfg.encoder.d_model,
-                    "scaling/total_params": param_counts["total"],
-                    "scaling/tokens_per_param": cfg.scaling_tokens_per_param,
-                    "scaling/flops_budget": cfg.scaling_flops_budget,
-                    "scaling/flops_per_step": flops_per_step,
-                }
-                wandb.config.update(scaling_meta, allow_val_change=True)
-
-            # Track training time for scaling analysis
+            # Track training time and final metrics for scaling analysis
             train_start_time = time.time()
-            final_metrics = []  # Keep last 5 logged metrics
+            final_loss, final_psnr = 0.0, 0.0
 
             # Training loop
             pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step,total=cfg.max_steps)
@@ -320,20 +308,9 @@ def run(cfg: TokenizerConfig):
                     lr_value = lr_schedule(step)
                     mse = metrics_cpu["loss_mse"]
                     psnr = metrics_cpu["psnr"]
-                    # Keep last 5 metrics (convert arrays to scalars)
-                    metric_dict = {}
-                    for k, v in metrics_cpu.items():
-                        if isinstance(v, (np.ndarray, jnp.ndarray)):
-                            if v.size == 1:
-                                metric_dict[k] = float(v.item())
-                            else:
-                                # Skip multi-element arrays
-                                continue
-                        else:
-                            metric_dict[k] = float(v)
-                    final_metrics.append(metric_dict)
-                    if len(final_metrics) > 5:
-                        final_metrics.pop(0)
+                    # Track final values for scaling CSV
+                    final_loss = float(metrics_cpu["loss_total"])
+                    final_psnr = float(psnr)
                     logger.log(
                         step,
                         {
@@ -343,6 +320,9 @@ def run(cfg: TokenizerConfig):
                             "lpips": metrics_cpu["loss_lpips"],
                             "psnr": psnr,
                             "lr": lr_value,
+                            # Cumulative metrics for W&B x-axis flexibility
+                            "tokens_seen": tokens_per_step * step,
+                            "flops_spent": flops_per_step * step,
                             **({} if not cfg.logger.log_gradients else {
                                 "grad/global_norm": metrics_cpu["grad/global_norm"],
                                 "grad/encoder_norm": metrics_cpu["grad/encoder_norm"],
@@ -363,24 +343,16 @@ def run(cfg: TokenizerConfig):
                     viz_videos = batch["videos"][:8]
                     viz_step(tokenizer, viz_videos, step_rng, step, vis_dir, logger)
 
-            # Log final scaling metrics
+            # Log final scaling metrics to CSV
             train_elapsed = time.time() - train_start_time
             final_step = min(step, cfg.max_steps - 1)
             tokens_trained = tokens_per_step * final_step
-            
-            # Write structured metrics file for analysis
-            metrics_file = run_dir / f"{cfg.run_name}_metrics.json"
-            metrics_data = {
-                "total_params": param_counts["total"],
-                "flops_per_step": float(flops_per_step),
-                "total_steps": int(final_step),
-                "tokens_trained": int(tokens_trained),
-                "train_elapsed_hours": train_elapsed / 3600,
-                "flops_budget": float(cfg.scaling_flops_budget) if cfg.scaling_flops_budget > 0 else None,
-                "final_metrics": final_metrics,  # Last 5 logged metrics
-            }
-            with open(metrics_file, "w") as f:
-                json.dump(metrics_data, f, indent=2)
+
+            # Append one line to parent directory's results.csv (for scaling analysis)
+            results_csv = run_dir.parent / "results.csv"
+            csv_line = f"{cfg.run_name},{param_counts['total']},{tokens_per_step},{flops_per_step:.6e},{cfg.scaling_flops_budget or 0},{final_step},{tokens_trained},{train_elapsed/3600:.4f},{final_loss:.6f},{final_psnr:.4f}\n"
+            with open(results_csv, "a") as f:
+                f.write(csv_line)
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
