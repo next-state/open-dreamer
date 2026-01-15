@@ -16,7 +16,7 @@ from .utils import (
     patchify, unpatchify
 )
 from .configs import (
-    TokenizerConfig, DynamicsModelConfig, DynamicsConfig, EncoderModelConfig, DecoderModelConfig,
+    TokenizerConfig, DynamicsModelConfig, DynamicsConfig, EncoderModelConfig, DecoderModelConfig, HeadsConfig,
 )
 from .parallel import MeshRules
 
@@ -1058,6 +1058,78 @@ class PolicyHeadMTP(nnx.Module):
         logits = self.out(x)                                  # (B, T, L*A)
         logits = rearrange(logits, 'b t (l a) -> b t l a', l=self.L, a=self.action_dim)
         return logits
+
+    @classmethod
+    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: Optional[nnx.Rngs] = None) -> "PolicyHeadMTP":
+        """
+        Load a pretrained PolicyHeadMTP model from checkpoint.
+
+        Args:
+            checkpoint_path: Path to heads checkpoint directory
+            mesh_rules: MeshRules for sharding strategy
+            rngs: Optional RNG state (defaults to Rngs(0))
+
+        Returns:
+            PolicyHeadMTP model
+        """
+        if rngs is None:
+            rngs = nnx.Rngs(0)
+
+        checkpoint_path = str(Path(checkpoint_path).resolve())
+        with ocp.CheckpointManager(checkpoint_path) as checkpoint_manager:
+            step = checkpoint_manager.latest_step()
+            if step is None:
+                raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
+
+            # Load metadata to get config
+            meta_restore_args = ocp.args.Composite(
+                meta=ocp.args.JsonRestore()  # type: ignore
+            )
+            meta_restored = checkpoint_manager.restore(step, args=meta_restore_args)
+            cfg = meta_restored["meta"]["cfg"]
+
+            # Extract parameters needed for PolicyHeadMTP initialization
+            # d_model comes from the dynamics config
+            d_model = cfg["dynamics_ckpt"]  # We'll load dynamics to get d_model
+            action_dim = cfg.get("action_dim", 4)
+            L = cfg.get("L", 2)
+            dtype = cfg.get("dtype", "float32")
+            param_dtype = cfg.get("param_dtype", "float32")
+
+            # For proper initialization, we need d_model from dynamics
+            # Load it from the dynamics checkpoint referenced in the config
+            heads_cfg = from_dict(HeadsConfig, cfg)
+
+            # Load dynamics to get d_model (lightweight operation, just reads config)
+            dynamics_meta_path = str(Path(heads_cfg.dynamics_ckpt).resolve())
+            with ocp.CheckpointManager(dynamics_meta_path) as dyn_manager:
+                dyn_step = dyn_manager.latest_step()
+                if dyn_step is None:
+                    raise FileNotFoundError(f"Dynamics checkpoint not found: {heads_cfg.dynamics_ckpt}")
+                dyn_meta_args = ocp.args.Composite(meta=ocp.args.JsonRestore())  # type: ignore
+                dyn_meta = dyn_manager.restore(dyn_step, args=dyn_meta_args)
+                d_model = dyn_meta["meta"]["cfg"]["dynamics"]["d_model"]
+
+            # Initialize model with config
+            model = cls(
+                d_model=d_model,
+                action_dim=action_dim,
+                L=L,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                mesh_rules=mesh_rules,
+                rngs=rngs
+            )
+
+            # Restore only the policy_head state
+            model_state = nnx.state(model)
+            restore_args = ocp.args.Composite(
+                policy_head=ocp.args.StandardRestore(model_state)  # type: ignore
+            )
+            restored = checkpoint_manager.restore(step, args=restore_args)
+            nnx.update(model, restored['policy_head'])
+
+        return model
 
 
 
