@@ -784,8 +784,9 @@ class Tokenizer(nnx.Module):
 
     def num_scaling_params(self) -> int:
         """Total params for scaling law analysis (Chinchilla-style, includes all)."""
-        state = nnx.state(self, nnx.Param)
-        return sum(jnp.size(x.value) for x in jax.tree.leaves(state))
+        _, state, _ = nnx.split(self, nnx.Param, ...)
+        sizes = jax.tree.map(jnp.size, state)
+        return jax.tree.reduce(lambda a, b: a + b, sizes)
 
     def count_excluded_params(self) -> int:
         """Params to exclude from FLOP estimation (embeddings + scalars)."""
@@ -1041,8 +1042,9 @@ class Dynamics(nnx.Module):
 
     def num_scaling_params(self) -> int:
         """Total params for scaling law analysis (Chinchilla-style, includes all)."""
-        state = nnx.state(self, nnx.Param)
-        return sum(jnp.size(x.value) for x in jax.tree.leaves(state))
+        _, state, _ = nnx.split(self, nnx.Param, ...)
+        sizes = jax.tree.map(jnp.size, state)
+        return jax.tree.reduce(lambda a, b: a + b, sizes)
 
     def count_excluded_params(self) -> int:
         """Params to exclude from FLOP estimation (embeddings + scalars)."""
