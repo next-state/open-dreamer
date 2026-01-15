@@ -146,7 +146,7 @@ def next_latent(
         # Dynamics call
         latent_clean_pred_seq, (h_seq, _) = dynamics(
             actions_input, step_indices, tau_indices, latent_input,
-            task_emeddings=task_embedding, deterministic=True, caches=caches
+            task_embeddings=task_embedding, deterministic=True, caches=caches
         )
 
         latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
@@ -175,7 +175,7 @@ def next_latent(
         # Dynamics call
         _, (h_seq_final, caches_new) = dynamics(
             action, step_indices, tau_indices, latent_noised_caching,
-            task_emeddings=task_embedding, deterministic=True, caches=caches
+            task_embeddings=task_embedding, deterministic=True, caches=caches
         )
         h_last = h_seq_final[:, -1:, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
     else:
@@ -282,7 +282,7 @@ def latent_rollout(
     # Dynamics call
     _, (h_seq, caches) = dynamics(
         actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx,
-        task_emeddings=initial_task_embedding, caches=caches, deterministic=True
+        task_embeddings=initial_task_embedding, caches=caches, deterministic=True
     )
 
     # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.

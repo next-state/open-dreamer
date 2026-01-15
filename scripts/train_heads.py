@@ -229,7 +229,7 @@ def train_step(
         # Dynamics loss (also returns hidden states for BC/reward training)
         dyn_losses, dyn_aux = shortcut_forcing_step(
             dyn, actions, latents, step_key, k_max,
-            B_self=B_self, agent_tokens=agent_tokens_bt
+            B_self=B_self, task_embeddings=agent_tokens_bt
         )
         dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
 

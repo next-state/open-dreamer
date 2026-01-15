@@ -89,7 +89,7 @@ def train_step(
             rng=step_key,
             k_max=k_max,
             B_self=B_self,
-            agent_tokens=None,  # Not used in dynamics pretraining
+            task_embeddings=None,  # Not used in dynamics pretraining
         )
         return losses['total'], aux
 

@@ -214,7 +214,7 @@ def shortcut_forcing_step(
     k_max: int,
     *,
     B_self: int = 0,
-    agent_tokens: jnp.ndarray | None = None,
+    task_embeddings: jnp.ndarray | None = None,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
     Compute shortcut forcing losses (flow + bootstrap) for a batch.
@@ -229,11 +229,11 @@ def shortcut_forcing_step(
         rng: Random key
         k_max: Maximum noise resolution
         B_self: Number of bootstrap examples (last B_self rows of batch)
-        agent_tokens: Optional (B, T, n_agent, d_model) agent tokens
+        task_embeddings: Optional (B, T, n_agent, d_model) agent tokens
         
     Returns:
         losses: Dict with 'total', 'flow', 'bootstrap' keys
-        aux: Dict with auxiliary metrics for logging. If agent_tokens is not None,
+        aux: Dict with auxiliary metrics for logging. If task_embeddings is not None,
              aux contains 'h_states' key with (B, T, n_agent, d_model) hidden states
              from the main forward pass (computed with noisy inputs)
     """
@@ -271,7 +271,7 @@ def shortcut_forcing_step(
     rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
         actions, step_idx_full, sigma_idx_full, z_tilde,
-        agent_tokens=agent_tokens, deterministic=False, rngs=rngs1
+        task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
     )
     
     # --- Flow loss (empirical rows) ---
@@ -286,7 +286,7 @@ def shortcut_forcing_step(
         z_pred_self = z_pred_full[B_emp:]
         z_tilde_self = z_tilde[B_emp:]
         actions_self = actions[B_emp:]
-        agent_tokens_self = agent_tokens[B_emp:] if agent_tokens is not None else None
+        task_embeddings_self = task_embeddings[B_emp:] if task_embeddings is not None else None
     
         # Half-step metadata
         d_half = d_self / 2.0
@@ -298,7 +298,7 @@ def shortcut_forcing_step(
         rngs2 = nnx.Rngs(dropout=key_dropout2)
         z1_half1, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
-            agent_tokens=agent_tokens_self, deterministic=False, rngs=rngs2
+            task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs2
         )
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
@@ -307,7 +307,7 @@ def shortcut_forcing_step(
         rngs3 = nnx.Rngs(dropout=key_dropout3)
         z1_half2, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
-            agent_tokens=agent_tokens_self, deterministic=False, rngs=rngs3
+            task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
         )
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
     

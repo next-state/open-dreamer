@@ -970,11 +970,11 @@ class Dynamics(nnx.Module):
                 meta=ocp.args.JsonRestore()  # type: ignore
             )
             meta_restored = checkpoint_manager.restore(step, args=meta_restore_args)
-            full_cfg = from_dict(DynamicsConfig, meta_restored["meta"]["cfg"])
-            dyn_model_cfg = full_cfg.dynamics
+            dyn_model_cfg = from_dict(DynamicsModelConfig, meta_restored["meta"]["cfg"]["dynamics"])
+            tokenizer_ckpt = meta_restored["meta"]["cfg"]["tokenizer_ckpt"]
 
             # Load tokenizer
-            tokenizer = Tokenizer.from_pretrained(full_cfg.tokenizer_ckpt, mesh_rules=mesh_rules, rngs=rngs)
+            tokenizer = Tokenizer.from_pretrained(tokenizer_ckpt, mesh_rules=mesh_rules, rngs=rngs)
 
             # Create and restore dynamics model states
             dynamics = cls(dyn_model_cfg, mesh_rules=mesh_rules, rngs=rngs)
@@ -1051,6 +1051,13 @@ class PolicyHeadMTP(nnx.Module):
 
         # Single matmul that produces all L offsets at once: (… , d_flat) -> (…, L, A)
         self.out = nnx.Linear(d_flat, L * action_dim, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
+
+    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> jnp.ndarray:
+        h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
+        x = self.projector(h_t, deterministic=deterministic, rngs=rngs)  # (B, T, D)
+        logits = self.out(x)                                  # (B, T, L*A)
+        logits = rearrange(logits, 'b t (l a) -> b t l a', l=self.L, a=self.action_dim)
+        return logits
 
 
 

@@ -10,7 +10,7 @@ ckpt:
   save_interval_steps: 100_000
 
 dataset:
-  B: 32
+  B: 128
   T: 32
 
 action_dim: 16

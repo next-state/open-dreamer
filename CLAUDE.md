@@ -22,9 +22,10 @@ This is a reproduction of the Dreamer 4 paper. The paper can be found in `docs/m
   - `utils.py` - General utilities
 
 - **Reactor Integration** (`reactor/`): Interactive model usage
+  - Reactor powers real time inference of the world model and the policy
   - Documentation: https://docs.reactor.inc/runtime/overview
-  - `reactor.py` - Main reactor interface
-  - `reactor_hybrid.py` - Hybrid reactor implementation
+  - `reactor_hybrid.py` - Main reactor interface
+  - `reactor.py` - Older reactor interface. it only powers the dynamics model
   - `model_procgen.py` - Procgen model integration
 
 ---
