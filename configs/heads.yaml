@@ -10,8 +10,8 @@ ckpt:
   save_interval_steps: 100_000
 
 dataset:
-  B: 128
-  T: 32
+  B: 64
+  T: 64
 
 action_dim: 16
 n_agent: 4
