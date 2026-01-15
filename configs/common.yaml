@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 run_name: ???
-use_wandb: true
+use_wandb: False
 dataset: ???
 
 # Checkpointing

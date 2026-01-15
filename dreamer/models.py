@@ -17,7 +17,6 @@ from .utils import (
 )
 from .configs import (
     TokenizerConfig, DynamicsModelConfig, DynamicsConfig, EncoderModelConfig, DecoderModelConfig,
-    TaskEmbedderConfig, PolicyHeadConfig, RewardHeadConfig, ValueHeadConfig,
 )
 from .parallel import MeshRules
 
@@ -1009,22 +1008,6 @@ class TaskEmbedder(nnx.Module):
 
         self.agent_base = nnx.Param(jax.random.normal(rngs.params(), (d_model,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
-    @classmethod
-    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: nnx.Rngs) -> "TaskEmbedder":
-        """Load TaskEmbedder from checkpoint."""
-        cfg = from_dict(TaskEmbedderConfig, Path(checkpoint_path) / "config.json", key="task_embedder")
-        instance = cls(
-            d_model=cfg.d_model, n_agent=cfg.n_agent, use_ids=cfg.use_ids,
-            n_tasks=cfg.n_tasks, dtype=cfg.dtype, param_dtype=cfg.param_dtype,
-            mesh_rules=mesh_rules, rngs=rngs,
-        )
-        ckpt_manager = ocp.CheckpointManager(checkpoint_path, options=ocp.CheckpointManagerOptions(create=False))
-        step = ckpt_manager.latest_step()
-        restored = ckpt_manager.restore(step, args=ocp.args.Composite(
-            task_embedder_state=ocp.args.StandardRestore(nnx.state(instance)),
-        ))
-        nnx.update(instance, restored["task_embedder_state"])
-        return instance
 
     def __call__(self, task, B: int, T: int) -> jax.Array:
         """
@@ -1069,29 +1052,6 @@ class PolicyHeadMTP(nnx.Module):
         # Single matmul that produces all L offsets at once: (… , d_flat) -> (…, L, A)
         self.out = nnx.Linear(d_flat, L * action_dim, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
 
-    @classmethod
-    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: nnx.Rngs) -> "PolicyHeadMTP":
-        """Load PolicyHeadMTP from checkpoint."""
-        cfg = from_dict(PolicyHeadConfig, Path(checkpoint_path) / "config.json", key="policy_head")
-        instance = cls(
-            d_model=cfg.d_model, action_dim=cfg.action_dim, L=cfg.L,
-            dtype=cfg.dtype, param_dtype=cfg.param_dtype,
-            mesh_rules=mesh_rules, rngs=rngs,
-        )
-        ckpt_manager = ocp.CheckpointManager(checkpoint_path, options=ocp.CheckpointManagerOptions(create=False))
-        step = ckpt_manager.latest_step()
-        restored = ckpt_manager.restore(step, args=ocp.args.Composite(
-            policy_head_state=ocp.args.StandardRestore(nnx.state(instance)),
-        ))
-        nnx.update(instance, restored["policy_head_state"])
-        return instance
-
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> jnp.ndarray:
-        h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
-        x = self.projector(h_t, deterministic=deterministic, rngs=rngs)  # (B, T, D)
-        logits = self.out(x)                                  # (B, T, L*A)
-        logits = rearrange(logits, 'b t (l a) -> b t l a', l=self.L, a=self.action_dim)
-        return logits
 
 
 class RewardHeadMTP(nnx.Module):
@@ -1120,23 +1080,6 @@ class RewardHeadMTP(nnx.Module):
         # Precompute bin centers as a constant
         self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
 
-    @classmethod
-    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: nnx.Rngs) -> "RewardHeadMTP":
-        """Load RewardHeadMTP from checkpoint."""
-        cfg = from_dict(RewardHeadConfig, Path(checkpoint_path) / "config.json", key="reward_head")
-        instance = cls(
-            d_model=cfg.d_model, L=cfg.L, num_bins=cfg.num_bins,
-            log_low=cfg.log_low, log_high=cfg.log_high,
-            dtype=cfg.dtype, param_dtype=cfg.param_dtype,
-            mesh_rules=mesh_rules, rngs=rngs,
-        )
-        ckpt_manager = ocp.CheckpointManager(checkpoint_path, options=ocp.CheckpointManagerOptions(create=False))
-        step = ckpt_manager.latest_step()
-        restored = ckpt_manager.restore(step, args=ocp.args.Composite(
-            reward_head_state=ocp.args.StandardRestore(nnx.state(instance)),
-        ))
-        nnx.update(instance, restored["reward_head_state"])
-        return instance
 
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, '... n c -> ... (n c)')
@@ -1172,23 +1115,6 @@ class ValueHead(nnx.Module):
         # Precompute bin centers as a constant
         self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
 
-    @classmethod
-    def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: nnx.Rngs) -> "ValueHead":
-        """Load ValueHead from checkpoint."""
-        cfg = from_dict(ValueHeadConfig, Path(checkpoint_path) / "config.json", key="value_head")
-        instance = cls(
-            d_model=cfg.d_model, L=cfg.L, num_bins=cfg.num_bins,
-            log_low=cfg.log_low, log_high=cfg.log_high,
-            dtype=cfg.dtype, param_dtype=cfg.param_dtype,
-            mesh_rules=mesh_rules, rngs=rngs,
-        )
-        ckpt_manager = ocp.CheckpointManager(checkpoint_path, options=ocp.CheckpointManagerOptions(create=False))
-        step = ckpt_manager.latest_step()
-        restored = ckpt_manager.restore(step, args=ocp.args.Composite(
-            value_head_state=ocp.args.StandardRestore(nnx.state(instance)),
-        ))
-        nnx.update(instance, restored["value_head_state"])
-        return instance
 
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
