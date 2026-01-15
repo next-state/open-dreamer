@@ -490,6 +490,7 @@ def build_optimizer(
         nnx.Optimizer instance
     """
     if optimizer_cfg.mup_scaling:
+        # FIXME: shouldn't we simply do this inside of build_lr_scheduler and scale the maximum lr?
         mup_scale = (d_model / optimizer_cfg.mup_base_dim) ** -0.5
         effective_schedule = lambda step, _s=lr_schedule, _m=mup_scale: _s(step) * _m
     else:

@@ -12,6 +12,7 @@ References:
 - https://github.com/karpathy/nanochat
 """
 
+# FIXME: use https://docs.jax.dev/en/latest/aot.html
 
 def estimate_axial_transformer_flops(
     nparams: int,
