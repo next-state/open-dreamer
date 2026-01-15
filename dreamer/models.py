@@ -529,6 +529,7 @@ class BlockCausalTransformer(nnx.Module):
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
                  use_residual_lambdas: bool = False, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.d_model = d_model
         self.depth = depth
         self.time_every = time_every
         self.use_residual_lambdas = use_residual_lambdas
@@ -585,6 +586,25 @@ class BlockCausalTransformer(nnx.Module):
                 new_caches[time_index] = new_cache_i
 
         return x, new_caches
+
+    def estimate_attention_flops(self, batch_size: int, seq_time: int, seq_space: int) -> int:
+        """Attention FLOPs per training step (forward + backward).
+
+        Computes FLOPs for Q@K^T and attn@V operations only (not weight matrices).
+        Factor of 12 = 2 matmuls × 2 ops × 3 (forward + backward).
+        """
+        n_time = self.depth // self.time_every
+        n_space = self.depth - n_time
+        space_attn = 12 * n_space * self.d_model * (seq_space ** 2) * batch_size * seq_time
+        time_attn = 12 * n_time * self.d_model * (seq_time ** 2) * batch_size * seq_space
+        return int(space_attn + time_attn)
+
+    def count_excluded_params(self) -> int:
+        """Count params excluded from FLOP estimation (per-layer scalars)."""
+        if not self.use_residual_lambdas:
+            return 0
+        return self.resid_lambdas.value.size + self.x0_lambdas.value.size
+
 
 # ============================================================================
 # Tokenizer
@@ -751,7 +771,7 @@ class Tokenizer(nnx.Module):
     def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> Dict[int, KVCache]:
         """Creates concrete, zero-filled KV cache buffers for JIT compilation."""
         layout = self.decoder.get_token_layout()
-        
+
         return create_transformer_caches(
             depth=self.cfg.decoder.depth,
             time_every=self.cfg.decoder.time_every,
@@ -761,6 +781,43 @@ class Tokenizer(nnx.Module):
             head_dim=self.cfg.decoder.d_model // self.cfg.decoder.n_heads,
             dtype=dtype
         )
+
+    def num_scaling_params(self) -> int:
+        """Total params for scaling law analysis (Chinchilla-style, includes all)."""
+        state = nnx.state(self, nnx.Param)
+        return sum(jnp.size(x.value) for x in jax.tree.leaves(state))
+
+    def count_excluded_params(self) -> int:
+        """Params to exclude from FLOP estimation (embeddings + scalars)."""
+        excluded = 0
+        # Learned tokens (embedding-like)
+        excluded += self.encoder.latents_enc.value.size
+        excluded += self.encoder.mask_and_replace.mask_token.value.size
+        excluded += self.decoder.patch_queries.value.size
+        # Per-layer scalars
+        excluded += self.encoder.transformer.count_excluded_params()
+        excluded += self.decoder.transformer.count_excluded_params()
+        return excluded
+
+    def estimate_flops(self, batch_size: int, seq_length: int) -> int:
+        """FLOPs per training step (forward + backward).
+
+        Uses Karpathy/Bahdanau methodology:
+        - 6 FLOPs per weight param per token (excluding embeddings/scalars)
+        - Plus attention computation FLOPs (Q@K^T and attn@V)
+        """
+        S = self.decoder.get_token_layout().S
+
+        # Weight FLOPs (excluding embeddings/scalars)
+        total_params = self.num_scaling_params()
+        excluded = self.count_excluded_params()
+        weight_flops = 6 * (total_params - excluded) * batch_size * seq_length * S
+
+        # Attention FLOPs
+        enc_attn = self.encoder.transformer.estimate_attention_flops(batch_size, seq_length, S)
+        dec_attn = self.decoder.transformer.estimate_attention_flops(batch_size, seq_length, S)
+
+        return int(weight_flops + enc_attn + dec_attn)
 
     @classmethod
     def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: Optional[nnx.Rngs] = None) -> "Tokenizer":   
@@ -981,6 +1038,45 @@ class Dynamics(nnx.Module):
         x1_hat = self.flow_x_head(spatial_tokens)
         h_t = x[:, :, layout.slices()[Modality.AGENT], :] if agent_tokens is not None else None  # (B,T,n_agent,D) or None
         return x1_hat, (h_t, new_caches)
+
+    def num_scaling_params(self) -> int:
+        """Total params for scaling law analysis (Chinchilla-style, includes all)."""
+        state = nnx.state(self, nnx.Param)
+        return sum(jnp.size(x.value) for x in jax.tree.leaves(state))
+
+    def count_excluded_params(self) -> int:
+        """Params to exclude from FLOP estimation (embeddings + scalars)."""
+        excluded = 0
+        # Register tokens
+        excluded += self.register_tokens.value.size
+        # Action encoder embeddings
+        excluded += self.action_encoder.base_action_emb.value.size
+        excluded += self.action_encoder.emb_key.embedding.value.size
+        # Shortcut embeddings
+        excluded += self.step_embed.embedding.value.size
+        excluded += self.signal_embed.embedding.value.size
+        # Per-layer scalars
+        excluded += self.transformer.count_excluded_params()
+        return excluded
+
+    def estimate_flops(self, batch_size: int, seq_length: int, n_spatial: int) -> int:
+        """FLOPs per training step (forward + backward).
+
+        Uses Karpathy/Bahdanau methodology:
+        - 6 FLOPs per weight param per token (excluding embeddings/scalars)
+        - Plus attention computation FLOPs (Q@K^T and attn@V)
+        """
+        S = self.get_token_layout(n_spatial=n_spatial).S
+
+        # Weight FLOPs (excluding embeddings/scalars)
+        total_params = self.num_scaling_params()
+        excluded = self.count_excluded_params()
+        weight_flops = 6 * (total_params - excluded) * batch_size * seq_length * S
+
+        # Attention FLOPs
+        attn_flops = self.transformer.estimate_attention_flops(batch_size, seq_length, S)
+
+        return int(weight_flops + attn_flops)
 
     @classmethod
     def from_pretrained(cls, checkpoint_path: str, mesh_rules: MeshRules, rngs: Optional[nnx.Rngs] = None) -> Tuple["Dynamics", "Tokenizer"]:

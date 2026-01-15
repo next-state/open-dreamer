@@ -31,7 +31,7 @@ from dreamer.utils import (
     build_lr_schedule,
     build_optimizer,
 )
-from dreamer.scaling import estimate_tokenizer_flops, compute_max_steps, compute_steps_for_flops_budget
+from dreamer.scaling import compute_max_steps, compute_steps_for_flops_budget
 
 # disable preallocation completely
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -224,16 +224,9 @@ def run(cfg: TokenizerConfig):
         n_patches = (cfg.dataset.H // cfg.encoder.patch_size) * (cfg.dataset.W // cfg.encoder.patch_size)
         data_tokens_per_step = cfg.dataset.B * cfg.dataset.T * n_patches
         total_tokens_per_step = cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.encoder.n_latents)
-        flops_per_step = estimate_tokenizer_flops(
-            nparams=param_counts["total"],
-            encoder_depth=cfg.encoder.depth,
-            decoder_depth=cfg.decoder.depth,
-            d_model=cfg.encoder.d_model,
+        flops_per_step = tokenizer.estimate_flops(
             batch_size=cfg.dataset.B,
             seq_length=cfg.dataset.T,
-            n_patches=n_patches,
-            n_latents=cfg.encoder.n_latents,
-            time_every=cfg.encoder.time_every,
         )
 
         if cfg.scaling_flops_budget > 0:

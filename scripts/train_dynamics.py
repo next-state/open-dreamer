@@ -24,7 +24,7 @@ from dreamer.utils import (
     build_lr_schedule,
     build_optimizer,
 )
-from dreamer.scaling import estimate_dynamics_flops, compute_max_steps, compute_steps_for_flops_budget
+from dreamer.scaling import compute_max_steps, compute_steps_for_flops_budget
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
@@ -139,15 +139,10 @@ def run(cfg: DynamicsConfig):
 
         # Scaling laws: compute FLOPs and max_steps from param count if enabled
         n_spatial = tokenizer_cfg.encoder.n_latents // cfg.dynamics.packing_factor
-        flops_per_step = estimate_dynamics_flops(
-            nparams=param_counts["total"],
-            depth=cfg.dynamics.depth,
-            d_model=cfg.dynamics.d_model,
+        flops_per_step = dynamics.estimate_flops(
             batch_size=cfg.dataset.B,
             seq_length=cfg.dataset.T,
             n_spatial=n_spatial,
-            n_register=cfg.dynamics.n_register,
-            time_every=cfg.dynamics.time_every,
         )
 
         # Tokens per step (for scaling analysis)
