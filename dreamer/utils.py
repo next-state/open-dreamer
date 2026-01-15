@@ -252,69 +252,6 @@ def build_checkpoint_manager(
     return ocp.CheckpointManager(ckpt_dir, options=checkpoint_options, item_names=item_names)
 
 
-ModelT = TypeVar('ModelT', bound=nnx.Module)
-
-
-def try_restore(
-        checkpoint_manager: ocp.CheckpointManager,
-        model: ModelT,
-        optimizer: nnx.Optimizer,
-        train_iterator: grain.DataLoaderIterator,
-        rngs: jax.Array,
-    ) -> tuple[
-        int, ModelT, nnx.Optimizer, grain.DataLoaderIterator, jax.Array
-    ]:
-
-    step = checkpoint_manager.latest_step()
-    if step is None:
-        print("No checkpoint found, starting from scratch.")
-        return 0, model, optimizer, train_iterator, rngs
-        
-    model_state = nnx.state(model)
-    optimizer_state = nnx.state(optimizer)
-    
-    restore_args = ocp.args.Composite(
-        model_state=ocp.args.StandardRestore(model_state),  # type: ignore
-        optimizer_state=ocp.args.StandardRestore(optimizer_state),  # type: ignore
-        train_dataloader_state=grain.checkpoint.CheckpointRestore(train_iterator),  # type: ignore
-        rngs=ocp.args.StandardRestore({"key": rngs}),  # type: ignore
-    )
-    
-    restored = checkpoint_manager.restore(step, args=restore_args)
-    nnx.update(model, restored["model_state"])
-    nnx.update(optimizer, restored["optimizer_state"])
-    train_iterator = restored["train_dataloader_state"]
-    rngs = restored["rngs"]["key"]
-    print(f"Restored checkpoint from step {step}.")
-
-    return step + 1, model, optimizer, train_iterator, rngs
-
-
-def maybe_save(
-        checkpoint_manager: ocp.CheckpointManager,
-        step: int,
-        model: nnx.Module,
-        optimizer: nnx.Optimizer,
-        train_iterator: grain.DataLoaderIterator,
-        rngs: jax.Array,
-        meta: dict,
-    ) -> None:
-    if not checkpoint_manager.should_save(step):
-        return
-
-    model_state = nnx.state(model)
-    optimizer_state = nnx.state(optimizer)
-
-    checkpoint_manager_args = ocp.args.Composite(
-        model_state=ocp.args.StandardSave(model_state),  # type: ignore
-        optimizer_state=ocp.args.StandardSave(optimizer_state),  # type: ignore
-        train_dataloader_state=grain.checkpoint.CheckpointSave(train_iterator),  # type: ignore
-        rngs=ocp.args.StandardSave({'key': rngs}),  # type: ignore
-        meta=ocp.args.JsonSave(meta)  # type: ignore
-    )
-    checkpoint_manager.save(step, args=checkpoint_manager_args)
-
-
 BundleT = TypeVar('BundleT')
 
 

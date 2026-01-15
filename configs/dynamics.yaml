@@ -30,6 +30,7 @@ dynamics:
     k_max: 128
     dtype: ${dtype}
     param_dtype: ${param_dtype}
+    tokenizer_ckpt: ${tokenizer_ckpt}
 
 bootstrap_start: 5_000
 self_fraction: 0.25

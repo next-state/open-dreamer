@@ -1,10 +1,14 @@
 defaults:
   - common
-  - _self_
   - dataset: coinrun
+  - _self_
 
-run_name: tokenizer
+run_name: tokenizer_new
 
+dataset:
+  B: 64
+  T: 32
+  
 ckpt:
   max_to_keep: 1
   save_interval_steps: 10_000

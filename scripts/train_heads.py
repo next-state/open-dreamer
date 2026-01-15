@@ -15,7 +15,6 @@ Architecture:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 
 import hydra
 import jax
@@ -24,6 +23,7 @@ from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
+from dreamer.bundles import DynamicsCheckpointBundle, HeadsCheckpointBundle
 from dreamer.configs import HeadsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
@@ -47,23 +47,6 @@ from dreamer.utils import (
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
-
-
-# ---------------------------
-# Checkpoint Bundle
-# ---------------------------
-
-@dataclass
-class HeadsCheckpointBundle:
-    """Bundle of all models and optimizers for checkpoint save/restore."""
-    dynamics: Dynamics
-    task_embedder: TaskEmbedder
-    policy_head: PolicyHeadMTP
-    reward_head: RewardHeadMTP
-    dynamics_optimizer: nnx.Optimizer
-    task_embedder_optimizer: nnx.Optimizer
-    policy_optimizer: nnx.Optimizer
-    reward_optimizer: nnx.Optimizer
 
 
 # ---------------------------
@@ -285,7 +268,9 @@ def run(cfg: HeadsConfig):
         rng, init_key = jax.random.split(key)
 
         print(f"[setup] Loading pretrained dynamics and tokenizer from {cfg.dynamics_ckpt}")
-        dynamics, tokenizer = Dynamics.from_pretrained(cfg.dynamics_ckpt, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        dynamics_bundle = DynamicsCheckpointBundle.from_pretrained(cfg.dynamics_ckpt, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        dynamics = dynamics_bundle.dynamics
+        tokenizer = dynamics_bundle.tokenizer
         dynamics_cfg = dynamics.cfg
         tokenizer_cfg = tokenizer.cfg
 
@@ -326,8 +311,9 @@ def run(cfg: HeadsConfig):
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
-        # Create checkpoint bundle
+        # Create checkpoint bundle (includes frozen tokenizer for self-contained checkpoints)
         bundle = HeadsCheckpointBundle(
+            tokenizer=tokenizer,
             dynamics=dynamics,
             task_embedder=task_embedder,
             policy_head=policy_head,
@@ -369,7 +355,7 @@ def run(cfg: HeadsConfig):
 
                 # Training step (encodes videos and trains)
                 metrics = encode_and_train_step(
-                    tokenizer, bundle.dynamics, bundle.task_embedder, bundle.policy_head, bundle.reward_head,
+                    bundle.tokenizer, bundle.dynamics, bundle.task_embedder, bundle.policy_head, bundle.reward_head,
                     bundle.dynamics_optimizer, bundle.task_embedder_optimizer,
                     bundle.policy_optimizer, bundle.reward_optimizer,
                     videos, actions, rewards,
@@ -400,7 +386,7 @@ def run(cfg: HeadsConfig):
                     val_actions = actions[:4]
                     run_evaluation(
                         cfg, tokenizer_cfg, step,
-                        tokenizer, bundle.dynamics,
+                        bundle.tokenizer, bundle.dynamics,
                         val_videos, val_actions, vis_dir, rng, logger, bundle.policy_head,
                         bundle.task_embedder
                     )

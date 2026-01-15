@@ -17,13 +17,15 @@ from tqdm import tqdm
 from dreamer.configs import TokenizerConfig
 from dreamer.training import compute_psnr
 from dreamer.data import make_iterator
+from dreamer.bundles import TokenizerCheckpointBundle
 from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
 from dreamer.parallel import build_parallel
 from dreamer.utils import (
     build_checkpoint_manager,
-    try_restore,
-    maybe_save,
+    get_bundle_item_names,
+    try_restore_bundle,
+    maybe_save_bundle,
     normalize_with_dataset_stats,
     count_parameters_by_component,
     setup_training_directories,
@@ -197,14 +199,23 @@ def run(cfg: TokenizerConfig):
         # Build optimizer
         optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule)
 
+        # Create checkpoint bundle
+        bundle = TokenizerCheckpointBundle(
+            tokenizer=tokenizer,
+            tokenizer_optimizer=optimizer,
+        )
+
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
-        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
+        with build_checkpoint_manager(
+            cfg.ckpt, ckpt_dir,
+            item_names=get_bundle_item_names(bundle)
+        ) as checkpoint_manager:
             # Resume from checkpoint
-            start_step, tokenizer, optimizer, train_iterator, rng = try_restore(
-                checkpoint_manager, tokenizer, optimizer, train_iterator, rng
+            start_step, bundle, train_iterator, rng = try_restore_bundle(
+                checkpoint_manager, bundle, train_iterator, rng
             )
 
             # Training loop
@@ -221,7 +232,7 @@ def run(cfg: TokenizerConfig):
                 videos = jax.device_put(batch["videos"], data_sharding)
 
                 aux = train_step(
-                    tokenizer, optimizer, videos,
+                    bundle.tokenizer, bundle.tokenizer_optimizer, videos,
                     mae_key=mae_key, dropout_key=dropout_key, step=step,
                     lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
                     dataset_mean=tuple(cfg.dataset.dataset_mean),
@@ -257,12 +268,12 @@ def run(cfg: TokenizerConfig):
                     )
 
                 # Checkpointing
-                maybe_save(checkpoint_manager, step, tokenizer, optimizer, train_iterator, rng, meta)
+                maybe_save_bundle(checkpoint_manager, step, bundle, train_iterator, rng, meta)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
-                    viz_step(tokenizer, viz_videos, step_rng, step, vis_dir, logger)
+                    viz_step(bundle.tokenizer, viz_videos, step_rng, step, vis_dir, logger)
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
