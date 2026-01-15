@@ -43,8 +43,8 @@ decoder:
   time_every: ${encoder.time_every}
   H: ${dataset.H}
   W: ${dataset.W}
-  patch_size: ${patch_size}
-  d_patch: ${mul:${patch_size},${patch_size},${dataset.C}}
+  patch_size: ${encoder.patch_size}
+  d_patch: ${mul:${decoder.patch_size},${decoder.patch_size},${dataset.C}}
   use_residual_lambdas: ${encoder.use_residual_lambdas}
   dtype: ${dtype}
   param_dtype: ${param_dtype}
@@ -76,8 +76,8 @@ optimizer:
   muon_ns_steps: 5
   muon_nesterov: true
   # MuP LR scaling
-  mup_scaling: false
-  mup_base_dim: 768
+  mup_scaling: true
+  mup_base_dim: 512
 
 lpips_weight: 0.2
 lpips_frac: 0.5

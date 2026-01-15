@@ -30,8 +30,8 @@ D_MODEL_MULT=64
 # Configuration by mode
 if [ "$MODE" == "isoflop" ]; then
     # Iso-FLOPs: multiple depths × multiple FLOPs budgets
-    DEPTHS=(6 5 4 3 2 1)
-    FLOPS_BUDGETS=(1e16 3e16 6e16 1e17 3e17 6e17)
+    DEPTHS=(10 9 8 7 6 5 4)
+    FLOPS_BUDGETS=(1e18 3e18 6e18)
 elif [ "$MODE" == "optimal" ]; then
     # Compute-optimal: multiple depths × fixed tokens_per_param
     DEPTHS=(7)
@@ -85,7 +85,7 @@ for DEPTH in "${DEPTHS[@]}"; do
             CMD="uv run scripts/train_${MODEL}.py \
                 run_name=${RUN_NAME} \
                 use_wandb=true \
-                ckpt.max_to_keep=null \
+                ckpt.save_interval_steps=100_000 \
                 encoder.depth=${DEPTH} encoder.d_model=${D_MODEL} \
                 encoder.n_heads=${N_HEADS} encoder.n_kv_heads=${N_HEADS} \
                 decoder.depth=${DEPTH} decoder.d_model=${D_MODEL} \
@@ -109,7 +109,7 @@ for DEPTH in "${DEPTHS[@]}"; do
         CMD="uv run scripts/train_${MODEL}.py \
             run_name=${RUN_NAME} \
             use_wandb=true \
-            ckpt.max_to_keep=null \
+            ckpt.save_interval_steps=100_000 \
             encoder.depth=${DEPTH} encoder.d_model=${D_MODEL} \
             encoder.n_heads=${N_HEADS} encoder.n_kv_heads=${N_HEADS} \
             decoder.depth=${DEPTH} decoder.d_model=${D_MODEL} \
