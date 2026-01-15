@@ -14,6 +14,7 @@ from .utils import (
 )
 from .configs import (
     TokenizerModelConfig, DynamicsModelConfig, EncoderModelConfig, DecoderModelConfig,
+    TaskEmbedderModelConfig, PolicyHeadModelConfig, RewardHeadModelConfig,
 )
 from .parallel import MeshRules
 
@@ -913,24 +914,17 @@ class Dynamics(nnx.Module):
 class TaskEmbedder(nnx.Module):
     """Task embedder for agent conditioning."""
 
-    def __init__(self, d_model: int, n_agent: int = 1, use_ids: bool = True,
-                 n_tasks: int = 128, d_task: int = 64, dtype: Any = jnp.float32,
-                 param_dtype: Any = jnp.float32, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
-        self.d_model = d_model
-        self.n_agent = n_agent
-        self.use_ids = use_ids
-        self.n_tasks = n_tasks
-        self.d_task = d_task
-        dtype = to_jnp_dtype(dtype)
-        param_dtype = to_jnp_dtype(param_dtype)
+    def __init__(self, cfg: TaskEmbedderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.cfg = cfg
+        dtype = to_jnp_dtype(cfg.dtype)
+        param_dtype = to_jnp_dtype(cfg.param_dtype)
 
-        if use_ids:
-            self.emb = nnx.Embed(n_tasks, d_model, dtype=dtype, param_dtype=param_dtype, embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')), rngs=rngs)
+        if cfg.use_ids:
+            self.emb = nnx.Embed(cfg.n_tasks, cfg.d_model, dtype=dtype, param_dtype=param_dtype, embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')), rngs=rngs)
         else:
-            self.emb = nnx.Linear(d_task, d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
+            self.emb = nnx.Linear(cfg.d_task, cfg.d_model, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
 
-        self.agent_base = nnx.Param(jax.random.normal(rngs.params(), (d_model,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
-
+        self.agent_base = nnx.Param(jax.random.normal(rngs.params(), (cfg.d_model,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
     def __call__(self, task, B: int, T: int) -> jax.Array:
         """
@@ -946,75 +940,61 @@ class TaskEmbedder(nnx.Module):
         x = emb + base[None, :]
 
         # Replicate across time and agent slots
-        x = jnp.broadcast_to(x[:, None, None, :], (B, T, self.n_agent, self.d_model))
+        x = jnp.broadcast_to(x[:, None, None, :], (B, T, self.cfg.n_agent, self.cfg.d_model))
         return x
 
 
 class PolicyHeadMTP(nnx.Module):
     """Multi-Token action prediction."""
 
-    def __init__(self, d_model: int, action_dim: int, L: int = 8, kind: str = "categorical",
-                 mlp_ratio: float = 2.0, dropout_rate: float = 0.0, swiglu: bool = True,
-                 parity_2over3: bool = False, dtype: Any = jnp.float32,
-                 param_dtype: Any = jnp.float32, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
-        self.d_model = d_model
-        self.action_dim = action_dim
-        self.L = L
-        self.kind = kind
-        dtype = to_jnp_dtype(dtype)
-        param_dtype = to_jnp_dtype(param_dtype)
+    def __init__(self, cfg: PolicyHeadModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.cfg = cfg
+        dtype = to_jnp_dtype(cfg.dtype)
+        param_dtype = to_jnp_dtype(cfg.param_dtype)
 
         # Feature projector: operates on flattened agent tokens (L*d_model)
-        d_flat = d_model * L
+        d_flat = cfg.d_model * cfg.L
         self.projector = MLP(
-            d_model=d_flat, mlp_ratio=mlp_ratio, dropout_rate=dropout_rate,
-            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype,
+            d_model=d_flat, mlp_ratio=cfg.mlp_ratio, dropout_rate=cfg.dropout_rate,
+            swiglu=cfg.swiglu, parity_2over3=cfg.parity_2over3, dtype=dtype,
             param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs
         )
 
         # Single matmul that produces all L offsets at once: (… , d_flat) -> (…, L, A)
-        self.out = nnx.Linear(d_flat, L * action_dim, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
+        self.out = nnx.Linear(d_flat, cfg.L * cfg.action_dim, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
 
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> jnp.ndarray:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)  # (B, T, D)
         logits = self.out(x)                                  # (B, T, L*A)
-        logits = rearrange(logits, 'b t (l a) -> b t l a', l=self.L, a=self.action_dim)
+        logits = rearrange(logits, 'b t (l a) -> b t l a', l=self.cfg.L, a=self.cfg.action_dim)
         return logits
 
 
 class RewardHeadMTP(nnx.Module):
     """Multi-Token reward prediction with symexp twohot bins."""
 
-    def __init__(self, d_model: int, L: int = 8, num_bins: int = 101, mlp_ratio: float = 2.0,
-                 dropout_rate: float = 0.0, swiglu: bool = True, parity_2over3: bool = False,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
-                 log_low: float = -8.0, log_high: float = 8.0, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
-        self.d_model = d_model
-        self.L = L
-        self.num_bins = num_bins
-        self.log_low = log_low
-        self.log_high = log_high
-        dtype = to_jnp_dtype(dtype)
-        param_dtype = to_jnp_dtype(param_dtype)
+    def __init__(self, cfg: RewardHeadModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.cfg = cfg
+        dtype = to_jnp_dtype(cfg.dtype)
+        param_dtype = to_jnp_dtype(cfg.param_dtype)
 
-        d_flat = d_model * L
+        d_flat = cfg.d_model * cfg.L
         self.projector = MLP(
-            d_model=d_flat, mlp_ratio=mlp_ratio, dropout_rate=dropout_rate,
-            swiglu=swiglu, parity_2over3=parity_2over3, dtype=dtype,
+            d_model=d_flat, mlp_ratio=cfg.mlp_ratio, dropout_rate=cfg.dropout_rate,
+            swiglu=cfg.swiglu, parity_2over3=cfg.parity_2over3, dtype=dtype,
             param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs
         )
-        self.out = nnx.Linear(d_flat, L * num_bins, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
+        self.out = nnx.Linear(d_flat, cfg.L * cfg.num_bins, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
 
         # Precompute bin centers as a constant
-        self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
-
+        self.symexp_centers_log = jnp.linspace(cfg.log_low, cfg.log_high, cfg.num_bins)
 
     def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, '... n c -> ... (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L*K)
-        logits = rearrange(logits, '... (l k) -> ... l k', l=self.L, k=self.num_bins)
+        logits = rearrange(logits, '... (l k) -> ... l k', l=self.cfg.L, k=self.cfg.num_bins)
         return logits, self.symexp_centers_log
 
 

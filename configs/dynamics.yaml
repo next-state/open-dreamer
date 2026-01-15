@@ -8,7 +8,7 @@ tokenizer_ckpt: logs/tokenizer_new/checkpoints/
 
 ckpt:
   max_to_keep: 2
-  save_interval_steps: 1_000
+  save_interval_steps: 100
 
 dataset:
   B: 32
@@ -30,7 +30,6 @@ dynamics:
     k_max: 128
     dtype: ${dtype}
     param_dtype: ${param_dtype}
-    tokenizer_ckpt: ${tokenizer_ckpt}
 
 bootstrap_start: 5_000
 self_fraction: 0.25

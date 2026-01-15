@@ -249,7 +249,7 @@ def train_step(
 def run(cfg: HeadsConfig):
     """Main training loop for agent finetuning."""
     # Setup
-    run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
+    run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
     
     # Logging
     logger = build_logger(
@@ -278,23 +278,9 @@ def run(cfg: HeadsConfig):
         print("[setup] Initializing agent components")
         rng, task_key, pol_key, rew_key = jax.random.split(rng, 4)
 
-        task_embedder = TaskEmbedder(
-            d_model=dynamics.cfg.d_model, n_agent=cfg.n_agent,
-            use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks,
-            dtype=cfg.dtype, param_dtype=cfg.param_dtype,
-            mesh_rules=mesh_rules, rngs=nnx.Rngs(task_key)
-        )
-        policy_head = PolicyHeadMTP(
-            d_model=dynamics.cfg.d_model, action_dim=dynamics.cfg.action_dim,
-            L=cfg.L, dtype=cfg.dtype, param_dtype=cfg.param_dtype,
-            mesh_rules=mesh_rules, rngs=nnx.Rngs(pol_key)
-        )
-        reward_head = RewardHeadMTP(
-            d_model=dynamics.cfg.d_model, L=cfg.L, num_bins=cfg.num_reward_bins,
-            log_low=cfg.reward_log_low, log_high=cfg.reward_log_high,
-            dtype=cfg.dtype, param_dtype=cfg.param_dtype,
-            mesh_rules=mesh_rules, rngs=nnx.Rngs(rew_key)
-        )
+        task_embedder = TaskEmbedder(cfg.task_embedder, mesh_rules=mesh_rules, rngs=nnx.Rngs(task_key))
+        policy_head = PolicyHeadMTP(cfg.policy_head, mesh_rules=mesh_rules, rngs=nnx.Rngs(pol_key))
+        reward_head = RewardHeadMTP(cfg.reward_head, mesh_rules=mesh_rules, rngs=nnx.Rngs(rew_key))
 
         # Build learning rate schedules
         lr_schedule_policy = build_lr_schedule(cfg.lr_schedule_policy)
@@ -364,7 +350,7 @@ def run(cfg: HeadsConfig):
                     step=step,
                     packing_factor=dynamics_cfg.packing_factor,
                     k_max=bundle.dynamics.cfg.k_max,
-                    L_mtp=cfg.L,
+                    L_mtp=cfg.policy_head.L,
                     B_self=(B // 2) * (step >= cfg.bootstrap_start),  # This will make the function compile twice. TODO: see if it's worth fixing this
                     dynamics_loss_weight=cfg.dynamics_loss_weight,
                 )
@@ -376,7 +362,7 @@ def run(cfg: HeadsConfig):
 
                 # Checkpointing
                 maybe_save_bundle(
-                    checkpoint_manager, step, bundle, train_iterator, rng, meta
+                    checkpoint_manager, step, bundle, train_iterator, rng
                 )
 
                 # Periodic lightweight AR eval
