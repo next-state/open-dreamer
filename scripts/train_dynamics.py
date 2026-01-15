@@ -183,7 +183,7 @@ def run(cfg: DynamicsConfig):
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
         # Build optimizer
-        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule)
+        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model)
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)

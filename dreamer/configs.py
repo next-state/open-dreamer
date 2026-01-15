@@ -35,56 +35,58 @@ class DatasetConfig:
 @dataclass(frozen=False)
 class EncoderModelConfig:
     n_latents: int = 16
-    d_bottleneck: int = 32
-    d_model: int = 64
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    patch_size: int = 4
-    depth: int = 8
+    d_bottleneck: int = 16
+    depth: int = 4
+    d_model: int = 512
+    n_heads: int = 8
+    n_kv_heads: int = 1
+    patch_size: int = 8
     dropout_rate: float = 0.05
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
+    use_residual_lambdas: bool = False
     dtype: str = "float32"
     param_dtype: str = "float32"
-    
+
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
 @dataclass(frozen=False)
 class DecoderModelConfig:
-    d_bottleneck: int = 32  # Must match encoder's d_bottleneck
-    d_model: int = 64
-    n_heads: int = 4
-    n_kv_heads: int = 2
     n_latents: int = 16
-    patch_size: int = 4
-    d_patch: int = 48    # Will be computed from patch_size, C
-    depth: int = 8
+    d_bottleneck: int = 16  # Must match encoder's d_bottleneck
+    depth: int = 4
+    d_model: int = 512
+    n_heads: int = 8
+    n_kv_heads: int = 1
+    patch_size: int = 8
+    d_patch: int = 192    # Will be computed from patch_size, C
     dropout_rate: float = 0.05
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
+    use_residual_lambdas: bool = False
     dtype: str = "float32"
     param_dtype: str = "float32"
     H: int = 64
     W: int = 64
-    
+
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
 @dataclass(frozen=False, unsafe_hash=True)
 class DynamicsModelConfig:
-    d_model: int = 128
-    d_bottleneck: int = 32
     action_dim: int = 16
-    depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
+    d_bottleneck: int = 32
+    depth: int = 12
+    d_model: int = 768
+    n_heads: int = 12
+    n_kv_heads: int = 1
     packing_factor: int = 2
     n_register: int = 4 # number of register tokens for dynamics
     qk_norm_type: str | None = None
@@ -92,6 +94,7 @@ class DynamicsModelConfig:
     time_every: int = 4
     mlp_ratio: float = 4.0
     dropout_rate: float = 0.0
+    use_residual_lambdas: bool = False
     dtype: str = "float32"
     param_dtype: str = "float32"
 
@@ -127,13 +130,22 @@ class CheckpointConfig:
 @dataclass(frozen=False)
 class OptimizerConfig:
     """Configuration for optimizer."""
-    # Optimizer type
-    optimizer_type: str = "adamw"  # Currently only "adamw" supported
-
-    # Optimizer hyperparameters (AdamW)
-    b1: float = 0.9
-    b2: float = 0.9
+    # Optimizer type: "adamw" or "muon"
+    optimizer_type: str = "adamw"
     weight_decay: float = 1e-4
+
+    # AdamW hyperparameters (also used for non-matrix params when using Muon)
+    adam_b1: float = 0.9
+    adam_b2: float = 0.9
+
+    # Muon-specific hyperparameters (for 2D matrix params, excluding embeddings)
+    muon_beta: float = 0.95         # Momentum for Muon
+    muon_ns_steps: int = 5          # Newton-Schulz iterations
+    muon_nesterov: bool = True      # Use Nesterov momentum
+
+    # MuP scaling (scales LR by (d_model/mup_base_dim)^-0.5)
+    mup_base_dim: int = 768         # Reference dimension for MuP scaling
+    mup_scaling: bool = False       # Enable MuP LR scaling
 
 
 @dataclass(frozen=False)
@@ -183,8 +195,6 @@ class BaseExperimentConfig:
 
 @dataclass(frozen=False)
 class TokenizerConfig(BaseExperimentConfig):
-    patch_size: int = 4
-
     # Model
     encoder: EncoderModelConfig = field(default_factory=EncoderModelConfig)
     decoder: DecoderModelConfig = field(default_factory=DecoderModelConfig)

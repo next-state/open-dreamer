@@ -47,7 +47,7 @@ def build_parallel(strategy: str) -> tuple[Mesh, NamedSharding, MeshRules]:
     Build parallelization setup (mesh, data_sharding, mesh_rules).
     
     Args:
-        cfg: BaseExperimentConfig instance with parallel_strategy field
+        strategy: the strategy to be used for parallelism
     
     Returns:
         Tuple of (mesh, data_sharding, mesh_rules)

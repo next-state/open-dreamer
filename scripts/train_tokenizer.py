@@ -42,6 +42,8 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Register OmegaConf resolver for arithmetic expressions
 # Usage: ${mul:a,b,c,...} multiplies all arguments
 OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
+OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
+OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
 
 
 # ------------------------
@@ -219,7 +221,7 @@ def run(cfg: TokenizerConfig):
         print(f"Parameter counts: {param_counts_formatted}")
 
         # Scaling laws: compute max_steps from param count if enabled
-        n_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
+        n_patches = (cfg.dataset.H // cfg.encoder.patch_size) * (cfg.dataset.W // cfg.encoder.patch_size)
         data_tokens_per_step = cfg.dataset.B * cfg.dataset.T * n_patches
         total_tokens_per_step = cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.encoder.n_latents)
         flops_per_step = estimate_tokenizer_flops(
@@ -263,7 +265,7 @@ def run(cfg: TokenizerConfig):
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
         # Build optimizer
-        optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule)
+        optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule, d_model=cfg.encoder.d_model)
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)

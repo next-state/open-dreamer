@@ -512,10 +512,23 @@ class BlockCausalTransformer(nnx.Module):
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, depth: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
+                 use_residual_lambdas: bool = False, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.depth = depth
         self.time_every = time_every
+        self.use_residual_lambdas = use_residual_lambdas
+        param_dtype = to_jnp_dtype(param_dtype)
+
+        if use_residual_lambdas:
+            self.resid_lambdas = nnx.Param(
+                jnp.ones(depth, dtype=param_dtype),
+                sharding_names=mesh_rules('embed')
+            )
+            self.x0_lambdas = nnx.Param(
+                jnp.zeros(depth, dtype=param_dtype),
+                sharding_names=mesh_rules('embed')
+            )
 
         # Create layers
         self.layers = nnx.List([
@@ -523,7 +536,7 @@ class BlockCausalTransformer(nnx.Module):
                 dim=d_model, num_heads=n_heads, num_kv_heads=n_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every,
-                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype, 
+                rope_theta=rope_theta, dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             ) for i in range(depth)
         ])
@@ -541,8 +554,12 @@ class BlockCausalTransformer(nnx.Module):
             output tensor and updated caches (always returns tuple, caches can be None)
         """
         new_caches = {} if caches is not None else None
+        x0 = x
 
         for i, layer in enumerate(self.layers):
+            if self.use_residual_lambdas:
+                x = self.resid_lambdas.value[i] * x + self.x0_lambdas.value[i] * x0
+
             time_index = i // self.time_every
             is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
@@ -576,6 +593,7 @@ class Encoder(nnx.Module):
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
             dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
             time_every=cfg.time_every, rope_theta=cfg.rope_theta, dtype=dtype, param_dtype=param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -650,6 +668,7 @@ class Decoder(nnx.Module):
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
             dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
             time_every=cfg.time_every, rope_theta=cfg.rope_theta, dtype=dtype, param_dtype=param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -829,7 +848,9 @@ class Dynamics(nnx.Module):
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads,
             depth=cfg.depth, dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type,
             mlp_ratio=cfg.mlp_ratio, time_every=cfg.time_every, rope_theta=cfg.rope_theta,
-            dtype=self.dtype, param_dtype=self.param_dtype, mesh_rules=mesh_rules, rngs=rngs
+            dtype=self.dtype, param_dtype=self.param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
+            mesh_rules=mesh_rules, rngs=rngs
         )
 
         # Discrete embeddings for shortcut conditioning

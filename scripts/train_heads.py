@@ -306,11 +306,12 @@ def run(cfg: HeadsConfig):
         lr_schedule_reward = build_lr_schedule(cfg.lr_schedule_reward)
         lr_schedule_dynamics = build_lr_schedule(cfg.lr_schedule_dynamics)
 
-        # Build optimizers
-        task_embedder_optimizer = build_optimizer(cfg.optimizer, task_embedder, lr_schedule_policy)  # Use same LR as policy
-        policy_optimizer = build_optimizer(cfg.optimizer, policy_head, lr_schedule_policy)
-        reward_optimizer = build_optimizer(cfg.optimizer, reward_head, lr_schedule_reward)
-        dynamics_optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule_dynamics)
+        # Build optimizers (all heads use dynamics.cfg.d_model for MuP scaling)
+        d_model = dynamics.cfg.d_model
+        task_embedder_optimizer = build_optimizer(cfg.optimizer, task_embedder, lr_schedule_policy, d_model=d_model)
+        policy_optimizer = build_optimizer(cfg.optimizer, policy_head, lr_schedule_policy, d_model=d_model)
+        reward_optimizer = build_optimizer(cfg.optimizer, reward_head, lr_schedule_reward, d_model=d_model)
+        dynamics_optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule_dynamics, d_model=d_model)
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)

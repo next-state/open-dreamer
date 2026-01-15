@@ -441,27 +441,87 @@ def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
         )
 
 
-def build_optimizer(optimizer_cfg: OptimizerConfig, model: nnx.Module, lr_schedule: optax.Schedule) -> nnx.Optimizer:
+def _build_muon_weight_dims(model: nnx.Module) -> dict:
+    """
+    Build muon_weight_dimension_numbers that excludes nnx.Embed params from Muon.
+
+    Returns a pytree matching model params where:
+    - nnx.Embed weights -> None (use AdamW)
+    - All other 2D params -> use Muon (default behavior)
+
+    Args:
+        model: nnx.Module to analyze
+
+    Returns:
+        Dict matching param structure with None for embedding params
+    """
+    def _mark_embeds(module):
+        """Recursively find Embed modules and mark their params for AdamW."""
+        result = {}
+        for name, child in vars(module).items():
+            if isinstance(child, nnx.Embed):
+                # Mark embedding weights for AdamW (None = don't use Muon)
+                result[name] = {"embedding": None}
+            elif isinstance(child, nnx.Module):
+                sub_result = _mark_embeds(child)
+                if sub_result:
+                    result[name] = sub_result
+        return result
+
+    return _mark_embeds(model)
+
+
+def build_optimizer(
+    optimizer_cfg: OptimizerConfig,
+    model: nnx.Module,
+    lr_schedule: optax.Schedule,
+    d_model: int = 768,
+) -> nnx.Optimizer:
     """
     Build optimizer with given learning rate schedule.
-    
+
     Args:
         optimizer_cfg: OptimizerConfig instance
         model: nnx.Module to optimize
         lr_schedule: optax.Schedule instance
+        d_model: Model dimension for MuP LR scaling (default 768)
 
     Returns:
         nnx.Optimizer instance
     """
+    if optimizer_cfg.mup_scaling:
+        mup_scale = (d_model / optimizer_cfg.mup_base_dim) ** -0.5
+        effective_schedule = lambda step, _s=lr_schedule, _m=mup_scale: _s(step) * _m
+    else:
+        effective_schedule = lr_schedule
+
     if optimizer_cfg.optimizer_type == "adamw":
         tx = optax.adamw(
-            lr_schedule,
-            b1=optimizer_cfg.b1,
-            b2=optimizer_cfg.b2,
+            effective_schedule,
+            b1=optimizer_cfg.adam_b1,
+            b2=optimizer_cfg.adam_b2,
             weight_decay=optimizer_cfg.weight_decay,
+        )
+    elif optimizer_cfg.optimizer_type == "muon":
+        import optax.contrib
+
+        weight_dims = _build_muon_weight_dims(model)
+
+        tx = optax.contrib.muon(
+            learning_rate=effective_schedule,
+            beta=optimizer_cfg.muon_beta,
+            ns_steps=optimizer_cfg.muon_ns_steps,
+            weight_decay=optimizer_cfg.weight_decay,
+            nesterov=optimizer_cfg.muon_nesterov,
+            # AdamW for non-Muon params (embeddings, biases)
+            adam_b1=optimizer_cfg.adam_b1,
+            adam_b2=optimizer_cfg.adam_b2,
+            adam_weight_decay=0.0,  # hardcoded to 0
+            # Exclusion mask for embeddings
+            muon_weight_dimension_numbers=weight_dims if weight_dims else None,
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_cfg.optimizer_type}")
-    
+
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     return optimizer

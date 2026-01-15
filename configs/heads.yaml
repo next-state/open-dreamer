@@ -42,10 +42,18 @@ lr_schedule_dynamics:
 
 # Optimizer config (shared across all components)
 optimizer:
-  optimizer_type: adamw
-  b1: 0.9
-  b2: 0.9
+  optimizer_type: muon
   weight_decay: 1e-4
+  # AdamW params (for embeddings/biases)
+  adam_b1: 0.9
+  adam_b2: 0.9
+  # Muon params (for 2D matrix weights)
+  muon_beta: 0.95
+  muon_ns_steps: 5
+  muon_nesterov: true
+  # MuP LR scaling
+  mup_scaling: false
+  mup_base_dim: 768
 
 dynamics_loss_weight: 0.1
 
