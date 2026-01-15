@@ -30,8 +30,8 @@ D_MODEL_MULT=64
 # Configuration by mode
 if [ "$MODE" == "isoflop" ]; then
     # Iso-FLOPs: multiple depths × multiple FLOPs budgets
-    DEPTHS=(10 9 8 7 6 5 4)
-    FLOPS_BUDGETS=(1e18 3e18 6e18)
+    DEPTHS=(7 6 5 4)  # (10 9 8 7 6 5 4)
+    FLOPS_BUDGETS=(6e18)  # (1e18 3e18 6e18)
 elif [ "$MODE" == "optimal" ]; then
     # Compute-optimal: multiple depths × fixed tokens_per_param
     DEPTHS=(7)

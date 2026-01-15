@@ -48,6 +48,8 @@ class EncoderModelConfig:
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
     use_residual_lambdas: bool = False
+    use_bias: bool = False
+    use_rmsnorm_scale: bool = True
     dtype: str = "float32"
     param_dtype: str = "float32"
 
@@ -70,6 +72,8 @@ class DecoderModelConfig:
     rope_theta: float = 10000.0
     time_every: int = 4
     use_residual_lambdas: bool = False
+    use_bias: bool = False
+    use_rmsnorm_scale: bool = True
     dtype: str = "float32"
     param_dtype: str = "float32"
     H: int = 64
@@ -95,6 +99,8 @@ class DynamicsModelConfig:
     mlp_ratio: float = 4.0
     dropout_rate: float = 0.0
     use_residual_lambdas: bool = False
+    use_bias: bool = False
+    use_rmsnorm_scale: bool = True
     dtype: str = "float32"
     param_dtype: str = "float32"
 

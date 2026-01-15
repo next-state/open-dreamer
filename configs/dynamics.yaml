@@ -29,6 +29,8 @@ dynamics:
     dropout_rate: 0.05
     k_max: 128
     use_residual_lambdas: true
+    use_bias: false
+    use_rmsnorm_scale: true
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 

@@ -24,6 +24,8 @@ encoder:
   mae_p_max: 0.9
   patch_size: 8
   use_residual_lambdas: true
+  use_bias: false
+  use_rmsnorm_scale: true
   dtype: ${dtype}
   param_dtype: ${param_dtype}
   
@@ -46,6 +48,8 @@ decoder:
   patch_size: ${encoder.patch_size}
   d_patch: ${mul:${decoder.patch_size},${decoder.patch_size},${dataset.C}}
   use_residual_lambdas: ${encoder.use_residual_lambdas}
+  use_bias: ${encoder.use_bias}
+  use_rmsnorm_scale: ${encoder.use_rmsnorm_scale}
   dtype: ${dtype}
   param_dtype: ${param_dtype}
   
