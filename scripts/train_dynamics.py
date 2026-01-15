@@ -175,10 +175,10 @@ def run(cfg: DynamicsConfig):
             print(f"[Scaling] {param_counts['total']:,} params × {cfg.scaling_tokens_per_param} = {total_tokens:,.0f} tokens -> {computed_steps:,} steps")
 
         # Build learning rate schedule
-        lr_schedule = build_lr_schedule(cfg.lr_schedule)
+        lr_schedule = build_lr_schedule(cfg.lr_schedule, d_model=cfg.dynamics.d_model)
 
         # Build optimizer
-        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model)
+        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule)
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)

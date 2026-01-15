@@ -124,6 +124,10 @@ class LRScheduleConfig:
     warmup_ratio: float = 0.0  # e.g., 0.1 = 10% warmup
     decay_ratio: float = 0.0   # e.g., 0.2 = 20% decay (for wsd)
 
+    # MuP scaling (scales LR by (d_model/mup_base_dim)^-0.5)
+    mup_base_dim: int = 768         # Reference dimension for MuP scaling
+    mup_scaling: bool = False       # Enable MuP LR scaling
+
 
 @dataclass(frozen=False)
 class CheckpointConfig:
@@ -148,10 +152,6 @@ class OptimizerConfig:
     muon_beta: float = 0.95         # Momentum for Muon
     muon_ns_steps: int = 5          # Newton-Schulz iterations
     muon_nesterov: bool = True      # Use Nesterov momentum
-
-    # MuP scaling (scales LR by (d_model/mup_base_dim)^-0.5)
-    mup_base_dim: int = 768         # Reference dimension for MuP scaling
-    mup_scaling: bool = False       # Enable MuP LR scaling
 
 
 @dataclass(frozen=False)

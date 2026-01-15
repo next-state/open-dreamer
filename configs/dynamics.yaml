@@ -47,6 +47,8 @@ lr_schedule:
   warmup_ratio: 0.167
   decay_ratio: 0.067
   max_steps: ${max_steps}
+  mup_scaling: true
+  mup_base_dim: 512
 
 optimizer:
   optimizer_type: muon
@@ -58,8 +60,5 @@ optimizer:
   muon_beta: 0.95
   muon_ns_steps: 5
   muon_nesterov: true
-  # MuP LR scaling
-  mup_scaling: false
-  mup_base_dim: 768
 
 write_video_every: 5_000

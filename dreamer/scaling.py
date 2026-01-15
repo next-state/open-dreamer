@@ -34,7 +34,6 @@ def compute_max_steps(
 def compute_steps_for_flops_budget(
     total_flops: float,
     flops_per_step: int,
-    min_steps: int = 10,
 ) -> int:
     """Compute training steps to achieve a fixed FLOPs budget.
 
@@ -44,10 +43,8 @@ def compute_steps_for_flops_budget(
     Args:
         total_flops: Target total FLOPs budget
         flops_per_step: FLOPs per training step for this model
-        min_steps: Minimum steps to run (default 10)
 
     Returns:
         Number of training steps
     """
-    steps = int(total_flops / flops_per_step)
-    return max(steps, min_steps)
+    return int(total_flops / flops_per_step)

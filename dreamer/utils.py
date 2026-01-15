@@ -392,33 +392,42 @@ def count_parameters_by_component(model):
     return counts
 
 
-def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
+def build_lr_schedule(schedule_cfg: LRScheduleConfig, d_model: int = 768) -> optax.Schedule:
     """
     Build learning rate schedule.
 
     Args:
         schedule_cfg: ScheduleConfig instance
+        d_model: Model dimension for MuP LR scaling (default 768)
 
     Returns:
         optax.Schedule instance
     """
     max_steps = schedule_cfg.max_steps
 
-    # Compute warmup/decay steps from ratios
+    lr = schedule_cfg.lr
+    init_lr = schedule_cfg.init_lr if schedule_cfg.init_lr is not None else 0.0
+    lr_end = schedule_cfg.lr_end if schedule_cfg.lr_end is not None else 0.0
+    if schedule_cfg.mup_scaling:
+        mup_scale = (d_model / schedule_cfg.mup_base_dim) ** -0.5
+        lr = lr * mup_scale
+        init_lr = init_lr * mup_scale
+        lr_end = lr_end * mup_scale
+
     warmup_steps = int(max_steps * schedule_cfg.warmup_ratio)
     decay_steps = int(max_steps * schedule_cfg.decay_ratio)
 
     if schedule_cfg.schedule_type == "constant":
-        return optax.constant_schedule(value=schedule_cfg.lr)
+        return optax.constant_schedule(value=lr)
     elif schedule_cfg.schedule_type == "cos":
         assert warmup_steps <= max_steps, "Warmup steps can't be greater than total steps."
         return optax.warmup_cosine_decay_schedule(
-            init_value=schedule_cfg.init_lr,
-            peak_value=schedule_cfg.lr,
+            init_value=init_lr,
+            peak_value=lr,
             warmup_steps=warmup_steps,
             # Note: decay_steps includes the warmup steps, so pass the total value.
             decay_steps=max_steps,
-            end_value=schedule_cfg.lr_end,
+            end_value=lr_end,
         )
     elif schedule_cfg.schedule_type == "wsd":
         assert (
@@ -426,11 +435,11 @@ def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
         ), f"Warmup ({warmup_steps}) + decay ({decay_steps}) > max_steps ({max_steps})."
         schedules = [
             optax.linear_schedule(
-                init_value=schedule_cfg.init_lr, end_value=schedule_cfg.lr, transition_steps=warmup_steps
+                init_value=init_lr, end_value=lr, transition_steps=warmup_steps
             ),
-            optax.constant_schedule(value=schedule_cfg.lr),
+            optax.constant_schedule(value=lr),
             optax.linear_schedule(
-                init_value=schedule_cfg.lr, end_value=schedule_cfg.lr_end, transition_steps=decay_steps
+                init_value=lr, end_value=lr_end, transition_steps=decay_steps
             ),
         ]
         boundaries = [warmup_steps, max_steps - decay_steps]
@@ -475,7 +484,6 @@ def build_optimizer(
     optimizer_cfg: OptimizerConfig,
     model: nnx.Module,
     lr_schedule: optax.Schedule,
-    d_model: int = 768,
 ) -> nnx.Optimizer:
     """
     Build optimizer with given learning rate schedule.
@@ -484,21 +492,13 @@ def build_optimizer(
         optimizer_cfg: OptimizerConfig instance
         model: nnx.Module to optimize
         lr_schedule: optax.Schedule instance
-        d_model: Model dimension for MuP LR scaling (default 768)
 
     Returns:
         nnx.Optimizer instance
     """
-    if optimizer_cfg.mup_scaling:
-        # FIXME: shouldn't we simply do this inside of build_lr_scheduler and scale the maximum lr?
-        mup_scale = (d_model / optimizer_cfg.mup_base_dim) ** -0.5
-        effective_schedule = lambda step, _s=lr_schedule, _m=mup_scale: _s(step) * _m
-    else:
-        effective_schedule = lr_schedule
-
     if optimizer_cfg.optimizer_type == "adamw":
         tx = optax.adamw(
-            effective_schedule,
+            lr_schedule,
             b1=optimizer_cfg.adam_b1,
             b2=optimizer_cfg.adam_b2,
             weight_decay=optimizer_cfg.weight_decay,
@@ -509,7 +509,7 @@ def build_optimizer(
         weight_dims = _build_muon_weight_dims(model)
 
         tx = optax.contrib.muon(
-            learning_rate=effective_schedule,
+            learning_rate=lr_schedule,
             beta=optimizer_cfg.muon_beta,
             ns_steps=optimizer_cfg.muon_ns_steps,
             weight_decay=optimizer_cfg.weight_decay,

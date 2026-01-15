@@ -29,16 +29,22 @@ lr_schedule_policy:
   schedule_type: constant
   lr: ${lr_schedule_dynamics.lr}
   max_steps: ${max_steps}
+  mup_scaling: ${lr_schedule_dynamics.mup_scaling}
+  mup_base_dim: ${lr_schedule_dynamics.mup_base_dim}
 
 lr_schedule_reward:
   schedule_type: constant
   lr: ${lr_schedule_dynamics.lr}
   max_steps: ${max_steps}
+  mup_scaling: ${lr_schedule_dynamics.mup_scaling}
+  mup_base_dim: ${lr_schedule_dynamics.mup_base_dim}
 
 lr_schedule_dynamics:
   schedule_type: constant
   lr: 1e-4
   max_steps: ${max_steps}
+  mup_scaling: true
+  mup_base_dim: 512
 
 # Optimizer config (shared across all components)
 optimizer:
@@ -51,9 +57,6 @@ optimizer:
   muon_beta: 0.95
   muon_ns_steps: 5
   muon_nesterov: true
-  # MuP LR scaling
-  mup_scaling: false
-  mup_base_dim: 768
 
 dynamics_loss_weight: 0.1
 
