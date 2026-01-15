@@ -108,7 +108,7 @@ def train_step(
 
 def run(cfg: DynamicsConfig):
     # Setup
-    run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
+    run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
     # Logging
     logger = build_logger(
@@ -198,7 +198,7 @@ def run(cfg: DynamicsConfig):
                     )
 
                 # Checkpointing
-                maybe_save_bundle(checkpoint_manager, step, bundle, train_iterator, rng, meta)
+                maybe_save_bundle(checkpoint_manager, step, bundle, train_iterator, rng)
 
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:

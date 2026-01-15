@@ -10,9 +10,9 @@ from einops import rearrange
 from enum import IntEnum
 from typing import Tuple, TypeVar
 import numpy as np
+from omegaconf import OmegaConf
 from dataclasses import fields, is_dataclass
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import OmegaConf
 from dreamer.configs import CheckpointConfig, LRScheduleConfig, OptimizerConfig
 
 
@@ -369,7 +369,6 @@ def maybe_save_bundle(
     bundle: BundleT,
     train_iterator: grain.DataLoaderIterator,
     rng: jax.Array,
-    meta: dict,
 ) -> None:
     """Save checkpoint bundle (generic for any dataclass).
     
@@ -400,7 +399,7 @@ def maybe_save_bundle(
         return
     
     # Build save args dynamically by introspecting bundle fields
-    save_kwargs = {}
+    save_kwargs, meta = {}, {}
     
     for field in fields(bundle):
         field_value = getattr(bundle, field.name)
@@ -409,6 +408,7 @@ def maybe_save_bundle(
         if isinstance(field_value, nnx.Module):
             state_key = f"{field.name}_state"
             save_kwargs[state_key] = ocp.args.StandardSave(nnx.state(field_value))  # type: ignore
+            meta[field.name] = OmegaConf.to_container(OmegaConf.create(field_value.cfg))
     
     # Add iterator, rngs, and meta
     save_kwargs["train_dataloader_state"] = grain.checkpoint.CheckpointSave(train_iterator)  # type: ignore
@@ -426,13 +426,12 @@ def _ensure_dir(p: Path) -> Path:
     return p
 
 
-def setup_training_directories(cfg) -> tuple[Path, Path, Path, dict]:
+def setup_training_directories(cfg) -> tuple[Path, Path, Path]:
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
-    meta = {"cfg": OmegaConf.to_container(cfg, resolve=True)}
     print(f"[setup] output dir: {run_dir.resolve()}")
-    return run_dir, ckpt_dir, vis_dir, meta
+    return run_dir, ckpt_dir, vis_dir
 
 
 

@@ -13,7 +13,7 @@ from .utils import (
     patchify, unpatchify
 )
 from .configs import (
-    TokenizerConfig, DynamicsModelConfig, EncoderModelConfig, DecoderModelConfig,
+    TokenizerModelConfig, DynamicsModelConfig, EncoderModelConfig, DecoderModelConfig,
 )
 from .parallel import MeshRules
 
@@ -690,7 +690,7 @@ class Decoder(nnx.Module):
 class Tokenizer(nnx.Module):
     """Complete tokenizer (encoder + decoder)."""
 
-    def __init__(self, cfg: TokenizerConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: TokenizerModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.cfg = cfg
 
         # Create encoder and decoder

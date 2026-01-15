@@ -8,53 +8,54 @@ run_name: tokenizer_new
 dataset:
   B: 64
   T: 32
-  
+
 ckpt:
   max_to_keep: 1
   save_interval_steps: 10_000
 
 patch_size: 8
 
-encoder:
-  n_latents: 16
-  d_bottleneck: 16
-  d_model: 512
-  n_heads: 8
-  n_kv_heads: 2
-  depth: 4
-  dropout_rate: 0.05
-  qk_norm_type: quest  # qknorm | quest | null
-  rope_theta: 10000.0
-  time_every: 4
-  mae_p_min: 0.0
-  mae_p_max: 0.9
-  patch_size: ${patch_size}
-  dtype: ${dtype}
-  param_dtype: ${param_dtype}
-  
-  dataset_mean: ${dataset.dataset_mean}
-  dataset_std: ${dataset.dataset_std}
+tokenizer:
+  encoder:
+    n_latents: 16
+    d_bottleneck: 16
+    d_model: 512
+    n_heads: 8
+    n_kv_heads: 2
+    depth: 4
+    dropout_rate: 0.05
+    qk_norm_type: quest  # qknorm | quest | null
+    rope_theta: 10000.0
+    time_every: 4
+    mae_p_min: 0.0
+    mae_p_max: 0.9
+    patch_size: ${patch_size}
+    dtype: ${dtype}
+    param_dtype: ${param_dtype}
 
-decoder:
-  d_bottleneck: ${encoder.d_bottleneck}
-  d_model: ${encoder.d_model}
-  n_heads: ${encoder.n_heads}
-  n_kv_heads: ${encoder.n_kv_heads}
-  n_latents: ${encoder.n_latents}
-  depth: ${encoder.depth}
-  dropout_rate: ${encoder.dropout_rate}
-  qk_norm_type: ${encoder.qk_norm_type}
-  rope_theta: ${encoder.rope_theta}
-  time_every: ${encoder.time_every}
-  H: ${dataset.H}
-  W: ${dataset.W}
-  patch_size: ${patch_size}
-  d_patch: ${mul:${patch_size},${patch_size},${dataset.C}}
-  dtype: ${dtype}
-  param_dtype: ${param_dtype}
-  
-  dataset_mean: ${dataset.dataset_mean}
-  dataset_std: ${dataset.dataset_std}
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
+
+  decoder:
+    d_bottleneck: ${tokenizer.encoder.d_bottleneck}
+    d_model: ${tokenizer.encoder.d_model}
+    n_heads: ${tokenizer.encoder.n_heads}
+    n_kv_heads: ${tokenizer.encoder.n_kv_heads}
+    n_latents: ${tokenizer.encoder.n_latents}
+    depth: ${tokenizer.encoder.depth}
+    dropout_rate: ${tokenizer.encoder.dropout_rate}
+    qk_norm_type: ${tokenizer.encoder.qk_norm_type}
+    rope_theta: ${tokenizer.encoder.rope_theta}
+    time_every: ${tokenizer.encoder.time_every}
+    H: ${dataset.H}
+    W: ${dataset.W}
+    patch_size: ${patch_size}
+    d_patch: ${mul:${patch_size},${patch_size},${dataset.C}}
+    dtype: ${dtype}
+    param_dtype: ${param_dtype}
+
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
 
 max_steps: 300_000
 tokenizer_loss_type: mse  # mse | mae

@@ -17,7 +17,7 @@ from flax import nnx
 from dreamer.configs import (
     DynamicsModelConfig,
     HeadsConfig,
-    TokenizerConfig,
+    TokenizerModelConfig,
 )
 from dreamer.models import (
     Dynamics,
@@ -67,7 +67,7 @@ class TokenizerCheckpointBundle:
             meta_restored = checkpoint_manager.restore(
                 step, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
             )
-            cfg = from_dict(TokenizerConfig, meta_restored["meta"]["cfg"])
+            cfg = from_dict(TokenizerModelConfig, meta_restored["meta"]["Tokenizer"])
 
             # Initialize tokenizer
             tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=rngs)
@@ -124,11 +124,11 @@ class DynamicsCheckpointBundle:
             meta_restored = checkpoint_manager.restore(
                 step, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
             )
-            cfg = meta_restored["meta"]["cfg"]
+            cfg = meta_restored["meta"]
 
             # Reconstruct configs
-            tokenizer_cfg = from_dict(TokenizerConfig, cfg)
-            dynamics_cfg = from_dict(DynamicsModelConfig, cfg["dynamics"])
+            tokenizer_cfg = from_dict(TokenizerModelConfig, cfg["Tokenizer"])
+            dynamics_cfg = from_dict(DynamicsModelConfig, cfg["Dynamics"])
 
             # Initialize models
             tokenizer = Tokenizer(tokenizer_cfg, mesh_rules=mesh_rules, rngs=rngs)
@@ -202,9 +202,7 @@ class HeadsCheckpointBundle:
             raw_cfg = meta_restored["meta"]["cfg"]
 
             # TokenizerConfig is stored at root level (encoder/decoder fields)
-            tokenizer_cfg = from_dict(TokenizerConfig, raw_cfg)
-
-            # DynamicsModelConfig is under 'dynamics' key
+            tokenizer_cfg = from_dict(TokenizerModelConfig, raw_cfg["tokenizer"])
             dynamics_cfg = from_dict(DynamicsModelConfig, raw_cfg["dynamics"])
 
             # Split rngs for each model

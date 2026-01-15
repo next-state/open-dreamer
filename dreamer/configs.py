@@ -77,6 +77,13 @@ class DecoderModelConfig:
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
+@dataclass(frozen=False)
+class TokenizerModelConfig:
+    """Model configuration for tokenizer (encoder + decoder architecture)."""
+    encoder: EncoderModelConfig = field(default_factory=EncoderModelConfig)
+    decoder: DecoderModelConfig = field(default_factory=DecoderModelConfig)
+
+
 @dataclass(frozen=False, unsafe_hash=True)
 class DynamicsModelConfig:
     d_model: int = 128
@@ -179,11 +186,8 @@ class BaseExperimentConfig:
 
 @dataclass(frozen=False)
 class TokenizerConfig(BaseExperimentConfig):
-    patch_size: int = 4
-
-    # Model
-    encoder: EncoderModelConfig = field(default_factory=EncoderModelConfig)
-    decoder: DecoderModelConfig = field(default_factory=DecoderModelConfig)
+    # Model architecture
+    tokenizer: TokenizerModelConfig = field(default_factory=TokenizerModelConfig)
 
     # Training
     lpips_weight: float = 0.2
@@ -193,8 +197,8 @@ class TokenizerConfig(BaseExperimentConfig):
 
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
-    
-    # Optimizer 
+
+    # Optimizer
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
 

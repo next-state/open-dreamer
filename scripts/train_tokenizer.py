@@ -169,7 +169,7 @@ def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger):
 
 def run(cfg: TokenizerConfig):
     # Setup
-    run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
+    run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
     # Logging
     logger = build_logger(
@@ -189,7 +189,7 @@ def run(cfg: TokenizerConfig):
         rng, init_key = jax.random.split(key)
 
         # Initialize tokenizer
-        tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        tokenizer = Tokenizer(cfg.tokenizer, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(tokenizer)
         print(f"Parameter counts: {param_counts}")
 
@@ -268,7 +268,7 @@ def run(cfg: TokenizerConfig):
                     )
 
                 # Checkpointing
-                maybe_save_bundle(checkpoint_manager, step, bundle, train_iterator, rng, meta)
+                maybe_save_bundle(checkpoint_manager, step, bundle, train_iterator, rng)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
