@@ -8,13 +8,13 @@ tokenizer_ckpt: logs/tokenizer_new/checkpoints/
 
 ckpt:
   max_to_keep: 2
-  save_interval_steps: 100
+  save_interval_steps: 10_000
 
 dataset:
-  B: 32
+  B: 64
 
 dynamics:
-    d_model: 256
+    d_model: 1024
     d_bottleneck: 16
     action_dim: 16
     depth: 12
@@ -34,7 +34,7 @@ dynamics:
 bootstrap_start: 5_000
 self_fraction: 0.25
 
-max_steps: 300_000
+max_steps: 100_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos

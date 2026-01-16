@@ -7,13 +7,13 @@ run_name: heads
 dynamics_ckpt: "logs/dynamics_new/checkpoints"
 
 ckpt:
-  save_interval_steps: 100_000
+  save_interval_steps: 10_000
 
 dataset:
   B: 128
   T: 32
 
-d_model: 256
+d_model: 1024
 n_agent: 8
 
 # Model configs (for initialization - stored in checkpoint meta)

@@ -3,6 +3,16 @@ from dataclasses import dataclass, field
 
 # ---- Dataset Configs ----
 
+
+@dataclass(frozen=False, unsafe_hash=True)
+class StreamingConfig:
+    """Configuration for streaming datasets from HuggingFace."""
+
+    enabled: bool = False
+    repo_id: str = ""
+    max_shards: int = 4
+
+
 @dataclass(frozen=False, unsafe_hash=True)
 class DatasetConfig:
     """Configuration for dataset parameters.
@@ -29,6 +39,9 @@ class DatasetConfig:
 
     # Reward-biased slicing probability (0.0 = disabled, 0.8 = 80% chance to include windows with nonzero reward)
     p_include_reward: float = 0.0
+
+    # Streaming configuration for on-demand HuggingFace downloads
+    streaming: StreamingConfig = field(default_factory=StreamingConfig)
 
 # ---- Model Configs ----
 

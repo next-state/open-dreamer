@@ -1,12 +1,12 @@
 defaults:
   - common
-  - dataset: coinrun
+  - dataset: minecraft
   - _self_
 
-run_name: tokenizer_new
+run_name: tokenizer_minecraft
 
 dataset:
-  B: 64
+  B: 16
   T: 32
 
 ckpt:
@@ -57,7 +57,7 @@ tokenizer:
     dataset_mean: ${dataset.dataset_mean}
     dataset_std: ${dataset.dataset_std}
 
-max_steps: 300_000
+max_steps: 100_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:

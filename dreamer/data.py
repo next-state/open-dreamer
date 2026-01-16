@@ -7,6 +7,7 @@ import glob
 import os
 
 from .configs import DatasetConfig
+from .minecraft_source import MinecraftVPTConfig, MinecraftVPTDataSource
 
 
 
@@ -120,12 +121,24 @@ def make_iterator(
 ):
     """
     Creates a data loading pipeline using Grain from a DatasetConfig.
+
+    Dispatches to streaming iterator if cfg.streaming.enabled is True.
     """
+    # Dispatch to streaming iterator if enabled
+    if cfg.streaming.enabled:
+        return make_minecraft_iterator(
+            cfg,
+            num_workers=num_workers,
+            prefetch_buffer_size=max(prefetch_buffer_size, 4),  # Higher for streaming
+            seed=seed,
+            print_filter_warnings=print_filter_warnings,
+        )
+
     array_record_paths = cfg.array_record_path
-    
+
     if not array_record_paths:
         raise ValueError("array_record_path cannot be empty.")
-    
+
     if isinstance(array_record_paths, str):
         if os.path.isdir(array_record_paths):
             array_record_paths = [
@@ -182,6 +195,77 @@ def make_iterator(
         read_options=grain.ReadOptions(
             prefetch_buffer_size=prefetch_buffer_size,
             num_threads=1,
+        ),
+    )
+
+    return dataloader
+
+
+def make_minecraft_iterator(
+    cfg: DatasetConfig,
+    num_workers: int = 22,
+    prefetch_buffer_size: int = 4,
+    seed: int = 42,
+    print_filter_warnings: bool = False,
+):
+    """
+    Creates data iterator using on-demand HuggingFace download for Minecraft VPT.
+
+    Uses MinecraftVPTDataSource which implements RandomAccessDataSource protocol
+    and downloads shards on-demand as they are accessed by Grain workers.
+    """
+    # Create streaming source config
+    source_cfg = MinecraftVPTConfig(
+        repo_id=cfg.streaming.repo_id,
+        target_dir=cfg.array_record_path,
+        max_shards=cfg.streaming.max_shards,
+    )
+    source = MinecraftVPTDataSource(source_cfg)
+
+    num_processes = jax.process_count()
+
+    if cfg.B % num_processes != 0:
+        raise ValueError(
+            f"Global batch size {cfg.B} must be divisible by "
+            f"the number of JAX processes {num_processes}."
+        )
+    per_process_batch_size = cfg.B // num_processes
+
+    sampler = grain.samplers.IndexSampler(
+        num_records=len(source),
+        shard_options=grain.sharding.ShardByJaxProcess(drop_remainder=True),
+        shuffle=True,
+        num_epochs=None,
+        seed=seed,
+    )
+
+    operations = [
+        EpisodeLengthFilter(
+            seq_len=cfg.T,
+            image_h=cfg.H,
+            image_w=cfg.W,
+            image_c=cfg.C,
+            print_filter_warnings=print_filter_warnings,
+        ),
+        ProcessEpisodeAndSlice(
+            seq_len=cfg.T,
+            image_h=cfg.H,
+            image_w=cfg.W,
+            image_c=cfg.C,
+            p_include_reward=cfg.p_include_reward,
+        ),
+        grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
+    ]
+
+    dataloader = grain.DataLoader(
+        data_source=source,
+        sampler=sampler,
+        operations=operations,
+        worker_count=num_workers,
+        worker_buffer_size=2,
+        read_options=grain.ReadOptions(
+            prefetch_buffer_size=prefetch_buffer_size,
+            num_threads=2,
         ),
     )
 
