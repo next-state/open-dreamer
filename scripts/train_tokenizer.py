@@ -43,6 +43,7 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
 OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
 OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
+OmegaConf.register_new_resolver("max", lambda *args: max(args))
 
 
 # ------------------------

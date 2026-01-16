@@ -15,7 +15,7 @@ encoder:
   depth: 4
   d_model: ${mul:64,${sum:${encoder.depth},${decoder.depth}}}
   n_heads: ${floordiv:${encoder.d_model},64}
-  n_kv_heads: ${floordiv:${encoder.n_heads},8}
+  n_kv_heads: ${max:1,${floordiv:${encoder.n_heads},8}}
   dropout_rate: 0.05
   qk_norm_type: quest  # qknorm | quest | null
   rope_theta: 10000.0
