@@ -271,7 +271,7 @@ def latent_rollout(
     # 1. Initialize caches and process context
     # We need to compute the max window size needed: context + rollout
     window_size = T_ctx + num_steps
-    n_agents = policy.L if isinstance(policy, PolicyHeadMTP) else 0
+    n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
     caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
     
     # Run dynamics on context to prefill caches and get last hidden state
