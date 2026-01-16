@@ -72,7 +72,6 @@ RUN=0
 # Main loop
 for DEPTH in "${DEPTHS[@]}"; do
     D_MODEL=$((DEPTH * D_MODEL_MULT))
-    N_HEADS=$((D_MODEL / 64))
 
     if [ "$MODE" == "isoflop" ]; then
         for FLOPS in "${FLOPS_BUDGETS[@]}"; do
@@ -87,9 +86,6 @@ for DEPTH in "${DEPTHS[@]}"; do
                 use_wandb=true \
                 ckpt.save_interval_steps=100_000 \
                 encoder.depth=${DEPTH} encoder.d_model=${D_MODEL} \
-                encoder.n_heads=${N_HEADS} encoder.n_kv_heads=${N_HEADS} \
-                decoder.depth=${DEPTH} decoder.d_model=${D_MODEL} \
-                decoder.n_heads=${N_HEADS} decoder.n_kv_heads=${N_HEADS} \
                 scaling_flops_budget=${FLOPS} \
                 hydra.run.dir=${OUT_DIR}/${RUN_NAME}"
 
@@ -111,9 +107,6 @@ for DEPTH in "${DEPTHS[@]}"; do
             use_wandb=true \
             ckpt.save_interval_steps=100_000 \
             encoder.depth=${DEPTH} encoder.d_model=${D_MODEL} \
-            encoder.n_heads=${N_HEADS} encoder.n_kv_heads=${N_HEADS} \
-            decoder.depth=${DEPTH} decoder.d_model=${D_MODEL} \
-            decoder.n_heads=${N_HEADS} decoder.n_kv_heads=${N_HEADS} \
             scaling_tokens_per_param=${TOKENS_PER_PARAM} \
             hydra.run.dir=${OUT_DIR}/${RUN_NAME}"
 
