@@ -210,7 +210,6 @@ class TokenizerConfig(BaseExperimentConfig):
     lpips_frac: float = 0.5
     visualize_every: int = 10_000
     tokenizer_loss_type: str = "mae" # "mse" | "mae"
-    n_minibatches: int = 1  # Number of minibatches for gradient accumulation
 
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)

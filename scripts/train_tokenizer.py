@@ -83,17 +83,16 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
 # Train step
 # ------------------------
 
-@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type", "n_minibatches"))
-def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, dropout_key, step,
-               lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str,
-               n_minibatches: int = 1):
+@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"))
+def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, dropout_key, step, 
+               lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
 
-    def loss_fn(model: Tokenizer, minibatch_videos, minibatch_mae_key, minibatch_dropout_key):
-        rngs = nnx.Rngs(mae=minibatch_mae_key, dropout=minibatch_dropout_key)
-        pred, (mae_mask, keep_prob) = model(minibatch_videos, deterministic=False, rngs=rngs)
+    def loss_fn(model: Tokenizer):
+        rngs = nnx.Rngs(mae=mae_key, dropout=dropout_key)
+        pred, (mae_mask, keep_prob) = model(videos, deterministic=False, rngs=rngs)
 
         pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
-        target_norm = normalize_with_dataset_stats(minibatch_videos, mean=dataset_mean, std=dataset_std)
+        target_norm = normalize_with_dataset_stats(videos, mean=dataset_mean, std=dataset_std)
         if tokenizer_loss_type == "mae":
             mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
         elif tokenizer_loss_type == "mse":
@@ -101,46 +100,18 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, d
         else:
             raise ValueError(f"Invalid loss type: {tokenizer_loss_type}")
 
-        psnr = compute_psnr(pred / 255.0, minibatch_videos / 255.0)
+        psnr = compute_psnr(pred / 255.0, videos / 255.0)
 
         lp = jnp.array(0.0)
         if lpips_weight > 0:
-            lp = lpips_on_mae_recon(pred / 255.0, minibatch_videos / 255.0, lpips_frac)
+            lp = lpips_on_mae_recon(pred / 255.0, videos / 255.0, lpips_frac)
 
         total = mse + lpips_weight * lp
 
         aux = {"loss_total": total, "loss_mse": mse, "loss_lpips": lp, "keep_prob": keep_prob, "psnr": psnr}
         return total, aux
 
-    # Gradient accumulation
-    batch_size = videos.shape[0]
-    minibatch_size = batch_size // n_minibatches
-
-    accumulated_grads = None
-    accumulated_aux = {}
-
-    for i in range(n_minibatches):
-        start_idx = i * minibatch_size
-        end_idx = start_idx + minibatch_size
-        minibatch = videos[start_idx:end_idx]
-
-        # Split RNG for each minibatch
-        minibatch_rng = jax.random.fold_in(mae_key, i)
-        minibatch_mae_key, minibatch_dropout_key = jax.random.split(minibatch_rng)
-
-        (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model, minibatch, minibatch_mae_key, minibatch_dropout_key)
-
-        # Accumulate gradients
-        if accumulated_grads is None:
-            accumulated_grads = grads
-            accumulated_aux = aux
-        else:
-            accumulated_grads = jax.tree_util.tree_map(lambda a, b: a + b, accumulated_grads, grads)
-            accumulated_aux = jax.tree_util.tree_map(lambda a, b: a + b, accumulated_aux, aux)
-
-    # Average gradients and aux
-    accumulated_grads = jax.tree_util.tree_map(lambda x: x / n_minibatches, accumulated_grads)
-    accumulated_aux = jax.tree_util.tree_map(lambda x: x / n_minibatches, accumulated_aux)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
 
     if log_gradients:
         def _tree_std_mean(tree):
@@ -150,16 +121,16 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, d
                 return jnp.array(0.0, dtype=jnp.float32)
             return jnp.mean(jnp.stack([jnp.asarray(x, dtype=jnp.float32) for x in leaves]))
 
-        accumulated_aux["grad/global_norm"] = optax.global_norm(accumulated_grads)
-        graphdef, grad_state = nnx.split(accumulated_grads)
-        accumulated_aux["grad/encoder_norm"] = optax.global_norm(grad_state.get("encoder", {}))
-        accumulated_aux["grad/decoder_norm"] = optax.global_norm(grad_state.get("decoder", {}))
-        accumulated_aux["grad/encoder_std_mean"] = _tree_std_mean(grad_state.get("encoder", {}))
-        accumulated_aux["grad/decoder_std_mean"] = _tree_std_mean(grad_state.get("decoder", {}))
+        aux["grad/global_norm"] = optax.global_norm(grads)
+        graphdef, grad_state = nnx.split(grads)
+        aux["grad/encoder_norm"] = optax.global_norm(grad_state.get("encoder", {}))
+        aux["grad/decoder_norm"] = optax.global_norm(grad_state.get("decoder", {}))
+        aux["grad/encoder_std_mean"] = _tree_std_mean(grad_state.get("encoder", {}))
+        aux["grad/decoder_std_mean"] = _tree_std_mean(grad_state.get("decoder", {}))
 
-    optimizer.update(model, accumulated_grads)
+    optimizer.update(model, grads)
 
-    return accumulated_aux
+    return aux
 
 # ------------------------
 # Visualization
@@ -294,8 +265,7 @@ def run(cfg: TokenizerConfig):
                     dataset_mean=tuple(cfg.dataset.dataset_mean),
                     dataset_std=tuple(cfg.dataset.dataset_std),
                     log_gradients=cfg.logger.log_gradients,
-                    tokenizer_loss_type=cfg.tokenizer_loss_type,
-                    n_minibatches=cfg.n_minibatches
+                    tokenizer_loss_type=cfg.tokenizer_loss_type
                 )
 
                 if logger.should_log(step):
