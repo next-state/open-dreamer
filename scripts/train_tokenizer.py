@@ -1,6 +1,5 @@
 import logging
 import os
-import time
 from functools import partial
 
 import einops
@@ -21,6 +20,7 @@ from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
 from dreamer.parallel import build_parallel
+from dreamer.scaling import ScalingContext
 from dreamer.utils import (
     build_checkpoint_manager,
     try_restore,
@@ -31,7 +31,6 @@ from dreamer.utils import (
     build_lr_schedule,
     build_optimizer,
 )
-from dreamer.scaling import compute_max_steps, compute_steps_for_flops_budget
 
 # disable preallocation completely
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -188,42 +187,19 @@ def run(cfg: TokenizerConfig):
         # Initialize tokenizer
         tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(tokenizer)
-        param_counts_formatted = {k: f"{v:,}" for k, v in param_counts.items()}
-        print(f"Parameter counts: {param_counts_formatted}")
+        print(f"Parameter counts: {param_counts['total']:,}")
 
-        # Scaling laws: compute max_steps from param count if enabled
+        # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_patches = (cfg.dataset.H // cfg.encoder.patch_size) * (cfg.dataset.W // cfg.encoder.patch_size)
-        data_tokens_per_step = cfg.dataset.B * cfg.dataset.T * n_patches
-        total_tokens_per_step = cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.encoder.n_latents)
-        flops_per_step = tokenizer.estimate_flops(
-            batch_size=cfg.dataset.B,
-            seq_length=cfg.dataset.T,
+        scaling = ScalingContext.create(
+            cfg=cfg,
+            param_count=param_counts["total"],
+            flops_per_step=tokenizer.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T),
+            data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * n_patches,
+            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.encoder.n_latents),
+            logger=logger,
+            run_dir=run_dir,
         )
-
-        if cfg.scaling_flops_budget > 0:
-            # Iso-FLOPs mode: fixed compute budget, steps computed from FLOPs
-            computed_steps = compute_steps_for_flops_budget(
-                total_flops=cfg.scaling_flops_budget,
-                flops_per_step=flops_per_step,
-            )
-            cfg.max_steps = computed_steps
-            cfg.lr_schedule.max_steps = computed_steps
-            cfg.ckpt.max_steps = computed_steps
-            logger.max_steps = computed_steps
-            print(f"[IsoFLOPs] {cfg.scaling_flops_budget:.2e} FLOPs / {flops_per_step:.2e} per step = {computed_steps:,} steps")
-        elif cfg.scaling_tokens_per_param > 0:
-            # Compute-optimal mode: fixed tokens per param ratio
-            computed_steps = compute_max_steps(
-                param_count=param_counts["total"],
-                tokens_per_param=cfg.scaling_tokens_per_param,
-                tokens_per_step=total_tokens_per_step,
-            )
-            cfg.max_steps = computed_steps
-            cfg.lr_schedule.max_steps = computed_steps
-            cfg.ckpt.max_steps = computed_steps
-            logger.max_steps = computed_steps
-            total_tokens = param_counts["total"] * cfg.scaling_tokens_per_param
-            print(f"[Scaling] {param_counts['total']:,} params × {cfg.scaling_tokens_per_param} = {total_tokens:,.0f} tokens -> {computed_steps:,} steps")
 
         # Build learning rate schedule
         lr_schedule = build_lr_schedule(cfg.lr_schedule, d_model=cfg.encoder.d_model)
@@ -241,9 +217,7 @@ def run(cfg: TokenizerConfig):
                 checkpoint_manager, tokenizer, optimizer, train_iterator, rng
             )
 
-            # Track training time and final metrics for scaling analysis
-            train_start_time = time.time()
-            final_loss, final_psnr = 0.0, 0.0
+            scaling.start_training()
 
             # Training loop
             pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step,total=cfg.max_steps)
@@ -270,12 +244,8 @@ def run(cfg: TokenizerConfig):
 
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(aux)
-                    lr_value = lr_schedule(step)
+                    scaling.on_step(step, metrics_cpu)
                     mse = metrics_cpu["loss_mse"]
-                    psnr = metrics_cpu["psnr"]
-                    # Track final values for scaling CSV
-                    final_loss = float(metrics_cpu["loss_total"])
-                    final_psnr = float(psnr)
                     logger.log(
                         step,
                         {
@@ -283,11 +253,9 @@ def run(cfg: TokenizerConfig):
                             "mse": mse,
                             "rmse": float(jnp.sqrt(mse)),
                             "lpips": metrics_cpu["loss_lpips"],
-                            "psnr": psnr,
-                            "lr": lr_value,
-                            "data_tokens_seen": data_tokens_per_step * step,
-                            "total_tokens_seen": total_tokens_per_step * step,
-                            "flops_spent": flops_per_step * step,
+                            "psnr": metrics_cpu["psnr"],
+                            "lr": lr_schedule(step),
+                            **scaling.get_step_metrics(step),
                             **({} if not cfg.logger.log_gradients else {
                                 "grad/global_norm": metrics_cpu["grad/global_norm"],
                                 "grad/encoder_norm": metrics_cpu["grad/encoder_norm"],
@@ -308,17 +276,7 @@ def run(cfg: TokenizerConfig):
                     viz_videos = batch["videos"][:8]
                     viz_step(tokenizer, viz_videos, step_rng, step, vis_dir, logger)
 
-            # Log final scaling metrics to CSV
-            train_elapsed = time.time() - train_start_time
-            final_step = min(step, cfg.max_steps - 1)
-            data_tokens_trained = data_tokens_per_step * final_step
-            total_tokens_trained = total_tokens_per_step * final_step
-
-            # Append one line to parent directory's results.csv (for scaling analysis)
-            results_csv = run_dir.parent / "results.csv"
-            csv_line = f"{cfg.run_name},{param_counts['total']},{data_tokens_per_step},{total_tokens_per_step},{flops_per_step:.6e},{cfg.scaling_flops_budget or 0},{final_step},{data_tokens_trained},{total_tokens_trained},{train_elapsed/3600:.4f},{final_loss:.6f},{final_psnr:.4f}\n"
-            with open(results_csv, "a") as f:
-                f.write(csv_line)
+            scaling.finalize()
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")

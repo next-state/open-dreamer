@@ -1,10 +1,8 @@
 import logging
-import time
 
 import hydra
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -14,6 +12,7 @@ from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.parallel import build_parallel
+from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
 from dreamer.utils import (
     build_checkpoint_manager,
@@ -24,7 +23,6 @@ from dreamer.utils import (
     build_lr_schedule,
     build_optimizer,
 )
-from dreamer.scaling import compute_max_steps, compute_steps_for_flops_budget
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
@@ -135,44 +133,19 @@ def run(cfg: DynamicsConfig):
         # Initialize dynamics
         dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(dynamics)
-        print(f"Parameter counts: {param_counts.get('transformer', 0):,}")
+        print(f"Parameter counts: {param_counts['total']:,}")
 
-        # Scaling laws: compute FLOPs and max_steps from param count if enabled
+        # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_spatial = tokenizer_cfg.encoder.n_latents // cfg.dynamics.packing_factor
-        flops_per_step = dynamics.estimate_flops(
-            batch_size=cfg.dataset.B,
-            seq_length=cfg.dataset.T,
-            n_spatial=n_spatial,
+        scaling = ScalingContext.create(
+            cfg=cfg,
+            param_count=param_counts["total"],
+            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T, n_spatial=n_spatial),
+            data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_spatial + 1),  # spatial + action
+            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
+            logger=logger,
+            run_dir=run_dir,
         )
-
-        # Tokens per step (for scaling analysis)
-        data_tokens_per_step = cfg.dataset.B * cfg.dataset.T * (n_spatial + 1) # spatial + action (both from dataloader)
-        total_tokens_per_step = cfg.dataset.B * cfg.dataset.T * (3 + n_spatial + cfg.dynamics.n_register)  # (action + signal + step + spatial + register)q
-
-        if cfg.scaling_flops_budget > 0:
-            # Iso-FLOPs mode: fixed compute budget, steps computed from FLOPs
-            computed_steps = compute_steps_for_flops_budget(
-                total_flops=cfg.scaling_flops_budget,
-                flops_per_step=flops_per_step,
-            )
-            cfg.max_steps = computed_steps
-            cfg.lr_schedule.max_steps = computed_steps
-            cfg.ckpt.max_steps = computed_steps
-            logger.max_steps = computed_steps
-            print(f"[IsoFLOPs] {cfg.scaling_flops_budget:.2e} FLOPs / {flops_per_step:.2e} per step = {computed_steps:,} steps")
-        elif cfg.scaling_tokens_per_param > 0:
-            # Compute-optimal mode: fixed tokens per param ratio
-            computed_steps = compute_max_steps(
-                param_count=param_counts["total"],
-                tokens_per_param=cfg.scaling_tokens_per_param,
-                tokens_per_step=total_tokens_per_step,
-            )
-            cfg.max_steps = computed_steps
-            cfg.lr_schedule.max_steps = computed_steps
-            cfg.ckpt.max_steps = computed_steps
-            logger.max_steps = computed_steps
-            total_tokens = param_counts["total"] * cfg.scaling_tokens_per_param
-            print(f"[Scaling] {param_counts['total']:,} params × {cfg.scaling_tokens_per_param} = {total_tokens:,.0f} tokens -> {computed_steps:,} steps")
 
         # Build learning rate schedule
         lr_schedule = build_lr_schedule(cfg.lr_schedule, d_model=cfg.dynamics.d_model)
@@ -190,9 +163,7 @@ def run(cfg: DynamicsConfig):
                 checkpoint_manager, dynamics, optimizer, train_iterator, rng
             )
 
-            # Track training time and final metrics for scaling analysis
-            train_start_time = time.time()
-            final_loss = 0.0
+            scaling.start_training()
 
             # Training loop
             pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step, total=cfg.max_steps)
@@ -220,19 +191,14 @@ def run(cfg: DynamicsConfig):
                 # Logging
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(aux)
-                    lr_value = lr_schedule(step)
-                    flow_mse = float(metrics_cpu["flow_mse"])
-                    final_loss = flow_mse  # Track for CSV output
+                    scaling.on_step(step, metrics_cpu)
                     logger.log(
                         step,
                         metrics={
-                            "flow_mse": flow_mse,
+                            "flow_mse": metrics_cpu["flow_mse"],
                             "boot_mse": metrics_cpu["bootstrap_mse"],
-                            "lr": lr_value,
-                            # Cumulative metrics for W&B x-axis flexibility
-                            "data_tokens_seen": data_tokens_per_step * step,
-                            "total_tokens_seen": total_tokens_per_step * step,
-                            "flops_spent": flops_per_step * step,
+                            "lr": lr_schedule(step),
+                            **scaling.get_step_metrics(step),
                         },
                         pbar=pbar,
                     )
@@ -251,17 +217,7 @@ def run(cfg: DynamicsConfig):
                         val_videos, jnp.asarray(val_actions), vis_dir, rng, logger
                     )
 
-            # Log final scaling metrics to CSV
-            train_elapsed = time.time() - train_start_time
-            final_step = min(step, cfg.max_steps - 1)
-            data_tokens_trained = data_tokens_per_step * final_step
-            total_tokens_trained = total_tokens_per_step * final_step
-
-            # Append one line to parent directory's results.csv (for scaling analysis)
-            results_csv = run_dir.parent / "results.csv"
-            csv_line = f"{cfg.run_name},{param_counts['total']},{data_tokens_per_step},{total_tokens_per_step},{flops_per_step:.6e},{cfg.scaling_flops_budget or 0},{final_step},{data_tokens_trained},{total_tokens_trained},{train_elapsed/3600:.4f},{final_loss:.6f},\n"
-            with open(results_csv, "a") as f:
-                f.write(csv_line)
+            scaling.finalize()
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")
