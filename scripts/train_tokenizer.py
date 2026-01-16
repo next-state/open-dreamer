@@ -187,7 +187,8 @@ def run(cfg: TokenizerConfig):
         # Initialize tokenizer
         tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(tokenizer)
-        print(f"Parameter counts: {param_counts['total']:,}")
+        param_counts_formatted = {k: f"{v:,}" for k, v in param_counts.items()}
+        print(f"Parameter counts: {param_counts_formatted}")
 
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_patches = (cfg.dataset.H // cfg.encoder.patch_size) * (cfg.dataset.W // cfg.encoder.patch_size)
