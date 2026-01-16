@@ -20,6 +20,7 @@ from flax import nnx
 import optax
 import time
 
+from dreamer.configs import DynamicsConfig, HeadsConfig
 from dreamer.generation import DenoiseSchedule
 from dreamer.models import PolicyHeadMTP, TaskEmbedder
 from dreamer.sampler import sample_video
@@ -620,7 +621,7 @@ def compute_policy_loss(
 # ---------------------------
 
 def run_evaluation(
-    cfg,
+    cfg: DynamicsConfig | HeadsConfig,
     tokenizer_cfg,
     step: int,
     tokenizer,
@@ -670,7 +671,7 @@ def run_evaluation(
 
         # Compute metrics
         dt = time.time() - t0
-        dataset_std = tokenizer_cfg.dataset.dataset_std[0]
+        dataset_std = cfg.dataset.dataset_std[0]
         normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
         normalized_gt = normalize_with_dataset_stats(gt_frames[:, -horizon:], mean=0, std=dataset_std)
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
