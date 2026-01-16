@@ -15,7 +15,6 @@ from omegaconf import OmegaConf
 from dreamer.configs import CheckpointConfig, LRScheduleConfig, OptimizerConfig
 
 
-
 # --- dtype helpers ---
 
 def to_jnp_dtype(dtype: str | jnp.dtype) -> jnp.dtype:
