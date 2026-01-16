@@ -24,9 +24,6 @@ if [ -n "$CUDA_DEVICES" ]; then
     export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
 fi
 
-# Architecture scaling: d_model = depth × 64
-D_MODEL_MULT=64
-
 # Configuration by mode
 if [ "$MODE" == "isoflop" ]; then
     # Iso-FLOPs: multiple depths × multiple FLOPs budgets
@@ -71,8 +68,6 @@ RUN=0
 
 # Main loop
 for DEPTH in "${DEPTHS[@]}"; do
-    D_MODEL=$((DEPTH * D_MODEL_MULT))
-
     if [ "$MODE" == "isoflop" ]; then
         for FLOPS in "${FLOPS_BUDGETS[@]}"; do
             RUN=$((RUN + 1))
@@ -85,7 +80,7 @@ for DEPTH in "${DEPTHS[@]}"; do
                 run_name=${RUN_NAME} \
                 use_wandb=true \
                 ckpt.save_interval_steps=100_000 \
-                encoder.depth=${DEPTH} encoder.d_model=${D_MODEL} \
+                encoder.depth=${DEPTH} \
                 scaling_flops_budget=${FLOPS} \
                 hydra.run.dir=${OUT_DIR}/${RUN_NAME}"
 
@@ -106,7 +101,7 @@ for DEPTH in "${DEPTHS[@]}"; do
             run_name=${RUN_NAME} \
             use_wandb=true \
             ckpt.save_interval_steps=100_000 \
-            encoder.depth=${DEPTH} encoder.d_model=${D_MODEL} \
+            encoder.depth=${DEPTH} \
             scaling_tokens_per_param=${TOKENS_PER_PARAM} \
             hydra.run.dir=${OUT_DIR}/${RUN_NAME}"
 
