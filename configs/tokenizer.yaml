@@ -1,60 +1,67 @@
 defaults:
   - common
-  - _self_
   - dataset: coinrun
+  - _self_
 
-run_name: tokenizer
+run_name: tokenizer_new
+
+dataset:
+  B: 64
+  T: 32
 
 ckpt:
   max_to_keep: 1
   save_interval_steps: 10_000
 
-encoder:
-  n_latents: 16
-  d_bottleneck: 16
-  depth: 4
-  d_model: ${mul:64,${sum:${encoder.depth},${decoder.depth}}}
-  n_heads: ${floordiv:${encoder.d_model},64}
-  n_kv_heads: ${max:1,${floordiv:${encoder.n_heads},8}}
-  dropout_rate: 0.05
-  qk_norm_type: quest  # qknorm | quest | null
-  rope_theta: 10000.0
-  time_every: 4
-  mae_p_min: 0.0
-  mae_p_max: 0.9
-  patch_size: 8
-  use_residual_lambdas: true
-  use_bias: false
-  use_rmsnorm_scale: true
-  dtype: ${dtype}
-  param_dtype: ${param_dtype}
-  
-  dataset_mean: ${dataset.dataset_mean}
-  dataset_std: ${dataset.dataset_std}
+patch_size: 8
 
-decoder:
-  n_latents: ${encoder.n_latents}
-  d_bottleneck: ${encoder.d_bottleneck}
-  depth: ${encoder.depth}
-  d_model: ${encoder.d_model}
-  n_heads: ${encoder.n_heads}
-  n_kv_heads: ${encoder.n_kv_heads}
-  dropout_rate: ${encoder.dropout_rate}
-  qk_norm_type: ${encoder.qk_norm_type}
-  rope_theta: ${encoder.rope_theta}
-  time_every: ${encoder.time_every}
-  H: ${dataset.H}
-  W: ${dataset.W}
-  patch_size: ${encoder.patch_size}
-  d_patch: ${mul:${decoder.patch_size},${decoder.patch_size},${dataset.C}}
-  use_residual_lambdas: ${encoder.use_residual_lambdas}
-  use_bias: ${encoder.use_bias}
-  use_rmsnorm_scale: ${encoder.use_rmsnorm_scale}
-  dtype: ${dtype}
-  param_dtype: ${param_dtype}
-  
-  dataset_mean: ${dataset.dataset_mean}
-  dataset_std: ${dataset.dataset_std}
+tokenizer:
+  encoder:
+    n_latents: 16
+    d_bottleneck: 16
+    depth: 4
+    d_model: ${mul:64,${sum:${encoder.depth},${decoder.depth}}}
+    n_heads: ${floordiv:${encoder.d_model},64}
+    n_kv_heads: ${max:1,${floordiv:${encoder.n_heads},8}}
+    dropout_rate: 0.05
+    qk_norm_type: quest  # qknorm | quest | null
+    rope_theta: 10000.0
+    time_every: 4
+    mae_p_min: 0.0
+    mae_p_max: 0.9
+    patch_size: 8
+    use_residual_lambdas: true
+    use_bias: false
+    use_rmsnorm_scale: true
+    dtype: ${dtype}
+    param_dtype: ${param_dtype}
+    
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
+
+  decoder:
+    n_latents: ${encoder.n_latents}
+    d_bottleneck: ${encoder.d_bottleneck}
+    depth: ${encoder.depth}
+    d_model: ${encoder.d_model}
+    n_heads: ${encoder.n_heads}
+    n_kv_heads: ${encoder.n_kv_heads}
+    dropout_rate: ${encoder.dropout_rate}
+    qk_norm_type: ${encoder.qk_norm_type}
+    rope_theta: ${encoder.rope_theta}
+    time_every: ${encoder.time_every}
+    H: ${dataset.H}
+    W: ${dataset.W}
+    patch_size: ${encoder.patch_size}
+    d_patch: ${mul:${decoder.patch_size},${decoder.patch_size},${dataset.C}}
+    use_residual_lambdas: ${encoder.use_residual_lambdas}
+    use_bias: ${encoder.use_bias}
+    use_rmsnorm_scale: ${encoder.use_rmsnorm_scale}
+    dtype: ${dtype}
+    param_dtype: ${param_dtype}
+    
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
 
 max_steps: 300_000
 tokenizer_loss_type: mse  # mse | mae

@@ -316,7 +316,7 @@ def train_step(
             actions_ctx=actions[:, :T_ctx],
             num_steps=horizon,
             rng=rng_imag,
-            initial_agent_tokens=agent_tokens_ctx,
+            initial_agent_latents=agent_tokens_ctx,
         )
         
         # Extract results

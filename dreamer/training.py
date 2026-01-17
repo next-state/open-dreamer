@@ -20,7 +20,9 @@ from flax import nnx
 import optax
 import time
 
+from dreamer.configs import DynamicsConfig, HeadsConfig
 from dreamer.generation import DenoiseSchedule
+from dreamer.models import PolicyHeadMTP, TaskEmbedder
 from dreamer.sampler import sample_video
 from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border
 
@@ -213,7 +215,7 @@ def shortcut_forcing_step(
     k_max: int,
     *,
     B_self: int = 0,
-    agent_tokens: jnp.ndarray | None = None,
+    task_embeddings: jnp.ndarray | None = None,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
     Compute shortcut forcing losses (flow + bootstrap) for a batch.
@@ -228,11 +230,11 @@ def shortcut_forcing_step(
         rng: Random key
         k_max: Maximum noise resolution
         B_self: Number of bootstrap examples (last B_self rows of batch)
-        agent_tokens: Optional (B, T, n_agent, d_model) agent tokens
+        task_embeddings: Optional (B, T, n_agent, d_model) agent tokens
         
     Returns:
         losses: Dict with 'total', 'flow', 'bootstrap' keys
-        aux: Dict with auxiliary metrics for logging. If agent_tokens is not None,
+        aux: Dict with auxiliary metrics for logging. If task_embeddings is not None,
              aux contains 'h_states' key with (B, T, n_agent, d_model) hidden states
              from the main forward pass (computed with noisy inputs)
     """
@@ -270,7 +272,7 @@ def shortcut_forcing_step(
     rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
         actions, step_idx_full, sigma_idx_full, z_tilde,
-        agent_tokens=agent_tokens, deterministic=False, rngs=rngs1
+        task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
     )
     
     # --- Flow loss (empirical rows) ---
@@ -285,7 +287,7 @@ def shortcut_forcing_step(
         z_pred_self = z_pred_full[B_emp:]
         z_tilde_self = z_tilde[B_emp:]
         actions_self = actions[B_emp:]
-        agent_tokens_self = agent_tokens[B_emp:] if agent_tokens is not None else None
+        task_embeddings_self = task_embeddings[B_emp:] if task_embeddings is not None else None
     
         # Half-step metadata
         d_half = d_self / 2.0
@@ -297,7 +299,7 @@ def shortcut_forcing_step(
         rngs2 = nnx.Rngs(dropout=key_dropout2)
         z1_half1, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
-            agent_tokens=agent_tokens_self, deterministic=False, rngs=rngs2
+            task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs2
         )
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
@@ -306,7 +308,7 @@ def shortcut_forcing_step(
         rngs3 = nnx.Rngs(dropout=key_dropout3)
         z1_half2, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
-            agent_tokens=agent_tokens_self, deterministic=False, rngs=rngs3
+            task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
         )
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
     
@@ -548,7 +550,7 @@ def compute_reward_loss(
     h_states: jnp.ndarray,
     rewards_btL: jnp.ndarray,
     rewards_valid: jnp.ndarray,
-) -> jnp.ndarray:
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
     Compute reward prediction loss with symexp twohot encoding.
     
@@ -560,6 +562,7 @@ def compute_reward_loss(
         
     Returns:
         reward_loss: Scalar categorical cross-entropy loss
+        metrics: Dict with breakdown metrics
     """
     # Forward pass
     reward_logits, centers_log = reward_head(h_states, deterministic=True) 
@@ -568,8 +571,19 @@ def compute_reward_loss(
     reward_targets = twohot_symlog_targets(rewards_btL, centers_log)  # (B, T, L, K)
     reward_loss_per = optax.safe_softmax_cross_entropy(logits=reward_logits, labels=reward_targets)  # (B, T, L)
     reward_loss = jnp.sum(reward_loss_per * rewards_valid) / jnp.maximum(rewards_valid.sum(), 1.0)
-    
-    return reward_loss
+    # add metrics on loss over when reward is nonzero and when it is zero.
+    reward_nonzero = (rewards_btL > 0) * rewards_valid
+    reward_zero = (rewards_btL == 0) * rewards_valid
+    reward_nonzero_count = reward_nonzero.sum()
+    reward_zero_count = reward_zero.sum()
+    metrics = {
+        "reward_nonzero_count": reward_nonzero_count,
+        "reward_zero_count": reward_zero_count,
+        "reward_loss_nonzero": jnp.sum(reward_loss_per * reward_nonzero) / jnp.maximum(reward_nonzero_count, 1.0),
+        "reward_loss_zero": jnp.sum(reward_loss_per * reward_zero) / jnp.maximum(reward_zero_count, 1.0),
+    }
+    return reward_loss, metrics
+
 
 
 def compute_policy_loss(
@@ -607,7 +621,7 @@ def compute_policy_loss(
 # ---------------------------
 
 def run_evaluation(
-    cfg,
+    cfg: DynamicsConfig | HeadsConfig,
     tokenizer_cfg,
     step: int,
     tokenizer,
@@ -617,6 +631,8 @@ def run_evaluation(
     vis_dir: Path,
     rng: jax.Array,
     logger,
+    policy: PolicyHeadMTP | None = None,
+    task_embedder: TaskEmbedder | None = None,
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
@@ -649,13 +665,13 @@ def run_evaluation(
         horizon = val_videos.shape[1] - ctx_length
 
         pred_frames, floor_frames, gt_frames = sample_video(
-            tokenizer, dynamics, 
-            val_videos, val_actions, horizon, schedule_config, rng
+            tokenizer, dynamics, val_videos, 
+            val_actions, horizon, schedule_config, rng, policy, task_embedder
         )
 
         # Compute metrics
         dt = time.time() - t0
-        dataset_std = tokenizer_cfg.dataset.dataset_std[0]
+        dataset_std = cfg.dataset.dataset_std[0]
         normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
         normalized_gt = normalize_with_dataset_stats(gt_frames[:, -horizon:], mean=0, std=dataset_std)
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
