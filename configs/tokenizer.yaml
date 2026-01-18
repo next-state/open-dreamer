@@ -67,15 +67,16 @@ lr_schedule:
   warmup_ratio: 0.033
   decay_ratio: 0.1
   max_steps: ${max_steps}
-  mup_scaling: true
-  mup_base_dim: 512
 
 optimizer:
   optimizer_type: muon
-  weight_decay: 1e-4
+  weight_decay: 0.02
   # AdamW params (for embeddings/biases)
+  adam_lr_ratio: 0.01
   adam_b1: 0.9
   adam_b2: 0.9
+  mup_scaling: true
+  mup_base_dim: 512
   # Muon params (for 2D matrix weights)
   muon_beta: 0.95
   muon_ns_steps: 5

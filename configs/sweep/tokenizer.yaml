@@ -6,36 +6,61 @@ metric:
   goal: maximize
 
 parameters:
-  patch_size:
-    values: [4, 8]
+  logger.log_every:
+    value: 500
 
-  encoder.n_latents:
-    values: [16, 32]
-  
-  encoder.d_model:
-    values: [128, 256, 512]
+  dataset.B:
+    value: 128
+  #  values: [8, 16, 32, 64, 128, 256, 512]
 
   encoder.depth:
-    values: [4, 8, 12]
+    value: 5
 
   encoder.dropout_rate:
-    values: [0.05, 0.1]
+    values: [0.001, 0.01, 0.05]
 
   encoder.qk_norm_type:
     values: [null, qknorm, quest]
 
-  encoder.rope_theta:
-    values: [10000.0, 150000.0]
+  encoder.use_residual_lambdas:
+    values: [true, false]
+  
+  encoder.use_rmsnorm_scale:
+    values: [true, false]
+
+  lr_schedule.lr:
+    values: [0.01, 0.007, 0.005, 0.003, 0.002, 0.001]
+
+  lr_schedule.warmup_ratio:
+    values: [0.0, 0.033, 0.1, 0.2]
+
+  lr_schedule.decay_ratio:
+    values: [0.1, 0.2, 0.4]
+
+  optimizer.adam_lr_ratio:
+    values: [0.01, 0.1, 1.]
+
+  optimizer.adam_b1:
+    values: [0.99, 0.95, 0.9, 0.8]
+
+  optimizer.adam_b2:
+    values: [0.99, 0.95, 0.9, 0.8]
+
+  optimizer.weight_decay:
+    values: [0.0, 1e-4, 1e-2, 0.1, 0.2]
+
+  optimizer.mup_scaling:
+    value: false
 
   use_wandb:
     value: true
 
   max_steps:
-    value: 50000
+    value: 25_000
 
 command:
   - uv
   - run
   - ${program}
   - ${args_no_hyphens}
-  - run_name=tok_patch${patch_size}_n_latents${encoder.n_latents}_d_model${encoder.d_model}_depth${encoder.depth}_dropout${encoder.dropout_rate}_qk_norm${encoder.qk_norm_type}_rope_theta${encoder.rope_theta}
+  - run_name=${encoder.dropout_rate}_${encoder.qk_norm_type}_${encoder.use_residual_lambdas}_${encoder.use_rmsnorm_scale}_lr${lr_schedule.lr}/{optimizer.adam_lr_ratio}_${lr_schedule.warmup_ratio}_${lr_schedule.decay_ratio}_b1${optimizer.adam_b1}_b2${optimizer.adam_b2}_wd${optimizer.weight_decay}    

@@ -204,10 +204,10 @@ def run(cfg: TokenizerConfig):
         )
 
         # Build learning rate schedule
-        lr_schedule = build_lr_schedule(cfg.lr_schedule, d_model=cfg.encoder.d_model)
+        lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
         # Build optimizer
-        optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule)
+        optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule, d_model=cfg.encoder.d_model)
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
