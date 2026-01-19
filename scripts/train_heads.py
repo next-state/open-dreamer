@@ -31,10 +31,12 @@ from dreamer.logging import build_logger
 from dreamer.models import Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
 from dreamer.parallel import build_parallel
 from dreamer.training import (
+    LossRMSState,
     compute_policy_loss,
     compute_reward_loss,
     run_evaluation,
     shortcut_forcing_step,
+    update_loss_rms,
 )
 from dreamer.utils import (
     build_checkpoint_manager,
@@ -114,7 +116,7 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
 # Training step
 # ---------------------------
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "L_mtp", "B_self"))
+@nnx.jit(static_argnames=("packing_factor", "k_max", "L_mtp", "B_self", "loss_weights"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -125,6 +127,7 @@ def encode_and_train_step(
     task_embedder_optimizer: nnx.Optimizer,
     policy_optimizer: nnx.Optimizer,
     reward_optimizer: nnx.Optimizer,
+    rms_state: LossRMSState,
     videos: jax.Array,
     actions: jax.Array,
     rewards: jax.Array,
@@ -136,32 +139,34 @@ def encode_and_train_step(
     k_max: int,
     L_mtp: int,
     B_self: int,
-    dynamics_loss_weight: float,
-) -> dict:
+    loss_weights: tuple[tuple[str, float], ...],
+) -> tuple[LossRMSState, dict]:
     """
     Encode videos and run training step.
 
     Combines frozen tokenizer encoding with agent finetuning in a single JIT.
+    Uses RMS loss normalization for stable multi-task training (paper Section 3).
     """
     # Phase 1: Encode (tokenizer frozen)
     rngs = nnx.Rngs(mae=tokenizer_key)
     latents, _ = tokenizer.encode(videos, packing_factor=packing_factor,
                                   deterministic=True, rngs=rngs)
 
-    # Phase 2: Train
-    metrics = train_step(
+    # Phase 2: Train with RMS normalization
+    rms_state, metrics = train_step(
         dynamics, task_embedder, policy_head, reward_head,
         dynamics_optimizer, task_embedder_optimizer,
         policy_optimizer, reward_optimizer,
+        rms_state,
         latents, actions, rewards,
         master_key=master_key, step=step,
         k_max=k_max, L_mtp=L_mtp, B_self=B_self,
-        dynamics_loss_weight=dynamics_loss_weight
+        loss_weights=loss_weights,
     )
-    return metrics
+    return rms_state, metrics
 
 
-@nnx.jit(static_argnames=("k_max", "L_mtp", "B_self"))
+@nnx.jit(static_argnames=("k_max", "L_mtp", "B_self", "loss_weights"))
 def train_step(
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
@@ -171,6 +176,7 @@ def train_step(
     task_embedder_optimizer: nnx.Optimizer,
     policy_optimizer: nnx.Optimizer,
     reward_optimizer: nnx.Optimizer,
+    rms_state: LossRMSState,
     latents: jax.Array,
     actions: jax.Array,
     rewards: jax.Array,
@@ -180,16 +186,28 @@ def train_step(
     k_max: int,
     L_mtp: int,
     B_self: int,
-    dynamics_loss_weight: float,
-) -> dict:
+    loss_weights: tuple[tuple[str, float], ...],
+) -> tuple[LossRMSState, dict]:
     """
     Agent finetuning step with BC + reward prediction + optional dynamics loss.
 
+    Uses RMS loss normalization (paper Section 3): Each loss is normalized by its
+    running RMS estimate before combining with fixed weights. This allows training
+    with multiple modalities/heads that have different loss scales.
+
     Models are updated in place by their respective optimizers.
 
+    Args:
+        loss_weights: Tuple of (name, weight) pairs for combining normalized losses.
+            Example: (("policy", 1.0), ("reward", 1.0), ("dynamics", 0.1))
+
     Returns:
+        rms_state: Updated LossRMSState with new running estimates
         metrics: Dict of scalar metrics for logging
     """
+    # Convert loss_weights tuple to dict for easier access
+    weights_dict = {name: weight for name, weight in loss_weights}
+
     # Generate step-specific key
     step_key = jax.random.fold_in(master_key, step)
     B, T_video, _, _ = latents.shape
@@ -203,31 +221,57 @@ def train_step(
     actions_btL, actions_valid = gather_future_actions(actions, L_mtp)
     rewards_btL, rewards_valid = gather_future_rewards(rewards, L_mtp)
 
-    # Define combined loss
+    # Get current RMS estimates (stop gradient so they don't affect backprop)
+    rms_estimates = {
+        name: jax.lax.stop_gradient(est)
+        for name, est in rms_state.estimates.items()
+    }
+
+    # Define combined loss with RMS normalization
     # Takes all models as a tuple to enable differentiation w.r.t. all of them
     def loss_fn(models):
-        dyn, task, pol, rew = models
+        dyn, task_emb, pol, rew = models
         # Dynamics loss (also returns hidden states for BC/reward training)
         dyn_losses, dyn_aux = shortcut_forcing_step(
             dyn, actions, latents, step_key, k_max,
             B_self=B_self, agent_tokens=agent_tokens_bt
         )
-        dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
+        dynamics_loss_raw, h_states = dyn_losses['total'], dyn_aux['h_states']
 
-        # TODO: See if we should compute the losses and the gradients sequentially (see figure 2 of https://arxiv.org/pdf/2404.19737 and comment in pull request #16)
-        # TODO: put gather_future_rewards and gather_future_actions inside of the compute_policy_loss function and compute_future_actions functions
-        policy_loss = compute_policy_loss(pol, h_states, actions_btL, actions_valid)
-        reward_loss = compute_reward_loss(rew, h_states, rewards_btL, rewards_valid)
+        # Policy and reward losses
+        policy_loss_raw = compute_policy_loss(pol, h_states, actions_btL, actions_valid)
+        reward_loss_raw = compute_reward_loss(rew, h_states, rewards_btL, rewards_valid)
 
-        # Combine losses
-        total_loss = policy_loss + reward_loss + dynamics_loss_weight * dynamics_loss
+        # Collect raw losses
+        raw_losses = {
+            "policy": policy_loss_raw,
+            "reward": reward_loss_raw,
+            "dynamics": dynamics_loss_raw,
+        }
+
+        # Normalize each loss by its running RMS estimate (paper Section 3)
+        # The RMS estimate is stop_gradient'd so gradients flow through loss only
+        normalized_losses = {}
+        for name, loss in raw_losses.items():
+            rms_est = rms_estimates.get(name, jnp.array(1.0))
+            normalized_losses[name] = loss / (rms_est + 1e-8)
+
+        # Combine normalized losses with fixed weights
+        total_loss = jnp.array(0.0)
+        for name, norm_loss in normalized_losses.items():
+            weight = weights_dict.get(name, 1.0)
+            total_loss = total_loss + weight * norm_loss
 
         aux = {
-            "policy_loss": policy_loss,
-            "reward_loss": reward_loss,
-            "dynamics_loss": dynamics_loss,
+            "policy_loss": policy_loss_raw,
+            "reward_loss": reward_loss_raw,
+            "dynamics_loss": dynamics_loss_raw,
+            "policy_loss_norm": normalized_losses["policy"],
+            "reward_loss_norm": normalized_losses["reward"],
+            "dynamics_loss_norm": normalized_losses["dynamics"],
             "flow_mse": dyn_aux["flow_mse"],
-            "bootstrap_mse": dyn_aux["bootstrap_mse"]
+            "bootstrap_mse": dyn_aux["bootstrap_mse"],
+            "raw_losses": raw_losses,  # For RMS update
         }
 
         return total_loss, aux
@@ -243,7 +287,16 @@ def train_step(
     policy_optimizer.update(policy_head, grads[2])
     reward_optimizer.update(reward_head, grads[3])
 
-    return metrics
+    # Update RMS estimates with raw losses (after gradient computation)
+    raw_losses = metrics.pop("raw_losses")
+    new_rms_state, _ = update_loss_rms(rms_state, raw_losses, decay=0.999, warmup_steps=100)
+
+    # Add RMS estimates to metrics for logging
+    metrics["rms/policy"] = new_rms_state.estimates["policy"]
+    metrics["rms/reward"] = new_rms_state.estimates["reward"]
+    metrics["rms/dynamics"] = new_rms_state.estimates["dynamics"]
+
+    return new_rms_state, metrics
 
 
 # ---------------------------
@@ -313,6 +366,18 @@ def run(cfg: HeadsConfig):
         reward_optimizer = build_optimizer(cfg.optimizer, reward_head, lr_schedule_reward, d_model=d_model)
         dynamics_optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule_dynamics, d_model=d_model)
 
+        # Initialize RMS loss normalization state (paper Section 3)
+        # This normalizes losses by running RMS estimates before combining
+        rms_state = LossRMSState.init(("policy", "reward", "dynamics"))
+
+        # Loss weights for combining normalized losses
+        # After RMS normalization, all losses have ~unit scale, so weights are intuitive
+        loss_weights = (
+            ("policy", cfg.loss_weight_policy),
+            ("reward", cfg.loss_weight_reward),
+            ("dynamics", cfg.dynamics_loss_weight),
+        )
+
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
@@ -325,6 +390,7 @@ def run(cfg: HeadsConfig):
                 "task_embedder_state", "task_embedder_optimizer_state",
                 "policy_state", "policy_optimizer_state",
                 "reward_state", "reward_optimizer_state",
+                "rms_state",  # RMS loss normalization state
                 "train_dataloader_state", "rngs", "meta"
             )
         ) as checkpoint_manager:
@@ -342,6 +408,9 @@ def run(cfg: HeadsConfig):
                 policy_opt_state = nnx.state(policy_optimizer)
                 reward_opt_state = nnx.state(reward_optimizer)
 
+                # RMS state as dict for checkpointing
+                rms_state_dict = {"estimates": rms_state.estimates, "counts": rms_state.counts}
+
                 # Create restore args composite
                 restore_args = ocp.args.Composite(
                     dynamics_state=ocp.args.StandardRestore(dynamics_state),  # type: ignore
@@ -352,6 +421,7 @@ def run(cfg: HeadsConfig):
                     task_embedder_optimizer_state=ocp.args.StandardRestore(task_embedder_opt_state),  # type: ignore
                     policy_optimizer_state=ocp.args.StandardRestore(policy_opt_state),  # type: ignore
                     reward_optimizer_state=ocp.args.StandardRestore(reward_opt_state),  # type: ignore
+                    rms_state=ocp.args.StandardRestore(rms_state_dict),  # type: ignore
                     train_dataloader_state=grain.checkpoint.CheckpointRestore(train_iterator),  # type: ignore
                     rngs=ocp.args.StandardRestore({"key": rng}),  # type: ignore
                 )
@@ -366,6 +436,8 @@ def run(cfg: HeadsConfig):
                 nnx.update(task_embedder_optimizer, restored["task_embedder_optimizer_state"])
                 nnx.update(policy_optimizer, restored["policy_optimizer_state"])
                 nnx.update(reward_optimizer, restored["reward_optimizer_state"])
+                rms_restored = restored["rms_state"]
+                rms_state = LossRMSState(rms_restored["estimates"], rms_restored["counts"])
                 train_iterator = restored["train_dataloader_state"]
                 rng = restored["rngs"]["key"]
                 start_step = step + 1
@@ -392,11 +464,12 @@ def run(cfg: HeadsConfig):
                 B, T = actions.shape
                 actions = jnp.concatenate((jnp.full_like(actions[:, 0:1], fill_value=15), actions[:, :-1]), axis=1)
 
-                # Training step (encodes videos and trains)
-                metrics = encode_and_train_step(
+                # Training step (encodes videos and trains) with RMS loss normalization
+                rms_state, metrics = encode_and_train_step(
                     tokenizer, dynamics, task_embedder, policy_head, reward_head,
                     dynamics_optimizer, task_embedder_optimizer,
                     policy_optimizer, reward_optimizer,
+                    rms_state,
                     videos, actions, rewards,
                     tokenizer_key=tokenizer_key,
                     master_key=master_key,
@@ -405,7 +478,7 @@ def run(cfg: HeadsConfig):
                     k_max=dynamics.cfg.k_max,
                     L_mtp=cfg.L,
                     B_self=(B // 2) * (step >= cfg.bootstrap_start),  # This will make the function compile twice. TODO: see if it's worth fixing this
-                    dynamics_loss_weight=cfg.dynamics_loss_weight,
+                    loss_weights=loss_weights,
                 )
 
                 # Logging
@@ -425,6 +498,9 @@ def run(cfg: HeadsConfig):
                     policy_opt_state = nnx.state(policy_optimizer)
                     reward_opt_state = nnx.state(reward_optimizer)
 
+                    # RMS state as dict for checkpointing
+                    rms_state_dict = {"estimates": rms_state.estimates, "counts": rms_state.counts}
+
                     # Create save args composite
                     save_args = ocp.args.Composite(
                         dynamics_state=ocp.args.StandardSave(dynamics_state),  # type: ignore
@@ -435,6 +511,7 @@ def run(cfg: HeadsConfig):
                         task_embedder_optimizer_state=ocp.args.StandardSave(task_embedder_opt_state),  # type: ignore
                         policy_optimizer_state=ocp.args.StandardSave(policy_opt_state),  # type: ignore
                         reward_optimizer_state=ocp.args.StandardSave(reward_opt_state),  # type: ignore
+                        rms_state=ocp.args.StandardSave(rms_state_dict),  # type: ignore
                         train_dataloader_state=grain.checkpoint.CheckpointSave(train_iterator),  # type: ignore
                         rngs=ocp.args.StandardSave({'key': rng}),  # type: ignore
                         meta=ocp.args.JsonSave(meta)  # type: ignore

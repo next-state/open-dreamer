@@ -15,7 +15,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import TokenizerConfig
-from dreamer.training import compute_psnr
+from dreamer.training import compute_psnr, LossRMSState, update_loss_rms
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
@@ -83,9 +83,24 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
 # Train step
 # ------------------------
 
-@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"))
-def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, dropout_key, step, 
-               lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
+@nnx.jit(static_argnames=("lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type", "loss_weights"))
+def train_step(model: Tokenizer, optimizer: nnx.Optimizer, rms_state: LossRMSState, videos, *, mae_key, dropout_key, step,
+               lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str,
+               loss_weights: tuple[tuple[str, float], ...]):
+    """
+    Tokenizer training step with RMS loss normalization.
+
+    Uses RMS loss normalization (paper Section 3) to balance MSE and LPIPS losses
+    which can have very different scales.
+    """
+    # Convert loss_weights tuple to dict for easier access
+    weights_dict = {name: weight for name, weight in loss_weights}
+
+    # Get current RMS estimates (stop gradient so they don't affect backprop)
+    rms_estimates = {
+        name: jax.lax.stop_gradient(est)
+        for name, est in rms_state.estimates.items()
+    }
 
     def loss_fn(model: Tokenizer):
         rngs = nnx.Rngs(mae=mae_key, dropout=dropout_key)
@@ -102,13 +117,28 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, d
 
         psnr = compute_psnr(pred / 255.0, videos / 255.0)
 
-        lp = jnp.array(0.0)
-        if lpips_weight > 0:
-            lp = lpips_on_mae_recon(pred / 255.0, videos / 255.0, lpips_frac)
+        lpips = lpips_on_mae_recon(pred / 255.0, videos / 255.0, lpips_frac)
 
-        total = mse + lpips_weight * lp
+        # Raw losses for RMS tracking
+        raw_losses = {"mse": mse, "lpips": lpips}
 
-        aux = {"loss_total": total, "loss_mse": mse, "loss_lpips": lp, "keep_prob": keep_prob, "psnr": psnr}
+        # Normalize each loss by its running RMS estimate (paper Section 3)
+        mse_norm = mse / (rms_estimates.get("mse", jnp.array(1.0)) + 1e-8)
+        lpips_norm = lpips / (rms_estimates.get("lpips", jnp.array(1.0)) + 1e-8)
+
+        # Combine normalized losses with fixed weights
+        total = weights_dict.get("mse", 1.0) * mse_norm + weights_dict.get("lpips", 0.2) * lpips_norm
+
+        aux = {
+            "loss_total": total,
+            "loss_mse": mse,
+            "loss_lpips": lpips,
+            "loss_mse_norm": mse_norm,
+            "loss_lpips_norm": lpips_norm,
+            "keep_prob": keep_prob,
+            "psnr": psnr,
+            "raw_losses": raw_losses,
+        }
         return total, aux
 
     (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
@@ -130,7 +160,15 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, d
 
     optimizer.update(model, grads)
 
-    return aux
+    # Update RMS estimates with raw losses (after gradient computation)
+    raw_losses = aux.pop("raw_losses")
+    new_rms_state, _ = update_loss_rms(rms_state, raw_losses, decay=0.999, warmup_steps=100)
+
+    # Add RMS estimates to metrics for logging
+    aux["rms/mse"] = new_rms_state.estimates["mse"]
+    aux["rms/lpips"] = new_rms_state.estimates["lpips"]
+
+    return new_rms_state, aux
 
 # ------------------------
 # Visualization
@@ -209,15 +247,54 @@ def run(cfg: TokenizerConfig):
         # Build optimizer
         optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule, d_model=cfg.encoder.d_model)
 
+        # Initialize RMS loss normalization state (paper Section 3)
+        # Balances MSE and LPIPS losses which have very different scales
+        rms_state = LossRMSState.init(("mse", "lpips"))
+
+        # Loss weights for combining normalized losses (paper Eq. 3)
+        # After RMS normalization, both losses have ~unit scale
+        loss_weights = (
+            ("mse", 1.0),
+            ("lpips", cfg.lpips_weight),  # Paper uses 0.2
+        )
+
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
-        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
-            # Resume from checkpoint
-            start_step, tokenizer, optimizer, train_iterator, rng = try_restore(
-                checkpoint_manager, tokenizer, optimizer, train_iterator, rng
-            )
+        import orbax.checkpoint as ocp
+        import grain.checkpoint
+        with build_checkpoint_manager(
+            cfg.ckpt, ckpt_dir,
+            item_names=("model_state", "optimizer_state", "rms_state", "train_dataloader_state", "rngs", "meta")
+        ) as checkpoint_manager:
+            # Resume from checkpoint (manual handling for rms_state support)
+            step = checkpoint_manager.latest_step()
+            if step is not None:
+                model_state = nnx.state(tokenizer)
+                optimizer_state = nnx.state(optimizer)
+                rms_state_dict = {"estimates": rms_state.estimates, "counts": rms_state.counts}
+
+                restore_args = ocp.args.Composite(
+                    model_state=ocp.args.StandardRestore(model_state),  # type: ignore
+                    optimizer_state=ocp.args.StandardRestore(optimizer_state),  # type: ignore
+                    rms_state=ocp.args.StandardRestore(rms_state_dict),  # type: ignore
+                    train_dataloader_state=grain.checkpoint.CheckpointRestore(train_iterator),  # type: ignore
+                    rngs=ocp.args.StandardRestore({"key": rng}),  # type: ignore
+                )
+
+                restored = checkpoint_manager.restore(step, args=restore_args)
+                nnx.update(tokenizer, restored["model_state"])
+                nnx.update(optimizer, restored["optimizer_state"])
+                rms_restored = restored["rms_state"]
+                rms_state = LossRMSState(rms_restored["estimates"], rms_restored["counts"])
+                train_iterator = restored["train_dataloader_state"]
+                rng = restored["rngs"]["key"]
+                start_step = step + 1
+                print(f"[ckpt] Restored checkpoint from step {step}")
+            else:
+                start_step = 0
+                print("[ckpt] No checkpoint found, starting from scratch")
 
             scaling.start_training()
 
@@ -234,14 +311,16 @@ def run(cfg: TokenizerConfig):
                 # Shard batch data
                 videos = jax.device_put(batch["videos"], data_sharding)
 
-                aux = train_step(
-                    tokenizer, optimizer, videos,
+                # Training step with RMS loss normalization
+                rms_state, aux = train_step(
+                    tokenizer, optimizer, rms_state, videos,
                     mae_key=mae_key, dropout_key=dropout_key, step=step,
-                    lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
+                    lpips_frac=cfg.lpips_frac,
                     dataset_mean=tuple(cfg.dataset.dataset_mean),
                     dataset_std=tuple(cfg.dataset.dataset_std),
                     log_gradients=cfg.logger.log_gradients,
-                    tokenizer_loss_type=cfg.tokenizer_loss_type
+                    tokenizer_loss_type=cfg.tokenizer_loss_type,
+                    loss_weights=loss_weights,
                 )
 
                 if logger.should_log(step):
@@ -256,6 +335,8 @@ def run(cfg: TokenizerConfig):
                             "rmse": float(jnp.sqrt(mse)),
                             "lpips": metrics_cpu["loss_lpips"],
                             "psnr": metrics_cpu["psnr"],
+                            "rms/mse": metrics_cpu["rms/mse"],
+                            "rms/lpips": metrics_cpu["rms/lpips"],
                             "lr": lr_schedule(step),
                             **scaling.get_step_metrics(step),
                             **({} if not cfg.logger.log_gradients else {
@@ -270,8 +351,21 @@ def run(cfg: TokenizerConfig):
                         pbar_filter=r"^(loss|mse|lpips|psnr|lr)$",
                     )
 
-                # Checkpointing
-                maybe_save(checkpoint_manager, step, tokenizer, optimizer, train_iterator, rng, meta)
+                # Checkpointing (with rms_state)
+                if checkpoint_manager.should_save(step):
+                    model_state = nnx.state(tokenizer)
+                    optimizer_state = nnx.state(optimizer)
+                    rms_state_dict = {"estimates": rms_state.estimates, "counts": rms_state.counts}
+
+                    save_args = ocp.args.Composite(
+                        model_state=ocp.args.StandardSave(model_state),  # type: ignore
+                        optimizer_state=ocp.args.StandardSave(optimizer_state),  # type: ignore
+                        rms_state=ocp.args.StandardSave(rms_state_dict),  # type: ignore
+                        train_dataloader_state=grain.checkpoint.CheckpointSave(train_iterator),  # type: ignore
+                        rngs=ocp.args.StandardSave({'key': rng}),  # type: ignore
+                        meta=ocp.args.JsonSave(meta)  # type: ignore
+                    )
+                    checkpoint_manager.save(step, args=save_args)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization

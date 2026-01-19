@@ -26,6 +26,135 @@ from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_borde
 
 
 # ---------------------------
+# RMS Loss Normalization
+# ---------------------------
+
+@jax.tree_util.register_pytree_node_class
+class LossRMSState:
+    """State container for running RMS estimates.
+
+    This is a JAX-compatible pytree that can be passed through JIT-compiled
+    functions and updated during training.
+
+    Attributes:
+        estimates: Dict mapping loss name -> running RMS estimate (scalar float32)
+        counts: Dict mapping loss name -> update count (for warmup)
+    """
+    def __init__(self, estimates: Dict[str, jnp.ndarray], counts: Dict[str, jnp.ndarray]):
+        self.estimates = estimates
+        self.counts = counts
+
+    @classmethod
+    def init(cls, loss_names: Tuple[str, ...], dtype=jnp.float32) -> "LossRMSState":
+        """Initialize with zeros for given loss names."""
+        estimates = {name: jnp.array(1.0, dtype=dtype) for name in loss_names}
+        counts = {name: jnp.array(0, dtype=jnp.int32) for name in loss_names}
+        return cls(estimates, counts)
+
+    def tree_flatten(self):
+        children = (self.estimates, self.counts)
+        aux_data = None
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        estimates, counts = children
+        return cls(estimates, counts)
+
+
+def update_loss_rms(
+    state: LossRMSState,
+    losses: Dict[str, jnp.ndarray],
+    decay: float = 0.999,
+    warmup_steps: int = 100,
+) -> Tuple[LossRMSState, Dict[str, jnp.ndarray]]:
+    """Update running RMS estimates and return normalized losses.
+
+    Paper Section 3: "To train a single dynamics transformer with multiple
+    modalities and output heads, we normalize all loss terms by running
+    estimates of their root-mean-square (RMS)."
+
+    Uses exponential moving average of loss magnitudes with a warmup period
+    where we use simple averaging for more stable initial estimates.
+
+    Args:
+        state: Current LossRMSState with running estimates
+        losses: Dict mapping loss name -> scalar loss value
+        decay: EMA decay factor (default: 0.999)
+        warmup_steps: Number of steps to use simple averaging before EMA
+
+    Returns:
+        new_state: Updated LossRMSState
+        normalized: Dict mapping loss name -> normalized loss (unit RMS on average)
+    """
+    new_estimates = {}
+    new_counts = {}
+    normalized = {}
+
+    for name, loss in losses.items():
+        # Get current estimates
+        old_est = state.estimates.get(name, jnp.array(1.0))
+        old_count = state.counts.get(name, jnp.array(0, dtype=jnp.int32))
+
+        # Compute current RMS (just absolute value for scalar)
+        loss_rms = jnp.abs(loss) + 1e-8
+
+        # Update count
+        new_count = old_count + 1
+
+        # Choose update rule: simple average during warmup, EMA after
+        warmup_decay = 1.0 / new_count.astype(jnp.float32)
+        effective_decay = jnp.where(new_count <= warmup_steps, 1.0 - warmup_decay, decay)
+
+        # Update running estimate
+        new_est = effective_decay * old_est + (1.0 - effective_decay) * loss_rms
+
+        new_estimates[name] = new_est
+        new_counts[name] = new_count
+
+        # Normalize loss by running RMS
+        normalized[name] = loss / new_est
+
+    new_state = LossRMSState(new_estimates, new_counts)
+    return new_state, normalized
+
+
+def normalize_and_combine_losses(
+    state: LossRMSState,
+    losses: Dict[str, jnp.ndarray],
+    weights: Dict[str, float],
+    decay: float = 0.999,
+    warmup_steps: int = 100,
+) -> Tuple[LossRMSState, jnp.ndarray, Dict[str, jnp.ndarray]]:
+    """Normalize losses by RMS and combine with fixed weights.
+
+    This is the main interface for multi-task loss normalization. Each loss
+    is normalized to have unit RMS on average, then combined with fixed weights.
+
+    Args:
+        state: Current LossRMSState
+        losses: Dict mapping loss name -> scalar loss value
+        weights: Dict mapping loss name -> fixed weight for combining
+        decay: EMA decay factor
+        warmup_steps: Warmup period for stable initial estimates
+
+    Returns:
+        new_state: Updated LossRMSState
+        total_loss: Weighted sum of normalized losses
+        normalized: Dict of normalized losses for logging
+    """
+    new_state, normalized = update_loss_rms(state, losses, decay, warmup_steps)
+
+    # Combine with fixed weights
+    total_loss = jnp.array(0.0)
+    for name, norm_loss in normalized.items():
+        weight = weights.get(name, 1.0)
+        total_loss = total_loss + weight * norm_loss
+
+    return new_state, total_loss, normalized
+
+
+# ---------------------------
 # Sampling utilities
 # ---------------------------
 
