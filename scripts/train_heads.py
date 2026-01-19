@@ -23,7 +23,6 @@ from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from dreamer.bundles import DynamicsCheckpointBundle, HeadsCheckpointBundle
 from dreamer.configs import HeadsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
@@ -35,14 +34,18 @@ from dreamer.training import (
     run_evaluation,
     shortcut_forcing_step,
 )
-from dreamer.utils import (
+from dreamer.checkpointing import (
+    DynamicsCheckpointBundle,
+    HeadsCheckpointBundle,
     build_checkpoint_manager,
-    build_lr_schedule,
-    build_optimizer,
     get_bundle_item_names,
     maybe_save_bundle,
-    setup_training_directories,
     try_restore_bundle,
+)
+from dreamer.utils import (
+    build_lr_schedule,
+    build_optimizer,
+    setup_training_directories,
 )
 
 # Suppress absl info logs
@@ -261,7 +264,7 @@ def run(cfg: HeadsConfig):
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
-    with (logger,jax.set_mesh(mesh)):
+    with logger, jax.set_mesh(mesh):
         
         # Load pretrained tokenizer and dynamics
         key = jax.random.key(cfg.seed)
@@ -372,7 +375,7 @@ def run(cfg: HeadsConfig):
                     val_videos = batch["videos"][:4]
                     val_actions = actions[:4]
                     run_evaluation(
-                        cfg, tokenizer_cfg, step,
+                        cfg, step,
                         bundle.tokenizer, bundle.dynamics,
                         val_videos, val_actions, vis_dir, rng, logger, bundle.policy_head,
                         bundle.task_embedder

@@ -125,7 +125,7 @@ def next_latent(
             step_indices= jnp.full((B, 1), step_idx,    dtype=jnp.int32)
             tau_indices = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
 
-            assert task_embedding is None or task_embedding.shape[1] == noisy_latent.shape[1], f"agent_tokens.shape = {task_embedding.shape}, noisy_latent.shape = {noisy_latent.shape}"
+            assert task_embedding is None or task_embedding.shape[1] == noisy_latent.shape[1], f"task_embedding.shape = {task_embedding.shape}, noisy_latent.shape = {noisy_latent.shape}"
         
         else: # Used only for debugging.
             assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None

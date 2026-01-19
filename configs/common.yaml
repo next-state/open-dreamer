@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 run_name: ???
-use_wandb: False
+use_wandb: false
 dataset: ???
 scaling_tokens_per_param: 0.0
 scaling_flops_budget: 0.0
