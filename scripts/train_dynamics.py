@@ -7,19 +7,22 @@ from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from dreamer.bundles import DynamicsCheckpointBundle, TokenizerCheckpointBundle
 from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.parallel import build_parallel
 from dreamer.training import run_evaluation, shortcut_forcing_step
-from dreamer.utils import (
+from dreamer.checkpointing import (
+    DynamicsCheckpointBundle,
+    TokenizerCheckpointBundle,
     build_checkpoint_manager,
-    count_parameters_by_component,
     get_bundle_item_names,
     maybe_save_bundle,
     try_restore_bundle,
+)
+from dreamer.utils import (
+    count_parameters_by_component,
     setup_training_directories,
     build_lr_schedule,
     build_optimizer,
@@ -120,7 +123,7 @@ def run(cfg: DynamicsConfig):
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
-    with (logger, jax.set_mesh(mesh)):
+    with logger, jax.set_mesh(mesh):
         key = jax.random.PRNGKey(cfg.seed)
         rng, init_key = jax.random.split(key)
 
@@ -207,7 +210,7 @@ def run(cfg: DynamicsConfig):
                     val_actions = batch["actions"][:4]
 
                     run_evaluation(
-                        cfg, tokenizer_cfg, step, bundle.tokenizer, bundle.dynamics,
+                        cfg, step, bundle.tokenizer, bundle.dynamics,
                         val_videos, jnp.asarray(val_actions), vis_dir, rng, logger
                     )
 

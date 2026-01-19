@@ -622,7 +622,6 @@ def compute_policy_loss(
 
 def run_evaluation(
     cfg: DynamicsConfig | HeadsConfig,
-    tokenizer_cfg,
     step: int,
     tokenizer,
     dynamics,

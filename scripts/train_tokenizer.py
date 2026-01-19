@@ -17,15 +17,16 @@ from tqdm import tqdm
 from dreamer.configs import TokenizerConfig
 from dreamer.training import compute_psnr
 from dreamer.data import make_iterator
-from dreamer.bundles import TokenizerCheckpointBundle
 from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
 from dreamer.parallel import build_parallel
-from dreamer.utils import (
+from dreamer.checkpointing import (
+    TokenizerCheckpointBundle,
     build_checkpoint_manager,
     get_bundle_item_names,
     try_restore_bundle,
     maybe_save_bundle,
+from dreamer.utils import(
     normalize_with_dataset_stats,
     count_parameters_by_component,
     setup_training_directories,
@@ -181,10 +182,7 @@ def run(cfg: TokenizerConfig):
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
-    with (
-        logger,
-        jax.set_mesh(mesh),
-    ):
+    with logger, jax.set_mesh(mesh):
         key = jax.random.key(cfg.seed)
         rng, init_key = jax.random.split(key)
 

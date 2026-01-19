@@ -144,7 +144,7 @@ def maybe_save_bundle(
     step: int,
     bundle: BundleT,
     train_iterator: grain.DataLoaderIterator,
-    rng: jax.Array,
+    rngs: jax.Array,
 ) -> None:
     """Save checkpoint bundle (generic for any dataclass).
     
@@ -156,7 +156,7 @@ def maybe_save_bundle(
         step: Current training step
         bundle: Dataclass containing models and optimizers to save
         train_iterator: Data iterator
-        rng: Random number generator state
+        rngs: Random number generator state
         meta: Metadata dictionary
     """
     if not is_dataclass(bundle):
@@ -178,7 +178,7 @@ def maybe_save_bundle(
     
     # Add iterator, rngs, and meta
     save_kwargs["train_dataloader_state"] = grain.checkpoint.CheckpointSave(train_iterator)  # type: ignore
-    save_kwargs["rngs"] = ocp.args.StandardSave({'key': rng})  # type: ignore
+    save_kwargs["rngs"] = ocp.args.StandardSave({'key': rngs})  # type: ignore
     save_kwargs["meta"] = ocp.args.JsonSave(meta)  # type: ignore
     
     save_args = ocp.args.Composite(**save_kwargs)
