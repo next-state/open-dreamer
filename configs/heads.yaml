@@ -1,42 +1,97 @@
 defaults:
   - common
+  - dataset: coinrun
   - _self_
 
-run_name: bc_rew
-tokenizer_ckpt: "logs/tokenizer/checkpoints"
-dynamics_ckpt: "logs/dynamics/checkpoints"
-ckpt_save_every: 100_000
+run_name: heads
+dynamics_ckpt: "logs/dynamics_new/checkpoints"
 
-dtype: ${dtype}
-param_dtype: ${param_dtype}
+ckpt:
+  save_interval_steps: 100_000
 
 dataset:
-  B: 64
+  B: 128
   T: 32
 
-action_dim: 16
-n_agent: 4
+d_model: 256
+n_agent: 8
+
+# Model configs (for initialization - stored in checkpoint meta)
+task_embedder:
+  d_model: ${d_model}
+  n_agent: ${n_agent}
+  use_ids: true
+  n_tasks: 128
+  d_task: 64
+  dtype: ${dtype}
+  param_dtype: ${param_dtype}
+
+policy_head:
+  d_model: ${d_model}
+  action_dim: 16
+  L: ${n_agent}
+  kind: categorical
+  mlp_ratio: 2.0
+  dropout_rate: 0.0
+  swiglu: true
+  parity_2over3: false
+  dtype: ${dtype}
+  param_dtype: ${param_dtype}
+
+reward_head:
+  d_model: ${d_model}
+  L: ${n_agent}
+  num_bins: 101
+  log_low: -5.0
+  log_high: 3.0
+  mlp_ratio: 2.0
+  dropout_rate: 0.0
+  swiglu: true
+  parity_2over3: false
+  dtype: ${dtype}
+  param_dtype: ${param_dtype}
 
 # Training hyperparameters
 bootstrap_start: 5000
 self_fraction: 0.25
+dynamics_loss_weight: 0.1
 
 max_steps: 1_000_000_000
 write_video_every: 500
 
-# Learning rates
-lr_policy: ${lr_dynamics}
-lr_reward: ${lr_dynamics}
-lr_dynamics: 1e-4
-dynamics_loss_weight: 0.1
+# Learning rate schedules
+lr_schedule_policy:
+  schedule_type: constant
+  lr: ${lr_schedule_dynamics.lr}
+  max_steps: ${max_steps}
+  mup_scaling: ${lr_schedule_dynamics.mup_scaling}
+  mup_base_dim: ${lr_schedule_dynamics.mup_base_dim}
 
-# Multi-token prediction settings
-L: ${n_agent}
-num_reward_bins: 101
-reward_log_low: -5.0  
-reward_log_high: 3.0
-n_tasks: 128
-use_task_ids: true
+lr_schedule_reward:
+  schedule_type: constant
+  lr: ${lr_schedule_dynamics.lr}
+  max_steps: ${max_steps}
+  mup_scaling: ${lr_schedule_dynamics.mup_scaling}
+  mup_base_dim: ${lr_schedule_dynamics.mup_base_dim}
+
+lr_schedule_dynamics:
+  schedule_type: constant
+  lr: 1e-4
+  max_steps: ${max_steps}
+  mup_scaling: true
+  mup_base_dim: 512
+
+# Optimizer config (shared across all components)
+optimizer:
+  optimizer_type: muon
+  weight_decay: 1e-4
+  # AdamW params (for embeddings/biases)
+  adam_b1: 0.9
+  adam_b2: 0.9
+  # Muon params (for 2D matrix weights)
+  muon_beta: 0.95
+  muon_ns_steps: 5
+  muon_nesterov: true
 
 # Loss weighting
 loss_weight_shortcut: 1.0

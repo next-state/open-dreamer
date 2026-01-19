@@ -23,6 +23,9 @@ class DatasetConfig:
     action_dim: int = 1
     array_record_path: str = "datasets/coinrun_episodes/train"
 
+    # For minecraft_vpt: number of shards to use (each shard = 1 episode)
+    index_max: int = 0
+
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] = (0.288675, 0.288675, 0.288675)  # sqrt(1/12)
@@ -35,56 +38,69 @@ class DatasetConfig:
 @dataclass(frozen=False)
 class EncoderModelConfig:
     n_latents: int = 16
-    d_bottleneck: int = 32
-    d_model: int = 64
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    patch_size: int = 4
-    depth: int = 8
+    d_bottleneck: int = 16
+    depth: int = 4
+    d_model: int = 512
+    n_heads: int = 8
+    n_kv_heads: int = 1
+    patch_size: int = 8
     dropout_rate: float = 0.05
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
+    use_residual_lambdas: bool = False
+    use_bias: bool = False
+    use_rmsnorm_scale: bool = True
     dtype: str = "float32"
     param_dtype: str = "float32"
-    
+
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
 @dataclass(frozen=False)
 class DecoderModelConfig:
-    d_bottleneck: int = 32  # Must match encoder's d_bottleneck
-    d_model: int = 64
-    n_heads: int = 4
-    n_kv_heads: int = 2
     n_latents: int = 16
-    patch_size: int = 4
-    d_patch: int = 48    # Will be computed from patch_size, C
-    depth: int = 8
+    d_bottleneck: int = 16  # Must match encoder's d_bottleneck
+    depth: int = 4
+    d_model: int = 512
+    n_heads: int = 8
+    n_kv_heads: int = 1
+    patch_size: int = 8
+    d_patch: int = 192    # Will be computed from patch_size, C
     dropout_rate: float = 0.05
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
+    use_residual_lambdas: bool = False
+    use_bias: bool = False
+    use_rmsnorm_scale: bool = True
     dtype: str = "float32"
     param_dtype: str = "float32"
     H: int = 64
     W: int = 64
-    
+
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
+@dataclass(frozen=False)
+class TokenizerModelConfig:
+    """Model configuration for tokenizer (encoder + decoder architecture)."""
+    encoder: EncoderModelConfig = field(default_factory=EncoderModelConfig)
+    decoder: DecoderModelConfig = field(default_factory=DecoderModelConfig)
+
+
 @dataclass(frozen=False, unsafe_hash=True)
 class DynamicsModelConfig:
-    d_model: int = 128
-    d_bottleneck: int = 32
     action_dim: int = 16
-    depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
+    d_bottleneck: int = 32
+    depth: int = 12
+    d_model: int = 768
+    n_heads: int = 12
+    n_kv_heads: int = 1
     packing_factor: int = 2
     n_register: int = 4 # number of register tokens for dynamics
     qk_norm_type: str | None = None
@@ -92,11 +108,58 @@ class DynamicsModelConfig:
     time_every: int = 4
     mlp_ratio: float = 4.0
     dropout_rate: float = 0.0
+    use_residual_lambdas: bool = False
+    use_bias: bool = False
+    use_rmsnorm_scale: bool = True
     dtype: str = "float32"
     param_dtype: str = "float32"
 
     # schedule
     k_max: int = 8
+
+
+@dataclass(frozen=False)
+class TaskEmbedderModelConfig:
+    """Model configuration for task embedder."""
+    d_model: int = 128
+    n_agent: int = 4
+    use_ids: bool = True
+    n_tasks: int = 128
+    d_task: int = 64
+    dtype: str = "float32"
+    param_dtype: str = "float32"
+
+
+@dataclass(frozen=False)
+class PolicyHeadModelConfig:
+    """Model configuration for policy head (MTP)."""
+    d_model: int = 128
+    action_dim: int = 16
+    L: int = 4
+    kind: str = "categorical"
+    mlp_ratio: float = 2.0
+    dropout_rate: float = 0.0
+    swiglu: bool = True
+    parity_2over3: bool = False
+    dtype: str = "float32"
+    param_dtype: str = "float32"
+
+
+@dataclass(frozen=False)
+class RewardHeadModelConfig:
+    """Model configuration for reward head (MTP)."""
+    d_model: int = 128
+    L: int = 4
+    num_bins: int = 101
+    log_low: float = -5.0
+    log_high: float = 3.0
+    mlp_ratio: float = 2.0
+    dropout_rate: float = 0.0
+    swiglu: bool = True
+    parity_2over3: bool = False
+    dtype: str = "float32"
+    param_dtype: str = "float32"
+
 
 # ---- Experiment Configs ----
 
@@ -111,9 +174,13 @@ class LRScheduleConfig:
     lr: float = 1e-4  # Used for constant schedule, or as peak/max_lr for other schedules
     init_lr: float = 0.0  # Starting LR for warmup schedules
     lr_end: float = 0.0  # Ending LR for decay schedules
-    warmup_steps: int = 10_000
-    wsd_decay_steps: int = 30_000
     max_steps: int = 1_000_000_000
+    warmup_ratio: float = 0.0  # e.g., 0.1 = 10% warmup
+    decay_ratio: float = 0.0   # e.g., 0.2 = 20% decay (for wsd)
+
+    # MuP scaling (scales LR by (d_model/mup_base_dim)^-0.5)
+    mup_base_dim: int = 768         # Reference dimension for MuP scaling
+    mup_scaling: bool = False       # Enable MuP LR scaling
 
 
 @dataclass(frozen=False)
@@ -127,13 +194,18 @@ class CheckpointConfig:
 @dataclass(frozen=False)
 class OptimizerConfig:
     """Configuration for optimizer."""
-    # Optimizer type
-    optimizer_type: str = "adamw"  # Currently only "adamw" supported
-
-    # Optimizer hyperparameters (AdamW)
-    b1: float = 0.9
-    b2: float = 0.9
+    # Optimizer type: "adamw" or "muon"
+    optimizer_type: str = "adamw"
     weight_decay: float = 1e-4
+
+    # AdamW hyperparameters (also used for non-matrix params when using Muon)
+    adam_b1: float = 0.9
+    adam_b2: float = 0.9
+
+    # Muon-specific hyperparameters (for 2D matrix params, excluding embeddings)
+    muon_beta: float = 0.95         # Momentum for Muon
+    muon_ns_steps: int = 5          # Newton-Schulz iterations
+    muon_nesterov: bool = True      # Use Nesterov momentum
 
 
 @dataclass(frozen=False)
@@ -157,7 +229,7 @@ class BaseExperimentConfig:
     run_name: str
     use_wandb: bool = False
 
-    # Checkpoint 
+    # Checkpoint
     ckpt: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     # Logger
@@ -165,25 +237,26 @@ class BaseExperimentConfig:
 
     # Dataset
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    
+
     # Training
     max_steps: int = 1_000_000_000
     log_every: int = 100
     seed: int = 0  # Random seed
     parallel_strategy: str = "data"  # Parallelization strategy: "data", "fsdp", or "tp"
-    
+
     # Precision
     dtype: str = "bfloat16"
     param_dtype: str = "float32"
 
+    # Scaling laws (set > 0 to enable auto-computed max_steps)
+    scaling_tokens_per_param: float = 0.0  # e.g., 8.0 for compute-optimal training
+    scaling_flops_budget: float = 0.0  # e.g., 1e17 for iso-FLOPs experiments
+
 
 @dataclass(frozen=False)
 class TokenizerConfig(BaseExperimentConfig):
-    patch_size: int = 4
-
-    # Model
-    encoder: EncoderModelConfig = field(default_factory=EncoderModelConfig)
-    decoder: DecoderModelConfig = field(default_factory=DecoderModelConfig)
+    # Model architecture
+    tokenizer: TokenizerModelConfig = field(default_factory=TokenizerModelConfig)
 
     # Training
     lpips_weight: float = 0.2
@@ -193,8 +266,8 @@ class TokenizerConfig(BaseExperimentConfig):
 
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
-    
-    # Optimizer 
+
+    # Optimizer
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
 
@@ -222,36 +295,30 @@ class DynamicsConfig(BaseExperimentConfig):
 
 
 @dataclass(frozen=False)
-class BCRewConfig(BaseExperimentConfig):
-    tokenizer_ckpt: str = ""  # checkpoint from train_tokenizer.py
+class HeadsConfig(BaseExperimentConfig):
     dynamics_ckpt: str = ""  # checkpoint from train_dynamics.py
-    action_dim: int = 4  # number of categorical actions
-    n_agent: int = 1  # number of agent tokens for dynamics
+
+    # Model configs (for initialization - stored in checkpoint meta)
+    task_embedder: TaskEmbedderModelConfig = field(default_factory=TaskEmbedderModelConfig)
+    policy_head: PolicyHeadModelConfig = field(default_factory=PolicyHeadModelConfig)
+    reward_head: RewardHeadModelConfig = field(default_factory=RewardHeadModelConfig)
 
     # Training hyperparameters
     bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
     self_fraction: float = 0.25   # used once we pass bootstrap_start
-
-    # Train
-    log_every: int = 5_000
-    
-    # Learning rates
-    lr_policy: float = 1e-4
-    lr_reward: float = 1e-4
-    lr_dynamics: float = 1e-5
     dynamics_loss_weight: float = 0.1
+
+    # Learning rate schedules (one per component)
+    lr_schedule_policy: LRScheduleConfig = field(default_factory=lambda: LRScheduleConfig(lr=1e-4))
+    lr_schedule_reward: LRScheduleConfig = field(default_factory=lambda: LRScheduleConfig(lr=1e-4))
+    lr_schedule_dynamics: LRScheduleConfig = field(default_factory=lambda: LRScheduleConfig(lr=1e-5))
+
+    # Optimizer config (shared across all components)
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
     # Eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
-    # Multi-token prediction (MTP) settings
-    L: int = 2                      # predict next L actions/rewards
-    num_reward_bins: int = 101      # twohot bins for symexp rewards
-    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
-    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
-    n_tasks: int = 128              # task-ID space for TaskEmbedder
-    use_task_ids: bool = True       # True: discrete task IDs; False: vector embed
-    
     # Loss weighting (to balance scales across different loss components)
     loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
     loss_weight_policy: float = 0.3      # weight for policy CE loss (nats)
@@ -260,7 +327,7 @@ class BCRewConfig(BaseExperimentConfig):
 
 @dataclass(frozen=False)
 class RLConfig(BaseExperimentConfig):
-    bc_rew_ckpt: str = ""  # checkpoint from train_bc_rew_heads.py
+    heads_ckpt: str = ""  # checkpoint from train_heads.py
     action_dim: int = 4
 
     # tokenizer / dynamics config

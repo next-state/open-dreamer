@@ -1,58 +1,70 @@
 defaults:
   - common
+  - dataset: minecraft_vpt
   - _self_
-  - dataset: coinrun
 
 run_name: tokenizer
+
+dataset:
+  B: 4
+  T: 4
 
 ckpt:
   max_to_keep: 1
   save_interval_steps: 10_000
 
-patch_size: 8
+patch_size: 16
 
-encoder:
-  n_latents: 16
-  d_bottleneck: 16
-  d_model: 512
-  n_heads: 8
-  n_kv_heads: 2
-  depth: 4
-  dropout_rate: 0.05
-  qk_norm_type: quest  # qknorm | quest | null
-  rope_theta: 10000.0
-  time_every: 4
-  mae_p_min: 0.0
-  mae_p_max: 0.9
-  patch_size: ${patch_size}
-  dtype: ${dtype}
-  param_dtype: ${param_dtype}
-  
-  dataset_mean: ${dataset.dataset_mean}
-  dataset_std: ${dataset.dataset_std}
+tokenizer:
+  encoder:
+    n_latents: 16
+    d_bottleneck: 16
+    depth: 4
+    d_model: ${mul:64,${sum:${tokenizer.encoder.depth},${tokenizer.decoder.depth}}}
+    n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
+    n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
+    dropout_rate: 0.0
 
-decoder:
-  d_bottleneck: ${encoder.d_bottleneck}
-  d_model: ${encoder.d_model}
-  n_heads: ${encoder.n_heads}
-  n_kv_heads: ${encoder.n_kv_heads}
-  n_latents: ${encoder.n_latents}
-  depth: ${encoder.depth}
-  dropout_rate: ${encoder.dropout_rate}
-  qk_norm_type: ${encoder.qk_norm_type}
-  rope_theta: ${encoder.rope_theta}
-  time_every: ${encoder.time_every}
-  H: ${dataset.H}
-  W: ${dataset.W}
-  patch_size: ${patch_size}
-  d_patch: ${mul:${patch_size},${patch_size},${dataset.C}}
-  dtype: ${dtype}
-  param_dtype: ${param_dtype}
-  
-  dataset_mean: ${dataset.dataset_mean}
-  dataset_std: ${dataset.dataset_std}
+    qk_norm_type: quest  # qknorm | quest | null
+    rope_theta: 10000.0
+    time_every: 4
+    mae_p_min: 0.0
+    mae_p_max: 0.9
+    patch_size: 8
+    use_residual_lambdas: true
+    use_bias: false
+    use_rmsnorm_scale: true
+    dtype: ${dtype}
+    param_dtype: ${param_dtype}
+    
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
 
-max_steps: 300_000
+  decoder:
+    n_latents: ${tokenizer.encoder.n_latents}
+    d_bottleneck: ${tokenizer.encoder.d_bottleneck}
+    depth: ${tokenizer.encoder.depth}
+    d_model: ${tokenizer.encoder.d_model}
+    n_heads: ${tokenizer.encoder.n_heads}
+    n_kv_heads: ${tokenizer.encoder.n_kv_heads}
+    dropout_rate: ${tokenizer.encoder.dropout_rate}
+    qk_norm_type: ${tokenizer.encoder.qk_norm_type}
+    rope_theta: ${tokenizer.encoder.rope_theta}
+    time_every: ${tokenizer.encoder.time_every}
+    H: ${dataset.H}
+    W: ${dataset.W}
+    patch_size: ${tokenizer.encoder.patch_size}
+    d_patch: ${mul:${tokenizer.decoder.patch_size},${tokenizer.decoder.patch_size},${dataset.C}}
+    use_residual_lambdas: ${tokenizer.encoder.use_residual_lambdas}
+    use_bias: ${tokenizer.encoder.use_bias}
+    use_rmsnorm_scale: ${tokenizer.encoder.use_rmsnorm_scale}
+    dtype: ${dtype}
+    param_dtype: ${param_dtype}
+    
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
+
+max_steps: 30_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:
@@ -60,15 +72,22 @@ lr_schedule:
   lr: 6e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
-  warmup_steps: 10_000
-  wsd_decay_steps: 30_000
+  warmup_ratio: 0.033
+  decay_ratio: 0.1
   max_steps: ${max_steps}
+  mup_scaling: true
+  mup_base_dim: 512
 
 optimizer:
-  optimizer_type: adamw
-  b1: 0.9
-  b2: 0.9
+  optimizer_type: muon
   weight_decay: 1e-4
+  # AdamW params (for embeddings/biases)
+  adam_b1: 0.9
+  adam_b2: 0.9
+  # Muon params (for 2D matrix weights)
+  muon_beta: 0.95
+  muon_ns_steps: 5
+  muon_nesterov: true
 
 lpips_weight: 0.2
 lpips_frac: 0.5

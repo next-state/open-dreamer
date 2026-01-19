@@ -229,3 +229,5 @@ __marimo__/
 datasets
 datasets/
 migration/
+.claude/
+CLAUDE.md

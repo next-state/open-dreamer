@@ -20,10 +20,16 @@ from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
 from dreamer.parallel import build_parallel
-from dreamer.utils import (
+from dreamer.scaling import ScalingContext
+
+from dreamer.checkpointing import (
+    TokenizerCheckpointBundle,
     build_checkpoint_manager,
-    try_restore,
-    maybe_save,
+    get_bundle_item_names,
+    try_restore_bundle,
+    maybe_save_bundle,
+)
+from dreamer.utils import (
     normalize_with_dataset_stats,
     count_parameters_by_component,
     setup_training_directories,
@@ -40,6 +46,9 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Register OmegaConf resolver for arithmetic expressions
 # Usage: ${mul:a,b,c,...} multiplies all arguments
 OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
+OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
+OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
+OmegaConf.register_new_resolver("max", lambda *args: max(args))
 
 
 # ------------------------
@@ -84,11 +93,9 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, d
                lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
 
     def loss_fn(model: Tokenizer):
-        # Create RNG inside the loss function to avoid trace level issues with grad
         rngs = nnx.Rngs(mae=mae_key, dropout=dropout_key)
         pred, (mae_mask, keep_prob) = model(videos, deterministic=False, rngs=rngs)
 
-        # For MSE: use standardized values (matches old gradient dynamics)
         pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
         target_norm = normalize_with_dataset_stats(videos, mean=dataset_mean, std=dataset_std)
         if tokenizer_loss_type == "mae":
@@ -98,14 +105,12 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, d
         else:
             raise ValueError(f"Invalid loss type: {tokenizer_loss_type}")
 
-        # for psnr: use [0, 1] normalized pixel range.
         psnr = compute_psnr(pred / 255.0, videos / 255.0)
-        
-        # For LPIPS: use [0, 1] range
+
         lp = jnp.array(0.0)
         if lpips_weight > 0:
             lp = lpips_on_mae_recon(pred / 255.0, videos / 255.0, lpips_frac)
-        
+
         total = mse + lpips_weight * lp
 
         aux = {"loss_total": total, "loss_mse": mse, "loss_lpips": lp, "keep_prob": keep_prob, "psnr": psnr}
@@ -128,7 +133,6 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, d
         aux["grad/encoder_std_mean"] = _tree_std_mean(grad_state.get("encoder", {}))
         aux["grad/decoder_std_mean"] = _tree_std_mean(grad_state.get("decoder", {}))
 
-    # Update model with optimizer 
     optimizer.update(model, grads)
 
     return aux
@@ -167,7 +171,7 @@ def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger):
 
 def run(cfg: TokenizerConfig):
     # Setup
-    run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
+    run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
     # Logging
     logger = build_logger(
@@ -179,33 +183,54 @@ def run(cfg: TokenizerConfig):
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
-    with (
-        logger,
-        jax.set_mesh(mesh),
-    ):
+    with logger, jax.set_mesh(mesh):
         key = jax.random.key(cfg.seed)
         rng, init_key = jax.random.split(key)
 
         # Initialize tokenizer
-        tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        tokenizer = Tokenizer(cfg.tokenizer, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(tokenizer)
-        print(f"Parameter counts: {param_counts}")
+        param_counts_formatted = {k: f"{v:,}" for k, v in param_counts.items()}
+        print(f"Parameter counts: {param_counts_formatted}")
+
+        # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
+        n_patches = (cfg.dataset.H // cfg.tokenizer.encoder.patch_size) * (cfg.dataset.W // cfg.tokenizer.encoder.patch_size)
+        scaling = ScalingContext.create(
+            cfg=cfg,
+            param_count=param_counts["total"],
+            flops_per_step=tokenizer.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T),
+            data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * n_patches,
+            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.tokenizer.encoder.n_latents),
+            logger=logger,
+            run_dir=run_dir,
+        )
 
         # Build learning rate schedule
-        lr_schedule = build_lr_schedule(cfg.lr_schedule)
+        lr_schedule = build_lr_schedule(cfg.lr_schedule, d_model=cfg.tokenizer.encoder.d_model)
 
         # Build optimizer
         optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule)
+
+        # Create checkpoint bundle
+        bundle = TokenizerCheckpointBundle(
+            tokenizer=tokenizer,
+            tokenizer_optimizer=optimizer,
+        )
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
-        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
+        with build_checkpoint_manager(
+            cfg.ckpt, ckpt_dir,
+            item_names=get_bundle_item_names(bundle)
+        ) as checkpoint_manager:
             # Resume from checkpoint
-            start_step, tokenizer, optimizer, train_iterator, rng = try_restore(
-                checkpoint_manager, tokenizer, optimizer, train_iterator, rng
+            start_step, bundle, train_iterator, rng = try_restore_bundle(
+                checkpoint_manager, bundle, train_iterator, rng
             )
+
+            scaling.start_training()
 
             # Training loop
             pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step,total=cfg.max_steps)
@@ -221,7 +246,7 @@ def run(cfg: TokenizerConfig):
                 videos = jax.device_put(batch["videos"], data_sharding)
 
                 aux = train_step(
-                    tokenizer, optimizer, videos,
+                    bundle.tokenizer, bundle.tokenizer_optimizer, videos,
                     mae_key=mae_key, dropout_key=dropout_key, step=step,
                     lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
                     dataset_mean=tuple(cfg.dataset.dataset_mean),
@@ -232,9 +257,8 @@ def run(cfg: TokenizerConfig):
 
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(aux)
-                    lr_value = lr_schedule(step)
+                    scaling.on_step(step, metrics_cpu)
                     mse = metrics_cpu["loss_mse"]
-                    psnr = metrics_cpu["psnr"]
                     logger.log(
                         step,
                         {
@@ -242,8 +266,9 @@ def run(cfg: TokenizerConfig):
                             "mse": mse,
                             "rmse": float(jnp.sqrt(mse)),
                             "lpips": metrics_cpu["loss_lpips"],
-                            "psnr": psnr,
-                            "lr": lr_value,
+                            "psnr": metrics_cpu["psnr"],
+                            "lr": lr_schedule(step),
+                            **scaling.get_step_metrics(step),
                             **({} if not cfg.logger.log_gradients else {
                                 "grad/global_norm": metrics_cpu["grad/global_norm"],
                                 "grad/encoder_norm": metrics_cpu["grad/encoder_norm"],
@@ -257,12 +282,14 @@ def run(cfg: TokenizerConfig):
                     )
 
                 # Checkpointing
-                maybe_save(checkpoint_manager, step, tokenizer, optimizer, train_iterator, rng, meta)
+                maybe_save_bundle(checkpoint_manager, step, bundle, train_iterator, rng)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
-                    viz_step(tokenizer, viz_videos, step_rng, step, vis_dir, logger)
+                    viz_step(bundle.tokenizer, viz_videos, step_rng, step, vis_dir, logger)
+
+            scaling.finalize()
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
