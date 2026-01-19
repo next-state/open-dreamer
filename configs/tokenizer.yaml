@@ -1,28 +1,28 @@
 defaults:
   - common
-  - dataset: coinrun
+  - dataset: minecraft_vpt
   - _self_
 
 run_name: tokenizer
 
 dataset:
-  B: 96
-  T: 32
+  B: 4
+  T: 4
 
 ckpt:
   max_to_keep: 1
   save_interval_steps: 10_000
 
-patch_size: 8
+patch_size: 16
 
 tokenizer:
   encoder:
     n_latents: 16
     d_bottleneck: 16
     depth: 4
-    d_model: ${mul:64,${sum:${encoder.depth},${decoder.depth}}}
-    n_heads: ${floordiv:${encoder.d_model},64}
-    n_kv_heads: ${max:1,${floordiv:${encoder.n_heads},8}}
+    d_model: ${mul:64,${sum:${tokenizer.encoder.depth},${tokenizer.decoder.depth}}}
+    n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
+    n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
     dropout_rate: 0.0
 
     qk_norm_type: quest  # qknorm | quest | null
@@ -41,23 +41,23 @@ tokenizer:
     dataset_std: ${dataset.dataset_std}
 
   decoder:
-    n_latents: ${encoder.n_latents}
-    d_bottleneck: ${encoder.d_bottleneck}
-    depth: ${encoder.depth}
-    d_model: ${encoder.d_model}
-    n_heads: ${encoder.n_heads}
-    n_kv_heads: ${encoder.n_kv_heads}
-    dropout_rate: ${encoder.dropout_rate}
-    qk_norm_type: ${encoder.qk_norm_type}
-    rope_theta: ${encoder.rope_theta}
-    time_every: ${encoder.time_every}
+    n_latents: ${tokenizer.encoder.n_latents}
+    d_bottleneck: ${tokenizer.encoder.d_bottleneck}
+    depth: ${tokenizer.encoder.depth}
+    d_model: ${tokenizer.encoder.d_model}
+    n_heads: ${tokenizer.encoder.n_heads}
+    n_kv_heads: ${tokenizer.encoder.n_kv_heads}
+    dropout_rate: ${tokenizer.encoder.dropout_rate}
+    qk_norm_type: ${tokenizer.encoder.qk_norm_type}
+    rope_theta: ${tokenizer.encoder.rope_theta}
+    time_every: ${tokenizer.encoder.time_every}
     H: ${dataset.H}
     W: ${dataset.W}
-    patch_size: ${encoder.patch_size}
-    d_patch: ${mul:${decoder.patch_size},${decoder.patch_size},${dataset.C}}
-    use_residual_lambdas: ${encoder.use_residual_lambdas}
-    use_bias: ${encoder.use_bias}
-    use_rmsnorm_scale: ${encoder.use_rmsnorm_scale}
+    patch_size: ${tokenizer.encoder.patch_size}
+    d_patch: ${mul:${tokenizer.decoder.patch_size},${tokenizer.decoder.patch_size},${dataset.C}}
+    use_residual_lambdas: ${tokenizer.encoder.use_residual_lambdas}
+    use_bias: ${tokenizer.encoder.use_bias}
+    use_rmsnorm_scale: ${tokenizer.encoder.use_rmsnorm_scale}
     dtype: ${dtype}
     param_dtype: ${param_dtype}
     

@@ -1,0 +1,18 @@
+defaults:
+  - _self_
+
+name: minecraft_vpt
+
+array_record_path: /home/minecraft-vpt/contractor_demos/8xx_Jun_29/
+index_max: 1000
+
+B: 32
+T: 32
+H: 360
+W: 640
+C: 3
+
+dataset_mean: [0.5, 0.5, 0.5]
+dataset_std: [0.288675, 0.288675, 0.288675]
+
+p_include_reward: 0.0

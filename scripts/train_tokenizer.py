@@ -28,7 +28,8 @@ from dreamer.checkpointing import (
     get_bundle_item_names,
     try_restore_bundle,
     maybe_save_bundle,
-from dreamer.utils import(
+)
+from dreamer.utils import (
     normalize_with_dataset_stats,
     count_parameters_by_component,
     setup_training_directories,
@@ -193,19 +194,19 @@ def run(cfg: TokenizerConfig):
         print(f"Parameter counts: {param_counts_formatted}")
 
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
-        n_patches = (cfg.dataset.H // cfg.encoder.patch_size) * (cfg.dataset.W // cfg.encoder.patch_size)
+        n_patches = (cfg.dataset.H // cfg.tokenizer.encoder.patch_size) * (cfg.dataset.W // cfg.tokenizer.encoder.patch_size)
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
             flops_per_step=tokenizer.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T),
             data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * n_patches,
-            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.encoder.n_latents),
+            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.tokenizer.encoder.n_latents),
             logger=logger,
             run_dir=run_dir,
         )
 
         # Build learning rate schedule
-        lr_schedule = build_lr_schedule(cfg.lr_schedule, d_model=cfg.encoder.d_model)
+        lr_schedule = build_lr_schedule(cfg.lr_schedule, d_model=cfg.tokenizer.encoder.d_model)
 
         # Build optimizer
         optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule)

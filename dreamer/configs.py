@@ -23,6 +23,9 @@ class DatasetConfig:
     action_dim: int = 1
     array_record_path: str = "datasets/coinrun_episodes/train"
 
+    # For minecraft_vpt: number of shards to use (each shard = 1 episode)
+    index_max: int = 0
+
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] = (0.288675, 0.288675, 0.288675)  # sqrt(1/12)

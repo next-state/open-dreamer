@@ -9,6 +9,9 @@ import os
 from .configs import DatasetConfig
 
 
+# ==============================================================================
+# CoinRun Dataset
+# ==============================================================================
 
 class EpisodeLengthFilter(grain.transforms.Filter):
     """
@@ -111,6 +114,49 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         return data_dict
 
 
+# ==============================================================================
+# Minecraft VPT Dataset
+# ==============================================================================
+
+class MinecraftVPTEpisodeLengthFilter(grain.transforms.Filter):
+    """Filter episodes shorter than seq_len for Minecraft VPT dataset."""
+
+    def __init__(self, seq_len: int):
+        self.seq_len = seq_len
+
+    def filter(self, element: bytes) -> bool:
+        data = pickle.loads(element)
+        episode_len = data["video_shape"][0]
+        return episode_len >= self.seq_len
+
+
+class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
+    """Parse video bytes, random slice for Minecraft VPT dataset."""
+
+    def __init__(self, seq_len: int):
+        self.seq_len = seq_len
+
+    def random_map(self, element: bytes, rng: np.random.Generator) -> dict:
+        data = pickle.loads(element)
+
+        video_shape = data["video_shape"]
+        video = np.frombuffer(data["video"], dtype=np.uint8).reshape(video_shape)
+
+        episode_len = video_shape[0]
+        max_start = episode_len - self.seq_len
+        start = int(rng.integers(0, max_start + 1))
+
+        return {
+            "videos": video[start : start + self.seq_len],
+            "actions": None,
+            "rewards": None,
+        }
+
+
+# ==============================================================================
+# Factory
+# ==============================================================================
+
 def make_iterator(
     cfg: DatasetConfig,
     num_workers: int = 22,
@@ -121,20 +167,29 @@ def make_iterator(
     """
     Creates a data loading pipeline using Grain from a DatasetConfig.
     """
-    array_record_paths = cfg.array_record_path
-    
-    if not array_record_paths:
-        raise ValueError("array_record_path cannot be empty.")
-    
-    if isinstance(array_record_paths, str):
-        if os.path.isdir(array_record_paths):
-            array_record_paths = [
-                os.path.join(array_record_paths, f)
-                for f in os.listdir(array_record_paths)
-                if f.endswith(".array_record")
-            ]
-        else:
-            array_record_paths = [array_record_paths]
+    # Build array record paths based on dataset type
+    if cfg.name == "minecraft_vpt":
+        # Minecraft VPT: generate shard paths from index_max
+        if cfg.index_max <= 0:
+            raise ValueError("index_max must be > 0 for minecraft_vpt dataset")
+        array_record_paths = [
+            f"{cfg.array_record_path}/shard-{i:05d}.array_record"
+            for i in range(cfg.index_max)
+        ]
+    else:
+        # CoinRun: discover files in directory
+        array_record_paths = cfg.array_record_path
+        if not array_record_paths:
+            raise ValueError("array_record_path cannot be empty.")
+        if isinstance(array_record_paths, str):
+            if os.path.isdir(array_record_paths):
+                array_record_paths = [
+                    os.path.join(array_record_paths, f)
+                    for f in os.listdir(array_record_paths)
+                    if f.endswith(".array_record")
+                ]
+            else:
+                array_record_paths = [array_record_paths]
 
     num_processes = jax.process_count()
 
@@ -155,23 +210,31 @@ def make_iterator(
         seed=seed,
     )
 
-    operations = [
-        EpisodeLengthFilter(
-            seq_len=cfg.T,
-            image_h=cfg.H,
-            image_w=cfg.W,
-            image_c=cfg.C,
-            print_filter_warnings=print_filter_warnings,
-        ),
-        ProcessEpisodeAndSlice(
-            seq_len=cfg.T,
-            image_h=cfg.H,
-            image_w=cfg.W,
-            image_c=cfg.C,
-            p_include_reward=cfg.p_include_reward,
-        ),
-        grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
-    ]
+    # Build operations based on dataset type
+    if cfg.name == "minecraft_vpt":
+        operations = [
+            MinecraftVPTEpisodeLengthFilter(seq_len=cfg.T),
+            MinecraftVPTProcessEpisodeAndSlice(seq_len=cfg.T),
+            grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
+        ]
+    else:
+        operations = [
+            EpisodeLengthFilter(
+                seq_len=cfg.T,
+                image_h=cfg.H,
+                image_w=cfg.W,
+                image_c=cfg.C,
+                print_filter_warnings=print_filter_warnings,
+            ),
+            ProcessEpisodeAndSlice(
+                seq_len=cfg.T,
+                image_h=cfg.H,
+                image_w=cfg.W,
+                image_c=cfg.C,
+                p_include_reward=cfg.p_include_reward,
+            ),
+            grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
+        ]
 
     dataloader = grain.DataLoader(
         data_source=source,
