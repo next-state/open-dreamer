@@ -3,10 +3,10 @@ defaults:
   - dataset: coinrun
   - _self_
 
-run_name: tokenizer_new
+run_name: tokenizer
 
 dataset:
-  B: 64
+  B: 96
   T: 32
 
 ckpt:
@@ -23,7 +23,7 @@ tokenizer:
     n_heads: 8
     n_kv_heads: 2
     depth: 4
-    dropout_rate: 0.05
+    dropout_rate: 0.0
     qk_norm_type: quest  # qknorm | quest | null
     rope_theta: 10000.0
     time_every: 4
@@ -57,7 +57,7 @@ tokenizer:
     dataset_mean: ${dataset.dataset_mean}
     dataset_std: ${dataset.dataset_std}
 
-max_steps: 300_000
+max_steps: 30_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:
@@ -65,8 +65,8 @@ lr_schedule:
   lr: 6e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
-  warmup_steps: 10_000
-  wsd_decay_steps: 30_000
+  warmup_steps: 1_000
+  wsd_decay_steps: 3_000
   max_steps: ${max_steps}
 
 optimizer:

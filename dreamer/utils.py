@@ -266,25 +266,15 @@ def get_bundle_item_names(bundle: BundleT) -> tuple[str, ...]:
         
     Returns:
         Tuple of item names for checkpoint manager
-        
-    Example:
-        @dataclass
-        class MyBundle:
-            model: MyModel
-            optimizer: nnx.Optimizer
-            
-        bundle = MyBundle(model=model, optimizer=optimizer)
-        item_names = get_bundle_item_names(bundle)
-        # Returns: ("model_state", "optimizer_state", "train_dataloader_state", "rngs", "meta")
     """
     if not is_dataclass(bundle):
         raise TypeError(f"bundle must be a dataclass, got {type(bundle)}")
     
-    item_names = []
-    for field in fields(bundle):
-        field_value = getattr(bundle, field.name)
-        if isinstance(field_value, nnx.Module):
-            item_names.append(f"{field.name}_state")
+    item_names = [field.name for field in fields(bundle)]
+    # for field in fields(bundle):
+    #     field_value = getattr(bundle, field.name)
+    #     if isinstance(field_value, nnx.Module):
+    #         item_names.append(f"{field.name}_state")
     
     # Add standard items
     item_names.extend(["train_dataloader_state", "rngs", "meta"])
@@ -312,16 +302,6 @@ def try_restore_bundle(
     Returns:
         Tuple of (start_step, bundle, train_iterator, rng)
         
-    Example:
-        @dataclass
-        class MyBundle:
-            model: MyModel
-            optimizer: nnx.Optimizer
-            
-        bundle = MyBundle(model=model, optimizer=optimizer)
-        start_step, bundle, iterator, rng = try_restore_bundle(
-            checkpoint_manager, bundle, iterator, rng
-        )
     """
     if not is_dataclass(bundle):
         raise TypeError(f"bundle must be a dataclass, got {type(bundle)}")
@@ -336,11 +316,7 @@ def try_restore_bundle(
     
     for field in fields(bundle):
         field_value = getattr(bundle, field.name)
-        
-        # Detect if field is a model or optimizer
-        if isinstance(field_value, nnx.Module):
-            state_key = f"{field.name}_state"
-            restore_kwargs[state_key] = ocp.args.StandardRestore(nnx.state(field_value))  # type: ignore
+        restore_kwargs[field.name] = ocp.args.StandardRestore(nnx.state(field_value))  # type: ignore
     
     # Add iterator and rngs
     restore_kwargs["train_dataloader_state"] = grain.checkpoint.CheckpointRestore(train_iterator)  # type: ignore
@@ -352,9 +328,7 @@ def try_restore_bundle(
     # Update bundle fields in-place
     for field in fields(bundle):
         field_value = getattr(bundle, field.name)
-        if isinstance(field_value, nnx.Module):
-            state_key = f"{field.name}_state"
-            nnx.update(field_value, restored[state_key])
+        nnx.update(field_value, restored[field.name])
     
     train_iterator = restored["train_dataloader_state"]
     rng = restored["rngs"]["key"]
@@ -382,15 +356,6 @@ def maybe_save_bundle(
         train_iterator: Data iterator
         rng: Random number generator state
         meta: Metadata dictionary
-        
-    Example:
-        @dataclass
-        class MyBundle:
-            model: MyModel
-            optimizer: nnx.Optimizer
-            
-        bundle = MyBundle(model=model, optimizer=optimizer)
-        maybe_save_bundle(checkpoint_manager, step, bundle, iterator, rng, meta)
     """
     if not is_dataclass(bundle):
         raise TypeError(f"bundle must be a dataclass, got {type(bundle)}")
@@ -403,11 +368,8 @@ def maybe_save_bundle(
     
     for field in fields(bundle):
         field_value = getattr(bundle, field.name)
-        
-        # Detect if field is a model or optimizer
-        if isinstance(field_value, nnx.Module):
-            state_key = f"{field.name}_state"
-            save_kwargs[state_key] = ocp.args.StandardSave(nnx.state(field_value))  # type: ignore
+        save_kwargs[field.name] = ocp.args.StandardSave(nnx.state(field_value))  # type: ignore
+        if hasattr(field_value, 'cfg'):
             cfg = field_value.cfg
             meta[field.name] = asdict(cfg) if is_dataclass(cfg) else OmegaConf.to_container(cfg, resolve=True)
                

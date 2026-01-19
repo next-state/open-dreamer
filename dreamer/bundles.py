@@ -76,10 +76,10 @@ class TokenizerCheckpointBundle:
 
             # Restore weights
             restore_args = ocp.args.Composite(
-                tokenizer_state=ocp.args.StandardRestore(nnx.state(tokenizer))
+                tokenizer=ocp.args.StandardRestore(nnx.state(tokenizer))
             )
             restored = checkpoint_manager.restore(step, args=restore_args)
-            nnx.update(tokenizer, restored["tokenizer_state"])
+            nnx.update(tokenizer, restored["tokenizer"])
 
         return cls(tokenizer=tokenizer, tokenizer_optimizer=None)
 
@@ -138,12 +138,12 @@ class DynamicsCheckpointBundle:
 
             # Restore weights
             restore_args = ocp.args.Composite(
-                tokenizer_state=ocp.args.StandardRestore(nnx.state(tokenizer)),
-                dynamics_state=ocp.args.StandardRestore(nnx.state(dynamics)),
+                tokenizer=ocp.args.StandardRestore(nnx.state(tokenizer)),
+                dynamics=ocp.args.StandardRestore(nnx.state(dynamics)),
             )
             restored = checkpoint_manager.restore(step, args=restore_args)
-            nnx.update(tokenizer, restored["tokenizer_state"])
-            nnx.update(dynamics, restored["dynamics_state"])
+            nnx.update(tokenizer, restored["tokenizer"])
+            nnx.update(dynamics, restored["dynamics"])
 
         return cls(dynamics=dynamics, tokenizer=tokenizer, dynamics_optimizer=None)
 
@@ -219,18 +219,18 @@ class HeadsCheckpointBundle:
 
             # Restore weights for all models
             restore_args = ocp.args.Composite(
-                tokenizer_state=ocp.args.StandardRestore(nnx.state(tokenizer)),
-                dynamics_state=ocp.args.StandardRestore(nnx.state(dynamics)),
-                task_embedder_state=ocp.args.StandardRestore(nnx.state(task_embedder)),
-                policy_head_state=ocp.args.StandardRestore(nnx.state(policy_head)),
-                reward_head_state=ocp.args.StandardRestore(nnx.state(reward_head)),
+                tokenizer=ocp.args.StandardRestore(nnx.state(tokenizer)),
+                dynamics=ocp.args.StandardRestore(nnx.state(dynamics)),
+                task_embedder=ocp.args.StandardRestore(nnx.state(task_embedder)),
+                policy_head=ocp.args.StandardRestore(nnx.state(policy_head)),
+                reward_head=ocp.args.StandardRestore(nnx.state(reward_head)),
             )
             restored = checkpoint_manager.restore(step, args=restore_args)
-            nnx.update(tokenizer, restored["tokenizer_state"])
-            nnx.update(dynamics, restored["dynamics_state"])
-            nnx.update(task_embedder, restored["task_embedder_state"])
-            nnx.update(policy_head, restored["policy_head_state"])
-            nnx.update(reward_head, restored["reward_head_state"])
+            nnx.update(tokenizer, restored["tokenizer"])
+            nnx.update(dynamics, restored["dynamics"])
+            nnx.update(task_embedder, restored["task_embedder"])
+            nnx.update(policy_head, restored["policy_head"])
+            nnx.update(reward_head, restored["reward_head"])
 
         return cls(
             tokenizer=tokenizer,
