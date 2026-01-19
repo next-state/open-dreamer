@@ -5,8 +5,8 @@ name: coinrun
 
 array_record_path: datasets/coinrun_episodes/train
 
-B: 128
-T: 64
+B: 512
+T: 8
 H: 64
 W: 64
 C: 3

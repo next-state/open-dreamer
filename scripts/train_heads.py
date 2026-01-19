@@ -286,12 +286,13 @@ def run(cfg: HeadsConfig):
         reward_head = RewardHeadMTP(cfg.reward_head, mesh_rules=mesh_rules, rngs=nnx.Rngs(rew_key))
 
         # Build learning rate schedules
-        lr_schedule_policy = build_lr_schedule(cfg.lr_schedule_policy)
-        lr_schedule_reward = build_lr_schedule(cfg.lr_schedule_reward)
-        lr_schedule_dynamics = build_lr_schedule(cfg.lr_schedule_dynamics)
+        d_model = dynamics.cfg.d_model
+        lr_schedule_policy = build_lr_schedule(cfg.lr_schedule_policy, d_model=d_model)
+        lr_schedule_reward = build_lr_schedule(cfg.lr_schedule_reward, d_model=d_model)
+        lr_schedule_dynamics = build_lr_schedule(cfg.lr_schedule_dynamics, d_model=d_model)
 
         # Build optimizers
-        task_embedder_optimizer = build_optimizer(cfg.optimizer, task_embedder, lr_schedule_policy)  # Use same LR as policy
+        task_embedder_optimizer = build_optimizer(cfg.optimizer, task_embedder, lr_schedule_policy)
         policy_optimizer = build_optimizer(cfg.optimizer, policy_head, lr_schedule_policy)
         reward_optimizer = build_optimizer(cfg.optimizer, reward_head, lr_schedule_reward)
         dynamics_optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule_dynamics)

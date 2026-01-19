@@ -14,12 +14,12 @@ dataset:
   B: 32
 
 dynamics:
-    d_model: 256
-    d_bottleneck: 16
     action_dim: 16
+    d_bottleneck: 16
     depth: 12
-    n_heads: 8
-    n_kv_heads: 2
+    d_model: ${mul:64,${dynamics.depth}}
+    n_heads: ${floordiv:${dynamics.d_model},64}
+    n_kv_heads: ${floordiv:{dynamics.num_heads},8}
     packing_factor: 2
     n_register: 32
     qk_norm_type: quest
@@ -28,6 +28,9 @@ dynamics:
     mlp_ratio: 4
     dropout_rate: 0.05
     k_max: 128
+    use_residual_lambdas: true
+    use_bias: false
+    use_rmsnorm_scale: true
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
@@ -41,14 +44,21 @@ lr_schedule:
   lr: 3e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
-  warmup_steps: 50_000
-  wsd_decay_steps: 20_000
+  warmup_ratio: 0.167
+  decay_ratio: 0.067
   max_steps: ${max_steps}
+  mup_scaling: true
+  mup_base_dim: 512
 
 optimizer:
-  optimizer_type: adamw
-  b1: 0.9
-  b2: 0.9
+  optimizer_type: muon
   weight_decay: 1e-4
+  # AdamW params (for embeddings/biases)
+  adam_b1: 0.9
+  adam_b2: 0.9
+  # Muon params (for 2D matrix weights)
+  muon_beta: 0.95
+  muon_ns_steps: 5
+  muon_nesterov: true
 
 write_video_every: 5_000

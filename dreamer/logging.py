@@ -22,7 +22,7 @@ class Logger:
         if self.log_every <= 0:
             return False
         is_periodic = (step % self.log_every == 0)
-        is_last = (self.max_steps is not None) and (step == self.max_steps)
+        is_last = (self.max_steps is not None) and (step == self.max_steps - 1)
         return is_periodic or is_last
 
     def __enter__(self):

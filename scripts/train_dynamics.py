@@ -12,6 +12,7 @@ from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.parallel import build_parallel
+from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
 from dreamer.checkpointing import (
     DynamicsCheckpointBundle,
@@ -135,10 +136,22 @@ def run(cfg: DynamicsConfig):
         # Initialize dynamics
         dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(dynamics)
-        print(f"Parameter counts: {param_counts.get('transformer', 0)/1e6:.2f}M")
+        print(f"Parameter counts: {param_counts['total']:,}")
+
+        # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
+        n_spatial = tokenizer_cfg.encoder.n_latents // cfg.dynamics.packing_factor
+        scaling = ScalingContext.create(
+            cfg=cfg,
+            param_count=param_counts["total"],
+            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T, n_spatial=n_spatial),
+            data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_spatial + 1),  # spatial + action
+            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
+            logger=logger,
+            run_dir=run_dir,
+        )
 
         # Build learning rate schedule
-        lr_schedule = build_lr_schedule(cfg.lr_schedule)
+        lr_schedule = build_lr_schedule(cfg.lr_schedule, d_model=cfg.dynamics.d_model)
 
         # Build optimizer
         optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule)
@@ -162,6 +175,8 @@ def run(cfg: DynamicsConfig):
             start_step, bundle, train_iterator, rng = try_restore_bundle(
                 checkpoint_manager, bundle, train_iterator, rng
             )
+
+            scaling.start_training()
 
             # Training loop
             pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step, total=cfg.max_steps)
@@ -189,13 +204,14 @@ def run(cfg: DynamicsConfig):
                 # Logging
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(aux)
-                    lr_value = lr_schedule(step)
+                    scaling.on_step(step, metrics_cpu)
                     logger.log(
                         step,
                         metrics={
                             "flow_mse": metrics_cpu["flow_mse"],
                             "boot_mse": metrics_cpu["bootstrap_mse"],
-                            "lr": lr_value,
+                            "lr": lr_schedule(step),
+                            **scaling.get_step_metrics(step),
                         },
                         pbar=pbar,
                     )
@@ -213,6 +229,8 @@ def run(cfg: DynamicsConfig):
                         cfg, step, bundle.tokenizer, bundle.dynamics,
                         val_videos, jnp.asarray(val_actions), vis_dir, rng, logger
                     )
+
+            scaling.finalize()
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")

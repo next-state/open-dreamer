@@ -64,23 +64,34 @@ lr_schedule_policy:
   schedule_type: constant
   lr: ${lr_schedule_dynamics.lr}
   max_steps: ${max_steps}
+  mup_scaling: ${lr_schedule_dynamics.mup_scaling}
+  mup_base_dim: ${lr_schedule_dynamics.mup_base_dim}
 
 lr_schedule_reward:
   schedule_type: constant
   lr: ${lr_schedule_dynamics.lr}
   max_steps: ${max_steps}
+  mup_scaling: ${lr_schedule_dynamics.mup_scaling}
+  mup_base_dim: ${lr_schedule_dynamics.mup_base_dim}
 
 lr_schedule_dynamics:
   schedule_type: constant
   lr: 1e-4
   max_steps: ${max_steps}
+  mup_scaling: true
+  mup_base_dim: 512
 
 # Optimizer config (shared across all components)
 optimizer:
-  optimizer_type: adamw
-  b1: 0.9
-  b2: 0.9
+  optimizer_type: muon
   weight_decay: 1e-4
+  # AdamW params (for embeddings/biases)
+  adam_b1: 0.9
+  adam_b2: 0.9
+  # Muon params (for 2D matrix weights)
+  muon_beta: 0.95
+  muon_ns_steps: 5
+  muon_nesterov: true
 
 # Loss weighting
 loss_weight_shortcut: 1.0

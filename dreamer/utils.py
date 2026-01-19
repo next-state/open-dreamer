@@ -16,7 +16,6 @@ from hydra.core.hydra_config import HydraConfig
 from dreamer.configs import CheckpointConfig, LRScheduleConfig, OptimizerConfig
 
 
-
 # --- dtype helpers ---
 
 def to_jnp_dtype(dtype: str | jnp.dtype) -> jnp.dtype:
@@ -308,43 +307,57 @@ def count_parameters_by_component(model):
     return counts
 
 
-def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
+def build_lr_schedule(schedule_cfg: LRScheduleConfig, d_model: int = 768) -> optax.Schedule:
     """
     Build learning rate schedule.
-    
+
     Args:
         schedule_cfg: ScheduleConfig instance
-    
+        d_model: Model dimension for MuP LR scaling (default 768)
+
     Returns:
         optax.Schedule instance
     """
     max_steps = schedule_cfg.max_steps
+
+    lr = schedule_cfg.lr
+    init_lr = schedule_cfg.init_lr if schedule_cfg.init_lr is not None else 0.0
+    lr_end = schedule_cfg.lr_end if schedule_cfg.lr_end is not None else 0.0
+    if schedule_cfg.mup_scaling:
+        mup_scale = (d_model / schedule_cfg.mup_base_dim) ** -0.5
+        lr = lr * mup_scale
+        init_lr = init_lr * mup_scale
+        lr_end = lr_end * mup_scale
+
+    warmup_steps = int(max_steps * schedule_cfg.warmup_ratio)
+    decay_steps = int(max_steps * schedule_cfg.decay_ratio)
+
     if schedule_cfg.schedule_type == "constant":
-        return optax.constant_schedule(value=schedule_cfg.lr)
+        return optax.constant_schedule(value=lr)
     elif schedule_cfg.schedule_type == "cos":
-        assert schedule_cfg.warmup_steps <= max_steps, "Warmup steps can't be greater than total steps."
+        assert warmup_steps <= max_steps, "Warmup steps can't be greater than total steps."
         return optax.warmup_cosine_decay_schedule(
-            init_value=schedule_cfg.init_lr,
-            peak_value=schedule_cfg.lr,
-            warmup_steps=schedule_cfg.warmup_steps,
+            init_value=init_lr,
+            peak_value=lr,
+            warmup_steps=warmup_steps,
             # Note: decay_steps includes the warmup steps, so pass the total value.
             decay_steps=max_steps,
-            end_value=schedule_cfg.lr_end,
+            end_value=lr_end,
         )
     elif schedule_cfg.schedule_type == "wsd":
         assert (
-            schedule_cfg.warmup_steps + schedule_cfg.wsd_decay_steps <= max_steps
-        ), "Warmup and decay period is longer than total steps."
+            warmup_steps + decay_steps <= max_steps
+        ), f"Warmup ({warmup_steps}) + decay ({decay_steps}) > max_steps ({max_steps})."
         schedules = [
             optax.linear_schedule(
-                init_value=schedule_cfg.init_lr, end_value=schedule_cfg.lr, transition_steps=schedule_cfg.warmup_steps
+                init_value=init_lr, end_value=lr, transition_steps=warmup_steps
             ),
-            optax.constant_schedule(value=schedule_cfg.lr),
+            optax.constant_schedule(value=lr),
             optax.linear_schedule(
-                init_value=schedule_cfg.lr, end_value=schedule_cfg.lr_end, transition_steps=schedule_cfg.wsd_decay_steps
+                init_value=lr, end_value=lr_end, transition_steps=decay_steps
             ),
         ]
-        boundaries = [schedule_cfg.warmup_steps, max_steps - schedule_cfg.wsd_decay_steps]
+        boundaries = [warmup_steps, max_steps - decay_steps]
         return optax.join_schedules(schedules, boundaries)
     else:
         raise ValueError(
@@ -352,10 +365,44 @@ def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
         )
 
 
-def build_optimizer(optimizer_cfg: OptimizerConfig, model: nnx.Module, lr_schedule: optax.Schedule) -> nnx.Optimizer:
+def _build_muon_weight_dims(model: nnx.Module) -> dict:
+    """
+    Build muon_weight_dimension_numbers that excludes nnx.Embed params from Muon.
+
+    Returns a pytree matching model params where:
+    - nnx.Embed weights -> None (use AdamW)
+    - All other 2D params -> use Muon (default behavior)
+
+    Args:
+        model: nnx.Module to analyze
+
+    Returns:
+        Dict matching param structure with None for embedding params
+    """
+    def _mark_embeds(module):
+        """Recursively find Embed modules and mark their params for AdamW."""
+        result = {}
+        for name, child in vars(module).items():
+            if isinstance(child, nnx.Embed):
+                # Mark embedding weights for AdamW (None = don't use Muon)
+                result[name] = {"embedding": None}
+            elif isinstance(child, nnx.Module):
+                sub_result = _mark_embeds(child)
+                if sub_result:
+                    result[name] = sub_result
+        return result
+
+    return _mark_embeds(model)
+
+
+def build_optimizer(
+    optimizer_cfg: OptimizerConfig,
+    model: nnx.Module,
+    lr_schedule: optax.Schedule,
+) -> nnx.Optimizer:
     """
     Build optimizer with given learning rate schedule.
-    
+
     Args:
         optimizer_cfg: OptimizerConfig instance
         model: nnx.Module to optimize
@@ -367,12 +414,30 @@ def build_optimizer(optimizer_cfg: OptimizerConfig, model: nnx.Module, lr_schedu
     if optimizer_cfg.optimizer_type == "adamw":
         tx = optax.adamw(
             lr_schedule,
-            b1=optimizer_cfg.b1,
-            b2=optimizer_cfg.b2,
+            b1=optimizer_cfg.adam_b1,
+            b2=optimizer_cfg.adam_b2,
             weight_decay=optimizer_cfg.weight_decay,
+        )
+    elif optimizer_cfg.optimizer_type == "muon":
+        import optax.contrib
+
+        weight_dims = _build_muon_weight_dims(model)
+
+        tx = optax.contrib.muon(
+            learning_rate=lr_schedule,
+            beta=optimizer_cfg.muon_beta,
+            ns_steps=optimizer_cfg.muon_ns_steps,
+            weight_decay=optimizer_cfg.weight_decay,
+            nesterov=optimizer_cfg.muon_nesterov,
+            # AdamW for non-Muon params (embeddings, biases)
+            adam_b1=optimizer_cfg.adam_b1,
+            adam_b2=optimizer_cfg.adam_b2,
+            adam_weight_decay=0.0,  # hardcoded to 0
+            # Exclusion mask for embeddings
+            muon_weight_dimension_numbers=weight_dims if weight_dims else None,
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_cfg.optimizer_type}")
-    
+
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     return optimizer

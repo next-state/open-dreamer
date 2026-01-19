@@ -19,41 +19,48 @@ tokenizer:
   encoder:
     n_latents: 16
     d_bottleneck: 16
-    d_model: 512
-    n_heads: 8
-    n_kv_heads: 2
     depth: 4
+    d_model: ${mul:64,${sum:${encoder.depth},${decoder.depth}}}
+    n_heads: ${floordiv:${encoder.d_model},64}
+    n_kv_heads: ${max:1,${floordiv:${encoder.n_heads},8}}
     dropout_rate: 0.0
+
     qk_norm_type: quest  # qknorm | quest | null
     rope_theta: 10000.0
     time_every: 4
     mae_p_min: 0.0
     mae_p_max: 0.9
-    patch_size: ${patch_size}
+    patch_size: 8
+    use_residual_lambdas: true
+    use_bias: false
+    use_rmsnorm_scale: true
     dtype: ${dtype}
     param_dtype: ${param_dtype}
-
+    
     dataset_mean: ${dataset.dataset_mean}
     dataset_std: ${dataset.dataset_std}
 
   decoder:
-    d_bottleneck: ${tokenizer.encoder.d_bottleneck}
-    d_model: ${tokenizer.encoder.d_model}
-    n_heads: ${tokenizer.encoder.n_heads}
-    n_kv_heads: ${tokenizer.encoder.n_kv_heads}
-    n_latents: ${tokenizer.encoder.n_latents}
-    depth: ${tokenizer.encoder.depth}
-    dropout_rate: ${tokenizer.encoder.dropout_rate}
-    qk_norm_type: ${tokenizer.encoder.qk_norm_type}
-    rope_theta: ${tokenizer.encoder.rope_theta}
-    time_every: ${tokenizer.encoder.time_every}
+    n_latents: ${encoder.n_latents}
+    d_bottleneck: ${encoder.d_bottleneck}
+    depth: ${encoder.depth}
+    d_model: ${encoder.d_model}
+    n_heads: ${encoder.n_heads}
+    n_kv_heads: ${encoder.n_kv_heads}
+    dropout_rate: ${encoder.dropout_rate}
+    qk_norm_type: ${encoder.qk_norm_type}
+    rope_theta: ${encoder.rope_theta}
+    time_every: ${encoder.time_every}
     H: ${dataset.H}
     W: ${dataset.W}
-    patch_size: ${patch_size}
-    d_patch: ${mul:${patch_size},${patch_size},${dataset.C}}
+    patch_size: ${encoder.patch_size}
+    d_patch: ${mul:${decoder.patch_size},${decoder.patch_size},${dataset.C}}
+    use_residual_lambdas: ${encoder.use_residual_lambdas}
+    use_bias: ${encoder.use_bias}
+    use_rmsnorm_scale: ${encoder.use_rmsnorm_scale}
     dtype: ${dtype}
     param_dtype: ${param_dtype}
-
+    
     dataset_mean: ${dataset.dataset_mean}
     dataset_std: ${dataset.dataset_std}
 
@@ -65,15 +72,22 @@ lr_schedule:
   lr: 6e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
-  warmup_steps: 1_000
-  wsd_decay_steps: 3_000
+  warmup_ratio: 0.033
+  decay_ratio: 0.1
   max_steps: ${max_steps}
+  mup_scaling: true
+  mup_base_dim: 512
 
 optimizer:
-  optimizer_type: adamw
-  b1: 0.9
-  b2: 0.9
+  optimizer_type: muon
   weight_decay: 1e-4
+  # AdamW params (for embeddings/biases)
+  adam_b1: 0.9
+  adam_b2: 0.9
+  # Muon params (for 2D matrix weights)
+  muon_beta: 0.95
+  muon_ns_steps: 5
+  muon_nesterov: true
 
 lpips_weight: 0.2
 lpips_frac: 0.5
