@@ -95,7 +95,6 @@ class TokenizerModelConfig:
 
 @dataclass(frozen=False, unsafe_hash=True)
 class DynamicsModelConfig:
-    action_dim: int = 16
     d_bottleneck: int = 32
     depth: int = 12
     d_model: int = 768
@@ -116,6 +115,11 @@ class DynamicsModelConfig:
 
     # schedule
     k_max: int = 8
+
+    # action conditioning
+    num_binary_actions: int = 0
+    categorical_action_dim: int = 0
+    continuous_action_dim: int = 0
 
 
 @dataclass(frozen=False)
@@ -141,8 +145,14 @@ class PolicyHeadModelConfig:
     dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
+    use_bias: bool = False
     dtype: str = "float32"
     param_dtype: str = "float32"
+
+    # action conditioning
+    num_binary_actions: int = 0
+    categorical_action_dim: int = 0
+    continuous_action_dim: int = 0
 
 
 @dataclass(frozen=False)

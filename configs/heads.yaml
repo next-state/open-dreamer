@@ -28,15 +28,19 @@ task_embedder:
 
 policy_head:
   d_model: ${d_model}
-  action_dim: 16
   L: ${n_agent}
   kind: categorical
   mlp_ratio: 2.0
   dropout_rate: 0.0
   swiglu: true
   parity_2over3: false
+  use_bias: false
   dtype: ${dtype}
   param_dtype: ${param_dtype}
+
+  num_binary_actions: 0
+  categorical_action_dim: 16
+  continuous_action_dim: 0
 
 reward_head:
   d_model: ${d_model}

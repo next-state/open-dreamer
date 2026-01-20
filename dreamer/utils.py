@@ -76,10 +76,8 @@ class Modality(IntEnum):
     PROPRIO  = 2
     REGISTER = 3
     SPATIAL = 4
-    SHORTCUT_SIGNAL = 5
-    SHORTCUT_STEP = 6
-    AGENT = 7
-    # add more as needed
+    SHORTCUT = 5
+    AGENT = 6
 
 @jax.tree_util.register_pytree_node_class
 class TokenLayout:

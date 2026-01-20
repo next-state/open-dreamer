@@ -460,8 +460,16 @@ class TimeSelfAttention(nnx.Module):
             mesh_rules=mesh_rules, rngs=rngs
         )
 
-    def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None, rngs: Optional[nnx.Rngs] = None):
-        # mask does nothing, but is required for API consistency
+    def __call__(
+        self,
+        x,
+        mask,
+        *,
+        deterministic: bool = True,
+        cache: Optional[KVCache] = None,
+        rngs: Optional[nnx.Rngs] = None
+    ):
+        # mask does nothing, but is required for API consistency  # TODO: implement independent masking
         # x: (B, T, S, D) -> attention across T, causal
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
@@ -509,7 +517,15 @@ class BlockCausalLayer(nnx.Module):
         # MLP
         self.mlp = MLP(dim, mlp_ratio, dropout_rate, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
 
-    def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None, rngs: Optional[nnx.Rngs] = None):
+    def __call__(
+        self,
+        x,
+        mask,
+        *,
+        deterministic: bool = True,
+        cache: Optional[KVCache] = None,
+        rngs: Optional[nnx.Rngs] = None
+    ):
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
         y, new_cache = self.attn(y, mask=mask, deterministic=deterministic, cache=cache, rngs=rngs)
@@ -558,11 +574,19 @@ class BlockCausalTransformer(nnx.Module):
             ) for i in range(depth)
         ])
 
-    def __call__(self, x, mask, *, deterministic: bool = True, caches: Optional[Dict[int, KVCache]] = None, rngs: Optional[nnx.Rngs] = None) ->Tuple[jax.Array, KVCache | None]:
+    def __call__(
+        self,
+        x,
+        mask,
+        *,
+        deterministic: bool = True,
+        caches: Optional[Dict[int, KVCache]] = None,
+        rngs: Optional[nnx.Rngs] = None
+    ) -> Tuple[jax.Array, KVCache | None]:
         """
         Args:
-            x: input tensor
-            mask: attention mask
+            x: (B, T, S, D) input tensor
+            mask: attention mask (spatial)
             deterministic: whether to use deterministic mode (no dropout)
             caches: optional dict mapping layer_index -> KVCache
             rngs: optional RNG state for dropout
@@ -804,9 +828,7 @@ class Tokenizer(nnx.Module):
     def estimate_flops(self, batch_size: int, seq_length: int) -> int:
         """FLOPs per training step (forward + backward).
 
-        Uses Karpathy/Bahdanau methodology:
-        - 6 FLOPs per weight param per token (excluding embeddings/scalars)
-        - Plus attention computation FLOPs (Q@K^T and attn@V)
+        Follows https://github.com/karpathy/nanochat/discussions/420.
         """
         S = self.decoder.get_token_layout().S
 
@@ -829,35 +851,105 @@ class Tokenizer(nnx.Module):
 class ActionEncoder(nnx.Module):
     """Action encoder for dynamics model."""
 
-    def __init__(self, d_model: int, action_dim: int = 16, dtype: Any = jnp.float32,
-                 param_dtype: Any = jnp.float32, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        d_model: int,
+        num_binary_actions: int = 0,
+        categorical_action_dim: int = 0,
+        continuous_action_dim: int = 0,
+        use_bias: bool = False,
+        dtype: Any = jnp.float32,
+        param_dtype: Any = jnp.float32,
+        *,
+        mesh_rules: MeshRules,
+        rngs: nnx.Rngs
+    ):
         self.d_model = d_model
-        self.action_dim = action_dim
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
+        self.dtype = dtype
 
         # Base "action token" embedding (used always)
-        self.base_action_emb = nnx.Param(jax.random.normal(rngs.params(), (d_model,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
-        # Embed categorical actions
-        self.emb_key = nnx.Embed(
-            action_dim, d_model,
-            dtype=dtype, param_dtype=param_dtype,
-            embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
-            rngs=rngs
+        self.base_action_emb = nnx.Param(
+            jax.random.normal(rngs.params(), (d_model,), dtype=param_dtype) * 0.02,
+            sharding_names=mesh_rules('embed')
         )
 
-    def __call__(self, actions: Optional[jnp.ndarray], batch_time_shape: Optional[Tuple[int,int]] = None, as_tokens: bool = True):
-        base_emb = self.base_action_emb.value.astype(self.emb_key.embedding.value.dtype)
+        # Embed binary actions
+        self.binary_embeds_list = None
+        if num_binary_actions > 0:
+            self.binary_embeds_list = nnx.List([
+                nnx.Embed(
+                    2, d_model,
+                    dtype=dtype, param_dtype=param_dtype,
+                    embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
+                    rngs=rngs
+                )
+                for _ in range(num_binary_actions)
+            ])  # num_binary_actions * (B, T, d_model)
 
-        if actions is None:
-            # unlabeled videos: just broadcast base embedding
-            assert batch_time_shape is not None
-            B, T = batch_time_shape
-            out = jnp.broadcast_to(base_emb, (B, T, self.d_model))
-        else:
-            # embed categorical actions
-            emb_key = self.emb_key(actions)
-            out = emb_key + base_emb  # broadcast add
+        # Embed categorical action
+        self.categorical_embeds = None
+        if categorical_action_dim > 0:
+            self.categorical_embeds = nnx.Embed(
+                categorical_action_dim, d_model,
+                dtype=dtype, param_dtype=param_dtype,
+                embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
+                rngs=rngs
+            )  # (B, T, d_model)
+
+        # Continuous actions: linear projection
+        self.continuous_proj = None
+        if continuous_action_dim > 0:
+            self.continuous_proj = nnx.Linear(
+                continuous_action_dim, d_model,
+                use_bias=use_bias,
+                dtype=dtype, param_dtype=param_dtype,
+                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')),
+                rngs=rngs
+            )  # (B, T, d_model)
+
+    def __call__(
+        self,
+        batch_time_shape: Tuple[int, int],
+        binary_actions: Optional[jnp.ndarray] = None,
+        categorical_action: Optional[jnp.ndarray] = None,
+        continuous_action: Optional[jnp.ndarray] = None,
+        as_tokens: bool = True
+    ):
+        """
+        Encode actions into embeddings.
+
+        Args:
+            batch_time_shape: (B, T) shape for unlabeled videos
+            binary_actions: (B, T, num_binary_actions) with values 0 or 1
+            categorical_action: (B, T, categorical_action_dim) categorical values
+            continuous_action: (B, T, continuous_action_dim) continuous values
+            as_tokens: whether to expand to token dimension
+
+        Returns:
+            Action embeddings (B, T, d_model) or (B, T, 1, d_model) if as_tokens=True
+        """
+        base_emb = self.base_action_emb.value.astype(self.dtype)
+
+        # Unlabeled videos: just broadcast base embedding
+        B, T = batch_time_shape
+        out = jnp.broadcast_to(base_emb, (B, T, self.d_model))
+
+        if binary_actions is not None and self.binary_embeds_list is not None:
+            binary_emb = jnp.zeros((B, T, self.d_model), dtype=self.dtype)
+            for i, emb in enumerate(self.binary_embeds_list):
+                binary_state = binary_actions[..., i]  # (B, T)
+                binary_emb = binary_emb + emb(binary_state)
+            out = out + binary_emb
+
+        if categorical_action is not None and self.categorical_embeds is not None:
+            categorical_emb = self.categorical_embeds(categorical_action.astype(self.dtype))
+            out = out + categorical_emb
+
+        if continuous_action is not None and self.continuous_proj is not None:
+            continuous_emb = self.continuous_proj(continuous_action.astype(self.dtype))
+            out = out + continuous_emb
 
         if as_tokens:
             # expand a token axis (S_a = 1)
@@ -889,7 +981,16 @@ class Dynamics(nnx.Module):
         self.register_tokens = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_register, cfg.d_model), dtype=self.param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
         # Action encoder
-        self.action_encoder = ActionEncoder(d_model=cfg.d_model, action_dim=cfg.action_dim, dtype=self.dtype, param_dtype=self.param_dtype, mesh_rules=mesh_rules, rngs=rngs)
+        self.action_encoder = ActionEncoder(
+            d_model=cfg.d_model,
+            num_binary_actions=cfg.num_binary_actions,
+            categorical_action_dim=cfg.categorical_action_dim,
+            continuous_action_dim=cfg.continuous_action_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            mesh_rules=mesh_rules,
+            rngs=rngs
+        )
 
         # Transformer
         self.transformer = BlockCausalTransformer(
@@ -903,11 +1004,13 @@ class Dynamics(nnx.Module):
         )
 
         # Discrete embeddings for shortcut conditioning
+
         # Step size d ∈ {1, 1/2, 1/4, ..., 1/k_max}
         # We index steps by: step_idx = log2(1/d) ∈ {0, 1, 2, ..., log2(k_max)}
         self.num_step_bins = int(math.log2(cfg.k_max)) + 1
+        half_dim = cfg.d_model // 2
         self.step_embed = nnx.Embed(
-            self.num_step_bins, cfg.d_model,
+            self.num_step_bins, half_dim,
             dtype=self.dtype, param_dtype=self.param_dtype,
             embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
             rngs=rngs
@@ -916,7 +1019,7 @@ class Dynamics(nnx.Module):
         # Signal level τ ∈ {0, d, 2d, ..., 1 - d, 1}
         # We index signals by: signal_idx = τ * k_max ∈ {0, 1, 2, ..., k_max}
         self.signal_embed = nnx.Embed(
-            cfg.k_max, cfg.d_model,
+            cfg.k_max, half_dim,
             dtype=self.dtype, param_dtype=self.param_dtype,
             embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
             rngs=rngs
@@ -934,8 +1037,7 @@ class Dynamics(nnx.Module):
     def get_token_layout(self, n_spatial: int, n_agent: int = 0) -> TokenLayout:
         segments = [
             (Modality.ACTION, 1),
-            (Modality.SHORTCUT_SIGNAL, 1),
-            (Modality.SHORTCUT_STEP, 1),
+            (Modality.SHORTCUT, 1),
             (Modality.SPATIAL, n_spatial),
             (Modality.REGISTER, self.cfg.n_register),
         ]
@@ -958,54 +1060,78 @@ class Dynamics(nnx.Module):
             dtype=dtype
         )
 
-    def __call__(self, actions, step_indices, tau_indices, packed_enc_tokens, *,
-                task_embeddings: Optional[jnp.ndarray] = None, deterministic: bool = True,
-                caches: Optional[KVCache | None] = None, rngs: Optional[nnx.Rngs] = None
-    )->Tuple[jax.Array, Tuple[jax.Array|None, KVCache|None]]:
+    def __call__(
+        self,
+        step_indices,
+        tau_indices,
+        packed_enc_tokens,
+        *,
+        binary_actions: Optional[jnp.ndarray] = None,
+        categorical_action: Optional[jnp.ndarray] = None,
+        continuous_action: Optional[jnp.ndarray] = None,
+        task_embeddings: Optional[jnp.ndarray] = None,
+        deterministic: bool = True,
+        caches: Optional[KVCache | None] = None,
+        rngs: Optional[nnx.Rngs] = None
+    ) -> Tuple[jax.Array, Tuple[jax.Array | None, KVCache | None]]:
         """
         Args:
-          packed_enc_tokens:      (B, T, n_spatial, d_spatial) packed encoder tokens
-          actions:       (B, T) int32 in [0, n_keyboard) raw action tokens
-          step_indices:  (B, T) int32 — step indices for embedding lookup
-          tau_indices:   (B, T) int32 - signal indices for embedding lookup
-          caches:     optional dict of KVCache for each layer
+            packed_enc_tokens: (B, T, n_spatial, d_spatial) packed encoder tokens
+            binary_actions: (B, T, num_binary_actions) with values 0 or 1
+            categorical_action: (B, T, categorical_action_dim) int32 categorical values
+            continuous_action: (B, T, continuous_action_dim) continuous values
+            step_indices: (B, T) int32 — step indices for embedding lookup
+            tau_indices: (B, T) int32 - signal indices for embedding lookup
+            caches: optional dict of KVCache for each layer
 
         Shapes produced:
-          spatial_tokens: (B, T, n_spatial, d_model)
-          action_tokens:  (B, T, 1, d_model)  # if your ActionEncoder emits one token
-          signal_token:   (B, T, 1, d_model)
-          step_token:     (B, T, 1, d_model)
+            spatial_tokens: (B, T, n_spatial, d_model)
+            action_token:  (B, T, 1, d_model)
+            shortcut_token: (B, T, 1, d_model)
         """
-        # --- 1) Project spatial tokens to model dimension
-        spatial_tokens = self.spatial_proj(packed_enc_tokens) # (B, T, n_spatial, d_model)
+        B, T = packed_enc_tokens.shape[:2]
 
-        # --- 2) Encode actions to d_model
-        action_tokens = self.action_encoder(actions)  # (B, T, N_a, d_model)
+        # Project spatial tokens to d_model
+        spatial_tokens = self.spatial_proj(packed_enc_tokens)  # (B, T, n_spatial, d_model)
 
-        # --- 3) Prepare learned register tokens
+        # Encode actions to d_model
+        action_token = self.action_encoder(
+            batch_time_shape=(B, T),
+            binary_actions=binary_actions,
+            categorical_action=categorical_action,
+            continuous_action=continuous_action
+        )  # (B, T, 1, d_model)
+
+        # Prepare learned register tokens
         B, T = spatial_tokens.shape[:2]
         register_tokens = jnp.broadcast_to(
-            self.register_tokens.value.astype(self.dtype)[None, None, ...],  # (1,1,n_register,d_model)
+            self.register_tokens.value.astype(self.dtype)[None, None, ...],  # (1, 1 ,n_register, d_model)
             (B, T, self.n_register, self.d_model),
         )
 
-        # --- 4) Shortcut embeddings (discrete lookup)
-        step_tok   = self.step_embed(step_indices)[:, :, None, :]         # (B, T, 1, d_model)
-        signal_tok = self.signal_embed(tau_indices)[:, :, None, :]     # (B, T, 1, d_model)
+        # Shortcut embeddings (discrete lookup, concatenated to single token)
+        step_emb = self.step_embed(step_indices)       # (B, T, d_model//2)
+        signal_emb = self.signal_embed(tau_indices)    # (B, T, d_model//2)
+        shortcut_token = jnp.concatenate([step_emb, signal_emb], axis=-1)[:, :, None, :]  # (B, T, 1, d_model)
 
-        # --- 5) Concatenate in your declared layout order
+        # Concatenate in declared layout order (`get_token_layout`)
+        tokens = [action_token, shortcut_token, spatial_tokens, register_tokens]
         if task_embeddings is not None:
-            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, task_embeddings]
-        else:
-            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
-        tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
+            tokens.append(task_embeddings)
+            
+        tokens = jnp.concatenate(tokens, axis=2)  # (B, T, S, D)
 
         # make the layout for masking
         n_agent = task_embeddings.shape[2] if task_embeddings is not None else 0
         layout = self.get_token_layout(n_spatial=spatial_tokens.shape[2], n_agent=n_agent)
         mask = layout.make_mask("wm_agent")
 
-        x, new_caches = self.transformer(tokens, mask, deterministic=deterministic, caches=caches, rngs=rngs)
+        x, new_caches = self.transformer(
+            tokens, mask,
+            deterministic=deterministic,
+            caches=caches,
+            rngs=rngs
+        )
 
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
         x1_hat = self.flow_x_head(spatial_tokens)
@@ -1025,7 +1151,11 @@ class Dynamics(nnx.Module):
         excluded += self.register_tokens.value.size
         # Action encoder embeddings
         excluded += self.action_encoder.base_action_emb.value.size
-        excluded += self.action_encoder.emb_key.embedding.value.size
+        if self.action_encoder.binary_embeds_list is not None:
+            for binary_emb in self.action_encoder.binary_embeds_list:
+                excluded += binary_emb.embedding.value.size
+        if self.action_encoder.categorical_embeds is not None:
+            excluded += self.action_encoder.categorical_embeds.embedding.value.size
         # Shortcut embeddings
         excluded += self.step_embed.embedding.value.size
         excluded += self.signal_embed.embedding.value.size
@@ -1036,9 +1166,7 @@ class Dynamics(nnx.Module):
     def estimate_flops(self, batch_size: int, seq_length: int, n_spatial: int) -> int:
         """FLOPs per training step (forward + backward).
 
-        Uses Karpathy/Bahdanau methodology:
-        - 6 FLOPs per weight param per token (excluding embeddings/scalars)
-        - Plus attention computation FLOPs (Q@K^T and attn@V)
+        Follows https://github.com/karpathy/nanochat/discussions/420.
         """
         S = self.get_token_layout(n_spatial=n_spatial).S
 
@@ -1091,6 +1219,9 @@ class PolicyHeadMTP(nnx.Module):
 
     def __init__(self, cfg: PolicyHeadModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.cfg = cfg
+        self.num_binary_actions = cfg.num_binary_actions
+        self.categorical_action_dim = cfg.categorical_action_dim
+        self.continuous_action_dim = cfg.continuous_action_dim
         dtype = to_jnp_dtype(cfg.dtype)
         param_dtype = to_jnp_dtype(cfg.param_dtype)
 
@@ -1102,15 +1233,121 @@ class PolicyHeadMTP(nnx.Module):
             param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs
         )
 
-        # Single matmul that produces all L offsets at once: (… , d_flat) -> (…, L, A)
-        self.out = nnx.Linear(d_flat, cfg.L * cfg.action_dim, use_bias=cfg.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
+        self.out_binary = None
+        if cfg.num_binary_actions > 0:
+            # Binary keyboard: one logit per key (Bernoulli)
+            self.out_binary = nnx.Linear(
+                d_flat, cfg.L * cfg.num_binary_actions,
+                use_bias=cfg.use_bias, dtype=dtype, param_dtype=param_dtype,
+                kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
+                rngs=rngs
+            )
 
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> jnp.ndarray:
+        self.out_categorical = None
+        if cfg.categorical_action_dim > 0:
+            self.out_categorical = nnx.Linear(
+                d_flat, cfg.L * cfg.categorical_action_dim,
+                use_bias=cfg.use_bias, dtype=dtype, param_dtype=param_dtype,
+                kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
+                rngs=rngs
+            )
+
+        self.out_continuous = None
+        if cfg.continuous_action_dim > 0:
+            # Gaussian: mean + log_var
+            self.out_continuous = nnx.Linear(
+                d_flat, cfg.L * cfg.continuous_action_dim * 2,
+                use_bias=cfg.use_bias, dtype=dtype, param_dtype=param_dtype,
+                kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
+                rngs=rngs
+            )
+
+    def __call__(
+        self,
+        h_t: jnp.ndarray,
+        *,
+        deterministic: bool = True,
+        rngs: Optional[nnx.Rngs] = None
+    ) -> dict[str, jnp.ndarray]:
+        """
+        Forward pass.
+
+        Args:
+            h_t: (B, T, n_agent, d_model) hidden states
+
+        Returns:
+            Dict with keys:
+            - "binary_logits": (B, T, L, num_binary_actions) if binary actions enabled
+            - "categorical_logits": (B, T, L, categorical_action_dim) if categorical action enabled
+            - "mouse_mean": (B, T, L, continuous_action_dim) if continuous action enabled
+            - "mouse_log_var": (B, T, L, continuous_action_dim) if continuous action enabled
+        """
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)  # (B, T, D)
-        logits = self.out(x)                                  # (B, T, L*A)
-        logits = rearrange(logits, 'b t (l a) -> b t l a', l=self.cfg.L, a=self.cfg.action_dim)
-        return logits
+
+        outputs = {}
+
+        if self.out_binary is not None:
+            binary_logits = self.out_binary(x)  # (B, T, L*A)
+            binary_logits = rearrange(binary_logits, "b t (l a) -> b t l a", l=self.cfg.L, a=self.num_binary_actions)
+            outputs["binary_logits"] = binary_logits
+
+        if self.out_categorical is not None:
+            categorical_logits = self.out_categorical(x)  # (B, T, L*A)
+            categorical_logits = rearrange(categorical_logits, "b t (l a) -> b t l a", l=self.cfg.L, a=self.categorical_action_dim)
+            outputs["categorical_logits"] = categorical_logits
+
+        if self.out_continuous is not None:
+            continuous_out = self.out_continuous(x)  # (B, T, L*continuous_action_dim*2)
+            continuous_out = rearrange(continuous_out, "b t (l m) -> b t l m", l=self.cfg.L, m=self.cfg.continuous_action_dim * 2)
+            outputs["continuous_mean"] = continuous_out[..., :self.cfg.continuous_action_dim]
+            outputs["continuous_log_var"] = continuous_out[..., self.cfg.continuous_action_dim:]
+
+        return outputs
+
+    def sample(
+        self,
+        h_t: jnp.ndarray,
+        rng: jax.Array,
+        *,
+        deterministic: bool = True,
+        rngs: Optional[nnx.Rngs] = None
+    ) -> dict[str, jnp.ndarray]:
+        """
+        Sample actions from the policy.
+
+        Args:
+            h_t: (B, T, n_agent, d_model) hidden states
+            rng: Random key for sampling
+
+        Returns:
+            Dict with sampled actions:
+            - "binary": (B, T, L) sampled binary value
+            - "categorical": (B, T, L) int32 sampled category
+            - "continuous": (B, T, L, mouse_dim) sampled continuous values
+        """
+        outputs = self(h_t, deterministic=deterministic, rngs=rngs)
+        samples = {}
+
+        rng_cat, rng_mouse = jax.random.split(rng)
+
+        if "binary_logits" in outputs:
+            binary_logits = outputs["binary_logits"]
+            probs = jax.nn.sigmoid(binary_logits)
+            samples['keyboard'] = jax.random.bernoulli(rng_cat, probs).astype(jnp.int32)
+
+        if "categorical_logits" in outputs:
+            categorical_logits = outputs["categorical_logits"]
+            samples['categorical'] = jax.random.categorical(rng_cat, categorical_logits, axis=-1)
+
+        if "continuous_mean" in outputs:
+            mean = outputs["continuous_mean"]
+            log_var = outputs["continuous_log_var"]
+            std = jnp.exp(0.5 * log_var)
+            eps = jax.random.normal(rng_mouse, mean.shape)
+            samples["continuous"] = mean + std * eps
+
+        return samples
 
 
 class RewardHeadMTP(nnx.Module):

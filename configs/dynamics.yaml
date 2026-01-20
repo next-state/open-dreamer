@@ -14,7 +14,6 @@ dataset:
   B: 32
 
 dynamics:
-    action_dim: 16
     d_bottleneck: 16
     depth: 12
     d_model: ${mul:64,${dynamics.depth}}
@@ -33,6 +32,10 @@ dynamics:
     use_rmsnorm_scale: true
     dtype: ${dtype}
     param_dtype: ${param_dtype}
+
+    num_binary_actions: 0
+    categorical_action_dim: 16
+    continuous_action_dim: 0
 
 bootstrap_start: 5_000
 self_fraction: 0.25
