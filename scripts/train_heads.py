@@ -38,9 +38,6 @@ from dreamer.checkpointing import (
     DynamicsCheckpointBundle,
     HeadsCheckpointBundle,
     build_checkpoint_manager,
-    get_bundle_item_names,
-    maybe_save_bundle,
-    try_restore_bundle,
 )
 from dreamer.utils import (
     build_lr_schedule,
@@ -317,12 +314,12 @@ def run(cfg: HeadsConfig):
         # Checkpointing
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
-            item_names=get_bundle_item_names(bundle)
+            item_names=HeadsCheckpointBundle.get_item_names()
         ) as checkpoint_manager:
-            
+
             # Restore from checkpoint
-            start_step, bundle, train_iterator, rng = try_restore_bundle(
-                checkpoint_manager, bundle, train_iterator, rng
+            start_step, bundle, train_iterator, rng = bundle.restore(
+                checkpoint_manager, train_iterator, rng
             )
 
             # Training loop
@@ -365,9 +362,7 @@ def run(cfg: HeadsConfig):
                     logger.log(step, metrics=metrics_cpu, pbar=pbar)
 
                 # Checkpointing
-                maybe_save_bundle(
-                    checkpoint_manager, step, bundle, train_iterator, rng
-                )
+                bundle.maybe_save(checkpoint_manager, step, train_iterator, rng)
 
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
