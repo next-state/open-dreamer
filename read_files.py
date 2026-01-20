@@ -21,8 +21,11 @@ def main():
     for k, v in data.items():
         if isinstance(v, bytes):
             print(f"  {k}: bytes[{len(v)}]")
-        elif isinstance(v, (list, tuple)):
+        elif isinstance(v, list):
             print(f"  {k}: {type(v).__name__}[{len(v)}]")
+        elif isinstance(v, tuple):
+            print(f"  {k}: {type(v).__name__}[{len(v)}]")
+            print(v)
         else:
             print(f"  {k}: {v}")
 
