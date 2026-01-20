@@ -1,6 +1,6 @@
 defaults:
   - common
-  - dataset: minecraft_vpt
+  - dataset: coinrun
   - _self_
 
 run_name: tokenizer

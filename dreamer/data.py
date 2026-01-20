@@ -21,23 +21,24 @@ class EpisodeLengthFilter(grain.transforms.Filter):
     def __init__(
         self,
         seq_len: int,
-        image_h: int,
-        image_w: int,
-        image_c: int,
         *,
         print_filter_warnings: bool = True,
     ):
         self.seq_len = seq_len
-        self.image_h = image_h
-        self.image_w = image_w
-        self.image_c = image_c
         self.print_filter_warnings = print_filter_warnings
 
     def filter(self, element: Any) -> bool:
         assert isinstance(element, bytes)
         element = pickle.loads(element)
 
-        current_episode_len = element["sequence_length"]
+        # Handle both CoinRun and Minecraft VPT formats
+        if "sequence_length" in element:
+            current_episode_len = element["sequence_length"]
+        elif "video_shape" in element:
+            current_episode_len = element["video_shape"][0]
+        else:
+            raise ValueError("Unknown episode format: missing 'sequence_length' or 'video_shape'")
+
         if current_episode_len < self.seq_len:
             if self.print_filter_warnings:
                 print(
@@ -118,18 +119,6 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
 # Minecraft VPT Dataset
 # ==============================================================================
 
-class MinecraftVPTEpisodeLengthFilter(grain.transforms.Filter):
-    """Filter episodes shorter than seq_len for Minecraft VPT dataset."""
-
-    def __init__(self, seq_len: int):
-        self.seq_len = seq_len
-
-    def filter(self, element: bytes) -> bool:
-        data = pickle.loads(element)
-        episode_len = data["video_shape"][0]
-        return episode_len >= self.seq_len
-
-
 class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
     """Parse video bytes, random slice for Minecraft VPT dataset."""
 
@@ -170,12 +159,8 @@ def make_iterator(
     # Build array record paths based on dataset type
     if cfg.name == "minecraft_vpt":
         # Minecraft VPT: generate shard paths from index_max
-        if cfg.index_max <= 0:
-            raise ValueError("index_max must be > 0 for minecraft_vpt dataset")
-        array_record_paths = [
-            f"{cfg.array_record_path}/shard-{i:05d}.array_record"
-            for i in range(cfg.index_max)
-        ]
+        assert cfg.index_max >= 0, "index_max must be > 0 for minecraft_vpt dataset"
+        array_record_paths = [f"{cfg.array_record_path}/shard-{i:05d}.array_record" for i in range(cfg.index_max)]
     else:
         # CoinRun: discover files in directory
         array_record_paths = cfg.array_record_path
@@ -213,7 +198,10 @@ def make_iterator(
     # Build operations based on dataset type
     if cfg.name == "minecraft_vpt":
         operations = [
-            MinecraftVPTEpisodeLengthFilter(seq_len=cfg.T),
+            EpisodeLengthFilter(
+                seq_len=cfg.T,
+                print_filter_warnings=print_filter_warnings,
+            ),
             MinecraftVPTProcessEpisodeAndSlice(seq_len=cfg.T),
             grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
         ]
@@ -221,9 +209,6 @@ def make_iterator(
         operations = [
             EpisodeLengthFilter(
                 seq_len=cfg.T,
-                image_h=cfg.H,
-                image_w=cfg.W,
-                image_c=cfg.C,
                 print_filter_warnings=print_filter_warnings,
             ),
             ProcessEpisodeAndSlice(
