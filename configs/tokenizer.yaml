@@ -13,8 +13,6 @@ ckpt:
   max_to_keep: 1
   save_interval_steps: 10_000
 
-patch_size: 16
-
 tokenizer:
   encoder:
     n_latents: 16
