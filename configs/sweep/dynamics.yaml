@@ -6,8 +6,29 @@ metric:
   goal: maximize
 
 parameters:
-  max_lr:
-    values: [1e-4, 3e-4]
+  lr_schedule.lr:
+    values: [0.004, 0.003, 0.002]
+
+  lr_schedule.warmup_ratio:
+    values: [0.05]
+
+  lr_schedule.decay_ratio:
+    values: [0.4, 0.5]
+
+  optimizer.adam_lr_ratio:
+    values: [0.1, 1.]
+
+  optimizer.adam_b1:
+    values: [0.99, 0.95, 0.9]
+
+  optimizer.adam_b2:
+    values: [0.99, 0.999] 
+
+  optimizer.weight_decay:
+    values: [0.1]
+
+  optimizer.mup_scaling:
+    value: false
 
   dynamics.n_register:
     values: [16, 32]
@@ -23,16 +44,22 @@ parameters:
   
   dynamics.n_kv_heads:
     values: [2, 4]
+  
+  ckpt.max_to_keep:
+    value: 0
 
   use_wandb:
     value: true
 
   max_steps:
-    value: 50000
+    value: 20_000
+    
+  dataset.B:
+    value: 256
 
 command:
   - uv
   - run
   - ${program}
   - ${args_no_hyphens}
-  - run_name=fixed_d_model${dynamics.d_model}_n_register${dynamics.n_register}_depth${dynamics.depth}_k_max${dynamics.k_max}_dropout${dynamics.dropout_rate}_qk_norm${dynamics.qk_norm_type}_rope_theta${dynamics.rope_theta}_n_heads${dynamics.n_heads}_n_kv_heads${dynamics.n_kv_heads}
+  - run_name=lr${lr_schedule.lr}_warmup${lr_schedule.warmup_ratio}_decay${lr_schedule.decay_ratio}_adam_lr${optimizer.adam_lr_ratio}_b1${optimizer.adam_b1}_b2${optimizer.adam_b2}_nreg${dynamics.n_register}_nh${dynamics.n_heads}_nkv${dynamics.n_kv_heads}

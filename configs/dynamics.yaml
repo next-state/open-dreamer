@@ -7,8 +7,8 @@ run_name: dynamics
 tokenizer_ckpt: logs/tok-b20.999/checkpoints/
 
 ckpt:
-  max_to_keep: 0
-  save_interval_steps: 100
+  max_to_keep: 1
+  save_interval_steps: 10_000
 
 dataset:
   B: 512
@@ -54,7 +54,7 @@ optimizer:
   # AdamW params (for embeddings/biases)
   adam_lr_ratio: 0.01
   adam_b1: 0.9
-  adam_b2: 0.9
+  adam_b2: 0.99
   mup_scaling: true
   mup_base_dim: 512
   # Muon params (for 2D matrix weights)
