@@ -1,28 +1,31 @@
 defaults:
   - common
   - dataset: coinrun
+  - dataset: coinrun
   - _self_
 
 run_name: tokenizer
 
+dataset:
+  B: 256
+  T: 8
 
 ckpt:
   max_to_keep: 1
   save_interval_steps: 10_000
 
-
 tokenizer:
   encoder:
     n_latents: 16
     d_bottleneck: 16
-    depth: 4
+    depth: 5
     d_model: ${mul:64,${sum:${tokenizer.encoder.depth},${tokenizer.decoder.depth}}}
     n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
     dropout_rate: 0.0
 
-    qk_norm_type: quest  # qknorm | quest | null
-    rope_theta: 10000.0 #TODO: check this!
+    qk_norm_type: qknorm  # qknorm | quest | null
+    rope_theta: 10000.0
     time_every: 4
     mae_p_min: 0.0
     mae_p_max: 0.9
@@ -65,22 +68,22 @@ tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
-  lr: 0.004  # constant LR or peak LR for schedules
+  lr: 0.003  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05
-  decay_ratio: 0.4
+  decay_ratio: 0.5
   max_steps: ${max_steps}
-  mup_scaling: false
-  mup_base_dim: 512
 
 optimizer:
   optimizer_type: muon
   weight_decay: 0.1
-  
   # AdamW params (for embeddings/biases)
-  adam_b1: 0.95
-  adam_b2: 0.999
+  adam_lr_ratio: 1.0
+  adam_b1: 0.9
+  adam_b2: 0.99
+  mup_scaling: true
+  mup_base_dim: 640
   # Muon params (for 2D matrix weights)
   muon_beta: 0.95
   muon_ns_steps: 5

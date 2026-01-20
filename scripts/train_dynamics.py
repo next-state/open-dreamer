@@ -148,10 +148,10 @@ def run(cfg: DynamicsConfig):
         )
 
         # Build learning rate schedule
-        lr_schedule = build_lr_schedule(cfg.lr_schedule, d_model=cfg.dynamics.d_model)
+        lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
         # Build optimizer
-        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule)
+        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model)
 
         # Create checkpoint bundle (includes frozen tokenizer for self-contained checkpoints)
         bundle = DynamicsCheckpointBundle(

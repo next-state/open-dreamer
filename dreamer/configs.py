@@ -178,10 +178,6 @@ class LRScheduleConfig:
     warmup_ratio: float = 0.0  # e.g., 0.1 = 10% warmup
     decay_ratio: float = 0.0   # e.g., 0.2 = 20% decay (for wsd)
 
-    # MuP scaling (scales LR by (d_model/mup_base_dim)^-0.5)
-    mup_base_dim: int = 768         # Reference dimension for MuP scaling
-    mup_scaling: bool = False       # Enable MuP LR scaling
-
 
 @dataclass(frozen=False)
 class CheckpointConfig:
@@ -195,12 +191,17 @@ class CheckpointConfig:
 class OptimizerConfig:
     """Configuration for optimizer."""
     # Optimizer type: "adamw" or "muon"
-    optimizer_type: str = "adamw"
+    optimizer_type: str = "muon"
     weight_decay: float = 1e-4
 
     # AdamW hyperparameters (also used for non-matrix params when using Muon)
+    adam_lr_ratio: float = 1.0      # adam_lr = muon_lr * adam_lr_ratio
     adam_b1: float = 0.9
     adam_b2: float = 0.9
+
+    # MuP scaling (scales AdamW LR by (d_model/mup_base_dim)^-0.5)
+    mup_base_dim: int = 512         # Reference dimension for MuP scaling
+    mup_scaling: bool = False       # Enable MuP LR scaling
 
     # Muon-specific hyperparameters (for 2D matrix params, excluding embeddings)
     muon_beta: float = 0.95         # Momentum for Muon

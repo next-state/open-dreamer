@@ -334,7 +334,8 @@ class GroupedQueryAttention(nnx.Module):
         self.use_rmsnorm_scale = use_rmsnorm_scale
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
-
+        self.dtype = dtype
+        
         assert self.dim % self.num_heads == 0
         assert self.num_heads % self.num_kv_heads == 0
 
@@ -370,8 +371,8 @@ class GroupedQueryAttention(nnx.Module):
 
         scale = q.shape[-1] ** -0.5
         if self.qk_norm_type == 'qknorm':
-            q = self.q_ln(q)
-            k = self.k_ln(k)
+            q = self.q_ln(q).astype(self.dtype)
+            k = self.k_ln(k).astype(self.dtype)
         elif self.qk_norm_type == 'quest':
             # claims to beat qknorm https://openreview.net/pdf?id=HkztQWZfl2
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)

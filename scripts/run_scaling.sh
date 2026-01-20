@@ -6,7 +6,7 @@
 #   ./scripts/run_scaling.sh isoflop tokenizer
 #
 # Stage 2 (Compute-Optimal): Train at discovered ratio
-#   TOKENS_PER_PARAM=20 ./scripts/run_scaling.sh optimal tokenizer
+#   TOKENS_PER_PARAM=156 ./scripts/run_scaling.sh optimal tokenizer
 #
 # Options:
 #   --dry-run    Print commands without executing
@@ -27,11 +27,11 @@ fi
 # Configuration by mode
 if [ "$MODE" == "isoflop" ]; then
     # Iso-FLOPs: multiple depths × multiple FLOPs budgets
-    DEPTHS=(7 6 5 4)  # (10 9 8 7 6 5 4)
-    FLOPS_BUDGETS=(6e18)  # (1e18 3e18 6e18)
+    DEPTHS=(5)  # (10 9 8 7 6 5 4)
+    FLOPS_BUDGETS=(6e17 1e18 3e18)  # (1e18 3e18 6e18)
 elif [ "$MODE" == "optimal" ]; then
     # Compute-optimal: multiple depths × fixed tokens_per_param
-    DEPTHS=(7)
+    DEPTHS=(1 2 3 4 5 6 7 8)
     TOKENS_PER_PARAM=${TOKENS_PER_PARAM:-20}
 else
     echo "Unknown mode: $MODE. Use 'isoflop' or 'optimal'."
