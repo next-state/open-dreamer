@@ -6,7 +6,7 @@ name: coinrun
 array_record_path: datasets/coinrun_episodes/train
 
 B: 512
-T: 8
+T: 64
 H: 64
 W: 64
 C: 3

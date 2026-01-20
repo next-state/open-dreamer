@@ -1,7 +1,6 @@
 defaults:
   - common
   - dataset: coinrun
-  - dataset: coinrun
   - _self_
 
 run_name: tokenizer

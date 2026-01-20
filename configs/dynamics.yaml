@@ -1,25 +1,25 @@
 defaults:
   - common
-  - _self_
   - dataset: coinrun
+  - _self_
 
-run_name: dynamics_new
-tokenizer_ckpt: logs/tokenizer_new/checkpoints/
+run_name: dynamics
+tokenizer_ckpt: logs/tok-b20.999/checkpoints/
 
 ckpt:
-  max_to_keep: 2
+  max_to_keep: 0
   save_interval_steps: 100
 
 dataset:
-  B: 32
+  B: 512
 
 dynamics:
     action_dim: 16
     d_bottleneck: 16
-    depth: 12
+    depth: 8
     d_model: ${mul:64,${dynamics.depth}}
     n_heads: ${floordiv:${dynamics.d_model},64}
-    n_kv_heads: ${floordiv:{dynamics.num_heads},8}
+    n_kv_heads: ${floordiv:${dynamics.n_heads},8}
     packing_factor: 2
     n_register: 32
     qk_norm_type: quest

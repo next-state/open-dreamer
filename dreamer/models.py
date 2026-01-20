@@ -700,7 +700,7 @@ class Decoder(nnx.Module):
 
         self.n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
         self.up_proj = nnx.Linear(cfg.d_bottleneck, cfg.d_model, use_bias=cfg.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
-        self.patch_head = nnx.Linear(cfg.d_model, cfg.d_patch, use_bias=cfg.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.patch_head = nnx.Linear(cfg.d_model, cfg.d_patch, use_bias=cfg.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
 
         self.transformer = BlockCausalTransformer(
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,

@@ -6,6 +6,7 @@ Bundles have `from_pretrained` class methods for loading checkpoints for inferen
 (without optimizers).
 """
 from __future__ import annotations
+from aiohttp.abc import AbstractAccessLogger
 
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
@@ -37,17 +38,25 @@ from dreamer.utils import from_dict
 
 
 
+class NoOpCheckpointManager(ocp.CheckpointManager):
+    """No-op checkpoint manager that does nothing (used when max_to_keep == 0)."""
+    def should_save(self, step: int) -> bool: return False
+
+
 def build_checkpoint_manager(
         ckpt_cfg: CheckpointConfig,
         ckpt_dir: Path,
         item_names=("model_state", "optimizer_state", "train_dataloader_state", "rngs", "meta"),
     ) -> ocp.CheckpointManager:
+
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=ckpt_cfg.max_to_keep,
         save_interval_steps=ckpt_cfg.save_interval_steps,
         save_on_steps=[ckpt_cfg.max_steps - 1],  # always save at the end
     )
 
+    if ckpt_cfg.max_to_keep == 0:
+        return NoOpCheckpointManager(ckpt_dir, options=checkpoint_options, item_names=item_names)
     return ocp.CheckpointManager(ckpt_dir, options=checkpoint_options, item_names=item_names)
 
 

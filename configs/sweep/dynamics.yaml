@@ -9,27 +9,15 @@ parameters:
   max_lr:
     values: [1e-4, 3e-4]
 
-  dynamics.d_model:
-    values: [256, 512]
-  
   dynamics.n_register:
     values: [16, 32]
   
-  dynamics.depth:
-    values: [6, 12]
+  # dynamics.k_max:
+  #   values: [8, 64]
 
-  dynamics.k_max:
-    values: [8, 64]
+  # dynamics.dropout_rate:
+  #   values: [0.05]
 
-  dynamics.dropout_rate:
-    values: [0.05]
-
-  dynamics.qk_norm_type:
-    values: [null, qknorm, quest]
-
-  dynamics.rope_theta:
-    values: [10000.0, 150000.0]
-  
   dynamics.n_heads:
     values: [4, 8]
   
