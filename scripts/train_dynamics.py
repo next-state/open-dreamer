@@ -18,9 +18,6 @@ from dreamer.checkpointing import (
     DynamicsCheckpointBundle,
     TokenizerCheckpointBundle,
     build_checkpoint_manager,
-    get_bundle_item_names,
-    maybe_save_bundle,
-    try_restore_bundle,
 )
 from dreamer.utils import (
     count_parameters_by_component,
@@ -169,11 +166,11 @@ def run(cfg: DynamicsConfig):
 
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
-            item_names=get_bundle_item_names(bundle)
+            item_names=DynamicsCheckpointBundle.get_item_names()
         ) as checkpoint_manager:
             # Resume from checkpoint
-            start_step, bundle, train_iterator, rng = try_restore_bundle(
-                checkpoint_manager, bundle, train_iterator, rng
+            start_step, bundle, train_iterator, rng = bundle.restore(
+                checkpoint_manager, train_iterator, rng
             )
 
             scaling.start_training()
@@ -217,7 +214,7 @@ def run(cfg: DynamicsConfig):
                     )
 
                 # Checkpointing
-                maybe_save_bundle(checkpoint_manager, step, bundle, train_iterator, rng)
+                bundle.maybe_save(checkpoint_manager, step, train_iterator, rng)
 
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:

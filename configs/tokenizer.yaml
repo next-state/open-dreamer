@@ -1,6 +1,7 @@
 defaults:
   - common
   - dataset: coinrun
+  - dataset: coinrun
   - _self_
 
 run_name: tokenizer
@@ -28,13 +29,13 @@ tokenizer:
     time_every: 4
     mae_p_min: 0.0
     mae_p_max: 0.9
-    patch_size: 8
+    patch_size: 20
     use_residual_lambdas: true
     use_bias: false
     use_rmsnorm_scale: true
     dtype: ${dtype}
     param_dtype: ${param_dtype}
-    
+
     dataset_mean: ${dataset.dataset_mean}
     dataset_std: ${dataset.dataset_std}
 
@@ -58,11 +59,11 @@ tokenizer:
     use_rmsnorm_scale: ${tokenizer.encoder.use_rmsnorm_scale}
     dtype: ${dtype}
     param_dtype: ${param_dtype}
-    
+
     dataset_mean: ${dataset.dataset_mean}
     dataset_std: ${dataset.dataset_std}
 
-max_steps: 30_000
+max_steps: 300_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:

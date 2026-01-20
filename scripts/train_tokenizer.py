@@ -25,9 +25,6 @@ from dreamer.scaling import ScalingContext
 from dreamer.checkpointing import (
     TokenizerCheckpointBundle,
     build_checkpoint_manager,
-    get_bundle_item_names,
-    try_restore_bundle,
-    maybe_save_bundle,
 )
 from dreamer.utils import (
     normalize_with_dataset_stats,
@@ -223,11 +220,11 @@ def run(cfg: TokenizerConfig):
 
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
-            item_names=get_bundle_item_names(bundle)
+            item_names=TokenizerCheckpointBundle.get_item_names()
         ) as checkpoint_manager:
             # Resume from checkpoint
-            start_step, bundle, train_iterator, rng = try_restore_bundle(
-                checkpoint_manager, bundle, train_iterator, rng
+            start_step, bundle, train_iterator, rng = bundle.restore(
+                checkpoint_manager, train_iterator, rng
             )
 
             scaling.start_training()
@@ -282,7 +279,7 @@ def run(cfg: TokenizerConfig):
                     )
 
                 # Checkpointing
-                maybe_save_bundle(checkpoint_manager, step, bundle, train_iterator, rng)
+                bundle.maybe_save(checkpoint_manager, step, train_iterator, rng)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization

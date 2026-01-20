@@ -7,28 +7,19 @@ Bundles have `from_pretrained` class methods for loading checkpoints for inferen
 """
 from __future__ import annotations
 
-import operator
 from dataclasses import asdict, dataclass, fields, is_dataclass
-from enum import IntEnum
 from pathlib import Path
-from typing import Optional, Tuple, TypeVar
+from typing import ClassVar, Optional, Self
 
 import grain
 import jax
-import jax.numpy as jnp
-import numpy as np
-import optax
 import orbax.checkpoint as ocp
-from einops import rearrange
 from flax import nnx
-from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 
 from dreamer.configs import (
     CheckpointConfig,
     DynamicsModelConfig,
-    LRScheduleConfig,
-    OptimizerConfig,
     PolicyHeadModelConfig,
     RewardHeadModelConfig,
     TaskEmbedderModelConfig,
@@ -60,136 +51,40 @@ def build_checkpoint_manager(
     return ocp.CheckpointManager(ckpt_dir, options=checkpoint_options, item_names=item_names)
 
 
-BundleT = TypeVar('BundleT')
+class CheckpointBundle:
+    """Base class for checkpoint bundles with save/restore/from_pretrained.
 
+    Subclasses should be dataclasses that define:
+    - `_model_registry`: ClassVar mapping field names to (ConfigClass, ModelClass) tuples
+    - Fields for models (those in registry) and optional optimizers
 
-def get_bundle_item_names(bundle: BundleT) -> tuple[str, ...]:
-    """Get checkpoint item names from a bundle dataclass.
-    
-    Introspects the bundle to generate the list of item names needed for
-    build_checkpoint_manager.
-    
-    Args:
-        bundle: Dataclass containing models and optimizers
-        
-    Returns:
-        Tuple of item names for checkpoint manager
+    Example:
+        @dataclass
+        class TokenizerCheckpointBundle(CheckpointBundle):
+            _model_registry: ClassVar[dict] = {
+                "tokenizer": (TokenizerModelConfig, Tokenizer),
+            }
+            tokenizer: Tokenizer
+            tokenizer_optimizer: Optional[nnx.Optimizer] = None
     """
-    if not is_dataclass(bundle):
-        raise TypeError(f"bundle must be a dataclass, got {type(bundle)}")
-    
-    item_names = [field.name for field in fields(bundle)]
-    item_names.extend(["train_dataloader_state", "rngs", "meta"])
-    
-    return tuple(item_names)
 
+    _model_registry: ClassVar[dict[str, tuple[type, type]]] = {}
 
-def try_restore_bundle(
-    checkpoint_manager: ocp.CheckpointManager,
-    bundle: BundleT,
-    train_iterator: grain.DataLoaderIterator,
-    rng: jax.Array,
-) -> tuple[int, BundleT, grain.DataLoaderIterator, jax.Array]:
-    """Restore checkpoint bundle (generic for any dataclass).
-    
-    This function introspects the bundle dataclass to automatically save/restore
-    all fields that are nnx.Module or nnx.Optimizer instances.
-    
-    Args:
-        checkpoint_manager: Checkpoint manager
-        bundle: Dataclass containing models and optimizers to restore
-        train_iterator: Data iterator
-        rng: Random number generator state
-        
-    Returns:
-        Tuple of (start_step, bundle, train_iterator, rng)
-        
-    """
-    if not is_dataclass(bundle):
-        raise TypeError(f"bundle must be a dataclass, got {type(bundle)}")
-    
-    step = checkpoint_manager.latest_step()
-    if step is None:
-        print("No checkpoint found, starting from scratch.")
-        return 0, bundle, train_iterator, rng
-    
-    # Build restore args dynamically by introspecting bundle fields
-    restore_kwargs = {}
-    
-    for field in fields(bundle):
-        field_value = getattr(bundle, field.name)
-        restore_kwargs[field.name] = ocp.args.StandardRestore(nnx.state(field_value))  # type: ignore
-    
-    # Add iterator and rngs
-    restore_kwargs["train_dataloader_state"] = grain.checkpoint.CheckpointRestore(train_iterator)  # type: ignore
-    restore_kwargs["rngs"] = ocp.args.StandardRestore({"key": rng})  # type: ignore
-    
-    restore_args = ocp.args.Composite(**restore_kwargs)
-    restored = checkpoint_manager.restore(step, args=restore_args)
-    
-    # Update bundle fields in-place
-    for field in fields(bundle):
-        field_value = getattr(bundle, field.name)
-        nnx.update(field_value, restored[field.name])
-    
-    train_iterator = restored["train_dataloader_state"]
-    rng = restored["rngs"]["key"]
-    print(f"Restored checkpoint from step {step}.")
-    
-    return step + 1, bundle, train_iterator, rng
+    @classmethod
+    def get_item_names(cls) -> tuple[str, ...]:
+        """Get checkpoint item names for this bundle.
 
+        Introspects the dataclass fields and adds standard items.
 
-def maybe_save_bundle(
-    checkpoint_manager: ocp.CheckpointManager,
-    step: int,
-    bundle: BundleT,
-    train_iterator: grain.DataLoaderIterator,
-    rngs: jax.Array,
-) -> None:
-    """Save checkpoint bundle (generic for any dataclass).
-    
-    This function introspects the bundle dataclass to automatically save/restore
-    all fields that are nnx.Module or nnx.Optimizer instances.
-    
-    Args:
-        checkpoint_manager: Checkpoint manager
-        step: Current training step
-        bundle: Dataclass containing models and optimizers to save
-        train_iterator: Data iterator
-        rngs: Random number generator state
-        meta: Metadata dictionary
-    """
-    if not is_dataclass(bundle):
-        raise TypeError(f"bundle must be a dataclass, got {type(bundle)}")
-    
-    if not checkpoint_manager.should_save(step):
-        return
-    
-    # Build save args dynamically by introspecting bundle fields
-    save_kwargs, meta = {}, {}
-    
-    for field in fields(bundle):
-        field_value = getattr(bundle, field.name)
-        save_kwargs[field.name] = ocp.args.StandardSave(nnx.state(field_value))  # type: ignore
-        if hasattr(field_value, 'cfg'):
-            cfg = field_value.cfg
-            meta[field.name] = asdict(cfg) if is_dataclass(cfg) else OmegaConf.to_container(cfg, resolve=True)
-               
-    
-    # Add iterator, rngs, and meta
-    save_kwargs["train_dataloader_state"] = grain.checkpoint.CheckpointSave(train_iterator)  # type: ignore
-    save_kwargs["rngs"] = ocp.args.StandardSave({'key': rngs})  # type: ignore
-    save_kwargs["meta"] = ocp.args.JsonSave(meta)  # type: ignore
-    
-    save_args = ocp.args.Composite(**save_kwargs)
-    checkpoint_manager.save(step, args=save_args)
+        Returns:
+            Tuple of item names for checkpoint manager
+        """
+        if not is_dataclass(cls):
+            raise TypeError(f"CheckpointBundle subclass must be a dataclass, got {cls}")
 
-@dataclass
-class TokenizerCheckpointBundle:
-    """Bundle for tokenizer checkpoint save/restore."""
-
-    tokenizer: Tokenizer
-    tokenizer_optimizer: Optional[nnx.Optimizer] = None
+        item_names = [field.name for field in fields(cls)]
+        item_names.extend(["train_dataloader_state", "rngs", "meta"])
+        return tuple(item_names)
 
     @classmethod
     def from_pretrained(
@@ -197,8 +92,11 @@ class TokenizerCheckpointBundle:
         checkpoint_path: str,
         mesh_rules: MeshRules,
         rngs: Optional[nnx.Rngs] = None,
-    ) -> "TokenizerCheckpointBundle":
-        """Load tokenizer bundle from checkpoint (without optimizer).
+    ) -> Self:
+        """Load bundle from checkpoint (without optimizers).
+
+        Uses the _model_registry to determine which fields are models and
+        how to reconstruct them from saved configs.
 
         Args:
             checkpoint_path: Path to checkpoint directory
@@ -206,8 +104,13 @@ class TokenizerCheckpointBundle:
             rngs: Random number generators (default: Rngs(0))
 
         Returns:
-            TokenizerCheckpointBundle with loaded tokenizer, optimizer=None
+            Bundle with loaded models, optimizers set to None
         """
+        if not cls._model_registry:
+            raise NotImplementedError(
+                f"{cls.__name__} must define _model_registry class variable"
+            )
+
         if rngs is None:
             rngs = nnx.Rngs(0)
         checkpoint_path = str(Path(checkpoint_path).resolve())
@@ -221,92 +124,161 @@ class TokenizerCheckpointBundle:
             meta_restored = checkpoint_manager.restore(
                 step, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
             )
-            cfg = from_dict(TokenizerModelConfig, meta_restored["meta"]["tokenizer"])
+            meta = meta_restored["meta"]
 
-            # Initialize tokenizer
-            tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=rngs)
+            # Initialize models from registry
+            models = {}
+            for field_name, (config_cls, model_cls) in cls._model_registry.items():
+                cfg = from_dict(config_cls, meta[field_name])
+                models[field_name] = model_cls(cfg, mesh_rules=mesh_rules, rngs=rngs)
 
             # Restore weights
-            restore_args = ocp.args.Composite(
-                tokenizer=ocp.args.StandardRestore(nnx.state(tokenizer))
-            )
+            restore_kwargs = {
+                name: ocp.args.StandardRestore(nnx.state(model))
+                for name, model in models.items()
+            }
+            restore_args = ocp.args.Composite(**restore_kwargs)
             restored = checkpoint_manager.restore(step, args=restore_args)
-            nnx.update(tokenizer, restored["tokenizer"])
 
-        return cls(tokenizer=tokenizer, tokenizer_optimizer=None)
+            # Update model weights
+            for name, model in models.items():
+                nnx.update(model, restored[name])
+
+        # Build kwargs for dataclass constructor (models + None for optimizers)
+        init_kwargs = dict(models)
+        for field in fields(cls):
+            if field.name not in models:
+                init_kwargs[field.name] = None
+
+        return cls(**init_kwargs)
+
+    def restore(
+        self,
+        checkpoint_manager: ocp.CheckpointManager,
+        train_iterator: grain.DataLoaderIterator,
+        rng: jax.Array,
+    ) -> tuple[int, Self, grain.DataLoaderIterator, jax.Array]:
+        """Restore checkpoint state into this bundle (in-place update).
+
+        Args:
+            checkpoint_manager: Checkpoint manager
+            train_iterator: Data iterator
+            rng: Random number generator state
+
+        Returns:
+            Tuple of (start_step, self, train_iterator, rng)
+        """
+        step = checkpoint_manager.latest_step()
+        if step is None:
+            print("No checkpoint found, starting from scratch.")
+            return 0, self, train_iterator, rng
+
+        # Build restore args dynamically by introspecting bundle fields
+        restore_kwargs = {}
+
+        for field in fields(self):
+            field_value = getattr(self, field.name)
+            restore_kwargs[field.name] = ocp.args.StandardRestore(nnx.state(field_value))
+
+        # Add iterator and rngs
+        restore_kwargs["train_dataloader_state"] = grain.checkpoint.CheckpointRestore(train_iterator)
+        restore_kwargs["rngs"] = ocp.args.StandardRestore({"key": rng})
+
+        restore_args = ocp.args.Composite(**restore_kwargs)
+        restored = checkpoint_manager.restore(step, args=restore_args)
+
+        # Update bundle fields in-place
+        for field in fields(self):
+            field_value = getattr(self, field.name)
+            nnx.update(field_value, restored[field.name])
+
+        train_iterator = restored["train_dataloader_state"]
+        rng = restored["rngs"]["key"]
+        print(f"Restored checkpoint from step {step}.")
+
+        return step + 1, self, train_iterator, rng
+
+    def maybe_save(
+        self,
+        checkpoint_manager: ocp.CheckpointManager,
+        step: int,
+        train_iterator: grain.DataLoaderIterator,
+        rngs: jax.Array,
+    ) -> None:
+        """Save checkpoint if checkpoint_manager.should_save(step).
+
+        Args:
+            checkpoint_manager: Checkpoint manager
+            step: Current training step
+            train_iterator: Data iterator
+            rngs: Random number generator state
+        """
+        if not checkpoint_manager.should_save(step):
+            return
+
+        # Build save args dynamically by introspecting bundle fields
+        save_kwargs, meta = {}, {}
+
+        for field in fields(self):
+            field_value = getattr(self, field.name)
+            save_kwargs[field.name] = ocp.args.StandardSave(nnx.state(field_value))
+            if hasattr(field_value, 'cfg'):
+                cfg = field_value.cfg
+                meta[field.name] = asdict(cfg) if is_dataclass(cfg) else OmegaConf.to_container(cfg, resolve=True)
+
+        # Add iterator, rngs, and meta
+        save_kwargs["train_dataloader_state"] = grain.checkpoint.CheckpointSave(train_iterator)
+        save_kwargs["rngs"] = ocp.args.StandardSave({'key': rngs})
+        save_kwargs["meta"] = ocp.args.JsonSave(meta)
+
+        save_args = ocp.args.Composite(**save_kwargs)
+        checkpoint_manager.save(step, args=save_args)
+
+@dataclass
+class TokenizerCheckpointBundle(CheckpointBundle):
+    """Bundle for tokenizer checkpoint save/restore."""
+
+    _model_registry: ClassVar[dict[str, tuple[type, type]]] = {
+        "tokenizer": (TokenizerModelConfig, Tokenizer),
+    }
+
+    tokenizer: Tokenizer
+    tokenizer_optimizer: Optional[nnx.Optimizer] = None
 
 
 @dataclass
-class DynamicsCheckpointBundle:
+class DynamicsCheckpointBundle(CheckpointBundle):
     """Bundle for dynamics checkpoint save/restore.
 
     Note: tokenizer is included but frozen (not trained). Including it makes
     checkpoints self-contained for downstream usage.
     """
 
+    _model_registry: ClassVar[dict[str, tuple[type, type]]] = {
+        "dynamics": (DynamicsModelConfig, Dynamics),
+        "tokenizer": (TokenizerModelConfig, Tokenizer),
+    }
+
     dynamics: Dynamics
     tokenizer: Tokenizer
     dynamics_optimizer: Optional[nnx.Optimizer] = None
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        checkpoint_path: str,
-        mesh_rules: MeshRules,
-        rngs: Optional[nnx.Rngs] = None,
-    ) -> "DynamicsCheckpointBundle":
-        """Load dynamics bundle from checkpoint (without optimizer).
-
-        Args:
-            checkpoint_path: Path to checkpoint directory
-            mesh_rules: Mesh sharding rules
-            rngs: Random number generators (default: Rngs(0))
-
-        Returns:
-            DynamicsCheckpointBundle with loaded dynamics and tokenizer, optimizer=None
-        """
-        if rngs is None:
-            rngs = nnx.Rngs(0)
-        checkpoint_path = str(Path(checkpoint_path).resolve())
-
-        with ocp.CheckpointManager(checkpoint_path) as checkpoint_manager:
-            step = checkpoint_manager.latest_step()
-            if step is None:
-                raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
-
-            # Load config from metadata
-            meta_restored = checkpoint_manager.restore(
-                step, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
-            )
-            cfg = meta_restored["meta"]
-
-            # Reconstruct configs
-            tokenizer_cfg = from_dict(TokenizerModelConfig, cfg["tokenizer"])
-            dynamics_cfg = from_dict(DynamicsModelConfig, cfg["dynamics"])
-
-            # Initialize models
-            tokenizer = Tokenizer(tokenizer_cfg, mesh_rules=mesh_rules, rngs=rngs)
-            dynamics = Dynamics(dynamics_cfg, mesh_rules=mesh_rules, rngs=rngs)
-
-            # Restore weights
-            restore_args = ocp.args.Composite(
-                tokenizer=ocp.args.StandardRestore(nnx.state(tokenizer)),
-                dynamics=ocp.args.StandardRestore(nnx.state(dynamics)),
-            )
-            restored = checkpoint_manager.restore(step, args=restore_args)
-            nnx.update(tokenizer, restored["tokenizer"])
-            nnx.update(dynamics, restored["dynamics"])
-
-        return cls(dynamics=dynamics, tokenizer=tokenizer, dynamics_optimizer=None)
-
 
 @dataclass
-class HeadsCheckpointBundle:
+class HeadsCheckpointBundle(CheckpointBundle):
     """Bundle for heads checkpoint save/restore.
 
     Note: tokenizer is included but frozen (not trained). Including it makes
     checkpoints self-contained for downstream usage (e.g., inference, visualization).
     """
+
+    _model_registry: ClassVar[dict[str, tuple[type, type]]] = {
+        "tokenizer": (TokenizerModelConfig, Tokenizer),
+        "dynamics": (DynamicsModelConfig, Dynamics),
+        "task_embedder": (TaskEmbedderModelConfig, TaskEmbedder),
+        "policy_head": (PolicyHeadModelConfig, PolicyHeadMTP),
+        "reward_head": (RewardHeadModelConfig, RewardHeadMTP),
+    }
 
     tokenizer: Tokenizer
     dynamics: Dynamics
@@ -317,81 +289,3 @@ class HeadsCheckpointBundle:
     task_embedder_optimizer: Optional[nnx.Optimizer] = None
     policy_optimizer: Optional[nnx.Optimizer] = None
     reward_optimizer: Optional[nnx.Optimizer] = None
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        checkpoint_path: str,
-        mesh_rules: MeshRules,
-        rngs: Optional[nnx.Rngs] = None,
-    ) -> "HeadsCheckpointBundle":
-        """Load heads bundle from checkpoint (without optimizers).
-
-        Args:
-            checkpoint_path: Path to checkpoint directory
-            mesh_rules: Mesh sharding rules
-            rngs: Random number generators (default: Rngs(0))
-
-        Returns:
-            HeadsCheckpointBundle with all models loaded, optimizers=None
-        """
-        if rngs is None:
-            rngs = nnx.Rngs(0)
-        checkpoint_path = str(Path(checkpoint_path).resolve())
-
-        with ocp.CheckpointManager(checkpoint_path) as checkpoint_manager:
-            step = checkpoint_manager.latest_step()
-            if step is None:
-                raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
-
-            # Load config from metadata (uses class names as keys)
-            meta_restored = checkpoint_manager.restore(
-                step, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
-            )
-            meta = meta_restored["meta"]
-
-            # Reconstruct configs using class names as keys
-            tokenizer_cfg = from_dict(TokenizerModelConfig, meta["tokenizer"])
-            dynamics_cfg = from_dict(DynamicsModelConfig, meta["dynamics"])
-            task_embedder_cfg = from_dict(TaskEmbedderModelConfig, meta["task_embedder"])
-            policy_head_cfg = from_dict(PolicyHeadModelConfig, meta["policy_head"])
-            reward_head_cfg = from_dict(RewardHeadModelConfig, meta["reward_head"])
-
-            # Split rngs for each model
-            tok_key, dyn_key, task_key, pol_key, rew_key = [
-                nnx.Rngs(i) for i in range(5)
-            ]
-
-            # Initialize all models with their configs
-            tokenizer = Tokenizer(tokenizer_cfg, mesh_rules=mesh_rules, rngs=tok_key)
-            dynamics = Dynamics(dynamics_cfg, mesh_rules=mesh_rules, rngs=dyn_key)
-            task_embedder = TaskEmbedder(task_embedder_cfg, mesh_rules=mesh_rules, rngs=task_key)
-            policy_head = PolicyHeadMTP(policy_head_cfg, mesh_rules=mesh_rules, rngs=pol_key)
-            reward_head = RewardHeadMTP(reward_head_cfg, mesh_rules=mesh_rules, rngs=rew_key)
-
-            # Restore weights for all models
-            restore_args = ocp.args.Composite(
-                tokenizer=ocp.args.StandardRestore(nnx.state(tokenizer)),
-                dynamics=ocp.args.StandardRestore(nnx.state(dynamics)),
-                task_embedder=ocp.args.StandardRestore(nnx.state(task_embedder)),
-                policy_head=ocp.args.StandardRestore(nnx.state(policy_head)),
-                reward_head=ocp.args.StandardRestore(nnx.state(reward_head)),
-            )
-            restored = checkpoint_manager.restore(step, args=restore_args)
-            nnx.update(tokenizer, restored["tokenizer"])
-            nnx.update(dynamics, restored["dynamics"])
-            nnx.update(task_embedder, restored["task_embedder"])
-            nnx.update(policy_head, restored["policy_head"])
-            nnx.update(reward_head, restored["reward_head"])
-
-        return cls(
-            tokenizer=tokenizer,
-            dynamics=dynamics,
-            task_embedder=task_embedder,
-            policy_head=policy_head,
-            reward_head=reward_head,
-            dynamics_optimizer=None,
-            task_embedder_optimizer=None,
-            policy_optimizer=None,
-            reward_optimizer=None,
-        )
