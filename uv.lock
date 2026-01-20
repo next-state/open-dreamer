@@ -1727,18 +1727,14 @@ wheels = [
 
 [[package]]
 name = "optax"
-version = "0.2.6"
-source = { registry = "https://pypi.org/simple" }
+version = "0.2.7.dev0"
+source = { git = "https://github.com/google-deepmind/optax.git#78d9c0c9a3fd0fc41a6b35480926e51ee4765f71" }
 dependencies = [
     { name = "absl-py" },
     { name = "chex" },
     { name = "jax" },
     { name = "jaxlib" },
     { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/3b/90c11f740a3538200b61cd2b7d9346959cb9e31e0bdea3d2f886b7262203/optax-0.2.6.tar.gz", hash = "sha256:ba8d1e12678eba2657484d6feeca4fb281b8066bdfd5efbfc0f41b87663109c0", size = 269660, upload-time = "2025-09-15T22:41:24.76Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b8/ec/19c6cc6064c7fc8f0cd6d5b37c4747849e66040c6ca98f86565efc2c227c/optax-0.2.6-py3-none-any.whl", hash = "sha256:f875251a5ab20f179d4be57478354e8e21963373b10f9c3b762b94dcb8c36d91", size = 367782, upload-time = "2025-09-15T22:41:22.825Z" },
 ]
 
 [[package]]
@@ -2647,7 +2643,7 @@ requires-dist = [
     { name = "jax", extras = ["cuda12"] },
     { name = "jaxlpips" },
     { name = "matplotlib" },
-    { name = "optax" },
+    { name = "optax", git = "https://github.com/google-deepmind/optax.git" },
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "procgen-mirror" },
     { name = "reactor-runtime", specifier = ">=0.0.4" },

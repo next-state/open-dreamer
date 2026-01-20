@@ -22,7 +22,7 @@ dependencies = [
     "ipykernel>=7.1.0",
     "reactor-runtime>=0.0.4",
     "pandas>=2.3.3",
-    "awscli>=1.27.0"
+    "awscli>=1.27.0",
 ]
 
 [dependency-groups]
@@ -33,6 +33,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.uv.sources]
+optax = { git = "https://github.com/google-deepmind/optax.git" }
 
 [tool.setuptools]
 package-dir = {"" = "."}
