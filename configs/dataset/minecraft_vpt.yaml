@@ -4,10 +4,10 @@ defaults:
 name: minecraft_vpt
 
 array_record_path: /home/minecraft-vpt/contractor_demos/8xx_Jun_29/
-index_max: 1000
+index_max: 10000
 
-B: 32
-T: 32
+B: 4
+T: 4
 H: 360
 W: 640
 C: 3
