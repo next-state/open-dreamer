@@ -20,7 +20,9 @@ class DatasetConfig:
     C: int = 3   # channels
 
     # Dataset path and action space
-    action_dim: int = 1
+    num_binary_actions: int = 0
+    categorical_action_dim: int = 0
+    continuous_action_dim: int = 0
     array_record_path: str = "datasets/coinrun_episodes/train"
 
     # For minecraft_vpt: number of shards to use (each shard = 1 episode)

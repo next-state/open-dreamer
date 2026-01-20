@@ -33,9 +33,9 @@ dynamics:
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
-    num_binary_actions: 0
-    categorical_action_dim: 16
-    continuous_action_dim: 0
+    num_binary_actions: ${dataset.num_binary_actions}
+    categorical_action_dim: ${dataset.categorical_action_dim}
+    continuous_action_dim: ${dataset.continuous_action_dim}
 
 bootstrap_start: 5_000
 self_fraction: 0.25
