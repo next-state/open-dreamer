@@ -10,8 +10,9 @@ from einops import rearrange
 from enum import IntEnum
 from typing import Tuple, TypeVar
 import numpy as np
-from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
+from dataclasses import asdict, fields, is_dataclass
+from hydra.core.hydra_config import HydraConfig
 from dreamer.configs import CheckpointConfig, LRScheduleConfig, OptimizerConfig
 
 
@@ -232,86 +233,6 @@ def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
     return rearrange(z_btLd, '... n_spatial (k d) -> ... (n_spatial k) d', n_spatial=n_spatial, k=k)
 
 
-# ============================================================================
-# Checkpointing Utilities
-# ============================================================================
-
-def build_checkpoint_manager(
-        ckpt_cfg: CheckpointConfig,
-        ckpt_dir: Path,
-        item_names=("model_state", "optimizer_state", "train_dataloader_state", "rngs", "meta"),
-    ) -> ocp.CheckpointManager:
-    checkpoint_options = ocp.CheckpointManagerOptions(
-        max_to_keep=ckpt_cfg.max_to_keep,
-        save_interval_steps=ckpt_cfg.save_interval_steps,
-        save_on_steps=[ckpt_cfg.max_steps - 1],  # always save at the end
-    )
-
-    return ocp.CheckpointManager(ckpt_dir, options=checkpoint_options, item_names=item_names)
-
-
-ModelT = TypeVar('ModelT', bound=nnx.Module)
-
-
-def try_restore(
-        checkpoint_manager: ocp.CheckpointManager,
-        model: ModelT,
-        optimizer: nnx.Optimizer,
-        train_iterator: grain.DataLoaderIterator,
-        rngs: jax.Array,
-    ) -> tuple[
-        int, ModelT, nnx.Optimizer, grain.DataLoaderIterator, jax.Array
-    ]:
-
-    step = checkpoint_manager.latest_step()
-    if step is None:
-        print("No checkpoint found, starting from scratch.")
-        return 0, model, optimizer, train_iterator, rngs
-        
-    model_state = nnx.state(model)
-    optimizer_state = nnx.state(optimizer)
-    
-    restore_args = ocp.args.Composite(
-        model_state=ocp.args.StandardRestore(model_state),  # type: ignore
-        optimizer_state=ocp.args.StandardRestore(optimizer_state),  # type: ignore
-        train_dataloader_state=grain.checkpoint.CheckpointRestore(train_iterator),  # type: ignore
-        rngs=ocp.args.StandardRestore({"key": rngs}),  # type: ignore
-    )
-    
-    restored = checkpoint_manager.restore(step, args=restore_args)
-    nnx.update(model, restored["model_state"])
-    nnx.update(optimizer, restored["optimizer_state"])
-    train_iterator = restored["train_dataloader_state"]
-    rngs = restored["rngs"]["key"]
-    print(f"Restored checkpoint from step {step}.")
-
-    return step + 1, model, optimizer, train_iterator, rngs
-
-
-def maybe_save(
-        checkpoint_manager: ocp.CheckpointManager,
-        step: int,
-        model: nnx.Module,
-        optimizer: nnx.Optimizer,
-        train_iterator: grain.DataLoaderIterator,
-        rngs: jax.Array,
-        meta: dict,
-    ) -> None:
-    if not checkpoint_manager.should_save(step):
-        return
-
-    model_state = nnx.state(model)
-    optimizer_state = nnx.state(optimizer)
-
-    checkpoint_manager_args = ocp.args.Composite(
-        model_state=ocp.args.StandardSave(model_state),  # type: ignore
-        optimizer_state=ocp.args.StandardSave(optimizer_state),  # type: ignore
-        train_dataloader_state=grain.checkpoint.CheckpointSave(train_iterator),  # type: ignore
-        rngs=ocp.args.StandardSave({'key': rngs}),  # type: ignore
-        meta=ocp.args.JsonSave(meta)  # type: ignore
-    )
-    checkpoint_manager.save(step, args=checkpoint_manager_args)
-
 # -------- Training utilities (shared across scripts) --------
 
 def _ensure_dir(p: Path) -> Path:
@@ -320,18 +241,13 @@ def _ensure_dir(p: Path) -> Path:
     return p
 
 
-def setup_training_directories(cfg) -> tuple[Path, Path, Path, dict]:
+def setup_training_directories(cfg) -> tuple[Path, Path, Path]:
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
-    meta = {"cfg": OmegaConf.to_container(cfg, resolve=True)}
     print(f"[setup] output dir: {run_dir.resolve()}")
-    return run_dir, ckpt_dir, vis_dir, meta
+    return run_dir, ckpt_dir, vis_dir
 
-
-def _to_uint8(img_f32):
-    """Convert float32 image to uint8."""
-    return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
 
 
 def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jnp.ndarray:

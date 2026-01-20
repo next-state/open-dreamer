@@ -14,11 +14,16 @@ from dreamer.models import Dynamics, Tokenizer
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
-from dreamer.utils import (
+from dreamer.checkpointing import (
+    DynamicsCheckpointBundle,
+    TokenizerCheckpointBundle,
     build_checkpoint_manager,
+    get_bundle_item_names,
+    maybe_save_bundle,
+    try_restore_bundle,
+)
+from dreamer.utils import (
     count_parameters_by_component,
-    maybe_save,
-    try_restore,
     setup_training_directories,
     build_lr_schedule,
     build_optimizer,
@@ -90,7 +95,7 @@ def train_step(
             rng=step_key,
             k_max=k_max,
             B_self=B_self,
-            agent_tokens=None,  # Not used in dynamics pretraining
+            task_embeddings=None,  # Not used in dynamics pretraining
         )
         return losses['total'], aux
 
@@ -107,7 +112,7 @@ def train_step(
 
 def run(cfg: DynamicsConfig):
     # Setup
-    run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
+    run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
     # Logging
     logger = build_logger(
@@ -119,15 +124,13 @@ def run(cfg: DynamicsConfig):
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
-    with (
-        logger,
-        jax.set_mesh(mesh),
-    ):
+    with logger, jax.set_mesh(mesh):
         key = jax.random.PRNGKey(cfg.seed)
         rng, init_key = jax.random.split(key)
 
         # Load pretrained tokenizer
-        tokenizer = Tokenizer.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
+        tokenizer_bundle = TokenizerCheckpointBundle.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
+        tokenizer = tokenizer_bundle.tokenizer
         tokenizer_cfg = tokenizer.cfg
 
         # Initialize dynamics
@@ -153,14 +156,24 @@ def run(cfg: DynamicsConfig):
         # Build optimizer
         optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model)
 
+        # Create checkpoint bundle (includes frozen tokenizer for self-contained checkpoints)
+        bundle = DynamicsCheckpointBundle(
+            dynamics=dynamics,
+            tokenizer=tokenizer,
+            dynamics_optimizer=optimizer,
+        )
+
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
-        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
+        with build_checkpoint_manager(
+            cfg.ckpt, ckpt_dir,
+            item_names=get_bundle_item_names(bundle)
+        ) as checkpoint_manager:
             # Resume from checkpoint
-            start_step, dynamics, optimizer, train_iterator, rng = try_restore(
-                checkpoint_manager, dynamics, optimizer, train_iterator, rng
+            start_step, bundle, train_iterator, rng = try_restore_bundle(
+                checkpoint_manager, bundle, train_iterator, rng
             )
 
             scaling.start_training()
@@ -178,7 +191,7 @@ def run(cfg: DynamicsConfig):
 
                 # Training step
                 aux = encode_and_train_step(
-                    tokenizer, dynamics, optimizer,
+                    bundle.tokenizer, bundle.dynamics, bundle.dynamics_optimizer,
                     videos, actions,
                     tokenizer_key=tokenizer_key,
                     master_key=master_key,
@@ -204,7 +217,7 @@ def run(cfg: DynamicsConfig):
                     )
 
                 # Checkpointing
-                maybe_save(checkpoint_manager, step, dynamics, optimizer, train_iterator, rng, meta)
+                maybe_save_bundle(checkpoint_manager, step, bundle, train_iterator, rng)
 
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
@@ -213,7 +226,7 @@ def run(cfg: DynamicsConfig):
                     val_actions = batch["actions"][:4]
 
                     run_evaluation(
-                        cfg, tokenizer_cfg, step, tokenizer, dynamics,
+                        cfg, step, bundle.tokenizer, bundle.dynamics,
                         val_videos, jnp.asarray(val_actions), vis_dir, rng, logger
                     )
 

@@ -23,6 +23,9 @@ class DatasetConfig:
     action_dim: int = 1
     array_record_path: str = "datasets/coinrun_episodes/train"
 
+    # For minecraft_vpt: number of shards to use (each shard = 1 episode)
+    index_max: int = 0
+
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] = (0.288675, 0.288675, 0.288675)  # sqrt(1/12)
@@ -83,6 +86,13 @@ class DecoderModelConfig:
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
+@dataclass(frozen=False)
+class TokenizerModelConfig:
+    """Model configuration for tokenizer (encoder + decoder architecture)."""
+    encoder: EncoderModelConfig = field(default_factory=EncoderModelConfig)
+    decoder: DecoderModelConfig = field(default_factory=DecoderModelConfig)
+
+
 @dataclass(frozen=False, unsafe_hash=True)
 class DynamicsModelConfig:
     action_dim: int = 16
@@ -106,6 +116,50 @@ class DynamicsModelConfig:
 
     # schedule
     k_max: int = 8
+
+
+@dataclass(frozen=False)
+class TaskEmbedderModelConfig:
+    """Model configuration for task embedder."""
+    d_model: int = 128
+    n_agent: int = 4
+    use_ids: bool = True
+    n_tasks: int = 128
+    d_task: int = 64
+    dtype: str = "float32"
+    param_dtype: str = "float32"
+
+
+@dataclass(frozen=False)
+class PolicyHeadModelConfig:
+    """Model configuration for policy head (MTP)."""
+    d_model: int = 128
+    action_dim: int = 16
+    L: int = 4
+    kind: str = "categorical"
+    mlp_ratio: float = 2.0
+    dropout_rate: float = 0.0
+    swiglu: bool = True
+    parity_2over3: bool = False
+    dtype: str = "float32"
+    param_dtype: str = "float32"
+
+
+@dataclass(frozen=False)
+class RewardHeadModelConfig:
+    """Model configuration for reward head (MTP)."""
+    d_model: int = 128
+    L: int = 4
+    num_bins: int = 101
+    log_low: float = -5.0
+    log_high: float = 3.0
+    mlp_ratio: float = 2.0
+    dropout_rate: float = 0.0
+    swiglu: bool = True
+    parity_2over3: bool = False
+    dtype: str = "float32"
+    param_dtype: str = "float32"
+
 
 # ---- Experiment Configs ----
 
@@ -202,9 +256,8 @@ class BaseExperimentConfig:
 
 @dataclass(frozen=False)
 class TokenizerConfig(BaseExperimentConfig):
-    # Model
-    encoder: EncoderModelConfig = field(default_factory=EncoderModelConfig)
-    decoder: DecoderModelConfig = field(default_factory=DecoderModelConfig)
+    # Model architecture
+    tokenizer: TokenizerModelConfig = field(default_factory=TokenizerModelConfig)
 
     # Training
     lpips_weight: float = 0.2
@@ -214,8 +267,8 @@ class TokenizerConfig(BaseExperimentConfig):
 
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
-    
-    # Optimizer 
+
+    # Optimizer
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
 
@@ -244,14 +297,17 @@ class DynamicsConfig(BaseExperimentConfig):
 
 @dataclass(frozen=False)
 class HeadsConfig(BaseExperimentConfig):
-    tokenizer_ckpt: str = ""  # checkpoint from train_tokenizer.py
     dynamics_ckpt: str = ""  # checkpoint from train_dynamics.py
-    action_dim: int = 4  # number of categorical actions
-    n_agent: int = 1  # number of agent tokens for dynamics
+
+    # Model configs (for initialization - stored in checkpoint meta)
+    task_embedder: TaskEmbedderModelConfig = field(default_factory=TaskEmbedderModelConfig)
+    policy_head: PolicyHeadModelConfig = field(default_factory=PolicyHeadModelConfig)
+    reward_head: RewardHeadModelConfig = field(default_factory=RewardHeadModelConfig)
 
     # Training hyperparameters
     bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
     self_fraction: float = 0.25   # used once we pass bootstrap_start
+    dynamics_loss_weight: float = 0.1
 
     # Learning rate schedules (one per component)
     lr_schedule_policy: LRScheduleConfig = field(default_factory=lambda: LRScheduleConfig(lr=1e-4))
@@ -261,19 +317,9 @@ class HeadsConfig(BaseExperimentConfig):
     # Optimizer config (shared across all components)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
-    dynamics_loss_weight: float = 0.1
-
     # Eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
-    # Multi-token prediction (MTP) settings
-    L: int = 2                      # predict next L actions/rewards
-    num_reward_bins: int = 101      # twohot bins for symexp rewards
-    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
-    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
-    n_tasks: int = 128              # task-ID space for TaskEmbedder
-    use_task_ids: bool = True       # True: discrete task IDs; False: vector embed
-    
     # Loss weighting (to balance scales across different loss components)
     loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
     loss_weight_policy: float = 0.3      # weight for policy CE loss (nats)

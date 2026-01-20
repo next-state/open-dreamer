@@ -3,15 +3,15 @@ defaults:
   - _self_
   - dataset: coinrun
 
-run_name: dynamics
-tokenizer_ckpt: logs/tokenizer/checkpoints/
+run_name: dynamics_new
+tokenizer_ckpt: logs/tokenizer_new/checkpoints/
 
 ckpt:
   max_to_keep: 2
-  save_interval_steps: 10_000
+  save_interval_steps: 100
 
 dataset:
-  B: 256
+  B: 32
 
 dynamics:
     action_dim: 16

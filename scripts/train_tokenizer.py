@@ -21,10 +21,15 @@ from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
-from dreamer.utils import (
+
+from dreamer.checkpointing import (
+    TokenizerCheckpointBundle,
     build_checkpoint_manager,
-    try_restore,
-    maybe_save,
+    get_bundle_item_names,
+    try_restore_bundle,
+    maybe_save_bundle,
+)
+from dreamer.utils import (
     normalize_with_dataset_stats,
     count_parameters_by_component,
     setup_training_directories,
@@ -166,7 +171,7 @@ def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger):
 
 def run(cfg: TokenizerConfig):
     # Setup
-    run_dir, ckpt_dir, vis_dir, meta = setup_training_directories(cfg)
+    run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
     # Logging
     logger = build_logger(
@@ -178,27 +183,24 @@ def run(cfg: TokenizerConfig):
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
-    with (
-        logger,
-        jax.set_mesh(mesh),
-    ):
+    with logger, jax.set_mesh(mesh):
         key = jax.random.key(cfg.seed)
         rng, init_key = jax.random.split(key)
 
         # Initialize tokenizer
-        tokenizer = Tokenizer(cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        tokenizer = Tokenizer(cfg.tokenizer, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
         param_counts = count_parameters_by_component(tokenizer)
         param_counts_formatted = {k: f"{v:,}" for k, v in param_counts.items()}
         print(f"Parameter counts: {param_counts_formatted}")
 
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
-        n_patches = (cfg.dataset.H // cfg.encoder.patch_size) * (cfg.dataset.W // cfg.encoder.patch_size)
+        n_patches = (cfg.dataset.H // cfg.tokenizer.encoder.patch_size) * (cfg.dataset.W // cfg.tokenizer.encoder.patch_size)
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
             flops_per_step=tokenizer.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T),
             data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * n_patches,
-            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.encoder.n_latents),
+            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.tokenizer.encoder.n_latents),
             logger=logger,
             run_dir=run_dir,
         )
@@ -207,16 +209,25 @@ def run(cfg: TokenizerConfig):
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
         # Build optimizer
-        optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule, d_model=cfg.encoder.d_model)
+        optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule, d_model=cfg.tokenizer.encoder.d_model)
+
+        # Create checkpoint bundle
+        bundle = TokenizerCheckpointBundle(
+            tokenizer=tokenizer,
+            tokenizer_optimizer=optimizer,
+        )
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
-        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
+        with build_checkpoint_manager(
+            cfg.ckpt, ckpt_dir,
+            item_names=get_bundle_item_names(bundle)
+        ) as checkpoint_manager:
             # Resume from checkpoint
-            start_step, tokenizer, optimizer, train_iterator, rng = try_restore(
-                checkpoint_manager, tokenizer, optimizer, train_iterator, rng
+            start_step, bundle, train_iterator, rng = try_restore_bundle(
+                checkpoint_manager, bundle, train_iterator, rng
             )
 
             scaling.start_training()
@@ -235,7 +246,7 @@ def run(cfg: TokenizerConfig):
                 videos = jax.device_put(batch["videos"], data_sharding)
 
                 aux = train_step(
-                    tokenizer, optimizer, videos,
+                    bundle.tokenizer, bundle.tokenizer_optimizer, videos,
                     mae_key=mae_key, dropout_key=dropout_key, step=step,
                     lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
                     dataset_mean=tuple(cfg.dataset.dataset_mean),
@@ -271,12 +282,12 @@ def run(cfg: TokenizerConfig):
                     )
 
                 # Checkpointing
-                maybe_save(checkpoint_manager, step, tokenizer, optimizer, train_iterator, rng, meta)
+                maybe_save_bundle(checkpoint_manager, step, bundle, train_iterator, rng)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
-                    viz_step(tokenizer, viz_videos, step_rng, step, vis_dir, logger)
+                    viz_step(bundle.tokenizer, viz_videos, step_rng, step, vis_dir, logger)
 
             scaling.finalize()
 
