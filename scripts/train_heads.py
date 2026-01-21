@@ -26,7 +26,9 @@ from tqdm import tqdm
 from dreamer.configs import HeadsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
-from dreamer.models import Actions, Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
+from dreamer.models import Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
+from dreamer.types import Actions
+from dreamer.configs import DatasetConfig
 from dreamer.parallel import build_parallel
 from dreamer.training import (
     compute_policy_loss,
@@ -47,6 +49,24 @@ from dreamer.utils import (
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
+
+
+# ---------------------------
+# Action helpers
+# ---------------------------
+
+def shift_actions(actions: Actions, cfg: DatasetConfig) -> Actions:
+    """Shift actions right by 1, preprend noop action."""
+    
+    def _shift(x, v):
+        if x is None: return None
+        return jnp.concatenate([jnp.full_like(x[:, :1], v), x[:, :-1]], axis=1)
+
+    return Actions(
+        binary      = _shift(actions.binary, 0),
+        categorical = _shift(actions.categorical, cfg.categorical_action_dim - 1),
+        continuous  = _shift(actions.continuous, 0.0)
+    )
 
 
 # ---------------------------
@@ -344,14 +364,11 @@ def run(cfg: HeadsConfig):
                 actions = jax.device_put(batch["actions"], data_sharding)
                 rewards = jax.device_put(batch["rewards"], data_sharding)
 
-                # FIXME: shift actions with new Actions class
-                """
-                # Action shifting: prepend "first action token" = 15
-                B, T = actions.shape
-                actions = jnp.concatenate((jnp.full_like(actions[:, 0:1], fill_value=15), actions[:, :-1]), axis=1)
-                """
+                # Action shifting: prepend "first action token" (noop) so action[t] aligns with state[t]
+                actions = shift_actions(actions, cfg.dataset)
 
                 # Training step (encodes videos and trains)
+                B = cfg.dataset.B
                 metrics = encode_and_train_step(
                     bundle.tokenizer, bundle.dynamics, bundle.task_embedder, bundle.policy_head, bundle.reward_head,
                     bundle.dynamics_optimizer, bundle.task_embedder_optimizer,

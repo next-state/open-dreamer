@@ -79,31 +79,9 @@ def input_to_action(controller_state: Dict[str, Any]) -> Actions:
     )
 
 
-def policy(policy_model: PolicyHeadMTP, policy_vars: Dict, agent_tokens: jax.Array, rng: jax.Array) -> jax.Array:
-    """
-    Run policy model to select actions from agent tokens.
-    
-    Args:
-        policy_model: Policy head model
-        policy_vars: Policy model parameters
-        agent_tokens: Agent token representations from dynamics (B, n_agent, d_model)
-        rng: Random key for sampling
-        
-    Returns:
-        Sampled action as JAX array
-    """
-
-    # FIXME: the correct usage is policy_model.sample(h_t, greedy=True, rng=rng_policy)
-
-    # # Get action logits from policy head
-    # logits = policy_model.apply(policy_vars, agent_tokens, deterministic=False)
-    
-    # # Sample action from categorical distribution
-    # action = jax.random.categorical(rng, logits)
-    
-    # return action
-
-    raise NotImplementedError
+def policy(policy_model: PolicyHeadMTP, h_t: jax.Array, rng: jax.Array, greedy: bool = True) -> Actions:
+    # TODO: condition on task embeddings
+    return policy_model.sample(h_t, greedy=greedy, rng=rng)
 
 
 class DreamerVideoModel(VideoModel):
@@ -161,11 +139,11 @@ class DreamerVideoModel(VideoModel):
             
             # Load policy if checkpoint provided
             self.policy = None
-            self.policy_vars = None
             if cfg.policy_ckpt is not None:
                 raise NotImplementedError("Loading policy from checkpoint is not implemented yet")
-                logger.info(f"Loading policy from {cfg.policy_ckpt}")
-                self.policy, self.policy_vars, self.policy_cfg = PolicyHeadMTP.from_pretrained(cfg.policy_ckpt)
+                # TODO: Implement policy loading from checkpoint
+                # logger.info(f"Loading policy from {cfg.policy_ckpt}")
+                # self.policy = PolicyHeadMTP.from_pretrained(cfg.policy_ckpt, mesh_rules=mesh_rules, rngs=nnx.Rngs(0))
             
             # Initialize denoising schedule
             self.schedule = DenoiseSchedule.init(num_steps=cfg.num_steps, k_max=self.dynamics_cfg.k_max, tau_ctx=cfg.tau_ctx)
