@@ -6,8 +6,8 @@ defaults:
 run_name: tokenizer
 
 dataset:
-  B: 256
-  T: 8
+  B: 32
+  T: 32
 
 ckpt:
   max_to_keep: 1
@@ -28,7 +28,7 @@ tokenizer:
     time_every: 4
     mae_p_min: 0.0
     mae_p_max: 0.9
-    patch_size: 20
+    patch_size: 8
     use_residual_lambdas: true
     use_bias: false
     use_rmsnorm_scale: true

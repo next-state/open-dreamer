@@ -17,11 +17,13 @@ User Input → input_to_action() → Action Index
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
+from omegaconf import DictConfig, OmegaConf
 from procgen import ProcgenEnv
 from reactor_runtime import VideoModel, command, get_ctx
+from reactor_runtime.model_api import model
 
 # Configure logging to show DEBUG level messages
 logging.basicConfig(
@@ -45,6 +47,11 @@ class ProcgenReactorConfig:
 
     # Action space configuration (CoinRun has 7 discrete actions)
     action_dim: int = 7
+
+    # Video settings
+    fps: int = 5
+    height: int = 64
+    width: int = 64
 
 
 def input_to_action(
@@ -72,16 +79,17 @@ def input_to_action(
         Integer action index
     """
     # Key to action mapping (priority order: diagonals first, then cardinals)
+    # Uses indices from docstring: 0=none, 1=right, 2=left, 3=jump, 4=right-jump, 5=left-jump, 6=down
     key_map = [
-        ("q", 2),  # Left-Jump # correct
-        ("e", 8),  # Right-Jump
-        ("w", 5),  # Jump/Up # correct
-        ("s", 3),  # Down
-        ("d", 7),  # Right # correct
-        ("a", 1),  # Left #correct
+        ("q", 5),  # Left-Jump ↖
+        ("e", 4),  # Right-Jump ↗
+        ("w", 3),  # Jump/Up ↑
+        ("s", 6),  # Down ↓
+        ("d", 1),  # Right →
+        ("a", 2),  # Left ←
     ]
 
-    action_idx = 4  # Default: no movement
+    action_idx = 0  # Default: no movement
     for key, action in key_map:
         if controller_state.get(key, False):
             action_idx = action
@@ -90,6 +98,7 @@ def input_to_action(
     return action_idx
 
 
+@model(name="procgen-coinrun", config="configs/procgen.yaml")
 class ProcgenVideoModel(VideoModel):
     """
     Procgen environment integration with Reactor VideoModel interface.
@@ -103,8 +112,6 @@ class ProcgenVideoModel(VideoModel):
     - Async session management
     - Proper state reset between sessions
     """
-
-    name: str = "procgen-coinrun"
 
     @command("send_keyboard_state", description="Update keyboard state (WASD+QE keys)")
     def send_keyboard_state(
@@ -138,34 +145,24 @@ class ProcgenVideoModel(VideoModel):
             obs = self.env.reset()
             logger.debug("Environment reset to new level")
 
-    def __init__(
-        self,
-        fps: int = 5,
-        size: Tuple[int, int] = (64, 64),
-        cfg: Optional[ProcgenReactorConfig] = None,
-        **kwargs,
-    ):
+    def __init__(self, config: DictConfig):
         """
         Initialize Procgen environment.
 
         Args:
-            fps: Target frames per second (CoinRun typically runs at 15 FPS)
-            size: (height, width) of output video (CoinRun native is 64x64)
-            cfg: ProcgenReactorConfig with environment settings
-            **kwargs: Additional arguments
+            config: DictConfig loaded from configs/procgen.yaml and merged by Reactor
         """
         super().__init__()
 
         logger.info("Initializing Procgen CoinRun...")
         print("DEBUG: Initializing Procgen CoinRun...", flush=True)
 
-        # Handle configuration
-        if cfg is None:
-            cfg = ProcgenReactorConfig()
+        # Merge config with defaults from dataclass
+        self.cfg = OmegaConf.structured(ProcgenReactorConfig)
+        self.cfg = OmegaConf.merge(self.cfg, config)
 
-        self.cfg = cfg
-        self.fps = fps
-        self.size = size
+        self.fps = self.cfg.fps
+        self.size = (self.cfg.height, self.cfg.width)
 
         # Create Procgen environment
         # num_envs=1 for single environment
@@ -223,7 +220,7 @@ class ProcgenVideoModel(VideoModel):
 
         try:
             last_frame_time = time.time()
-            while get_ctx()._stop_evt.is_set() is False:
+            while not get_ctx().should_stop():
                 # Get current action from user input
                 current_action = self.current_action
 
@@ -266,9 +263,8 @@ class ProcgenVideoModel(VideoModel):
             time.sleep(2)  # Fake machine resetting time
             raise e
         finally:
-            time.sleep(2)  # Fake machine resetting time
             self._running = False
-            if self.env is not None:
-                self.env.close()
+            # Note: Don't close self.env here - it persists across sessions
+            # Environment cleanup happens when the runtime shuts down
             logger.info("Procgen session ended.")
             print("DEBUG: Procgen session ended.", flush=True)

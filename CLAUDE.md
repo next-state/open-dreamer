@@ -11,15 +11,17 @@ This is a reproduction of the Dreamer 4 paper. The paper can be found in `docs/m
   - `train_policy.py` / `new_train_policy.py` - Train policy via imagination RL
 
 - **Core Library** (`dreamer/`): All functions and classes
-  - `models.py` - Model definitions (tokenizer, dynamics, etc.)
-  - `training.py` - Training utilities
+  - `models.py` - Model definitions (tokenizer, dynamics, policy, reward heads)
+  - `training.py` - Training utilities and loops
   - `data.py` - Data loading and processing
-  - `generation.py` - Generation/sampling utilities
-  - `sampler.py` - Sampling strategies
-  - `configs.py` - Configuration management
-  - `logging.py` - Logging utilities
-  - `parallel.py` - Parallelization utilities
-  - `utils.py` - General utilities
+  - `generation.py` - Generation/sampling utilities for world model rollouts
+  - `sampler.py` - Sampling strategies for action selection
+  - `configs.py` - Configuration management and argument parsing
+  - `logging.py` - Logging utilities (WandB, TensorBoard, etc.)
+  - `parallel.py` - Parallelization utilities (pmap, vmap helpers)
+  - `checkpointing.py` - Checkpoint management and model persistence
+  - `scaling.py` - Scaling law utilities for compute-optimal training
+  - `utils.py` - General utilities and helper functions
 
 - **Reactor Integration** (`reactor/`): Interactive model usage
   - Reactor powers real time inference of the world model and the policy

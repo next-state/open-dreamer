@@ -4,14 +4,14 @@ defaults:
   - _self_
 
 run_name: dynamics
-tokenizer_ckpt: logs/tok-b20.999/checkpoints/
+tokenizer_ckpt: logs/tokenizer/checkpoints/
 
 ckpt:
-  max_to_keep: 0
-  save_interval_steps: 100
+  max_to_keep: 1
+  save_interval_steps: 10_000
 
 dataset:
-  B: 512
+  B: 64
 
 dynamics:
     action_dim: 16
