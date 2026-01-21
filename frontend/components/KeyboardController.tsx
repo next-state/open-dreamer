@@ -28,8 +28,8 @@ export function KeyboardController({
   enabled = true,
   className,
 }: KeyboardControllerProps) {
-  const { sendMessage, status } = useReactor((state) => ({
-    sendMessage: state.sendMessage,
+  const { sendCommand, status } = useReactor((state) => ({
+    sendCommand: state.sendCommand,
     status: state.status,
   }));
 
@@ -50,7 +50,7 @@ export function KeyboardController({
     };
 
     // Send keyboard state to backend
-    sendMessage({ type: "send_keyboard_state", data: keyState });
+    sendCommand("send_keyboard_state", keyState);
 
     // Update active keys display
     const active: string[] = [];
@@ -61,7 +61,7 @@ export function KeyboardController({
     if (keyState.q) active.push("Q");
     if (keyState.e) active.push("E");
     setActiveKeys(active);
-  }, [sendMessage, enabled]);
+  }, [sendCommand, enabled]);
 
   const handleKeyDown = useCallback(
     (event: KeyboardEvent) => {
@@ -92,9 +92,8 @@ export function KeyboardController({
       // Reset to no keys pressed when disabled
       pressedKeys.current.clear();
       setActiveKeys([]);
-      sendMessage({ 
-        type: "send_keyboard_state", 
-        data: { w: false, a: false, s: false, d: false, q: false, e: false } 
+      sendCommand("send_keyboard_state", { 
+        w: false, a: false, s: false, d: false, q: false, e: false 
       });
       return;
     }
@@ -106,7 +105,7 @@ export function KeyboardController({
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [enabled, handleKeyDown, handleKeyUp, sendMessage]);
+  }, [enabled, handleKeyDown, handleKeyUp, sendCommand]);
 
   // Cleanup on unmount
   useEffect(() => {

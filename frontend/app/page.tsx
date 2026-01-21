@@ -57,7 +57,6 @@ export default function Home() {
         <ReactorProvider 
           modelName="procgen-coinrun" 
           local
-          insecureApiKey="local-dev"
         >
           <GameInterface />
         </ReactorProvider>

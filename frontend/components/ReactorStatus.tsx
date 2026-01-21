@@ -7,9 +7,8 @@ interface ReactorStatusProps {
 }
 
 export function ReactorStatus({ className }: ReactorStatusProps) {
-  const { status, waitingInfo, connect, disconnect } = useReactor((state) => ({
+  const { status, connect, disconnect } = useReactor((state) => ({
     status: state.status,
-    waitingInfo: state.waitingInfo,
     connect: state.connect,
     disconnect: state.disconnect,
   }));
@@ -48,14 +47,6 @@ export function ReactorStatus({ className }: ReactorStatusProps) {
                 : "Ready"}
             </span>
           </div>
-          {status === "waiting" && waitingInfo?.position !== undefined && (
-            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-gray-700/20 border border-gray-600/30">
-              <span className="text-xs text-gray-400">Queue Position:</span>
-              <span className="font-semibold text-xs text-gray-200">
-                #{waitingInfo.position}
-              </span>
-            </div>
-          )}
         </div>
         {status === "disconnected" ? (
           <button
