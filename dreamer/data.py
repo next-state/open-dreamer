@@ -63,12 +63,20 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         image_c: int,
         *,
         p_include_reward: float = 0.0,
+        patch_size: int | None = None,
     ):
         self.seq_len = seq_len
         self.image_h = image_h
         self.image_w = image_w
         self.image_c = image_c
         self.p_include_reward = float(p_include_reward)
+        self.pad_h = 0
+        self.pad_w = 0
+
+        if patch_size is not None:
+            assert image_h % 2 == 0 and image_w % 2 == 0 and patch_size % 2 == 0
+            self.pad_h = patch_size - (image_h % patch_size) // 2
+            self.pad_w = patch_size - (image_w % patch_size) // 2
 
     def random_map(self, element: dict, rng: np.random.Generator) -> Any:
         assert isinstance(element, bytes)
@@ -107,6 +115,14 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
         seq = episode_tensor[start_idx : start_idx + self.seq_len]
 
+        if self.pad_h > 0 or self.pad_w > 0:
+            seq = np.pad(
+                seq,
+                ((0, 0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w), (0, 0)),
+                mode='constant',
+                constant_values=0
+            )
+
         data_dict = {"videos": seq}
         actions_tensor = np.array(element["actions"])
         data_dict["actions"] = actions_tensor[start_idx : start_idx + self.seq_len]
@@ -120,10 +136,24 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
 # ==============================================================================
 
 class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
+    # TODO: consolidate with ProcessEpisodeAndSlice
     """Parse video bytes, random slice for Minecraft VPT dataset."""
 
-    def __init__(self, seq_len: int):
+    def __init__(
+        self,
+        seq_len: int,
+        image_h: int,
+        image_w: int,
+        image_c: int,
+        *,
+        patch_size: int | None = None,
+    ):
         self.seq_len = seq_len
+
+        if patch_size is not None:
+            assert image_h % 2 == 0 and image_w % 2 == 0 and patch_size % 2 == 0
+            self.pad_h = patch_size - (image_h % patch_size) // 2
+            self.pad_w = patch_size - (image_w % patch_size) // 2
 
     def random_map(self, element: bytes, rng: np.random.Generator) -> dict:
         data = pickle.loads(element)
@@ -135,8 +165,18 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
         max_start = episode_len - self.seq_len
         start = int(rng.integers(0, max_start + 1))
 
+        seq = video[start : start + self.seq_len]
+
+        if self.pad_h > 0 or self.pad_w > 0:
+            seq = np.pad(
+                seq,
+                ((0, 0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w), (0, 0)),
+                mode='constant',
+                constant_values=0
+            )
+
         return {
-            "videos": video[start : start + self.seq_len],
+            "videos": seq,
             "actions": None,
             "rewards": None,
         }
@@ -155,6 +195,13 @@ def make_iterator(
 ):
     """
     Creates a data loading pipeline using Grain from a DatasetConfig.
+    
+    Args:
+        cfg: Dataset configuration
+        num_workers: Number of worker processes
+        prefetch_buffer_size: Prefetch buffer size
+        seed: Random seed
+        print_filter_warnings: Whether to print filter warnings
     """
     # Build array record paths based on dataset type
     if cfg.name == "minecraft_vpt":
@@ -202,7 +249,13 @@ def make_iterator(
                 seq_len=cfg.T,
                 print_filter_warnings=print_filter_warnings,
             ),
-            MinecraftVPTProcessEpisodeAndSlice(seq_len=cfg.T),
+            MinecraftVPTProcessEpisodeAndSlice(
+                seq_len=cfg.T,
+                image_h=cfg.H,
+                image_w=cfg.W,
+                image_c=cfg.C,
+                patch_size=cfg.patch_size,
+            ),
             grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
         ]
     else:
@@ -217,6 +270,7 @@ def make_iterator(
                 image_w=cfg.W,
                 image_c=cfg.C,
                 p_include_reward=cfg.p_include_reward,
+                patch_size=cfg.patch_size,
             ),
             grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
         ]

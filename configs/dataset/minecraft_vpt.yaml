@@ -12,6 +12,8 @@ H: 360
 W: 640
 C: 3
 
+patch_size: 20
+
 num_binary_actions: 23  # keyboard actions
 categorical_action_dim: 121  # mouse actions
 continuous_action_dim: 0

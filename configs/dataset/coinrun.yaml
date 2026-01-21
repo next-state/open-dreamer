@@ -11,6 +11,8 @@ H: 64
 W: 64
 C: 3
 
+patch_size: 8
+
 num_binary_actions: 0
 categorical_action_dim: 16  # keyboard actions # TODO: do binary as convention, so that game can be played in reactor frontend
 continuous_action_dim: 0

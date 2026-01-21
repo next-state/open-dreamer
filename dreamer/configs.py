@@ -19,6 +19,8 @@ class DatasetConfig:
     W: int = 64  # width
     C: int = 3   # channels
 
+    patch_size: int = 8
+
     # Dataset path and action space
     num_binary_actions: int = 0
     categorical_action_dim: int = 0
