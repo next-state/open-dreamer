@@ -11,6 +11,7 @@ from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
+from dreamer.types import Actions
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
@@ -40,15 +41,14 @@ def encode_and_train_step(
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
     videos: jnp.ndarray,
-    actions: jnp.ndarray,
+    actions: Actions,
     *,
     tokenizer_key: jax.Array,
     master_key: jax.Array,
     step: int,
-    packing_factor:int,
-    B_self:int,
-    k_max:int,
-
+    packing_factor: int,
+    B_self: int,
+    k_max: int,
 ):
     # Phase 1: Encode videos to latents
     rngs = nnx.Rngs(mae=tokenizer_key)
@@ -73,7 +73,7 @@ def train_step(
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
     latents: jnp.ndarray,
-    actions: jnp.ndarray,
+    actions: Actions,
     *,
     B_self: int,
     k_max: int,
@@ -98,7 +98,7 @@ def train_step(
 
     (loss_val, metrics), grads = nnx.value_and_grad(loss_and_aux, has_aux=True)(dynamics)
 
-    # Update model with optimizer 
+    # Update model with optimizer
     optimizer.update(dynamics, grads)
 
     return metrics
@@ -224,7 +224,7 @@ def run(cfg: DynamicsConfig):
 
                     run_evaluation(
                         cfg, step, bundle.tokenizer, bundle.dynamics,
-                        val_videos, jnp.asarray(val_actions), vis_dir, rng, logger
+                        val_videos, val_actions, vis_dir, rng, logger
                     )
 
             scaling.finalize()

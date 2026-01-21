@@ -208,8 +208,8 @@ def compute_bootstrap_loss(
 # ---------------------------
 
 def shortcut_forcing_step(
-    dynamics_model,
-    actions: jnp.ndarray,
+    dynamics_model: Dynamics,
+    actions: Actions,
     latents: jnp.ndarray,
     rng: jax.Array,
     k_max: int,
@@ -219,10 +219,10 @@ def shortcut_forcing_step(
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
     Compute shortcut forcing losses (flow + bootstrap) for a batch.
-    
+
     This is the core training logic that can be reused in both dynamics pretraining
     and imagination training phases.
-    
+
     Args:
         dynamics_model: NNX Dynamics model instance
         actions: (B, T) Action sequence
@@ -231,7 +231,7 @@ def shortcut_forcing_step(
         k_max: Maximum noise resolution
         B_self: Number of bootstrap examples (last B_self rows of batch)
         task_embeddings: Optional (B, T, n_agent, d_model) agent tokens
-        
+
     Returns:
         losses: Dict with 'total', 'flow', 'bootstrap' keys
         aux: Dict with auxiliary metrics for logging. If task_embeddings is not None,
@@ -241,7 +241,7 @@ def shortcut_forcing_step(
     B, T, S, D = latents.shape
     B_emp = B - B_self
     emax = jnp.log2(k_max).astype(jnp.int32)
-    
+
     # Split RNG
     key_sigma, key_step, key_noise, key_dropout1, key_dropout2, key_dropout3 = jax.random.split(rng, 6)
     
@@ -288,13 +288,13 @@ def shortcut_forcing_step(
         z_tilde_self = z_tilde[B_emp:]
         actions_self = actions[B_emp:]
         task_embeddings_self = task_embeddings[B_emp:] if task_embeddings is not None else None
-    
+
         # Half-step metadata
         d_half = d_self / 2.0
         step_idx_half = step_idx_self + 1
         sigma_plus = sigma_self + d_half
         sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
-    
+
         # First half-step
         rngs2 = nnx.Rngs(dropout=key_dropout2)
         z1_half1, *_ = dynamics_model(
@@ -303,7 +303,7 @@ def shortcut_forcing_step(
         )
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
-    
+
         # Second half-step
         rngs3 = nnx.Rngs(dropout=key_dropout3)
         z1_half2, *_ = dynamics_model(
@@ -311,7 +311,7 @@ def shortcut_forcing_step(
             task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
         )
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
-    
+
         # Bootstrap loss (computed unconditionally)
         loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
     
@@ -589,31 +589,59 @@ def compute_reward_loss(
 def compute_policy_loss(
     policy_head,
     h_states: jnp.ndarray,
-    actions: jnp.ndarray,
+    actions: Actions,
     actions_valid: jnp.ndarray,
 ) -> jnp.ndarray:
     """
     Compute behavior cloning loss with multi-token prediction.
-    
+
     Args:
         policy_head: Policy head NNX model instance
         h_states: (B, T, n_agent, d_model) Hidden states from dynamics
-        actions: (B, T, L) Future action labels
+        actions: Actions object with (B, T, L, ...) future action labels
         actions_valid: (B, T, L) Validity mask
-        
+
     Returns:
-        policy_loss: Scalar categorical cross-entropy loss
+        policy_loss: Scalar loss (sum of losses for each action type)
     """
-    # Forward pass
-    policy_logits = policy_head(h_states, deterministic=True)  # (B, T, L, A)
-    
-    # Categorical cross-entropy for each future action
-    assert actions.dtype == jnp.int32, "actions must be of type int32"
     assert actions_valid.dtype == jnp.bool_, "actions_valid must be of type bool"
-    per_token_loss = optax.softmax_cross_entropy_with_integer_labels(policy_logits, actions)
-    policy_loss = jnp.sum(per_token_loss * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
-    
-    return policy_loss
+
+    # Forward pass - returns dict with logits for each action type
+    policy_outputs = policy_head(h_states, deterministic=True)
+
+    total_loss = jnp.array(0.0)
+
+    # Binary actions: BCE loss per key
+    if "binary_logits" in policy_outputs and actions.binary is not None:
+        logits = policy_outputs["binary_logits"]  # (B, T, L, num_keys)
+        targets = actions.binary  # (B, T, L, num_keys)
+        bce = optax.sigmoid_binary_cross_entropy(logits, targets.astype(jnp.float32))
+        # Average over keys, mask over (B, T, L)
+        bce_per_step = jnp.mean(bce, axis=-1)  # (B, T, L)
+        bce_masked = jnp.sum(bce_per_step * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
+        total_loss = total_loss + bce_masked
+
+    # Categorical action: CE loss
+    if "categorical_logits" in policy_outputs and actions.categorical is not None:
+        logits = policy_outputs["categorical_logits"]  # (B, T, L, action_dim)
+        targets = actions.categorical  # (B, T, L)
+        ce = optax.softmax_cross_entropy_with_integer_labels(logits, targets)  # (B, T, L)
+        ce_masked = jnp.sum(ce * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
+        total_loss = total_loss + ce_masked
+
+    # Continuous action: Gaussian NLL
+    if "continuous_mean" in policy_outputs and actions.continuous is not None:
+        mean = policy_outputs["continuous_mean"]  # (B, T, L, dim)
+        log_var = policy_outputs["continuous_log_var"]  # (B, T, L, dim)
+        targets = actions.continuous  # (B, T, L, dim)
+        # NLL = 0.5 * (log_var + (x - mu)^2 / exp(log_var))
+        nll = 0.5 * (log_var + (targets - mean) ** 2 * jnp.exp(-log_var))
+        # Average over action dimensions, mask over (B, T, L)
+        nll_per_step = jnp.mean(nll, axis=-1)  # (B, T, L)
+        nll_masked = jnp.sum(nll_per_step * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
+        total_loss = total_loss + nll_masked
+
+    return total_loss
 
 
 # ---------------------------
@@ -626,7 +654,7 @@ def run_evaluation(
     tokenizer,
     dynamics,
     val_videos: jnp.ndarray,
-    val_actions: jnp.ndarray,
+    val_actions: Actions,
     vis_dir: Path,
     rng: jax.Array,
     logger,
@@ -640,7 +668,6 @@ def run_evaluation(
 
     Args:
         cfg: Training config
-        tokenizer_cfg: Tokenizer config (for dataset stats)
         step: Current training step
         tokenizer: Tokenizer NNX model instance
         dynamics: Dynamics NNX model instance
@@ -649,6 +676,8 @@ def run_evaluation(
         vis_dir: Directory to save visualizations
         rng: Random key
         logger: Logger instance for logging metrics and videos
+        policy: Optional policy model for action sampling
+        task_embedder: Optional task embedder for agent tokens
     """
     k_max = dynamics.cfg.k_max
     schedule_shortcut = DenoiseSchedule.init(4, k_max)

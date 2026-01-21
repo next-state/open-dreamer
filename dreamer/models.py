@@ -17,6 +17,7 @@ from .configs import (
     TaskEmbedderModelConfig, PolicyHeadModelConfig, RewardHeadModelConfig,
 )
 from .parallel import MeshRules
+from .types import Actions
 
 
 # ============================================================================
@@ -662,15 +663,15 @@ class Encoder(nnx.Module):
         self.mask_and_replace = MAEReplacer(D=cfg.d_model, p_min=cfg.mae_p_min, p_max=cfg.mae_p_max, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
         self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_latents, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
-    def __call__(self, videos, *, deterministic: bool = True, packing_factor = None, rngs: nnx.Rngs = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
-        # 1) takes videos in the [0,255] range
+    def __call__(self, videos, *, deterministic: bool = True, packing_factor = None, rngs: nnx.Rngs | None = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+        # Videos in the [0, 255] range
         B, T, H, W, C = videos.shape
 
         normalized_videos = normalize_with_dataset_stats(videos, mean=self.dataset_mean, std=self.dataset_std)
         patch_tokens = patchify(normalized_videos, patch=self.patch_size)
-        proj_patches = self.patch_proj(patch_tokens)  # (B,T,Np,D)
+        proj_patches = self.patch_proj(patch_tokens)  # (B, T, Np, D)
 
-        # 2) MAE mask-and-replace on patch tokens (encoder input only during training)
+        # MAE mask-and-replace on patch tokens (encoder input only during training)
         if deterministic or rngs is None:
             # Skip MAE masking during inference
             proj_patches_masked = proj_patches
@@ -679,13 +680,13 @@ class Encoder(nnx.Module):
         else:
             proj_patches_masked, patch_mask, keep_prob = self.mask_and_replace(proj_patches, rngs=rngs)
 
-        # patch_mask is (B,T,Np,1), need to expand to pixels (B,T,Np, P*P)
+        # patch_mask is (B,T,Np,1), need to expand to pixels (B, T, Np, P*P)
         patch_mask_expanded = jnp.repeat(patch_mask, self.patch_size**2, axis=-1)
         frame_mask = unpatchify(patch_mask_expanded, self.patch_size, H, W)
 
-        # 3) Prepend learned latents
+        # Prepend learned latents
         latents = repeat(self.latents_enc.value.astype(proj_patches.dtype), "... -> b t ...", b=B, t=T)
-        tokens = jnp.concatenate([latents, proj_patches_masked], axis=2)  # (B,T,S=(Np+Nl),D)
+        tokens = jnp.concatenate([latents, proj_patches_masked], axis=2)  # (B, T, S=(Np+Nl), D)
 
         layout = TokenLayout((
             (Modality.LATENT, self.n_latents),
@@ -693,10 +694,10 @@ class Encoder(nnx.Module):
         ))
         mask = layout.make_mask("encoder")  # (1, 1, q_len, k_len)
 
-        # 5) Feed tokens into transformer
+        # Feed tokens into transformer
         encoded_tokens, _ = self.transformer(tokens, mask=mask, deterministic=deterministic, rngs=rngs)
 
-        # 6) Project latent tokens to bottleneck and tanh
+        # Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
         proj_tokens = nnx.tanh(self.bottleneck_proj(latent_tokens))
 
@@ -781,12 +782,12 @@ class Tokenizer(nnx.Module):
         self.encoder = Encoder(cfg.encoder, mesh_rules=mesh_rules, rngs=rngs)
         self.decoder = Decoder(cfg.decoder, mesh_rules=mesh_rules, rngs=rngs)
 
-    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs = None):
+    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None):
         z, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs)
         recon, _ = self.decoder(z, deterministic=deterministic, rngs=rngs)
         return recon, aux
 
-    def encode(self, videos, *, deterministic: bool = True, packing_factor = None, rngs: nnx.Rngs = None):
+    def encode(self, videos, *, deterministic: bool = True, packing_factor = None, rngs: nnx.Rngs | None = None):
         return self.encoder(videos, deterministic=deterministic, packing_factor=packing_factor, rngs=rngs)
 
     def decode(self, z, *, deterministic: bool = True, caches=None, packing_factor = None, rngs: Optional[nnx.Rngs] = None):
@@ -911,20 +912,16 @@ class ActionEncoder(nnx.Module):
 
     def __call__(
         self,
+        actions: Actions,
         batch_time_shape: Tuple[int, int],
-        binary_actions: Optional[jnp.ndarray] = None,
-        categorical_action: Optional[jnp.ndarray] = None,
-        continuous_action: Optional[jnp.ndarray] = None,
         as_tokens: bool = True
     ):
         """
         Encode actions into embeddings.
 
         Args:
+            actions: Actions to encode (B, T, *)
             batch_time_shape: (B, T) shape for unlabeled videos
-            binary_actions: (B, T, num_binary_actions) with values 0 or 1
-            categorical_action: (B, T, categorical_action_dim) categorical values
-            continuous_action: (B, T, continuous_action_dim) continuous values
             as_tokens: whether to expand to token dimension
 
         Returns:
@@ -936,19 +933,19 @@ class ActionEncoder(nnx.Module):
         B, T = batch_time_shape
         out = jnp.broadcast_to(base_emb, (B, T, self.d_model))
 
-        if binary_actions is not None and self.binary_embeds_list is not None:
+        if actions.binary is not None and self.binary_embeds_list is not None:
             binary_emb = jnp.zeros((B, T, self.d_model), dtype=self.dtype)
             for i, emb in enumerate(self.binary_embeds_list):
-                binary_state = binary_actions[..., i]  # (B, T)
+                binary_state = actions.binary[..., i]  # (B, T)
                 binary_emb = binary_emb + emb(binary_state)
             out = out + binary_emb
 
-        if categorical_action is not None and self.categorical_embeds is not None:
-            categorical_emb = self.categorical_embeds(categorical_action.astype(self.dtype))
+        if actions.categorical is not None and self.categorical_embeds is not None:
+            categorical_emb = self.categorical_embeds(actions.categorical.astype(self.dtype))
             out = out + categorical_emb
 
-        if continuous_action is not None and self.continuous_proj is not None:
-            continuous_emb = self.continuous_proj(continuous_action.astype(self.dtype))
+        if actions.continuous is not None and self.continuous_proj is not None:
+            continuous_emb = self.continuous_proj(actions.continuous.astype(self.dtype))
             out = out + continuous_emb
 
         if as_tokens:
@@ -1062,13 +1059,11 @@ class Dynamics(nnx.Module):
 
     def __call__(
         self,
+        actions: Actions,
         step_indices,
         tau_indices,
         packed_enc_tokens,
         *,
-        binary_actions: Optional[jnp.ndarray] = None,
-        categorical_action: Optional[jnp.ndarray] = None,
-        continuous_action: Optional[jnp.ndarray] = None,
         task_embeddings: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
         caches: Optional[KVCache | None] = None,
@@ -1076,12 +1071,10 @@ class Dynamics(nnx.Module):
     ) -> Tuple[jax.Array, Tuple[jax.Array | None, KVCache | None]]:
         """
         Args:
-            packed_enc_tokens: (B, T, n_spatial, d_spatial) packed encoder tokens
-            binary_actions: (B, T, num_binary_actions) with values 0 or 1
-            categorical_action: (B, T, categorical_action_dim) int32 categorical values
-            continuous_action: (B, T, continuous_action_dim) continuous values
+            actions: Actions object
             step_indices: (B, T) int32 — step indices for embedding lookup
             tau_indices: (B, T) int32 - signal indices for embedding lookup
+            packed_enc_tokens: (B, T, n_spatial, d_spatial) packed encoder tokens
             caches: optional dict of KVCache for each layer
 
         Shapes produced:
@@ -1096,10 +1089,8 @@ class Dynamics(nnx.Module):
 
         # Encode actions to d_model
         action_token = self.action_encoder(
+            actions=actions,
             batch_time_shape=(B, T),
-            binary_actions=binary_actions,
-            categorical_action=categorical_action,
-            continuous_action=continuous_action
         )  # (B, T, 1, d_model)
 
         # Prepare learned register tokens
@@ -1219,6 +1210,7 @@ class PolicyHeadMTP(nnx.Module):
 
     def __init__(self, cfg: PolicyHeadModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.cfg = cfg
+        self.L = cfg.L
         self.num_binary_actions = cfg.num_binary_actions
         self.categorical_action_dim = cfg.categorical_action_dim
         self.continuous_action_dim = cfg.continuous_action_dim
@@ -1278,7 +1270,7 @@ class PolicyHeadMTP(nnx.Module):
         Returns:
             Dict with keys:
             - "binary_logits": (B, T, L, num_binary_actions) if binary actions enabled
-            - "categorical_logits": (B, T, L, categorical_action_dim) if categorical action enabled
+            - "categorical_logits": (B, T, L) if categorical action enabled
             - "mouse_mean": (B, T, L, continuous_action_dim) if continuous action enabled
             - "mouse_log_var": (B, T, L, continuous_action_dim) if continuous action enabled
         """
@@ -1288,17 +1280,17 @@ class PolicyHeadMTP(nnx.Module):
         outputs = {}
 
         if self.out_binary is not None:
-            binary_logits = self.out_binary(x)  # (B, T, L*A)
+            binary_logits = self.out_binary(x)
             binary_logits = rearrange(binary_logits, "b t (l a) -> b t l a", l=self.cfg.L, a=self.num_binary_actions)
             outputs["binary_logits"] = binary_logits
 
         if self.out_categorical is not None:
-            categorical_logits = self.out_categorical(x)  # (B, T, L*A)
+            categorical_logits = self.out_categorical(x)
             categorical_logits = rearrange(categorical_logits, "b t (l a) -> b t l a", l=self.cfg.L, a=self.categorical_action_dim)
             outputs["categorical_logits"] = categorical_logits
 
         if self.out_continuous is not None:
-            continuous_out = self.out_continuous(x)  # (B, T, L*continuous_action_dim*2)
+            continuous_out = self.out_continuous(x)
             continuous_out = rearrange(continuous_out, "b t (l m) -> b t l m", l=self.cfg.L, m=self.cfg.continuous_action_dim * 2)
             outputs["continuous_mean"] = continuous_out[..., :self.cfg.continuous_action_dim]
             outputs["continuous_log_var"] = continuous_out[..., self.cfg.continuous_action_dim:]
@@ -1308,47 +1300,51 @@ class PolicyHeadMTP(nnx.Module):
     def sample(
         self,
         h_t: jnp.ndarray,
-        rng: jax.Array,
         *,
-        deterministic: bool = True,
-        rngs: Optional[nnx.Rngs] = None
-    ) -> dict[str, jnp.ndarray]:
+        greedy: bool = True,
+        rng: jax.Array,
+    ) -> Actions:
         """
         Sample actions from the policy.
 
         Args:
             h_t: (B, T, n_agent, d_model) hidden states
+            greedy: whether to do greedy sampling
             rng: Random key for sampling
 
-        Returns:
-            Dict with sampled actions:
-            - "binary": (B, T, L) sampled binary value
-            - "categorical": (B, T, L) int32 sampled category
-            - "continuous": (B, T, L, mouse_dim) sampled continuous values
+        Returns: Action object with actions sampled from policy
         """
-        outputs = self(h_t, deterministic=deterministic, rngs=rngs)
-        samples = {}
+        rng_policy, rng_binary, rng_categorical, rng_continuous = jax.random.split(rng, num=4)
 
-        rng_cat, rng_mouse = jax.random.split(rng)
+        outputs = self(h_t, deterministic=greedy, rngs=rng_policy)
+        actions = Actions()
 
         if "binary_logits" in outputs:
             binary_logits = outputs["binary_logits"]
-            probs = jax.nn.sigmoid(binary_logits)
-            samples['keyboard'] = jax.random.bernoulli(rng_cat, probs).astype(jnp.int32)
+            if greedy:
+                actions.binary = (binary_logits > 0).astype(jnp.int32)
+            else:
+                probs = jax.nn.sigmoid(binary_logits)
+                actions.binary = jax.random.bernoulli(rng_binary, probs).astype(jnp.int32)
 
         if "categorical_logits" in outputs:
             categorical_logits = outputs["categorical_logits"]
-            samples['categorical'] = jax.random.categorical(rng_cat, categorical_logits, axis=-1)
+            if greedy:
+                actions.categorical = jnp.argmax(categorical_logits, axis=-1)
+            else:
+                actions.categorical = jax.random.categorical(rng_categorical, categorical_logits, axis=-1)
 
         if "continuous_mean" in outputs:
             mean = outputs["continuous_mean"]
-            log_var = outputs["continuous_log_var"]
-            std = jnp.exp(0.5 * log_var)
-            eps = jax.random.normal(rng_mouse, mean.shape)
-            samples["continuous"] = mean + std * eps
+            if greedy:
+                actions.continuous = mean
+            else:
+                log_var = outputs["continuous_log_var"]
+                std = jnp.exp(0.5 * log_var)
+                eps = jax.random.normal(rng_continuous, mean.shape)
+                actions.continuous = mean + std * eps
 
-        return samples
-
+        return actions
 
 class RewardHeadMTP(nnx.Module):
     """Multi-Token reward prediction with symexp twohot bins."""

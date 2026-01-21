@@ -4,6 +4,7 @@ from flax import nnx
 from dreamer.models import Dynamics, PolicyHeadMTP
 from dreamer.generation import DenoiseSchedule, next_frame
 from dreamer.parallel import create_data_model_parallel, MeshRules
+from dreamer.types import Actions
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
 import numpy as np
@@ -43,7 +44,7 @@ class ReactorConfig:
     batch_size: int = 1
 
 
-def input_to_action(controller_state: Dict[str, Any]) -> jax.Array:
+def input_to_action(controller_state: Dict[str, Any]) -> Actions:
     """
     Convert keyboard input to CoinRun action.
     Used https://github.com/openai/coinrun/blob/master/coinrun/coinrun.cpp for reference
@@ -55,7 +56,7 @@ def input_to_action(controller_state: Dict[str, Any]) -> jax.Array:
         action_dim: Dimension of action space (7 for CoinRun)
 
     Returns:
-        Categorical integer action index of shape (1,)
+        Actions object *without time dimension*: (B=1, *)
     """
     # Key to action mapping (priority order: diagonals first, then cardinals)
     key_map = [
@@ -73,8 +74,9 @@ def input_to_action(controller_state: Dict[str, Any]) -> jax.Array:
             action_idx = action
             break
     
-    # Return categorical integer (not one-hot)
-    return jnp.full((1,1), action_idx, dtype=jnp.int32)
+    return Actions(
+        categorical=jnp.array([action_idx], dtype=jnp.int32)
+    )
 
 
 def policy(policy_model: PolicyHeadMTP, policy_vars: Dict, agent_tokens: jax.Array, rng: jax.Array) -> jax.Array:
@@ -90,15 +92,18 @@ def policy(policy_model: PolicyHeadMTP, policy_vars: Dict, agent_tokens: jax.Arr
     Returns:
         Sampled action as JAX array
     """
-    # Get action logits from policy head
-    logits = policy_model.apply(policy_vars, agent_tokens, deterministic=False)
-    
-    # Sample action from categorical distribution
-    action = jax.random.categorical(rng, logits)
-    
-    return action
 
+    # FIXME: the correct usage is policy_model.sample(h_t, greedy=True, rng=rng_policy)
 
+    # # Get action logits from policy head
+    # logits = policy_model.apply(policy_vars, agent_tokens, deterministic=False)
+    
+    # # Sample action from categorical distribution
+    # action = jax.random.categorical(rng, logits)
+    
+    # return action
+
+    raise NotImplementedError
 
 
 class DreamerVideoModel(VideoModel):

@@ -23,6 +23,7 @@ task_embedder:
   use_ids: true
   n_tasks: 128
   d_task: 64
+  use_bias: false
   dtype: ${dtype}
   param_dtype: ${param_dtype}
 
@@ -52,6 +53,7 @@ reward_head:
   dropout_rate: 0.0
   swiglu: true
   parity_2over3: false
+  use_bias: false
   dtype: ${dtype}
   param_dtype: ${param_dtype}
 

@@ -26,7 +26,7 @@ from tqdm import tqdm
 from dreamer.configs import HeadsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
-from dreamer.models import Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
+from dreamer.models import Actions, Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
 from dreamer.parallel import build_parallel
 from dreamer.training import (
     compute_policy_loss,
@@ -53,36 +53,44 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Multi-token prediction (MTP) helpers
 # ---------------------------
 
-def gather_future_actions(actions_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+def gather_future_actions(actions: Actions, BTL: tuple[int, int, int]) -> tuple[Actions, jnp.ndarray]:
     """
     Gather future actions for multi-token prediction.
-    
+
     At timestep t, predicts actions[t+1], actions[t+2], ..., actions[t+L]
     (Following Dreamer convention: action a_i happens before state s_i)
-    
-    Note: Paper equation uses n=0..L, but with Dreamer's convention where a_t is the 
+
+    Note: Paper equation uses n=0..L, but with Dreamer's convention where a_t is the
     action TO TAKE from state s_t, we predict L future actions starting from a_{t+1}.
-    
+
     Args:
-        actions_bt: (B, T) action labels
-        L: number of future steps to predict
-        
+        actions: Actions object with (B, T, ...) shaped arrays
+        BTL: tuple containing (B, T, L)
+
     Returns:
-        actions_btL: (B, T, L) future actions
-        valid_btL: (B, T, L) mask (0 for out-of-range)
+        actions_btL: Actions object with (B, T, L, ...) future actions
+        valid_btL: (B, T, L) mask (False for out-of-range)
     """
-    B, T = actions_bt.shape
-    actions_pad = jnp.pad(actions_bt, ((0, 0), (0, L)), constant_values=-1)
+    B, T, L = BTL
+
+    starts = jnp.arange(T)                               # [0, 1, ..., T-1]
+    offsets = jnp.arange(1, L + 1)                       # [1, 2, ..., L]
+    gather_indices = starts[:, None] + offsets[None, :]  # (T, L)
+    valid_mask_tl = gather_indices < T
+    valid_btL = jnp.broadcast_to(valid_mask_tl[None, ...], (B, T, L))
+
+    def pad_and_gather(x):
+        pad_width = [(0, 0), (0, L)] + [(0, 0)] * (x.ndim - 2)
+        x_pad = jnp.pad(x, pad_width, mode='constant', constant_values=0)
+        
+        # We slice axis 1 using (T, L) indices -> resulting in (B, T, L, ...)
+        return x_pad[:, gather_indices]
     
-    offsets = jnp.arange(1, L + 1)  # [1, 2, ..., L]
-    indices = jnp.arange(T)[:, None] + offsets[None, :]  # (T, L)
-    actions_btL = actions_pad[:, indices]  # (B, T, L)
-    valid_btL = (actions_btL >= 0)
-    
+    actions_btL = jax.tree.map(pad_and_gather, actions)
     return actions_btL, valid_btL
 
 
-def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+def gather_future_rewards(rewards_bt: jnp.ndarray, BTL: tuple[int, int, int]) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Gather future rewards for multi-token prediction.
     
@@ -97,18 +105,18 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
         rewards_btL: (B, T, L) future rewards
         valid_btL: (B, T, L) mask (0 for invalid)
     """
-    B, T = rewards_bt.shape
-    rewards_pad = jnp.pad(rewards_bt, ((0, 0), (0, L - 1)), constant_values=0.0)
+    B, T, L = BTL
     
-    offsets = jnp.arange(0, L)  # [0, 1, ..., L-1]
-    indices = jnp.arange(T)[:, None] + offsets[None, :]  # (T, L)
-    rewards_btL = rewards_pad[:, indices]  # (B, T, L)
+    starts = jnp.arange(T)                               # [0, 1, ..., T-1]
+    offsets = jnp.arange(0, L)                           # [0, 1, ..., L-1]
+    gather_indices = starts[:, None] + offsets[None, :]  # (T, L)
+    valid_mask_tl = (gather_indices < T) & (gather_indices > 0)
+    valid_btL = jnp.broadcast_to(valid_mask_tl[None, ...], (B, T, L))
+
+    pad_width = ((0, 0), (0, L))
+    rewards_pad = jnp.pad(rewards_bt, pad_width, constant_values=0.0)
     
-    # Valid when: t >= 1 AND 1 <= t+offset < T
-    # (skip r0 which is dummy, and stay in bounds)
-    valid_btL = (indices >= 1) & (indices < T) & (jnp.arange(T)[:, None] >= 1)
-    valid_btL = jnp.broadcast_to(valid_btL[None, :, :], (B, T, L))
-    
+    rewards_btL = rewards_pad[:, gather_indices]
     return rewards_btL, valid_btL
 
 
@@ -128,7 +136,7 @@ def encode_and_train_step(
     policy_optimizer: nnx.Optimizer,
     reward_optimizer: nnx.Optimizer,
     videos: jax.Array,
-    actions: jax.Array,
+    actions: Actions,
     rewards: jax.Array,
     *,
     tokenizer_key: jax.Array,
@@ -174,7 +182,7 @@ def train_step(
     policy_optimizer: nnx.Optimizer,
     reward_optimizer: nnx.Optimizer,
     latents: jax.Array,
-    actions: jax.Array,
+    actions: Actions,
     rewards: jax.Array,
     *,
     master_key: jax.Array,
@@ -202,8 +210,8 @@ def train_step(
     agent_tokens_bt = task_embedder(task=task, B=B, T=T_video)
 
     # Gather future actions and rewards for MTP
-    actions_btL, actions_valid = gather_future_actions(actions, L_mtp)
-    rewards_btL, rewards_valid = gather_future_rewards(rewards, L_mtp)
+    actions_btL, actions_valid = gather_future_actions(actions, (B, T_video, L_mtp))
+    rewards_btL, rewards_valid = gather_future_rewards(rewards, (B, T_video, L_mtp))
 
     # Define combined loss
     # Takes all models as a tuple to enable differentiation w.r.t. all of them
@@ -336,9 +344,12 @@ def run(cfg: HeadsConfig):
                 actions = jax.device_put(batch["actions"], data_sharding)
                 rewards = jax.device_put(batch["rewards"], data_sharding)
 
+                # FIXME: shift actions with new Actions class
+                """
                 # Action shifting: prepend "first action token" = 15
                 B, T = actions.shape
                 actions = jnp.concatenate((jnp.full_like(actions[:, 0:1], fill_value=15), actions[:, :-1]), axis=1)
+                """
 
                 # Training step (encodes videos and trains)
                 metrics = encode_and_train_step(

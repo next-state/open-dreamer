@@ -132,6 +132,7 @@ class TaskEmbedderModelConfig:
     use_ids: bool = True
     n_tasks: int = 128
     d_task: int = 64
+    use_bias: bool = False
     dtype: str = "float32"
     param_dtype: str = "float32"
 
@@ -169,6 +170,7 @@ class RewardHeadModelConfig:
     dropout_rate: float = 0.0
     swiglu: bool = True
     parity_2over3: bool = False
+    use_bias: bool = False
     dtype: str = "float32"
     param_dtype: str = "float32"
 

@@ -1,19 +1,14 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-import orbax.checkpoint as ocp
 from pathlib import Path
 import optax
-import grain
 import operator
 from einops import rearrange
 from enum import IntEnum
-from typing import Tuple, TypeVar
-import numpy as np
-from omegaconf import OmegaConf
-from dataclasses import asdict, fields, is_dataclass
+from typing import Tuple
 from hydra.core.hydra_config import HydraConfig
-from dreamer.configs import CheckpointConfig, LRScheduleConfig, OptimizerConfig
+from dreamer.configs import LRScheduleConfig, OptimizerConfig
 
 
 # --- dtype helpers ---
