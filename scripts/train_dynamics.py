@@ -55,6 +55,8 @@ def encode_and_train_step(
 ):
     rngs = nnx.Rngs(mae=tokenizer_key)
 
+    # TODO: handle edge cases B_img = 0 or B_img = B
+
     # Split batch: images vs videos
     # Image portion: reshape (B_img, T) frames into (B_img * T, 1) single-frame sequences
     images = rearrange(videos[:B_img], 'B_img T H W C -> (B_img T) 1 H W C')
