@@ -144,7 +144,7 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, BTL: tuple[int, int, int]) ->
 # Training step
 # ---------------------------
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "L_mtp", "B_self"))
+@nnx.jit(static_argnames=("packing_factor", "k_max", "L_mtp", "B_self", "image_fraction"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -166,6 +166,7 @@ def encode_and_train_step(
     k_max: int,
     L_mtp: int,
     B_self: int,
+    image_fraction: float,
     dynamics_loss_weight: float,
 ) -> dict:
     """
@@ -185,13 +186,13 @@ def encode_and_train_step(
         policy_optimizer, reward_optimizer,
         latents, actions, rewards,
         master_key=master_key, step=step,
-        k_max=k_max, L_mtp=L_mtp, B_self=B_self,
+        k_max=k_max, L_mtp=L_mtp, B_self=B_self, image_fraction=image_fraction,
         dynamics_loss_weight=dynamics_loss_weight
     )
     return metrics
 
 
-@nnx.jit(static_argnames=("k_max", "L_mtp", "B_self"))
+@nnx.jit(static_argnames=("k_max", "L_mtp", "B_self", "image_fraction"))
 def train_step(
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
@@ -210,6 +211,7 @@ def train_step(
     k_max: int,
     L_mtp: int,
     B_self: int,
+    image_fraction: float,
     dynamics_loss_weight: float,
 ) -> dict:
     """
@@ -240,7 +242,7 @@ def train_step(
         # Dynamics loss (also returns hidden states for BC/reward training)
         dyn_losses, dyn_aux = shortcut_forcing_step(
             dyn, actions, latents, step_key, k_max,
-            B_self=B_self, task_embeddings=agent_tokens_bt
+            B_self=B_self, image_fraction=image_fraction, task_embeddings=agent_tokens_bt
         )
         dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
 
@@ -381,6 +383,7 @@ def run(cfg: HeadsConfig):
                     k_max=bundle.dynamics.cfg.k_max,
                     L_mtp=cfg.policy_head.L,
                     B_self=(B // 2) * (step >= cfg.bootstrap_start),  # This will make the function compile twice. TODO: see if it's worth fixing this
+                    image_fraction=cfg.image_fraction,
                     dynamics_loss_weight=cfg.dynamics_loss_weight,
                 )
 

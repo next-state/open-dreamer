@@ -39,6 +39,7 @@ dynamics:
 
 bootstrap_start: 5_000
 self_fraction: 0.25
+image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
 
 max_steps: 300_000
 

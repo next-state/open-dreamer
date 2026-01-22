@@ -485,18 +485,43 @@ class TimeSelfAttention(nnx.Module):
         x,
         *,
         mask: jnp.ndarray | None = None,
+        B_img: int = 0,
         deterministic: bool = True,
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None
     ):
         # x: (B, T, S, D) -> attention across T, causal
         B, T, S, D = x.shape
-        x = rearrange(x, "B T S D -> (B S) T D")
 
-        out, new_cache = self.attn(x, mask=mask, deterministic=deterministic, cache=cache, rngs=rngs)
+        if B_img > 0:
+            B_vid = B - B_img
 
-        out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
-        return out, new_cache
+            x_vid = x[:B_vid]  # (B_vid, T, S, D)
+            x_img = x[B_vid:]  # (B_img, T, S, D)
+
+            # VIDEO: standard causal time attention
+            x_vid_flat = rearrange(x_vid, "B T S D -> (B S) T D")
+            out_vid_flat, cache_vid = self.attn(
+                x_vid_flat, mask=None, deterministic=deterministic, cache=cache, rngs=rngs
+            )
+            out_vid = rearrange(out_vid_flat, "(B S) T D -> B T S D", B=B_vid, S=S)
+
+            # IMAGE: reshape to T=1 (each frame independent, no temporal attention)
+            x_img_flat = rearrange(x_img, "B T S D -> (B T S) 1 D")
+            out_img_flat, _ = self.attn(
+                x_img_flat, mask=None, deterministic=deterministic, cache=None, rngs=rngs
+            )
+            out_img = rearrange(out_img_flat, "(B T S) 1 D -> B T S D", B=B_img, T=T, S=S)
+
+            # Recombine
+            out = jnp.concatenate([out_vid, out_img], axis=0)
+            return out, cache_vid
+        else:
+            # Standard path
+            x = rearrange(x, "B T S D -> (B S) T D")
+            out, new_cache = self.attn(x, mask=mask, deterministic=deterministic, cache=cache, rngs=rngs)
+            out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
+            return out, new_cache
 
 class BlockCausalLayer(nnx.Module):
     """Single block-causal transformer layer (alternating space/time attention)."""
@@ -541,15 +566,17 @@ class BlockCausalLayer(nnx.Module):
         x,
         *,
         space_mask: jnp.ndarray | None = None,
-        time_mask: jnp.ndarray | None = None,
+        B_img: int = 0,
         deterministic: bool = True,
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None
     ):
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
-        attn_mask = time_mask if self.use_time else space_mask
-        y, new_cache = self.attn(y, mask=attn_mask, deterministic=deterministic, cache=cache, rngs=rngs)
+        if self.use_time:
+            y, new_cache = self.attn(y, B_img=B_img, deterministic=deterministic, cache=cache, rngs=rngs)
+        else:
+            y, new_cache = self.attn(y, mask=space_mask, deterministic=deterministic, cache=cache, rngs=rngs)
         x = x + y
 
         # MLP
@@ -600,7 +627,7 @@ class BlockCausalTransformer(nnx.Module):
         x,
         *,
         space_mask: jnp.ndarray | None = None,
-        time_mask: jnp.ndarray | None = None,
+        B_img: int = 0,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
         rngs: nnx.Rngs | None = None
@@ -609,7 +636,7 @@ class BlockCausalTransformer(nnx.Module):
         Args:
             x: (B, T, S, D) input tensor
             space_mask: optional spatial attention mask
-            time_mask: optional time attention mask
+            B_img: number of image samples (last B_img rows get T=1 time attention)
             deterministic: whether to use deterministic mode (no dropout)
             caches: optional dict mapping layer_index -> KVCache
             rngs: optional RNG state for dropout
@@ -628,7 +655,7 @@ class BlockCausalTransformer(nnx.Module):
             is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
 
-            x, new_cache_i = layer(x, space_mask=space_mask, time_mask=time_mask, deterministic=deterministic, cache=cache_i, rngs=rngs)
+            x, new_cache_i = layer(x, space_mask=space_mask, B_img=B_img, deterministic=deterministic, cache=cache_i, rngs=rngs)
 
             if new_caches is not None and new_cache_i is not None:
                 new_caches[time_index] = new_cache_i
@@ -1095,6 +1122,7 @@ class Dynamics(nnx.Module):
         tau_indices,
         packed_enc_tokens,
         *,
+        B_img: int = 0,
         task_embeddings: jnp.ndarray | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
@@ -1106,6 +1134,7 @@ class Dynamics(nnx.Module):
             step_indices: (B, T) int32 — step indices for embedding lookup
             tau_indices: (B, T) int32 - signal indices for embedding lookup
             packed_enc_tokens: (B, T, n_spatial, d_spatial) packed encoder tokens
+            B_img: number of image samples (last B_img rows get T=1 time attention)
             caches: optional dict of KVCache for each layer
 
         Shapes produced:
@@ -1149,7 +1178,7 @@ class Dynamics(nnx.Module):
         space_mask = layout.build_space_mask("wm_agent")
 
         x, new_caches = self.transformer(
-            tokens, space_mask=space_mask,
+            tokens, space_mask=space_mask, B_img=B_img,
             deterministic=deterministic,
             caches=caches,
             rngs=rngs

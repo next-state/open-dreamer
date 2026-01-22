@@ -35,7 +35,7 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Training Step
 # ---------------------------
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "B_self"))
+@nnx.jit(static_argnames=("packing_factor", "k_max", "B_self", "image_fraction"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -49,6 +49,7 @@ def encode_and_train_step(
     packing_factor: int,
     B_self: int,
     k_max: int,
+    image_fraction: float,
 ):
     # Phase 1: Encode videos to latents
     rngs = nnx.Rngs(mae=tokenizer_key)
@@ -62,13 +63,13 @@ def encode_and_train_step(
     # Phase 2: Training step
     metrics = train_step(
         dynamics, optimizer, latents, actions,
-        B_self=B_self, k_max=k_max, master_key=master_key, step=step
+        B_self=B_self, k_max=k_max, image_fraction=image_fraction, master_key=master_key, step=step
     )
 
     return metrics
 
 
-@nnx.jit(static_argnames=("k_max", "B_self"))
+@nnx.jit(static_argnames=("k_max", "B_self", "image_fraction"))
 def train_step(
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
@@ -77,6 +78,7 @@ def train_step(
     *,
     B_self: int,
     k_max: int,
+    image_fraction: float,
     master_key: jax.Array,
     step: int
 ):
@@ -92,6 +94,7 @@ def train_step(
             rng=step_key,
             k_max=k_max,
             B_self=B_self,
+            image_fraction=image_fraction,
             task_embeddings=None,  # Not used in dynamics pretraining
         )
         return losses['total'], aux
@@ -196,6 +199,7 @@ def run(cfg: DynamicsConfig):
                     packing_factor=cfg.dynamics.packing_factor,
                     B_self=cfg.dataset.B//2,
                     k_max=cfg.dynamics.k_max,
+                    image_fraction=cfg.image_fraction,
                 )
 
                 # Logging

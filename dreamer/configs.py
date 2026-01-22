@@ -296,10 +296,9 @@ class DynamicsConfig(BaseExperimentConfig):
     dynamics: DynamicsModelConfig = field(default_factory=DynamicsModelConfig)
 
     # Training
-    max_steps: int = 50_000
     bootstrap_start: int = 5_000
     self_fraction: float = 0.25
-    batch_size: int = 16
+    image_fraction: float = 0.3
 
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
@@ -323,6 +322,7 @@ class HeadsConfig(BaseExperimentConfig):
     # Training hyperparameters
     bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
     self_fraction: float = 0.25   # used once we pass bootstrap_start
+    image_fraction: float = 0.0
     dynamics_loss_weight: float = 0.1
 
     # Learning rate schedules (one per component)
