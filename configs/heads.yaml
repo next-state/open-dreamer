@@ -60,7 +60,6 @@ reward_head:
 # Training hyperparameters
 bootstrap_start: 5000
 self_fraction: 0.25
-image_fraction: 0.0  # Fraction of batch to train as images (no temporal attention)
 dynamics_loss_weight: 0.1
 
 max_steps: 1_000_000_000

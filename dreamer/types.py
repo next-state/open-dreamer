@@ -16,6 +16,8 @@ from jax import Array
 from dataclasses import dataclass
 from flax import nnx
 
+from .configs import DatasetConfig
+
 
 @dataclass
 class Actions(nnx.Pytree):
@@ -34,7 +36,38 @@ class Actions(nnx.Pytree):
         """Slice Actions along batch/time dimensions."""
         return jax.tree.map(lambda x: x[key] if x is not None else None, self)
 
-# sources: (I had to interpolate a bit)
+
+def get_noop_action_like(template: Actions, cfg: DatasetConfig) -> Actions:
+    """Creates a (B, 1, ...) no-op start action."""
+
+    def _create_action(arr, fill_value):
+        if arr is None: return None
+        return jnp.full_like(arr[:, 0:1], fill_value)
+
+    return Actions(
+        binary     = _create_action(template.binary, 0),
+        categorical = _create_action(template.categorical, cfg.categorical_action_dim - 1),
+        continuous  = _create_action(template.continuous, 0.0)
+    )
+
+
+def shift_actions(actions: Actions, cfg: DatasetConfig) -> Actions:
+    """Shift actions right by 1, preprend noop action."""
+
+    noop_action = get_noop_action_like(actions, cfg)
+    
+    def _shift(current_arr, start_arr):
+        if current_arr is None: return None
+        return jnp.concatenate([start_arr, current_arr[:, :-1]], axis=1)
+
+    return Actions(
+        binary      = _shift(actions.binary, noop_action.binary),
+        categorical = _shift(actions.categorical, noop_action.categorical),
+        continuous  = _shift(actions.continuous, noop_action.continuous)
+    )
+
+
+# sources:
 # https://github.com/garrettallen14/JEPA-Image-World-Model/blob/main/video_dataset.py 
 # https://github.com/microsoft/imitation_learning_in_modern_video_games/blob/main/pixelbc/data/minerl_actions.py
 # https://github.com/openai/Video-Pre-Training/blob/main/lib/actions.py

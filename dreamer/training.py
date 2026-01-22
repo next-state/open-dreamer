@@ -216,7 +216,6 @@ def shortcut_forcing_step(
     k_max: int,
     *,
     B_self: int = 0,
-    image_fraction: float = 0.0,
     task_embeddings: jnp.ndarray | None = None,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
@@ -232,7 +231,6 @@ def shortcut_forcing_step(
         rng: Random key
         k_max: Maximum noise resolution
         B_self: Number of bootstrap examples (last B_self rows of batch)
-        image_fraction: Fraction of batch to train as images (diagonal-only time attention)
         task_embeddings: Optional (B, T, n_agent, d_model) agent tokens
 
     Returns:
@@ -243,15 +241,10 @@ def shortcut_forcing_step(
     """
     B, T, S, D = latents.shape
     B_emp = B - B_self
-    B_img = int(B * image_fraction)  # FIXME: in the validation step, we should keep B_img static to avoid recompilation!
     emax = jnp.log2(k_max).astype(jnp.int32)
 
     # Split RNG
     key_sigma, key_step, key_noise, key_dropout1, key_dropout2, key_dropout3 = jax.random.split(rng, 6)
-
-    # Set noop actions for image samples (last B_img rows)
-    if B_img > 0:
-        actions = set_noop_actions(actions, B_img)  # FIXME: make noop ops part of the Actions class
 
     # --- Step indices ---
     # Empirical rows: always use finest step (d_min)
@@ -280,7 +273,7 @@ def shortcut_forcing_step(
     rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
         actions, step_idx_full, sigma_idx_full, z_tilde,
-        B_img=B_img, task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
+        task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
     )
     
     # --- Flow loss (empirical rows) ---
@@ -296,8 +289,6 @@ def shortcut_forcing_step(
         z_tilde_self = z_tilde[B_emp:]
         actions_self = actions[B_emp:]
         task_embeddings_self = task_embeddings[B_emp:] if task_embeddings is not None else None
-        # B_img for bootstrap portion: how many of B_self are images
-        B_img_self = max(0, B_img - B_emp)  # FIXME: review!
 
         # Half-step metadata
         d_half = d_self / 2.0
@@ -309,7 +300,7 @@ def shortcut_forcing_step(
         rngs2 = nnx.Rngs(dropout=key_dropout2)
         z1_half1, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
-            B_img=B_img_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs2
+            task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs2
         )
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
@@ -318,7 +309,7 @@ def shortcut_forcing_step(
         rngs3 = nnx.Rngs(dropout=key_dropout3)
         z1_half2, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
-            B_img=B_img_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
+            task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
         )
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
 

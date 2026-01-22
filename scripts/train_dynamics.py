@@ -6,12 +6,14 @@ import jax.numpy as jnp
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
+from functools import partial
+from einops import rearrange, repeat
 
 from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.types import Actions
+from dreamer.types import Actions, get_noop_action_like
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
@@ -35,7 +37,7 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Training Step
 # ---------------------------
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "B_self", "image_fraction"))
+@nnx.jit(static_argnames=("packing_factor", "k_max", "B_self"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -49,7 +51,6 @@ def encode_and_train_step(
     packing_factor: int,
     B_self: int,
     k_max: int,
-    image_fraction: float,
 ):
     # Phase 1: Encode videos to latents
     rngs = nnx.Rngs(mae=tokenizer_key)
@@ -63,13 +64,13 @@ def encode_and_train_step(
     # Phase 2: Training step
     metrics = train_step(
         dynamics, optimizer, latents, actions,
-        B_self=B_self, k_max=k_max, image_fraction=image_fraction, master_key=master_key, step=step
+        B_self=B_self, k_max=k_max, master_key=master_key, step=step
     )
 
     return metrics
 
 
-@nnx.jit(static_argnames=("k_max", "B_self", "image_fraction"))
+@nnx.jit(static_argnames=("k_max", "B_self"))
 def train_step(
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
@@ -78,7 +79,6 @@ def train_step(
     *,
     B_self: int,
     k_max: int,
-    image_fraction: float,
     master_key: jax.Array,
     step: int
 ):
@@ -94,7 +94,6 @@ def train_step(
             rng=step_key,
             k_max=k_max,
             B_self=B_self,
-            image_fraction=image_fraction,
             task_embeddings=None,  # Not used in dynamics pretraining
         )
         return losses['total'], aux
@@ -167,6 +166,13 @@ def run(cfg: DynamicsConfig):
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
+        # Train step helper
+        encode_and_train_step_partial = partial(encode_and_train_step,
+            bundle.tokenizer, bundle.dynamics, bundle.dynamics_optimizer,
+            packing_factor=cfg.dynamics.packing_factor,
+            k_max=cfg.dynamics.k_max,
+        )
+
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
             item_names=DynamicsCheckpointBundle.get_item_names()
@@ -189,28 +195,31 @@ def run(cfg: DynamicsConfig):
                 videos = jax.device_put(batch["videos"], data_sharding)
                 actions = jax.device_put(batch["actions"], data_sharding)
 
-                # Training step
-                aux = encode_and_train_step(
-                    bundle.tokenizer, bundle.dynamics, bundle.dynamics_optimizer,
-                    videos, actions,
-                    tokenizer_key=tokenizer_key,
-                    master_key=master_key,
-                    step=step,
-                    packing_factor=cfg.dynamics.packing_factor,
-                    B_self=cfg.dataset.B//2,
-                    k_max=cfg.dynamics.k_max,
-                    image_fraction=cfg.image_fraction,
-                )
+                # Training step 1: treat cfg.image_fraction of the samples as separate images
+                B_img = int(cfg.dataset.B * cfg.image_fraction)
+                images = rearrange(videos[:B_img], 'B_img T H W C -> (B_img T) 1 H W C')
+                noop_actions = get_noop_action_like(actions[:B_img], cfg.dataset)
+                noop_actions = jax.tree.map(lambda x: repeat(x, 'B_img 1 ... -> (B_img T) 1 ...', T=cfg.dataset.T), noop_actions)
+                aux_img = encode_and_train_step_partial(images, noop_actions, tokenizer_key=tokenizer_key, master_key=master_key, step=step, B_self=B_img * cfg.dataset.T // 2)
+
+                # Training step 2: treat remaining samples as videos
+                B_vid = cfg.dataset.B - B_img
+                videos = videos[B_img:]   # (B_vid, T, H, W, C)
+                actions = actions[B_img:] # (B_vid, T, ...)
+                aux_vid = encode_and_train_step_partial(videos, actions, tokenizer_key=tokenizer_key, master_key=master_key, step=step, B_self=B_vid // 2)
 
                 # Logging
                 if logger.should_log(step):
-                    metrics_cpu = jax.device_get(aux)
-                    scaling.on_step(step, metrics_cpu)
+                    metrics_img_cpu = jax.device_get(aux_img)
+                    metrics_vid_cpu = jax.device_get(aux_vid)
+                    scaling.on_step(step, metrics_vid_cpu)
                     logger.log(
                         step,
                         metrics={
-                            "flow_mse": metrics_cpu["flow_mse"],
-                            "boot_mse": metrics_cpu["bootstrap_mse"],
+                            "image/flow_mse": metrics_img_cpu["flow_mse"],
+                            "image/boot_mse": metrics_img_cpu["bootstrap_mse"],
+                            "video/flow_mse": metrics_vid_cpu["flow_mse"],
+                            "video/boot_mse": metrics_vid_cpu["bootstrap_mse"],
                             "lr": lr_schedule(step),
                             **scaling.get_step_metrics(step),
                         },

@@ -27,8 +27,7 @@ from dreamer.configs import HeadsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
-from dreamer.types import Actions
-from dreamer.configs import DatasetConfig
+from dreamer.types import Actions, shift_actions
 from dreamer.parallel import build_parallel
 from dreamer.training import (
     compute_policy_loss,
@@ -49,24 +48,6 @@ from dreamer.utils import (
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
-
-
-# ---------------------------
-# Action helpers
-# ---------------------------
-
-def shift_actions(actions: Actions, cfg: DatasetConfig) -> Actions:
-    """Shift actions right by 1, preprend noop action."""
-    
-    def _shift(x, v):
-        if x is None: return None
-        return jnp.concatenate([jnp.full_like(x[:, :1], v), x[:, :-1]], axis=1)
-
-    return Actions(
-        binary      = _shift(actions.binary, 0),
-        categorical = _shift(actions.categorical, cfg.categorical_action_dim - 1),
-        continuous  = _shift(actions.continuous, 0.0)
-    )
 
 
 # ---------------------------
@@ -144,7 +125,7 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, BTL: tuple[int, int, int]) ->
 # Training step
 # ---------------------------
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "L_mtp", "B_self", "image_fraction"))
+@nnx.jit(static_argnames=("packing_factor", "k_max", "L_mtp", "B_self"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -166,7 +147,6 @@ def encode_and_train_step(
     k_max: int,
     L_mtp: int,
     B_self: int,
-    image_fraction: float,
     dynamics_loss_weight: float,
 ) -> dict:
     """
@@ -186,13 +166,13 @@ def encode_and_train_step(
         policy_optimizer, reward_optimizer,
         latents, actions, rewards,
         master_key=master_key, step=step,
-        k_max=k_max, L_mtp=L_mtp, B_self=B_self, image_fraction=image_fraction,
+        k_max=k_max, L_mtp=L_mtp, B_self=B_self,
         dynamics_loss_weight=dynamics_loss_weight
     )
     return metrics
 
 
-@nnx.jit(static_argnames=("k_max", "L_mtp", "B_self", "image_fraction"))
+@nnx.jit(static_argnames=("k_max", "L_mtp", "B_self"))
 def train_step(
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
@@ -211,7 +191,6 @@ def train_step(
     k_max: int,
     L_mtp: int,
     B_self: int,
-    image_fraction: float,
     dynamics_loss_weight: float,
 ) -> dict:
     """
@@ -242,7 +221,7 @@ def train_step(
         # Dynamics loss (also returns hidden states for BC/reward training)
         dyn_losses, dyn_aux = shortcut_forcing_step(
             dyn, actions, latents, step_key, k_max,
-            B_self=B_self, image_fraction=image_fraction, task_embeddings=agent_tokens_bt
+            B_self=B_self, task_embeddings=agent_tokens_bt
         )
         dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
 
@@ -383,7 +362,6 @@ def run(cfg: HeadsConfig):
                     k_max=bundle.dynamics.cfg.k_max,
                     L_mtp=cfg.policy_head.L,
                     B_self=(B // 2) * (step >= cfg.bootstrap_start),  # This will make the function compile twice. TODO: see if it's worth fixing this
-                    image_fraction=cfg.image_fraction,
                     dynamics_loss_weight=cfg.dynamics_loss_weight,
                 )
 

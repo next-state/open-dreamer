@@ -322,7 +322,6 @@ class HeadsConfig(BaseExperimentConfig):
     # Training hyperparameters
     bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
     self_fraction: float = 0.25   # used once we pass bootstrap_start
-    image_fraction: float = 0.0
     dynamics_loss_weight: float = 0.1
 
     # Learning rate schedules (one per component)
