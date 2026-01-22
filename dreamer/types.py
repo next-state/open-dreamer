@@ -16,8 +16,6 @@ from jax import Array
 from dataclasses import dataclass
 from flax import nnx
 
-from .configs import DatasetConfig
-
 
 @dataclass
 class Actions(nnx.Pytree):
@@ -37,7 +35,7 @@ class Actions(nnx.Pytree):
         return jax.tree.map(lambda x: x[key] if x is not None else None, self)
 
 
-def get_noop_action_like(template: Actions, cfg: DatasetConfig) -> Actions:
+def create_noop_action_like(template: Actions, categorical_action_dim: int) -> Actions:
     """Creates a (B, 1, ...) no-op start action."""
 
     def _create_action(arr, fill_value):
@@ -46,15 +44,15 @@ def get_noop_action_like(template: Actions, cfg: DatasetConfig) -> Actions:
 
     return Actions(
         binary     = _create_action(template.binary, 0),
-        categorical = _create_action(template.categorical, cfg.categorical_action_dim - 1),
+        categorical = _create_action(template.categorical, categorical_action_dim - 1),
         continuous  = _create_action(template.continuous, 0.0)
     )
 
 
-def shift_actions(actions: Actions, cfg: DatasetConfig) -> Actions:
+def shift_actions(actions: Actions, categorical_action_dim: int) -> Actions:
     """Shift actions right by 1, preprend noop action."""
 
-    noop_action = get_noop_action_like(actions, cfg)
+    noop_action = create_noop_action_like(actions, categorical_action_dim)
     
     def _shift(current_arr, start_arr):
         if current_arr is None: return None

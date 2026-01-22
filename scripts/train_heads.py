@@ -346,7 +346,7 @@ def run(cfg: HeadsConfig):
                 rewards = jax.device_put(batch["rewards"], data_sharding)
 
                 # Action shifting: prepend "first action token" (noop) so action[t] aligns with state[t]
-                actions = shift_actions(actions, cfg.dataset)
+                actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
 
                 # Training step (encodes videos and trains)
                 B = cfg.dataset.B

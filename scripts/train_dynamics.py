@@ -6,14 +6,13 @@ import jax.numpy as jnp
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
-from functools import partial
 from einops import rearrange, repeat
 
 from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.types import Actions, get_noop_action_like
+from dreamer.types import Actions, create_noop_action_like
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
@@ -37,73 +36,113 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Training Step
 # ---------------------------
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "B_self"))
+@nnx.jit(static_argnames=("packing_factor", "k_max", "B_img", "T", "categorical_action_dim"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
-    videos: jnp.ndarray,
-    actions: Actions,
+    videos: jnp.ndarray,      # Full batch (B, T, H, W, C)
+    actions: Actions,         # Full batch (B, T, ...)
     *,
     tokenizer_key: jax.Array,
     master_key: jax.Array,
     step: int,
     packing_factor: int,
-    B_self: int,
+    B_img: int,               # Number of samples to treat as images
+    T: int,
+    categorical_action_dim: int,
     k_max: int,
 ):
-    # Phase 1: Encode videos to latents
     rngs = nnx.Rngs(mae=tokenizer_key)
-    latents, _ = tokenizer.encode(
-        videos,
-        packing_factor=packing_factor,
-        deterministic=True,
-        rngs=rngs
+
+    # Split batch: images vs videos
+    # Image portion: reshape (B_img, T) frames into (B_img * T, 1) single-frame sequences
+    images = rearrange(videos[:B_img], 'B_img T H W C -> (B_img T) 1 H W C')
+    noop_actions = create_noop_action_like(actions[:B_img], categorical_action_dim)
+    noop_actions = jax.tree.map(lambda x: repeat(x, 'B_img 1 ... -> (B_img T) 1 ...', T=T), noop_actions)
+
+    # Video portion: keep as-is
+    videos_batch = videos[B_img:]
+    actions_batch = jax.tree.map(lambda x: x[B_img:], actions)
+
+    # Encode both batches
+    latents_img, _ = tokenizer.encode(images, packing_factor=packing_factor, deterministic=True, rngs=rngs)
+    latents_vid, _ = tokenizer.encode(videos_batch, packing_factor=packing_factor, deterministic=True, rngs=rngs)
+
+    # Compute B_self values
+    B_self_img = B_img * T // 2
+    B_vid = videos.shape[0] - B_img
+    B_self_vid = B_vid // 2
+
+    # Training step
+    metrics_img, metrics_vid = train_step(
+        dynamics, optimizer,
+        latents_img, noop_actions,
+        latents_vid, actions_batch,
+        B_self_img=B_self_img,
+        B_self_vid=B_self_vid,
+        k_max=k_max,
+        master_key=master_key,
+        step=step
     )
 
-    # Phase 2: Training step
-    metrics = train_step(
-        dynamics, optimizer, latents, actions,
-        B_self=B_self, k_max=k_max, master_key=master_key, step=step
-    )
-
-    return metrics
+    return metrics_img, metrics_vid
 
 
-@nnx.jit(static_argnames=("k_max", "B_self"))
+@nnx.jit(static_argnames=("k_max", "B_self_img", "B_self_vid"))
 def train_step(
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
-    latents: jnp.ndarray,
-    actions: Actions,
+    latents_img: jnp.ndarray,
+    actions_img: Actions,
+    latents_vid: jnp.ndarray,
+    actions_vid: Actions,
     *,
-    B_self: int,
+    B_self_img: int,
+    B_self_vid: int,
     k_max: int,
     master_key: jax.Array,
     step: int
 ):
-    # Generate step-specific key
     step_key = jax.random.fold_in(master_key, step)
+    key_img, key_vid = jax.random.split(step_key, 2)
 
-    def loss_and_aux(dynamics_model: Dynamics):
-        """Loss function that takes the model and returns (loss, aux)."""
+    def loss_fn(model: Dynamics, latents, actions, rng, B_self):
         losses, aux = shortcut_forcing_step(
-            dynamics_model=dynamics_model,
+            dynamics_model=model,
             actions=actions,
             latents=latents,
-            rng=step_key,
+            rng=rng,
             k_max=k_max,
             B_self=B_self,
             task_embeddings=None,  # Not used in dynamics pretraining
         )
         return losses['total'], aux
 
-    (loss_val, metrics), grads = nnx.value_and_grad(loss_and_aux, has_aux=True)(dynamics)
+    # Compute gradients for images
+    (loss_img, aux_img), grads_img = nnx.value_and_grad(loss_fn, has_aux=True)(
+        dynamics, latents_img, actions_img, key_img, B_self_img
+    )
+
+    # Compute gradients for videos
+    (loss_vid, aux_vid), grads_vid = nnx.value_and_grad(loss_fn, has_aux=True)(
+        dynamics, latents_vid, actions_vid, key_vid, B_self_vid
+    )
+
+    # Aggregate gradients (weighted average by batch size)
+    B_img = latents_img.shape[0]
+    B_vid = latents_vid.shape[0]
+    total_B = B_img + B_vid
+
+    combined_grads = jax.tree.map(
+        lambda g1, g2: (g1 * B_img + g2 * B_vid) / total_B,
+        grads_img, grads_vid
+    )
 
     # Update model with optimizer
-    optimizer.update(dynamics, grads)
+    optimizer.update(dynamics, combined_grads)
 
-    return metrics
+    return aux_img, aux_vid
 
 # ---------------------------
 # Main
@@ -166,13 +205,6 @@ def run(cfg: DynamicsConfig):
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
-        # Train step helper
-        encode_and_train_step_partial = partial(encode_and_train_step,
-            bundle.tokenizer, bundle.dynamics, bundle.dynamics_optimizer,
-            packing_factor=cfg.dynamics.packing_factor,
-            k_max=cfg.dynamics.k_max,
-        )
-
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
             item_names=DynamicsCheckpointBundle.get_item_names()
@@ -195,18 +227,22 @@ def run(cfg: DynamicsConfig):
                 videos = jax.device_put(batch["videos"], data_sharding)
                 actions = jax.device_put(batch["actions"], data_sharding)
 
-                # Training step 1: treat cfg.image_fraction of the samples as separate images
+                # Training step
                 B_img = int(cfg.dataset.B * cfg.image_fraction)
-                images = rearrange(videos[:B_img], 'B_img T H W C -> (B_img T) 1 H W C')
-                noop_actions = get_noop_action_like(actions[:B_img], cfg.dataset)
-                noop_actions = jax.tree.map(lambda x: repeat(x, 'B_img 1 ... -> (B_img T) 1 ...', T=cfg.dataset.T), noop_actions)
-                aux_img = encode_and_train_step_partial(images, noop_actions, tokenizer_key=tokenizer_key, master_key=master_key, step=step, B_self=B_img * cfg.dataset.T // 2)
-
-                # Training step 2: treat remaining samples as videos
                 B_vid = cfg.dataset.B - B_img
-                videos = videos[B_img:]   # (B_vid, T, H, W, C)
-                actions = actions[B_img:] # (B_vid, T, ...)
-                aux_vid = encode_and_train_step_partial(videos, actions, tokenizer_key=tokenizer_key, master_key=master_key, step=step, B_self=B_vid // 2)
+
+                aux_img, aux_vid = encode_and_train_step(
+                    bundle.tokenizer, bundle.dynamics, bundle.dynamics_optimizer,
+                    videos, actions,
+                    tokenizer_key=tokenizer_key,
+                    master_key=master_key,
+                    step=step,
+                    packing_factor=cfg.dynamics.packing_factor,
+                    B_img=B_img,
+                    T=cfg.dataset.T,
+                    categorical_action_dim=cfg.dataset.categorical_action_dim,
+                    k_max=cfg.dynamics.k_max,
+                )
 
                 # Logging
                 if logger.should_log(step):
