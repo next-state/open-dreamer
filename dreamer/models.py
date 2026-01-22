@@ -2,7 +2,7 @@ import einops
 import jax.numpy as jnp
 from flax import nnx
 import jax
-from typing import Optional, Tuple, Any, Dict
+from typing import Tuple, Any, Dict
 from einops import rearrange, repeat
 import math
 from .utils import (
@@ -119,6 +119,9 @@ class KVCache:
         return k_ordered, v_ordered, final_mask
 
 
+KVCachesDict = Dict[int, KVCache]  # Type alias for KV cache dictionaries
+
+
 def create_transformer_caches(
     depth: int,
     time_every: int,
@@ -127,7 +130,7 @@ def create_transformer_caches(
     num_kv_heads: int,
     head_dim: int,
     dtype=jnp.float32,
-) -> Dict[int, KVCache]:
+) -> KVCachesDict:
     """
     Creates KV cache dictionary for transformer layers.
 
@@ -295,7 +298,7 @@ class MLP(nnx.Module):
         self.fc_out = nnx.Linear(hidden, d_model, use_bias=self.use_bias, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
         self.dropout = nnx.Dropout(dropout_rate)
 
-    def __call__(self, x: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, *, deterministic: bool = True, rngs: nnx.Rngs | None = None) -> jnp.ndarray:
         if self.use_norm:
             x = self.norm(x)
 
@@ -354,7 +357,15 @@ class GroupedQueryAttention(nnx.Module):
 
         self.rope = RotaryEmbedding1D(dim=head_dim, theta=self.rope_theta, dtype=dtype, param_dtype=param_dtype)
 
-    def __call__(self, x, mask, *args, cache: Optional[KVCache] = None, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None):
+    def __call__(
+            self,
+            x,
+            *args,
+            mask: jnp.ndarray | None = None,
+            deterministic: bool = True,
+            cache: KVCache | None = None,
+            rngs: nnx.Rngs | None = None
+        ):
         """
         https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html
         B = batch size
@@ -434,12 +445,20 @@ class SpaceSelfAttention(nnx.Module):
             mesh_rules=mesh_rules, rngs=rngs
         )
 
-    def __call__(self, x, mask, *, deterministic: bool = True, cache: Optional[KVCache] = None, rngs: Optional[nnx.Rngs] = None):
+    def __call__(
+            self,
+            x,
+            *,
+            mask: jnp.ndarray | None = None,
+            deterministic: bool = True,
+            cache: KVCache | None = None,
+            rngs: nnx.Rngs | None = None
+        ):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B T) S D")
 
-        out, _ = self.attn(x, mask=mask, cache=None, deterministic=deterministic, rngs=rngs)
+        out, _ = self.attn(x, mask=mask, deterministic=deterministic, cache=None, rngs=rngs)
 
         out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
         return out, None  # Return None for cache consistency
@@ -464,18 +483,17 @@ class TimeSelfAttention(nnx.Module):
     def __call__(
         self,
         x,
-        mask,
         *,
+        mask,
         deterministic: bool = True,
-        cache: Optional[KVCache] = None,
-        rngs: Optional[nnx.Rngs] = None
+        cache: KVCache | None = None,
+        rngs: nnx.Rngs | None = None
     ):
-        # mask does nothing, but is required for API consistency  # TODO: implement independent masking
         # x: (B, T, S, D) -> attention across T, causal
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
 
-        out, new_cache = self.attn(x, mask=None, cache=cache, deterministic=deterministic, rngs=rngs)
+        out, new_cache = self.attn(x, mask=mask, deterministic=deterministic, cache=cache, rngs=rngs)
 
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         return out, new_cache
@@ -521,15 +539,17 @@ class BlockCausalLayer(nnx.Module):
     def __call__(
         self,
         x,
-        mask,
         *,
+        space_mask: jnp.ndarray | None = None,
+        time_mask: jnp.ndarray | None = None,
         deterministic: bool = True,
-        cache: Optional[KVCache] = None,
-        rngs: Optional[nnx.Rngs] = None
+        cache: KVCache | None = None,
+        rngs: nnx.Rngs | None = None
     ):
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
-        y, new_cache = self.attn(y, mask=mask, deterministic=deterministic, cache=cache, rngs=rngs)
+        attn_mask = time_mask if self.use_time else space_mask
+        y, new_cache = self.attn(y, mask=attn_mask, deterministic=deterministic, cache=cache, rngs=rngs)
         x = x + y
 
         # MLP
@@ -578,16 +598,18 @@ class BlockCausalTransformer(nnx.Module):
     def __call__(
         self,
         x,
-        mask,
         *,
+        space_mask: jnp.ndarray | None = None,
+        time_mask: jnp.ndarray | None = None,
         deterministic: bool = True,
-        caches: Optional[Dict[int, KVCache]] = None,
-        rngs: Optional[nnx.Rngs] = None
-    ) -> Tuple[jax.Array, KVCache | None]:
+        caches: KVCachesDict | None = None,
+        rngs: nnx.Rngs | None = None
+    ) -> Tuple[jax.Array, KVCachesDict | None]:
         """
         Args:
             x: (B, T, S, D) input tensor
-            mask: attention mask (spatial)
+            space_mask: optional spatial attention mask
+            time_mask: optional time attention mask
             deterministic: whether to use deterministic mode (no dropout)
             caches: optional dict mapping layer_index -> KVCache
             rngs: optional RNG state for dropout
@@ -606,7 +628,7 @@ class BlockCausalTransformer(nnx.Module):
             is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
 
-            x, new_cache_i = layer(x, mask=mask, deterministic=deterministic, cache=cache_i, rngs=rngs)
+            x, new_cache_i = layer(x, space_mask=space_mask, time_mask=time_mask, deterministic=deterministic, cache=cache_i, rngs=rngs)
 
             if new_caches is not None and new_cache_i is not None:
                 new_caches[time_index] = new_cache_i
@@ -692,10 +714,10 @@ class Encoder(nnx.Module):
             (Modality.LATENT, self.n_latents),
             (Modality.IMAGE, patch_tokens.shape[-2]),
         ))
-        mask = layout.make_mask("encoder")  # (1, 1, q_len, k_len)
+        space_mask = layout.make_space_mask("encoder")  # (1, 1, q_len, k_len)
 
         # Feed tokens into transformer
-        encoded_tokens, _ = self.transformer(tokens, mask=mask, deterministic=deterministic, rngs=rngs)
+        encoded_tokens, _ = self.transformer(tokens, space_mask=space_mask, deterministic=deterministic, rngs=rngs)
 
         # Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
@@ -745,27 +767,36 @@ class Decoder(nnx.Module):
             (Modality.IMAGE, self.n_patches)
         ))
 
-    def __call__(self, z: jnp.ndarray, *, deterministic: bool = True, packing_factor = None, caches: Optional[Dict[int, KVCache]] = None, rngs: Optional[nnx.Rngs] = None):
+    def __call__(
+            self,
+            z: jnp.ndarray,
+            *,
+            deterministic: bool = True,
+            packing_factor = None,
+            caches: KVCachesDict | None = None,
+            rngs: nnx.Rngs | None = None
+        ):
         if packing_factor is not None:
             z = rearrange(z, "... n (p d) -> ... (n p) d", p=packing_factor)
 
         B, T, N_l, d_bottleneck = z.shape
-        # 1) Up-project latent bottleneck to d_model (per latent token)
+
+        # Up-project latent bottleneck to d_model (per latent token)
         latents = self.up_proj(z)  # (B, T, N_l, D)
 
-        # 2) Learned per-patch query tokens (owned by the decoder)
+        # Learned per-patch query tokens (owned by the decoder)
         patches = repeat(self.patch_queries.value.astype(latents.dtype), " ... -> b t ...", b=B, t=T)  # (B, T, Np, D)
 
-        # 3) Concat: [latents, patch queries]  ->  (B, T, S=N_l+N_p, D)
+        # Concat: [latents, patch queries]  ->  (B, T, S=N_l+N_p, D)
         tokens = jnp.concatenate([latents, patches], axis=-2)
 
-        # 5) Make mask
+        # Make mask
         layout = self.get_token_layout()
-        mask = layout.make_mask("decoder")
+        space_mask = layout.make_space_mask("decoder")
 
-        x, new_caches = self.transformer(tokens, mask=mask, deterministic=deterministic, caches=caches, rngs=rngs)
-        # 6) Prediction head over the patch-query slice
+        x, new_caches = self.transformer(tokens, space_mask=space_mask, deterministic=deterministic, caches=caches, rngs=rngs)
 
+        # Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
         pred_btnd = self.patch_head(x_patches)  # (B, T, Np, D_patch)
         out_normalized_frames = unpatchify(pred_btnd, patch=self.patch_size, H=self.H, W=self.W)
@@ -790,11 +821,11 @@ class Tokenizer(nnx.Module):
     def encode(self, videos, *, deterministic: bool = True, packing_factor = None, rngs: nnx.Rngs | None = None):
         return self.encoder(videos, deterministic=deterministic, packing_factor=packing_factor, rngs=rngs)
 
-    def decode(self, z, *, deterministic: bool = True, caches=None, packing_factor = None, rngs: Optional[nnx.Rngs] = None):
+    def decode(self, z, *, deterministic: bool = True, caches: KVCachesDict | None = None, packing_factor = None, rngs: nnx.Rngs | None = None):
         frames, caches = self.decoder(z, deterministic=deterministic, packing_factor=packing_factor, caches=caches, rngs=rngs)
         return frames, caches
 
-    def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> Dict[int, KVCache]:
+    def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
         """Creates concrete, zero-filled KV cache buffers for JIT compilation."""
         layout = self.decoder.get_token_layout()
 
@@ -1043,7 +1074,7 @@ class Dynamics(nnx.Module):
         return TokenLayout(tuple(segments))
 
     def create_static_caches(self, batch_size: int, n_spatial: int, window_size: int = 1024,
-                           n_agent: int = 0, dtype=jnp.float32) -> Dict[int, KVCache]:
+                           n_agent: int = 0, dtype=jnp.float32) -> KVCachesDict:
         """Creates concrete, zero-filled buffers for JIT compilation."""
         layout = self.get_token_layout(n_spatial=n_spatial, n_agent=n_agent)
 
@@ -1064,17 +1095,19 @@ class Dynamics(nnx.Module):
         tau_indices,
         packed_enc_tokens,
         *,
-        task_embeddings: Optional[jnp.ndarray] = None,
+        time_mask: jnp.ndarray | None = None,
+        task_embeddings: jnp.ndarray | None = None,
         deterministic: bool = True,
-        caches: Optional[KVCache | None] = None,
-        rngs: Optional[nnx.Rngs] = None
-    ) -> Tuple[jax.Array, Tuple[jax.Array | None, KVCache | None]]:
+        caches: KVCachesDict | None = None,
+        rngs: nnx.Rngs | None = None
+    ) -> Tuple[jax.Array, Tuple[jax.Array | None, KVCachesDict | None]]:
         """
         Args:
             actions: Actions object
             step_indices: (B, T) int32 — step indices for embedding lookup
             tau_indices: (B, T) int32 - signal indices for embedding lookup
             packed_enc_tokens: (B, T, n_spatial, d_spatial) packed encoder tokens
+            time_mask: optional time attention mask
             caches: optional dict of KVCache for each layer
 
         Shapes produced:
@@ -1109,16 +1142,17 @@ class Dynamics(nnx.Module):
         tokens = [action_token, shortcut_token, spatial_tokens, register_tokens]
         if task_embeddings is not None:
             tokens.append(task_embeddings)
-            
+
         tokens = jnp.concatenate(tokens, axis=2)  # (B, T, S, D)
 
         # make the layout for masking
         n_agent = task_embeddings.shape[2] if task_embeddings is not None else 0
         layout = self.get_token_layout(n_spatial=spatial_tokens.shape[2], n_agent=n_agent)
-        mask = layout.make_mask("wm_agent")
+        space_mask = layout.make_space_mask("wm_agent")
 
         x, new_caches = self.transformer(
-            tokens, mask,
+            tokens,
+            space_mask=space_mask, time_mask=time_mask,
             deterministic=deterministic,
             caches=caches,
             rngs=rngs
@@ -1259,7 +1293,7 @@ class PolicyHeadMTP(nnx.Module):
         h_t: jnp.ndarray,
         *,
         deterministic: bool = True,
-        rngs: Optional[nnx.Rngs] = None
+        rngs: nnx.Rngs | None = None
     ) -> dict[str, jnp.ndarray]:
         """
         Forward pass.
@@ -1365,7 +1399,7 @@ class RewardHeadMTP(nnx.Module):
         # Precompute bin centers as a constant
         self.symexp_centers_log = jnp.linspace(cfg.log_low, cfg.log_high, cfg.num_bins)
 
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: nnx.Rngs | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, '... n c -> ... (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L*K)
@@ -1402,7 +1436,7 @@ class ValueHead(nnx.Module):
         self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
 
 
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: Optional[nnx.Rngs] = None) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: nnx.Rngs | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, K)

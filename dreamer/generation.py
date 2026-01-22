@@ -2,8 +2,8 @@ import math
 import einops
 import jax
 import jax.numpy as jnp
-from typing import Any, Tuple 
-from .models import Dynamics, KVCache, PolicyHeadMTP, Tokenizer
+from typing import Any, Tuple
+from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 from .types import Actions
 from flax.struct import dataclass
 
@@ -71,10 +71,10 @@ def next_latent(
     rng: jax.Array,
     prefill_length: int | None = None,
     task_embedding: jax.Array | None = None,  # (B, T_ctx+1, n_agent, d_model)
-    caches: KVCache | None = None,
+    caches: KVCachesDict | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: Actions | None = None,
-) -> Tuple[jax.Array, jax.Array | None, KVCache | None, jax.Array]:
+) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
 
@@ -193,7 +193,7 @@ def next_frame(
     tokenizer_cache: Any,
     rng: jax.Array,
     task_embedding: jax.Array | None = None,
-) -> Tuple[jax.Array, jax.Array | None, KVCache | None, Any, jax.Array]:
+) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, Any, jax.Array]:
     """
     Generate next frame using dynamics model and decode to pixels.
 
