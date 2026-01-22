@@ -99,7 +99,7 @@ class TokenLayout:
             idx += n
         return out
 
-    def make_space_mask(self, mode: str):
+    def build_space_mask(self, mode: str):
         """
         Returns a (1, 1, S, S) boolean mask indicating allowed key for each query index, per mode.
         S = number of tokens in a single frame.

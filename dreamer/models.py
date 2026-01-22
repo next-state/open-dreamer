@@ -484,7 +484,7 @@ class TimeSelfAttention(nnx.Module):
         self,
         x,
         *,
-        mask,
+        mask: jnp.ndarray | None = None,
         deterministic: bool = True,
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None
@@ -714,7 +714,7 @@ class Encoder(nnx.Module):
             (Modality.LATENT, self.n_latents),
             (Modality.IMAGE, patch_tokens.shape[-2]),
         ))
-        space_mask = layout.make_space_mask("encoder")  # (1, 1, q_len, k_len)
+        space_mask = layout.build_space_mask("encoder")  # (1, 1, q_len, k_len)
 
         # Feed tokens into transformer
         encoded_tokens, _ = self.transformer(tokens, space_mask=space_mask, deterministic=deterministic, rngs=rngs)
@@ -792,7 +792,7 @@ class Decoder(nnx.Module):
 
         # Make mask
         layout = self.get_token_layout()
-        space_mask = layout.make_space_mask("decoder")
+        space_mask = layout.build_space_mask("decoder")
 
         x, new_caches = self.transformer(tokens, space_mask=space_mask, deterministic=deterministic, caches=caches, rngs=rngs)
 
@@ -1095,7 +1095,6 @@ class Dynamics(nnx.Module):
         tau_indices,
         packed_enc_tokens,
         *,
-        time_mask: jnp.ndarray | None = None,
         task_embeddings: jnp.ndarray | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
@@ -1107,7 +1106,6 @@ class Dynamics(nnx.Module):
             step_indices: (B, T) int32 — step indices for embedding lookup
             tau_indices: (B, T) int32 - signal indices for embedding lookup
             packed_enc_tokens: (B, T, n_spatial, d_spatial) packed encoder tokens
-            time_mask: optional time attention mask
             caches: optional dict of KVCache for each layer
 
         Shapes produced:
@@ -1148,11 +1146,10 @@ class Dynamics(nnx.Module):
         # make the layout for masking
         n_agent = task_embeddings.shape[2] if task_embeddings is not None else 0
         layout = self.get_token_layout(n_spatial=spatial_tokens.shape[2], n_agent=n_agent)
-        space_mask = layout.make_space_mask("wm_agent")
+        space_mask = layout.build_space_mask("wm_agent")
 
         x, new_caches = self.transformer(
-            tokens,
-            space_mask=space_mask, time_mask=time_mask,
+            tokens, space_mask=space_mask,
             deterministic=deterministic,
             caches=caches,
             rngs=rngs
