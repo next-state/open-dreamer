@@ -1,13 +1,13 @@
 defaults:
   - common
-  - dataset: coinrun
+  - dataset: minecraft_vpt
   - _self_
 
 run_name: tokenizer
 
 dataset:
-  B: 256
-  T: 8
+  B: 16
+  T: 32
 
 ckpt:
   max_to_keep: 1

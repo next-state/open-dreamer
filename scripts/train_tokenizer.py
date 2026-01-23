@@ -64,9 +64,7 @@ def recon_loss_full_mse(pred, target):
     return jnp.mean(sq_err)  # scalar
 
 
-lpips_loss_fn = LPIPS(pretrained_network="alexnet")
-
-def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
+def lpips_on_mae_recon(lpips_model: LPIPS, pred, target, subsample_frac=1.0):
     # Lpips expects [-1, 1] pixel range. Normalize to [-1, 1]
     pred = (pred - 0.5) * 2
     target = (target - 0.5) * 2
@@ -79,14 +77,14 @@ def lpips_on_mae_recon(pred, target, subsample_frac=1.0):
 
     pred_lp = einops.rearrange(pred, "b t h w c -> (b t) h w c")
     tgt_lp  = einops.rearrange(target, "b t h w c -> (b t) h w c")
-    return jnp.mean(lpips_loss_fn(pred_lp, tgt_lp))
+    return jnp.mean(lpips_model(pred_lp, tgt_lp))
 
 # ------------------------
 # Train step
 # ------------------------
 
 @nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"))
-def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, dropout_key, step, 
+def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | None, videos, *, mae_key, dropout_key, step, 
                lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
 
     def loss_fn(model: Tokenizer):
@@ -106,7 +104,7 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, videos, *, mae_key, d
 
         lp = jnp.array(0.0)
         if lpips_weight > 0:
-            lp = lpips_on_mae_recon(pred / 255.0, videos / 255.0, lpips_frac)
+            lp = lpips_on_mae_recon(lpips_model, pred / 255.0, videos / 255.0, lpips_frac)
 
         total = mse + lpips_weight * lp
 
@@ -208,6 +206,9 @@ def run(cfg: TokenizerConfig):
         # Build optimizer
         optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule, d_model=cfg.tokenizer.encoder.d_model)
 
+        # Initialize LPIPS model once (avoids repeated HF downloads during JIT tracing)
+        lpips_model = LPIPS(pretrained_network="alexnet") if cfg.lpips_weight > 0 else None
+
         # Create checkpoint bundle
         bundle = TokenizerCheckpointBundle(
             tokenizer=tokenizer,
@@ -243,7 +244,7 @@ def run(cfg: TokenizerConfig):
                 videos = jax.device_put(batch["videos"], data_sharding)
 
                 aux = train_step(
-                    bundle.tokenizer, bundle.tokenizer_optimizer, videos,
+                    bundle.tokenizer, bundle.tokenizer_optimizer, lpips_model, videos,
                     mae_key=mae_key, dropout_key=dropout_key, step=step,
                     lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
                     dataset_mean=tuple(cfg.dataset.dataset_mean),
