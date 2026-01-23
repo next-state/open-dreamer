@@ -1,3 +1,4 @@
+import io
 import jax
 import numpy as np
 import grain
@@ -7,6 +8,29 @@ import glob
 import os
 
 from .configs import DatasetConfig
+
+
+# ==============================================================================
+# VPT Action Conversion
+# ==============================================================================
+
+VPT_BUTTON_KEYS = [
+    "attack", "back", "forward", "jump", "left", "right",
+    "sneak", "sprint", "use", "drop", "inventory",
+    "hotbar.1", "hotbar.2", "hotbar.3", "hotbar.4", "hotbar.5",
+    "hotbar.6", "hotbar.7", "hotbar.8", "hotbar.9"
+]
+
+
+def vpt_action_to_array(action_dict: dict) -> np.ndarray:
+    """Convert VPT action dict to (22,) float32 array: [camera(2), buttons(20)]."""
+    arr = np.zeros(22, dtype=np.float32)
+    arr[0:2] = action_dict.get("camera", [0.0, 0.0])
+    buttons = action_dict.get("buttons", {})
+    for i, key in enumerate(VPT_BUTTON_KEYS):
+        arr[2 + i] = float(buttons.get(key, 0))
+    arr[21] = float(action_dict.get("ESC", 0))
+    return arr
 
 
 # ==============================================================================
@@ -143,6 +167,64 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
 
 # ==============================================================================
+# Minecraft VPT Dataset (Decord-based for MP4 bytes)
+# ==============================================================================
+
+class MinecraftVPTDecordFilter(grain.transforms.Filter):
+    """Filter for Minecraft VPT records with MP4 bytes using decord."""
+
+    def __init__(self, seq_len: int, min_frames: int = 250):
+        self.seq_len = seq_len
+        self.min_frames = min_frames
+
+    def filter(self, element: bytes) -> bool:
+        from decord import VideoReader
+
+        data = pickle.loads(element)
+        try:
+            vr = VideoReader(io.BytesIO(data["video"]))
+            return len(vr) >= max(self.seq_len, self.min_frames)
+        except Exception:
+            return False
+
+
+class MinecraftVPTDecordProcessEpisodeAndSlice(grain.transforms.RandomMap):
+    """Process Minecraft VPT records with MP4 bytes using decord."""
+
+    def __init__(self, seq_len: int, include_actions: bool = True):
+        self.seq_len = seq_len
+        self.include_actions = include_actions
+
+    def random_map(self, element: bytes, rng: np.random.Generator) -> dict:
+        from decord import VideoReader, cpu
+
+        data = pickle.loads(element)
+
+        # Decode video
+        vr = VideoReader(io.BytesIO(data["video"]), ctx=cpu(0))
+        frame_count = len(vr)
+
+        # Random slice
+        max_start = max(0, frame_count - self.seq_len)
+        start = int(rng.integers(0, max_start + 1))
+        frames = vr.get_batch(range(start, start + self.seq_len)).asnumpy()
+
+        result = {
+            "videos": frames,
+            "rewards": np.zeros(self.seq_len, dtype=np.float32),
+        }
+
+        if self.include_actions:
+            action_list = pickle.loads(data["actions"])
+            action_slice = action_list[start : start + self.seq_len]
+            result["actions"] = np.stack([vpt_action_to_array(a) for a in action_slice])
+        else:
+            result["actions"] = None
+
+        return result
+
+
+# ==============================================================================
 # Factory
 # ==============================================================================
 
@@ -152,15 +234,20 @@ def make_iterator(
     prefetch_buffer_size: int = 1,
     seed: int = 42,
     print_filter_warnings: bool = False,
+    use_decord: bool = False,
 ):
     """
     Creates a data loading pipeline using Grain from a DatasetConfig.
+
+    Args:
+        use_decord: If True, use decord to decode MP4 bytes on-the-fly for minecraft_vpt.
+            This is required for data preprocessed with preprocess_minecraft.py.
     """
     # Build array record paths based on dataset type
     if cfg.name == "minecraft_vpt":
         # Minecraft VPT: generate shard paths from index_max
         assert cfg.index_max >= 0, "index_max must be > 0 for minecraft_vpt dataset"
-        array_record_paths = [f"{cfg.array_record_path}/shard-{i:05d}.array_record" for i in range(cfg.index_max)]
+        array_record_paths = [f"{cfg.array_record_path}/shard-{i:06d}.array_record" for i in range(cfg.index_max)]
     else:
         # CoinRun: discover files in directory
         array_record_paths = cfg.array_record_path
@@ -197,14 +284,26 @@ def make_iterator(
 
     # Build operations based on dataset type
     if cfg.name == "minecraft_vpt":
-        operations = [
-            EpisodeLengthFilter(
-                seq_len=cfg.T,
-                print_filter_warnings=print_filter_warnings,
-            ),
-            MinecraftVPTProcessEpisodeAndSlice(seq_len=cfg.T),
-            grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
-        ]
+        if use_decord:
+            # Decord-based pipeline for MP4 bytes (from preprocess_minecraft.py)
+            operations = [
+                MinecraftVPTDecordFilter(seq_len=cfg.T),
+                MinecraftVPTDecordProcessEpisodeAndSlice(
+                    seq_len=cfg.T,
+                    include_actions=True,
+                ),
+                grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
+            ]
+        else:
+            # Legacy pipeline for raw pixel bytes with video_shape metadata
+            operations = [
+                EpisodeLengthFilter(
+                    seq_len=cfg.T,
+                    print_filter_warnings=print_filter_warnings,
+                ),
+                MinecraftVPTProcessEpisodeAndSlice(seq_len=cfg.T),
+                grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
+            ]
     else:
         operations = [
             EpisodeLengthFilter(

@@ -23,6 +23,10 @@ dependencies = [
     "reactor-runtime>=0.0.4",
     "pandas>=2.3.3",
     "awscli>=1.27.0",
+    "huggingface-hub[cli]>=1.2.3",
+    "webdataset>=1.0.2",
+    "numpy>=1.26.4",
+    "decord>=0.6.0",
 ]
 
 [dependency-groups]

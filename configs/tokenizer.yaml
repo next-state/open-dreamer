@@ -17,7 +17,7 @@ tokenizer:
   encoder:
     n_latents: 16
     d_bottleneck: 16
-    depth: 5
+    depth: 9
     d_model: ${mul:64,${sum:${tokenizer.encoder.depth},${tokenizer.decoder.depth}}}
     n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
@@ -28,7 +28,7 @@ tokenizer:
     time_every: 4
     mae_p_min: 0.0
     mae_p_max: 0.9
-    patch_size: 20
+    patch_size: 8
     use_residual_lambdas: true
     use_bias: false
     use_rmsnorm_scale: true
@@ -71,7 +71,7 @@ lr_schedule:
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05
-  decay_ratio: 0.5
+  decay_ratio: 0.95
   max_steps: ${max_steps}
 
 optimizer:
