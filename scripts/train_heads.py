@@ -326,7 +326,7 @@ def run(cfg: HeadsConfig):
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
-        train_iterator = iter(train_dataloader)  # type: ignore
+        train_iterator = iter(train_dataloader)
 
         # Create RMS loss normalizer for balancing policy/reward/dynamics losses
         loss_normalizer = RMSLossNormalizer(loss_names=[

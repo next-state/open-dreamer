@@ -362,6 +362,7 @@ class GroupedQueryAttention(nnx.Module):
             x,
             *args,
             mask: jnp.ndarray | None = None,
+            local_window_size: int | tuple[int, int] | None = None,
             deterministic: bool = True,
             cache: KVCache | None = None,
             rngs: nnx.Rngs | None = None
@@ -412,14 +413,15 @@ class GroupedQueryAttention(nnx.Module):
             new_cache = None
             k_attn, v_attn = k, v
             mask_attn = mask
-            attn_is_causal = self.is_causal
+            attn_is_causal = self.is_causal and (mask is None)
 
         # SDPA
         attn = jax.nn.dot_product_attention(
             q, k_attn, v_attn,
             mask=mask_attn,
             scale=scale,
-            is_causal=attn_is_causal
+            is_causal=attn_is_causal,
+            local_window_size=local_window_size
         )  # TODO: try setting implementation="cudnn"
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
@@ -485,6 +487,7 @@ class TimeSelfAttention(nnx.Module):
         x,
         *,
         mask: jnp.ndarray | None = None,
+        local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None
@@ -493,7 +496,7 @@ class TimeSelfAttention(nnx.Module):
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
 
-        out, new_cache = self.attn(x, mask=mask, cache=cache, deterministic=deterministic, rngs=rngs)
+        out, new_cache = self.attn(x, mask=mask, local_window_size=local_window_size, cache=cache, deterministic=deterministic, rngs=rngs)
 
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         return out, new_cache
@@ -542,14 +545,20 @@ class BlockCausalLayer(nnx.Module):
         *,
         space_mask: jnp.ndarray | None = None,
         time_mask: jnp.ndarray | None = None,
+        time_local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None
     ):
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
-        attn_mask = time_mask if self.use_time else space_mask
-        y, new_cache = self.attn(y, mask=attn_mask, deterministic=deterministic, cache=cache, rngs=rngs)
+        if self.use_time:
+            attn_mask = time_mask if time_local_window_size is None else None
+            local_window_size = time_local_window_size
+        else:
+            attn_mask = space_mask
+            local_window_size = None
+        y, new_cache = self.attn(y, mask=attn_mask, local_window_size=local_window_size, deterministic=deterministic, cache=cache, rngs=rngs)
         x = x + y
 
         # MLP
@@ -601,6 +610,7 @@ class BlockCausalTransformer(nnx.Module):
         *,
         space_mask: jnp.ndarray | None = None,
         time_mask: jnp.ndarray | None = None,
+        time_local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
         rngs: nnx.Rngs | None = None
@@ -609,7 +619,8 @@ class BlockCausalTransformer(nnx.Module):
         Args:
             x: (B, T, S, D) input tensor
             space_mask: optional spatial attention mask
-            time_mask: optional time attention mask
+            time_mask: optional time attention mask (unused)
+            time_local_window_size: optional local window size for time attention (left, right) or int for symmetric
             deterministic: whether to use deterministic mode (no dropout)
             caches: optional dict mapping layer_index -> KVCache
             rngs: optional RNG state for dropout
@@ -628,7 +639,7 @@ class BlockCausalTransformer(nnx.Module):
             is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
 
-            x, new_cache_i = layer(x, space_mask=space_mask, time_mask=time_mask, deterministic=deterministic, cache=cache_i, rngs=rngs)
+            x, new_cache_i = layer(x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs)
 
             if new_caches is not None and new_cache_i is not None:
                 new_caches[time_index] = new_cache_i
@@ -1095,6 +1106,7 @@ class Dynamics(nnx.Module):
         tau_indices,
         packed_enc_tokens,
         *,
+        context_length: int | None = None,
         task_embeddings: jnp.ndarray | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
@@ -1106,6 +1118,9 @@ class Dynamics(nnx.Module):
             step_indices: (B, T) int32 — step indices for embedding lookup
             tau_indices: (B, T) int32 - signal indices for embedding lookup
             packed_enc_tokens: (B, T, n_spatial, d_spatial) packed encoder tokens
+            context_length: optional context length for sliding window attention. If provided,
+                           creates local_window_size=(context_length - 1, 0) for causal sliding window.
+            task_embeddings: (B, T, n_agent, d_model) optional agent tokens
             caches: optional dict of KVCache for each layer
 
         Shapes produced:
@@ -1143,13 +1158,19 @@ class Dynamics(nnx.Module):
 
         tokens = jnp.concatenate(tokens, axis=2)  # (B, T, S, D)
 
-        # make the layout for masking
+        # Make the layout for masking
         n_agent = task_embeddings.shape[2] if task_embeddings is not None else 0
         layout = self.get_token_layout(n_spatial=spatial_tokens.shape[2], n_agent=n_agent)
         space_mask = layout.build_space_mask("wm_agent")
 
+        # Compute local_window_size from context_length for sliding window causal attention
+        time_local_window_size = None
+        if context_length is not None:
+            time_local_window_size = (context_length - 1, 0)
+
         x, new_caches = self.transformer(
             tokens, space_mask=space_mask,
+            time_local_window_size=time_local_window_size,
             deterministic=deterministic,
             caches=caches,
             rngs=rngs

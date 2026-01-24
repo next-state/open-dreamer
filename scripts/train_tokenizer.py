@@ -216,7 +216,7 @@ def run(cfg: TokenizerConfig):
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
-        train_iterator = iter(train_dataloader)  # type: ignore
+        train_iterator = iter(train_dataloader)
 
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,

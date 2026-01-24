@@ -1,7 +1,8 @@
+import copy
 import jax
 import numpy as np
 import grain
-from typing import Any
+from typing import Any, Tuple
 import pickle
 import glob
 import os
@@ -288,3 +289,40 @@ def make_iterator(
     )
 
     return dataloader
+
+
+def make_dual_iterators(
+    cfg: DatasetConfig,
+    short_T: int,
+    long_T: int,
+    num_workers: int = 22,
+    prefetch_buffer_size: int = 1,
+    seed: int = 42,
+    print_filter_warnings: bool = False,
+) -> Tuple[grain.DataLoader, grain.DataLoader]:
+    """Create separate iterators for short and long sequences (alternating batch lengths)."""
+    # Create config for short sequences
+    cfg_short = copy.copy(cfg)
+    cfg_short.T = short_T
+
+    # Create config for long sequences
+    cfg_long = copy.copy(cfg)
+    cfg_long.T = long_T
+
+    # Use different seeds to avoid correlation between iterators
+    short_loader = make_iterator(
+        cfg_short,
+        num_workers=num_workers,
+        prefetch_buffer_size=prefetch_buffer_size,
+        seed=seed,
+        print_filter_warnings=print_filter_warnings,
+    )
+    long_loader = make_iterator(
+        cfg_long,
+        num_workers=num_workers,
+        prefetch_buffer_size=prefetch_buffer_size,
+        seed=seed + 1,  # Different seed for variety
+        print_filter_warnings=print_filter_warnings,
+    )
+
+    return short_loader, long_loader

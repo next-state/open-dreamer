@@ -120,6 +120,9 @@ class DynamicsModelConfig:
     # schedule
     k_max: int = 8
 
+    # attention window for sliding window attention (used when T > context_length)
+    context_length: int = 192
+
     # action conditioning
     num_binary_actions: int = 0
     categorical_action_dim: int = 0
@@ -300,9 +303,14 @@ class DynamicsConfig(BaseExperimentConfig):
     self_fraction: float = 0.25
     image_fraction: float = 0.3
 
+    # Alternating batch lengths (paper: "Sequence length" paragraph)
+    short_T: int = 64
+    long_T: int = 256
+    long_batch_ratio: float = 0.0  # Fraction of batches that use long_T
+
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
-    
+
     # Optimizer
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 

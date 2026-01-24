@@ -281,6 +281,7 @@ def shortcut_forcing_step(
     k_max: int,
     *,
     B_self: int = 0,
+    context_length: int | None = None,
     task_embeddings: jnp.ndarray | None = None,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
@@ -296,6 +297,8 @@ def shortcut_forcing_step(
         rng: Random key
         k_max: Maximum noise resolution
         B_self: Number of bootstrap examples (last B_self rows of batch)
+        context_length: optional context length for sliding window attention. If provided,
+                       creates local_window_size=(context_length - 1, 0) for causal sliding window.
         task_embeddings: Optional (B, T, n_agent, d_model) agent tokens
 
     Returns:
@@ -338,7 +341,7 @@ def shortcut_forcing_step(
     rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
         actions, step_idx_full, sigma_idx_full, z_tilde,
-        task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
+        context_length=context_length, task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
     )
     
     # --- Flow loss (empirical rows) ---
@@ -365,7 +368,7 @@ def shortcut_forcing_step(
         rngs2 = nnx.Rngs(dropout=key_dropout2)
         z1_half1, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
-            task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs2
+            context_length=context_length, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs2
         )
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
@@ -374,7 +377,7 @@ def shortcut_forcing_step(
         rngs3 = nnx.Rngs(dropout=key_dropout3)
         z1_half2, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
-            task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
+            context_length=context_length, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
         )
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
 
