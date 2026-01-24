@@ -351,13 +351,17 @@ def run(cfg: HeadsConfig):
         # Checkpointing
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
-            item_names=HeadsCheckpointBundle.get_item_names()
+            item_names=HeadsCheckpointBundle.get_item_names(
+                iterator_names=("train_dataloader_state",)
+            )
         ) as checkpoint_manager:
 
             # Restore from checkpoint
-            start_step, bundle, train_iterator, rng = bundle.restore(
-                checkpoint_manager, train_iterator, rng
+            iterators = {"train_dataloader_state": train_iterator}
+            start_step, bundle, iterators, rng = bundle.restore(
+                checkpoint_manager, iterators, rng
             )
+            train_iterator = iterators["train_dataloader_state"]
 
             # Training loop
             pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step, total=cfg.max_steps)
@@ -400,7 +404,8 @@ def run(cfg: HeadsConfig):
                     logger.log(step, metrics=metrics_cpu, pbar=pbar)
 
                 # Checkpointing
-                bundle.maybe_save(checkpoint_manager, step, train_iterator, rng)
+                iterators = {"train_dataloader_state": train_iterator}
+                bundle.maybe_save(checkpoint_manager, step, iterators, rng)
 
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:

@@ -184,12 +184,17 @@ def run(cfg: DynamicsConfig):
 
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
-            item_names=DynamicsCheckpointBundle.get_item_names()
+            item_names=DynamicsCheckpointBundle.get_item_names(
+                iterator_names=("short_dataloader_state", "long_dataloader_state")
+            )
         ) as checkpoint_manager:
             # Resume from checkpoint
-            start_step, bundle, short_iterator, rng = bundle.restore(
-                checkpoint_manager, short_iterator, rng
+            iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
+            start_step, bundle, iterators, rng = bundle.restore(
+                checkpoint_manager, iterators, rng
             )
+            short_iterator = iterators["short_dataloader_state"]
+            long_iterator = iterators["long_dataloader_state"]
 
             scaling.start_training()
 
@@ -252,7 +257,8 @@ def run(cfg: DynamicsConfig):
                     )
 
                 # Checkpointing
-                bundle.maybe_save(checkpoint_manager, step, short_iterator, rng)
+                iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
+                bundle.maybe_save(checkpoint_manager, step, iterators, rng)
 
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
