@@ -32,6 +32,7 @@ from dreamer.models import (
     TaskEmbedder,
     Tokenizer,
 )
+from dreamer.training import RMSLossNormalizer
 from dreamer.parallel import MeshRules
 from dreamer.utils import from_dict
 
@@ -289,3 +290,4 @@ class HeadsCheckpointBundle(CheckpointBundle):
     task_embedder_optimizer: Optional[nnx.Optimizer] = None
     policy_optimizer: Optional[nnx.Optimizer] = None
     reward_optimizer: Optional[nnx.Optimizer] = None
+    loss_normalizer: Optional[RMSLossNormalizer] = None

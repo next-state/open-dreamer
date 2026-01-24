@@ -29,6 +29,71 @@ from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_borde
 
 
 # ---------------------------
+# RMS Loss Normalization
+# ---------------------------
+
+class RMSLossNormalizer(nnx.Module):
+    """Normalizes loss terms by their running RMS estimates."""
+
+    def __init__(
+        self,
+        loss_names: list[str],
+        beta: float = 0.95,
+        eps: float = 1e-6,
+    ):
+        """
+        Args:
+            loss_names: List of loss term names to track
+            beta: EMA decay factor (higher = slower adaptation)
+            eps: Small constant for numerical stability
+        """
+        self.beta = beta
+        self.eps = eps
+
+        self.stats = {
+            # Initialize to 1.0 so first step doesn't explode
+            name: nnx.BatchStat(jnp.array(1.0)) 
+            for name in loss_names
+        }
+
+    def __call__(
+        self,
+        losses: Dict[str, jnp.ndarray],
+        update_ema: bool = True,
+    ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]]:
+        """
+        Normalize losses by their running RMS estimates.
+
+        Args:
+            losses: Dict mapping loss names to scalar loss values
+            update_ema: Whether to update running statistics (False for eval)
+
+        Returns:
+            normalized_losses: Dict of normalized loss values
+            rms_values: Dict of current RMS estimates (for logging)
+        """
+        normalized_losses = {}
+        rms_values = {}
+
+        for name, loss_val in losses.items():
+            if name not in self.stats:
+                continue
+
+            stat = self.stats[name]
+            rms = jnp.sqrt(stat.value)
+
+            if update_ema:
+                decay = 1.0 - self.beta
+                loss_sq = jax.lax.stop_gradient(loss_val) ** 2
+                stat.value = self.beta * stat.value + decay * loss_sq
+
+            normalized_losses[name] = loss_val / jnp.maximum(rms, self.eps)
+            rms_values[name] = rms
+
+        return normalized_losses, rms_values
+
+
+# ---------------------------
 # Sampling utilities
 # ---------------------------
 
@@ -592,7 +657,7 @@ def compute_policy_loss(
     h_states: jnp.ndarray,
     actions: Actions,
     actions_valid: jnp.ndarray,
-) -> jnp.ndarray:
+) -> Dict[str, jnp.ndarray]:
     """
     Compute behavior cloning loss with multi-token prediction.
 
@@ -603,14 +668,14 @@ def compute_policy_loss(
         actions_valid: (B, T, L) Validity mask
 
     Returns:
-        policy_loss: Scalar loss (sum of losses for each action type)
+        losses: Dict with individual losses per modality ('binary', 'categorical', 'continuous')
     """
     assert actions_valid.dtype == jnp.bool_, "actions_valid must be of type bool"
 
     # Forward pass - returns dict with logits for each action type
     policy_outputs = policy_head(h_states, deterministic=True)
 
-    total_loss = jnp.array(0.0)
+    losses = {}
 
     # Binary actions: BCE loss per key
     if "binary_logits" in policy_outputs and actions.binary is not None:
@@ -619,16 +684,14 @@ def compute_policy_loss(
         bce = optax.sigmoid_binary_cross_entropy(logits, targets.astype(jnp.float32))
         # Average over keys, mask over (B, T, L)
         bce_per_step = jnp.mean(bce, axis=-1)  # (B, T, L)
-        bce_masked = jnp.sum(bce_per_step * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
-        total_loss = total_loss + bce_masked
+        losses['binary'] = jnp.sum(bce_per_step * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
 
     # Categorical action: CE loss
     if "categorical_logits" in policy_outputs and actions.categorical is not None:
         logits = policy_outputs["categorical_logits"]  # (B, T, L, action_dim)
         targets = actions.categorical  # (B, T, L)
         ce = optax.softmax_cross_entropy_with_integer_labels(logits, targets)  # (B, T, L)
-        ce_masked = jnp.sum(ce * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
-        total_loss = total_loss + ce_masked
+        losses['categorical'] = jnp.sum(ce * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
 
     # Continuous action: Gaussian NLL
     if "continuous_mean" in policy_outputs and actions.continuous is not None:
@@ -639,10 +702,9 @@ def compute_policy_loss(
         nll = 0.5 * (log_var + (targets - mean) ** 2 * jnp.exp(-log_var))
         # Average over action dimensions, mask over (B, T, L)
         nll_per_step = jnp.mean(nll, axis=-1)  # (B, T, L)
-        nll_masked = jnp.sum(nll_per_step * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
-        total_loss = total_loss + nll_masked
+        losses['continuous'] = jnp.sum(nll_per_step * actions_valid) / jnp.maximum(actions_valid.sum(), 1.0)
 
-    return total_loss
+    return losses
 
 
 # ---------------------------

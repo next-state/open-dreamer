@@ -34,6 +34,7 @@ from dreamer.training import (
     compute_reward_loss,
     run_evaluation,
     shortcut_forcing_step,
+    RMSLossNormalizer,
 )
 from dreamer.checkpointing import (
     DynamicsCheckpointBundle,
@@ -136,6 +137,7 @@ def encode_and_train_step(
     task_embedder_optimizer: nnx.Optimizer,
     policy_optimizer: nnx.Optimizer,
     reward_optimizer: nnx.Optimizer,
+    loss_normalizer: RMSLossNormalizer,
     videos: jax.Array,
     actions: Actions,
     rewards: jax.Array,
@@ -164,6 +166,7 @@ def encode_and_train_step(
         dynamics, task_embedder, policy_head, reward_head,
         dynamics_optimizer, task_embedder_optimizer,
         policy_optimizer, reward_optimizer,
+        loss_normalizer,
         latents, actions, rewards,
         master_key=master_key, step=step,
         k_max=k_max, L_mtp=L_mtp, B_self=B_self,
@@ -182,6 +185,7 @@ def train_step(
     task_embedder_optimizer: nnx.Optimizer,
     policy_optimizer: nnx.Optimizer,
     reward_optimizer: nnx.Optimizer,
+    loss_normalizer: RMSLossNormalizer,
     latents: jax.Array,
     actions: Actions,
     rewards: jax.Array,
@@ -227,13 +231,30 @@ def train_step(
 
         # TODO: See if we should compute the losses and the gradients sequentially (see figure 2 of https://arxiv.org/pdf/2404.19737 and comment in pull request #16)
         # TODO: put gather_future_rewards and gather_future_actions inside of the compute_policy_loss function and compute_future_actions functions
-        policy_loss = compute_policy_loss(pol, h_states, actions_btL, actions_valid)
+        policy_losses = compute_policy_loss(pol, h_states, actions_btL, actions_valid)
         reward_loss, reward_metrics = compute_reward_loss(rew, h_states, rewards_btL, rewards_valid)
 
-        # Combine losses
-        total_loss = policy_loss + reward_loss + dynamics_loss_weight * dynamics_loss
 
-        aux = {"policy_loss": policy_loss, "reward_loss": reward_loss, "dynamics_loss": dynamics_loss, "flow_mse": dyn_aux["flow_mse"], "bootstrap_mse": dyn_aux["bootstrap_mse"], **reward_metrics}
+        raw_losses = {
+            "reward": reward_loss,
+            "dynamics": dynamics_loss,
+            **{f"policy_{k}": v for k, v in policy_losses.items()},
+        }
+        normalized, rms_info = loss_normalizer(raw_losses)
+
+        # Combine normalized losses
+        policy_loss_normalized = sum(v for k, v in normalized.items() if k.startswith("policy_"))
+        total_loss = policy_loss_normalized + normalized["reward"] + dynamics_loss_weight * normalized["dynamics"]
+
+        aux = {
+            "reward_loss": reward_loss,
+            "dynamics_loss": dynamics_loss,
+            "flow_mse": dyn_aux["flow_mse"],
+            "bootstrap_mse": dyn_aux["bootstrap_mse"],
+            **{f"policy_loss_{k}": v for k, v in policy_losses.items()},
+            **{f"rms_{k}": v for k, v in rms_info.items()},
+            **reward_metrics,
+        }
 
         return total_loss, aux
 
@@ -307,6 +328,12 @@ def run(cfg: HeadsConfig):
         train_dataloader = make_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)  # type: ignore
 
+        # Create RMS loss normalizer for balancing policy/reward/dynamics losses
+        loss_normalizer = RMSLossNormalizer(loss_names=[
+            'policy_binary', 'policy_categorical', 'policy_continuous',
+            'reward', 'dynamics'
+        ])
+
         # Create checkpoint bundle (includes frozen tokenizer for self-contained checkpoints)
         bundle = HeadsCheckpointBundle(
             tokenizer=tokenizer,
@@ -318,6 +345,7 @@ def run(cfg: HeadsConfig):
             task_embedder_optimizer=task_embedder_optimizer,
             policy_optimizer=policy_optimizer,
             reward_optimizer=reward_optimizer,
+            loss_normalizer=loss_normalizer,
         )
 
         # Checkpointing
@@ -354,6 +382,7 @@ def run(cfg: HeadsConfig):
                     bundle.tokenizer, bundle.dynamics, bundle.task_embedder, bundle.policy_head, bundle.reward_head,
                     bundle.dynamics_optimizer, bundle.task_embedder_optimizer,
                     bundle.policy_optimizer, bundle.reward_optimizer,
+                    bundle.loss_normalizer,
                     videos, actions, rewards,
                     tokenizer_key=tokenizer_key,
                     master_key=master_key,
