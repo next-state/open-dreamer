@@ -1,11 +1,4 @@
-"""
-Data types shared across the dreamer package.
-
-most of the information about the data is taken from: 
-https://github.com/openai/Video-Pre-Training/blob/095519fbd4ee0e9281d19f19601e45629de9ac3f/run_inverse_dynamics_model.py
-"""
 from __future__ import annotations
-import warnings
 
 from typing import Any, Final
 
@@ -65,40 +58,38 @@ def shift_actions(actions: Actions, categorical_action_dim: int) -> Actions:
     )
 
 
-# sources:
-# https://github.com/garrettallen14/JEPA-Image-World-Model/blob/main/video_dataset.py 
-# https://github.com/microsoft/imitation_learning_in_modern_video_games/blob/main/pixelbc/data/minerl_actions.py
-# https://github.com/openai/Video-Pre-Training/blob/main/lib/actions.py
-# key_to_index to be used with idx = key_to_index.get(key,22)
-# TODO: add a warning in case the ouput is 22
-key_to_index: Final[dict[str, int]] = {
-    "key.keyboard.w": 0,
-    "key.keyboard.a": 1,
-    "key.keyboard.s": 2,
-    "key.keyboard.d": 3,
-    "key.keyboard.space": 4,
-    "key.keyboard.left.shift": 5,
-    "key.keyboard.left.control": 6,
-    "key.keyboard.e": 7,
-    "key.keyboard.q": 8,
-    "key.keyboard.escape": 9,
-    "key.keyboard.f": 10,
-    "key.keyboard.1": 11,
-    "key.keyboard.2": 12,
-    "key.keyboard.3": 13,
-    "key.keyboard.4": 14,
-    "key.keyboard.5": 15,
-    "key.keyboard.6": 16,
-    "key.keyboard.7": 17,
-    "key.keyboard.8": 18,
-    "key.keyboard.9": 19,
-    "mouse.0": 20,
-    "mouse.1": 21,
-    "unknown": 22,
-}
-# In the dreamer paper it says that the actions are 23.
-# The actions from 0 to 21 in this list affect the game. everything else should go here.
+# ------------------------------------------------------------
+# VPT action space
+# ------------------------------------------------------------
 
+# source:
+# https://github.com/openai/Video-Pre-Training/blob/095519fbd4ee0e9281d19f19601e45629de9ac3f/run_inverse_dynamics_model.py
+key_to_index: Final[dict[str, int]] = {
+    # Keyboard actions (matching KEYBOARD_BUTTON_MAPPING order from reference)
+    "key.keyboard.w": 0,              # forward
+    "key.keyboard.a": 1,              # left
+    "key.keyboard.s": 2,              # back
+    "key.keyboard.d": 3,              # right
+    "key.keyboard.space": 4,          # jump
+    "key.keyboard.left.shift": 5,     # sneak
+    "key.keyboard.left.control": 6,   # sprint
+    "key.keyboard.e": 7,              # inventory
+    "key.keyboard.q": 8,              # drop
+    "key.keyboard.escape": 9,         # ESC
+    "key.keyboard.f": 10,             # swapHands
+    "key.keyboard.1": 11,             # hotbar.1
+    "key.keyboard.2": 12,             # hotbar.2
+    "key.keyboard.3": 13,             # hotbar.3
+    "key.keyboard.4": 14,             # hotbar.4
+    "key.keyboard.5": 15,             # hotbar.5
+    "key.keyboard.6": 16,             # hotbar.6
+    "key.keyboard.7": 17,             # hotbar.7
+    "key.keyboard.8": 18,             # hotbar.8
+    "key.keyboard.9": 19,             # hotbar.9
+    "mouse.0": 20,                    # attack
+    "mouse.1": 21,                    # use
+    "mouse.2": 22,                    # pickItem
+}
 
 
 # source:
@@ -145,7 +136,7 @@ def mouse_movement_to_categorical(dx: Array, dy: Array) -> Array:
     return bins[..., 1] * NUM_CAMERA_BINS + bins[..., 0]
 
 
-NUM_BINARY_ACTIONS: Final[int] = 23  # keyboard (22) + unknown (1)
+NUM_BINARY_ACTIONS: Final[int] = 23  # keyboard (20) + mouse buttons (3)
 
 
 def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
@@ -175,18 +166,19 @@ def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
         keyboard = action.get("keyboard", {})
         keys = keyboard.get("keys", [])
         for key in keys:
-            idx = key_to_index.get(key, 22)  # 22 = unknown
-            if idx == 22: warnings.warn(f"Unknown key: {key}")
+            idx = key_to_index.get(key)
             binary[t, idx] = 1
         
-        # Parse mouse buttons (attack=mouse.0, use=mouse.1)
+        # Parse mouse buttons
         mouse = action.get("mouse", {})
         buttons = mouse.get("buttons", [])
         for btn in buttons:
             if btn == 0:
-                binary[t, key_to_index["mouse.0"]] = 1
+                binary[t, key_to_index["mouse.0"]] = 1  # attack
             elif btn == 1:
-                binary[t, key_to_index["mouse.1"]] = 1
+                binary[t, key_to_index["mouse.1"]] = 1  # use
+            elif btn == 2:
+                binary[t, key_to_index["mouse.2"]] = 1  # pickItem
         
         # Parse camera movement
         camera_dx[t] = mouse.get("dx", 0.0)

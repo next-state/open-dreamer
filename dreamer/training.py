@@ -23,7 +23,7 @@ import time
 from dreamer.configs import DynamicsConfig, HeadsConfig
 from dreamer.generation import DenoiseSchedule
 from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
-from dreamer.types import Actions
+from dreamer.actions import Actions
 from dreamer.sampler import sample_video
 from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border
 

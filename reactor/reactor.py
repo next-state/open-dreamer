@@ -4,7 +4,7 @@ from flax import nnx
 from dreamer.models import Dynamics, PolicyHeadMTP
 from dreamer.generation import DenoiseSchedule, next_frame
 from dreamer.parallel import create_data_model_parallel, MeshRules
-from dreamer.types import Actions
+from dreamer.actions import Actions
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
 import numpy as np

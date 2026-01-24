@@ -27,7 +27,7 @@ from dreamer.configs import HeadsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
-from dreamer.types import Actions, shift_actions
+from dreamer.actions import Actions, shift_actions
 from dreamer.parallel import build_parallel
 from dreamer.training import (
     compute_policy_loss,

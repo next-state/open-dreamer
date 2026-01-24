@@ -17,7 +17,7 @@ from .configs import (
     TaskEmbedderModelConfig, PolicyHeadModelConfig, RewardHeadModelConfig,
 )
 from .parallel import MeshRules
-from .types import Actions
+from .actions import Actions
 
 
 # ============================================================================

@@ -12,7 +12,7 @@ from dreamer.configs import DynamicsConfig
 from dreamer.data import make_dual_iterators
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.types import Actions, create_noop_action_like
+from dreamer.actions import Actions, create_noop_action_like
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step

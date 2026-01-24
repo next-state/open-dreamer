@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
-from dreamer.types import Actions
+from dreamer.actions import Actions
 from .generation import DenoiseSchedule, video_rollout
 
 

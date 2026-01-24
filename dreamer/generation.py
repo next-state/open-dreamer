@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from typing import Any, Tuple
 from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
-from .types import Actions
+from .actions import Actions
 from flax.struct import dataclass
 
 
