@@ -7,6 +7,7 @@ import hydra
 import imageio
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
 import numpy as np
 import optax
 from flax import nnx
@@ -206,8 +207,21 @@ def run(cfg: TokenizerConfig):
         # Build optimizer
         optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule, d_model=cfg.tokenizer.encoder.d_model)
 
-        # Initialize LPIPS model once (avoids repeated HF downloads during JIT tracing)
-        lpips_model = LPIPS(pretrained_network="alexnet") if cfg.lpips_weight > 0 else None
+        # Initialize LPIPS model and replicate across devices
+        if cfg.lpips_weight > 0:
+            lpips_model = LPIPS(pretrained_network="alexnet")
+            replicated = NamedSharding(mesh, P())
+            
+            # Replicate linear_weights (nnx.List of arrays)
+            for i, w in enumerate(lpips_model.linear_weights):
+                lpips_model.linear_weights[i] = jax.device_put(w, replicated)
+            
+            # Replicate the feature extractor model params
+            _, state = nnx.split(lpips_model.model)
+            state = jax.tree.map(lambda x: jax.device_put(x, replicated), state)
+            nnx.update(lpips_model.model, state)
+        else:
+            lpips_model = None
 
         # Create checkpoint bundle
         bundle = TokenizerCheckpointBundle(

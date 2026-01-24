@@ -1,5 +1,6 @@
 import io
 
+import av
 import jax
 import numpy as np
 import grain
@@ -7,9 +8,6 @@ from typing import Any
 import pickle
 import glob
 import os
-
-import decord
-decord.bridge.set_bridge("native")
 
 from .configs import DatasetConfig
 
@@ -125,7 +123,7 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
 # ==============================================================================
 
 class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
-    """Parse MP4 video bytes using decord, random slice for Minecraft VPT dataset."""
+    """Parse MP4 video bytes using PyAV, random slice for Minecraft VPT dataset."""
 
     def __init__(self, seq_len: int):
         self.seq_len = seq_len
@@ -133,24 +131,33 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
     def random_map(self, element: bytes, rng: np.random.Generator) -> dict:
         data = pickle.loads(element)
 
-        # Decode MP4 bytes using decord (create cpu context here to avoid pickling issues with grain workers)
-        # num_threads=1 to avoid oversubscription since grain already uses multiple workers
-        mp4_bytes = io.BytesIO(data["video"])
-        vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(0), num_threads=1)
-
-        episode_len = len(vr)
+        # Use video_shape to get episode length without decoding
+        episode_len = data["video_shape"][0]
         max_start = episode_len - self.seq_len
         start = int(rng.integers(0, max_start + 1))
 
-        # Get frame indices for the slice
-        frame_indices = list(range(start, start + self.seq_len))
-        video_slice = vr.get_batch(frame_indices).asnumpy()  # (T, H, W, C)
+        # Decode MP4 bytes using PyAV (more stable with multiprocessing than decord)
+        # Seek to start frame and only decode seq_len frames
+        container = av.open(io.BytesIO(data["video"]))
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+
+        container.seek(start, stream=stream)
+
+        frames = []
+        for frame in container.decode(stream):
+            frames.append(frame.to_ndarray(format="rgb24"))
+            if len(frames) >= self.seq_len:
+                break
+        container.close()
+
+        video_slice = np.stack(frames)  # (T, H, W, C)
 
         # Keep as float32 in [0, 255] range (consistent with CoinRun loader)
-        video = video_slice.astype(np.float32)
+        video_out = video_slice.astype(np.float32)
 
         return {
-            "videos": video,
+            "videos": video_out,
             "actions": None,
             "rewards": None,
         }
@@ -162,7 +169,7 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
 def make_iterator(
     cfg: DatasetConfig,
-    num_workers: int = 128,
+    num_workers: int = 32,
     prefetch_buffer_size: int = 4,
     seed: int = 42,
     print_filter_warnings: bool = False,
