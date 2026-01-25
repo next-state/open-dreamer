@@ -4,7 +4,7 @@ defaults:
   - _self_
 
 run_name: heads
-dynamics_ckpt: "logs/dynamics_new/checkpoints"
+dynamics_ckpt: logs/dynamics/checkpoints
 
 ckpt:
   save_interval_steps: 100_000

@@ -31,6 +31,11 @@ from dreamer.utils import (
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
 
+OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
+OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
+OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
+OmegaConf.register_new_resolver("max", lambda *args: max(args))
+
 
 # ---------------------------
 # Training Step
@@ -66,7 +71,7 @@ def encode_and_train_step(
 
     # Videos (T=T)
     videos_batch = videos[B_img:]
-    actions_batch = jax.tree.map(lambda x: x[B_img:], actions)
+    actions_batch = actions[B_img:]
 
     # Encode both batches
     latents_img, _ = tokenizer.encode(images, packing_factor=packing_factor, deterministic=True, rngs=rngs)
@@ -263,8 +268,8 @@ def run(cfg: DynamicsConfig):
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
                     # Use subset of batch for visualization
-                    val_videos = batch["videos"][:4]
-                    val_actions = batch["actions"][:4]
+                    val_videos = videos[:4]
+                    val_actions = actions[:4]
 
                     run_evaluation(
                         cfg, step, bundle.tokenizer, bundle.dynamics,

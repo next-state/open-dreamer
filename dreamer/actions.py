@@ -6,12 +6,11 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import Array
-from dataclasses import dataclass
-from flax import nnx
+from flax import struct
 
 
-@dataclass
-class Actions(nnx.Pytree):
+@struct.dataclass
+class Actions:
     """Container for multi-modal action data.
 
     Attributes:

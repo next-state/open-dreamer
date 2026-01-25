@@ -201,7 +201,7 @@ def next_frame(
         tokenizer: Tokenizer NNX model for decoding
         dynamics: Dynamics NNX model
         schedule: Denoising schedule
-        action: Single action to condition on where the time dimension is squeezed (B, *)
+        action: Single action to condition on where the time dimension is squeezed (B, ...)
         latent_shape: Shape of latent (B, 1, n_spatial, D_s)
         dynamics_cache: KV cache for dynamics model from previous steps
         tokenizer_cache: KV cache for tokenizer decoder from previous steps
@@ -296,19 +296,17 @@ def latent_rollout(
         rng, rng_policy = jax.random.split(rng)
         
         if isinstance(policy, Actions):
-            action = policy[:, step_idx]
+            action = policy[:, step_idx]  # (B, ...)
         else:
-            all_actions = policy.sample(h_t, greedy=greedy, rng=rng_policy)  # (B, T, L, *)
-            action = all_actions[:, :, 0, ...]  # (B, T, *) - use first predicted action
+            all_actions = policy.sample(h_t, greedy=greedy, rng=rng_policy)  # (B, T, L, ...)
+            action = all_actions[:, 0, 0, ...]  # (B, ...) - use first predicted action
         
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng = next_latent(
             dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
         )
         
-        # Squeeze action to (B, *) for consistent output shape
-        action_out = jnp.squeeze(action)
-        return (h_next, caches_next, rng), (latent_next[:, 0], action_out, h_next) # latent_next is (B, 1, n_spatial, D_s) 
+        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
 
     # Run scan
     _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(

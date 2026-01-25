@@ -452,11 +452,13 @@ class SpaceSelfAttention(nnx.Module):
             x,
             *,
             mask: jnp.ndarray | None = None,
+            local_window_size: int | tuple[int, int] | None = None,
             deterministic: bool = True,
             cache: KVCache | None = None,
             rngs: nnx.Rngs | None = None
         ):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
+        # Note: local_window_size is ignored for space attention (just for compatibility)
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B T) S D")
 
@@ -919,9 +921,8 @@ class ActionEncoder(nnx.Module):
         )
 
         # Embed binary actions
-        self.binary_embeds_list = None
         if num_binary_actions > 0:
-            self.binary_embeds_list = nnx.List([
+            self.binary_embeds_list = nnx.data(nnx.List([
                 nnx.Embed(
                     2, d_model,
                     dtype=dtype, param_dtype=param_dtype,
@@ -929,28 +930,32 @@ class ActionEncoder(nnx.Module):
                     rngs=rngs
                 )
                 for _ in range(num_binary_actions)
-            ])  # num_binary_actions * (B, T, d_model)
+            ]))  # num_binary_actions * (B, T, d_model)
+        else:
+            self.binary_embeds_list = nnx.data(None)
 
         # Embed categorical action
-        self.categorical_embeds = None
         if categorical_action_dim > 0:
-            self.categorical_embeds = nnx.Embed(
+            self.categorical_embeds = nnx.data(nnx.Embed(
                 categorical_action_dim, d_model,
                 dtype=dtype, param_dtype=param_dtype,
                 embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
                 rngs=rngs
-            )  # (B, T, d_model)
+            ))  # (B, T, d_model)
+        else:
+            self.categorical_embeds = nnx.data(None)
 
         # Continuous actions: linear projection
-        self.continuous_proj = None
         if continuous_action_dim > 0:
-            self.continuous_proj = nnx.Linear(
+            self.continuous_proj = nnx.data(nnx.Linear(
                 continuous_action_dim, d_model,
                 use_bias=use_bias,
                 dtype=dtype, param_dtype=param_dtype,
                 kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')),
                 rngs=rngs
-            )  # (B, T, d_model)
+            ))  # (B, T, d_model)
+        else:
+            self.continuous_proj = nnx.data(None)
 
     def __call__(
         self,
@@ -962,7 +967,7 @@ class ActionEncoder(nnx.Module):
         Encode actions into embeddings.
 
         Args:
-            actions: Actions to encode (B, T, *)
+            actions: Actions to encode (B, T, ...)
             batch_time_shape: (B, T) shape for unlabeled videos
             as_tokens: whether to expand to token dimension
 
@@ -983,7 +988,7 @@ class ActionEncoder(nnx.Module):
             out = out + binary_emb
 
         if actions.categorical is not None and self.categorical_embeds is not None:
-            categorical_emb = self.categorical_embeds(actions.categorical.astype(self.dtype))
+            categorical_emb = self.categorical_embeds(actions.categorical)
             out = out + categorical_emb
 
         if actions.continuous is not None and self.continuous_proj is not None:

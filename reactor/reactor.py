@@ -56,7 +56,7 @@ def input_to_action(controller_state: Dict[str, Any]) -> Actions:
         action_dim: Dimension of action space (7 for CoinRun)
 
     Returns:
-        Actions object *without time dimension*: (B=1, *)
+        Actions object *without time dimension*: (B=1, ...)
     """
     # Key to action mapping (priority order: diagonals first, then cardinals)
     key_map = [

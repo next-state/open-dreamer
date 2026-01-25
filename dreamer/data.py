@@ -4,10 +4,10 @@ import numpy as np
 import grain
 from typing import Any, Tuple
 import pickle
-import glob
 import os
 
 from .configs import DatasetConfig
+from .actions import Actions
 
 
 # ==============================================================================
@@ -76,8 +76,12 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
         if patch_size is not None:
             assert image_h % 2 == 0 and image_w % 2 == 0 and patch_size % 2 == 0
-            self.pad_h = patch_size - (image_h % patch_size) // 2
-            self.pad_w = patch_size - (image_w % patch_size) // 2
+            remainder_h = image_h % patch_size
+            remainder_w = image_w % patch_size
+            if remainder_h > 0:
+                self.pad_h = (patch_size - remainder_h) // 2
+            if remainder_w > 0:
+                self.pad_w = (patch_size - remainder_w) // 2
 
     def random_map(self, element: dict, rng: np.random.Generator) -> Any:
         assert isinstance(element, bytes)
@@ -124,9 +128,11 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
                 constant_values=0
             )
 
-        data_dict = {"videos": seq}
+        data_dict: dict[str, Any] = {"videos": seq}
         actions_tensor = np.array(element["actions"])
-        data_dict["actions"] = actions_tensor[start_idx : start_idx + self.seq_len]
+        data_dict["actions_categorical"] = actions_tensor[start_idx : start_idx + self.seq_len]
+        data_dict["actions_binary"] = None
+        data_dict["actions_continuous"] = None
         data_dict["rewards"] = rewards_tensor[start_idx : start_idx + self.seq_len]
 
         return data_dict
@@ -150,13 +156,19 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
         patch_size: int | None = None,
     ):
         self.seq_len = seq_len
+        self.pad_h = 0
+        self.pad_w = 0
 
         if patch_size is not None:
             assert image_h % 2 == 0 and image_w % 2 == 0 and patch_size % 2 == 0
-            self.pad_h = patch_size - (image_h % patch_size) // 2
-            self.pad_w = patch_size - (image_w % patch_size) // 2
+            remainder_h = image_h % patch_size
+            remainder_w = image_w % patch_size
+            if remainder_h > 0:
+                self.pad_h = (patch_size - remainder_h) // 2
+            if remainder_w > 0:
+                self.pad_w = (patch_size - remainder_w) // 2
 
-    def random_map(self, element: bytes, rng: np.random.Generator) -> dict:
+    def random_map(self, element: bytes, rng: np.random.Generator) -> dict[str, Any]:
         data = pickle.loads(element)
 
         video_shape = data["video_shape"]
@@ -178,9 +190,22 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
         return {
             "videos": seq,
-            "actions": None,
+            "actions_categorical": None,
+            "actions_binary": None,
+            "actions_continuous": None,
             "rewards": None,
         }
+
+
+class CreateActions(grain.transforms.Map):
+    """Convert batched action arrays into Actions dataclass."""
+    def map(self, batch: dict) -> dict:
+        batch["actions"] = Actions(
+            binary=batch.pop("actions_binary", None),
+            categorical=batch.pop("actions_categorical", None),
+            continuous=batch.pop("actions_continuous", None),
+        )
+        return batch
 
 
 # ==============================================================================
@@ -258,6 +283,7 @@ def make_iterator(
                 patch_size=cfg.patch_size,
             ),
             grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
+            CreateActions(),
         ]
     else:
         operations = [
@@ -274,6 +300,7 @@ def make_iterator(
                 patch_size=cfg.patch_size,
             ),
             grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
+            CreateActions(),
         ]
 
     dataloader = grain.DataLoader(
