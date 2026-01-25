@@ -6,11 +6,11 @@ defaults:
 run_name: tokenizer
 
 dataset:
-  B: 32
+  B: 16
   T: 32
 
 ckpt:
-  max_to_keep: 1
+  max_to_keep: 0
   save_interval_steps: 10_000
 
 tokenizer:

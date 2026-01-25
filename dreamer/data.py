@@ -136,7 +136,9 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
         # Decode MP4 bytes using decord (create cpu context here to avoid pickling issues with grain workers)
         # num_threads=1 to avoid oversubscription since grain already uses multiple workers
         mp4_bytes = io.BytesIO(data["video"])
-        vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(0), num_threads=1)
+
+        cpu_idx = int(rng.integers(0, 2))
+        vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(cpu_idx), num_threads=1)
 
         episode_len = len(vr)
         max_start = episode_len - self.seq_len
@@ -162,8 +164,8 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
 def make_iterator(
     cfg: DatasetConfig,
-    num_workers: int = 128,
-    prefetch_buffer_size: int = 4,
+    num_workers: int = 64,
+    prefetch_buffer_size: int = 1,
     seed: int = 42,
     print_filter_warnings: bool = False,
 ):
