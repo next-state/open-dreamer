@@ -4,7 +4,7 @@ defaults:
 name: minecraft_vpt
 
 array_record_path: /home/ubuntu/minecraft-vpt/arrayrecords-mp4
-index_max: 15
+index_max: 1500
 
 B: 8
 T: 4

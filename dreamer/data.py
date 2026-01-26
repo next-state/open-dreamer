@@ -162,8 +162,8 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
 def make_iterator(
     cfg: DatasetConfig,
-    num_workers: int = 128,
-    prefetch_buffer_size: int = 4,
+    num_workers: int = 64,
+    prefetch_buffer_size: int = 1,
     seed: int = 42,
     print_filter_warnings: bool = False,
 ):
