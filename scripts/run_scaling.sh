@@ -27,7 +27,7 @@ fi
 # Configuration by mode
 if [ "$MODE" == "isoflop" ]; then
     # Iso-FLOPs: multiple depths × multiple FLOPs budgets
-    DEPTHS=(5)  # (10 9 8 7 6 5 4)
+    DEPTHS=(8 7 6 5 4)  # (10 9 8 7 6 5 4)
     FLOPS_BUDGETS=(6e17 1e18 3e18)  # (1e18 3e18 6e18)
 elif [ "$MODE" == "optimal" ]; then
     # Compute-optimal: multiple depths × fixed tokens_per_param
@@ -79,8 +79,8 @@ for DEPTH in "${DEPTHS[@]}"; do
             CMD="uv run scripts/train_${MODEL}.py \
                 run_name=${RUN_NAME} \
                 use_wandb=true \
-                ckpt.save_interval_steps=100_000 \
-                encoder.depth=${DEPTH} \
+                ckpt.max_to_keep=0 \
+                tokenizer.encoder.depth=${DEPTH} \
                 scaling_flops_budget=${FLOPS} \
                 hydra.run.dir=${OUT_DIR}/${RUN_NAME}"
 
@@ -100,8 +100,7 @@ for DEPTH in "${DEPTHS[@]}"; do
         CMD="uv run scripts/train_${MODEL}.py \
             run_name=${RUN_NAME} \
             use_wandb=true \
-            ckpt.save_interval_steps=100_000 \
-            encoder.depth=${DEPTH} \
+            tokenizer.encoder.depth=${DEPTH} \
             scaling_tokens_per_param=${TOKENS_PER_PARAM} \
             hydra.run.dir=${OUT_DIR}/${RUN_NAME}"
 
