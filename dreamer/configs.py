@@ -39,6 +39,9 @@ class DatasetConfig:
     # Reward-biased slicing probability (0.0 = disabled, 0.8 = 80% chance to include windows with nonzero reward)
     p_include_reward: float = 0.0
 
+    # Data type: "video" (default) or "latent" (pre-tokenized)
+    data_type: str = "video"
+
 # ---- Model Configs ----
 
 @dataclass(frozen=False)

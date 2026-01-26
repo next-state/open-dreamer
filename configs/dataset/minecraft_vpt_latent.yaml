@@ -1,0 +1,17 @@
+defaults:
+  - _self_
+
+name: minecraft_vpt_latent
+data_type: latent
+array_record_path: /scratch/tokenized_dataset_test 
+index_max: 3
+
+num_binary_actions: 23
+categorical_action_dim: 121
+continuous_action_dim: 0
+
+B: 8
+T: 4
+H: 360
+W: 640
+C: 3

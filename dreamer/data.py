@@ -2,6 +2,7 @@ import copy
 import io
 
 import jax
+import msgpack
 import numpy as np
 import grain
 from typing import Any, Tuple
@@ -213,6 +214,74 @@ class CreateActions(grain.transforms.Map):
 
 
 # ==============================================================================
+# Pre-tokenized Latent Dataset
+# ==============================================================================
+
+def _decode_value(value):
+    """Decode a single value, handling arrays and nested dicts."""
+    if isinstance(value, dict):
+        if value.get("_type") == "ndarray":
+            shape = tuple(value["shape"])
+            dtype = value["dtype"]
+            return np.frombuffer(value["data"], dtype=dtype).reshape(shape)
+        else:
+            return {k: _decode_value(v) for k, v in value.items()}
+    return value
+
+
+def deserialize_latent_record(data: bytes) -> dict:
+    """Deserialize latent record from msgpack format."""
+    encoded = msgpack.unpackb(data, raw=False)
+    return {k: _decode_value(v) for k, v in encoded.items()}
+
+
+class LatentEpisodeLengthFilter(grain.transforms.Filter):
+    """Filter latent episodes by sequence length."""
+    def __init__(self, seq_len: int, *, print_filter_warnings: bool = True):
+        self.seq_len = seq_len
+        self.print_filter_warnings = print_filter_warnings
+
+    def filter(self, element: bytes) -> bool:
+        data = deserialize_latent_record(element)
+        episode_len = data["latents"].shape[0]
+        if episode_len < self.seq_len:
+            if self.print_filter_warnings:
+                print(f"Filtering latent episode: {episode_len} < {self.seq_len}")
+            return False
+        return True
+
+
+class ProcessLatentAndSlice(grain.transforms.RandomMap):
+    """Random slice pre-tokenized latent episodes."""
+    def __init__(self, seq_len: int):
+        self.seq_len = seq_len
+
+    def random_map(self, element: bytes, rng: np.random.Generator) -> dict:
+        data = deserialize_latent_record(element)
+        latents = data["latents"]  # (T, n_latents, d_bottleneck)
+        actions = data["actions"]   # dict with action arrays
+
+        episode_len = latents.shape[0]
+        max_start = episode_len - self.seq_len
+        start = int(rng.integers(0, max_start + 1))
+
+        # Slice latents
+        sliced_latents = latents[start:start + self.seq_len].astype(np.float32)
+
+        # Slice actions (handle None values)
+        actions_binary = actions.get("binary")
+        actions_categorical = actions.get("categorical")
+        actions_continuous = actions.get("continuous")
+
+        return {
+            "latents": sliced_latents,
+            "actions_binary": actions_binary[start:start + self.seq_len] if actions_binary is not None else None,
+            "actions_categorical": actions_categorical[start:start + self.seq_len] if actions_categorical is not None else None,
+            "actions_continuous": actions_continuous[start:start + self.seq_len] if actions_continuous is not None else None,
+        }
+
+
+# ==============================================================================
 # Factory
 # ==============================================================================
 
@@ -233,10 +302,12 @@ def make_iterator(
         seed: Random seed
         print_filter_warnings: Whether to print filter warnings
     """
-    # Build array record paths based on dataset type
-    if cfg.name == "minecraft_vpt":
-        # Minecraft VPT: generate shard paths from index_max
-        assert cfg.index_max >= 0, "index_max must be > 0 for minecraft_vpt dataset"
+    # Build array record paths based on dataset type and data type
+    use_latent_data = cfg.data_type == "latent"
+
+    if use_latent_data or cfg.name == "minecraft_vpt":
+        # Latent or Minecraft VPT: generate shard paths from index_max
+        assert cfg.index_max >= 0, "index_max must be > 0 for minecraft_vpt or latent dataset"
         array_record_paths = [f"{cfg.array_record_path}/shard-{i:05d}.array_record" for i in range(cfg.index_max)]
     else:
         # CoinRun: discover files in directory
@@ -272,8 +343,19 @@ def make_iterator(
         seed=seed,
     )
 
-    # Build operations based on dataset type
-    if cfg.name == "minecraft_vpt":
+    # Build operations based on dataset type and data type
+    if use_latent_data:
+        # Pre-tokenized latent data path
+        operations = [
+            LatentEpisodeLengthFilter(
+                seq_len=cfg.T,
+                print_filter_warnings=print_filter_warnings,
+            ),
+            ProcessLatentAndSlice(seq_len=cfg.T),
+            grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
+            CreateActions(),
+        ]
+    elif cfg.name == "minecraft_vpt":
         operations = [
             EpisodeLengthFilter(
                 seq_len=cfg.T,
