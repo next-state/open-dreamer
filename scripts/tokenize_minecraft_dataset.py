@@ -28,6 +28,7 @@ from array_record.python.array_record_module import ArrayRecordWriter
 from flax import nnx
 from tqdm import tqdm
 
+from dreamer.actions import parse_action_dicts
 from dreamer.checkpointing import TokenizerCheckpointBundle
 from dreamer.parallel import build_parallel
 
@@ -45,45 +46,52 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 # ==============================================================================
 
 
+def _encode_value(value):
+    """Encode a single value, handling arrays and nested dicts."""
+    if isinstance(value, np.ndarray):
+        return {
+            "_type": "ndarray",
+            "data": value.tobytes(),
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+        }
+    elif isinstance(value, dict):
+        return {k: _encode_value(v) for k, v in value.items()}
+    else:
+        return value
+
+
 def serialize_record(record: dict) -> bytes:
     """Serialize record using msgpack (no pickle).
 
     Arrays are serialized via tobytes() with shape/dtype metadata.
-    Pre-serialized msgpack bytes (like actions) are stored directly.
+    Nested dicts are recursively encoded.
     """
-    encoded = {}
-    for key, value in record.items():
-        if isinstance(value, np.ndarray):
-            encoded[key] = value.tobytes()
-            encoded[f"{key}_shape"] = list(value.shape)
-            encoded[f"{key}_dtype"] = str(value.dtype)
-        else:
-            encoded[key] = value
+    encoded = {k: _encode_value(v) for k, v in record.items()}
     return msgpack.packb(encoded, use_bin_type=True)
+
+
+def _decode_value(value):
+    """Decode a single value, handling arrays and nested dicts."""
+    if isinstance(value, dict):
+        if value.get("_type") == "ndarray":
+            shape = tuple(value["shape"])
+            dtype = value["dtype"]
+            return np.frombuffer(value["data"], dtype=dtype).reshape(shape)
+        else:
+            return {k: _decode_value(v) for k, v in value.items()}
+    else:
+        return value
 
 
 def deserialize_record(data: bytes) -> dict:
     """Deserialize record from msgpack format.
 
     Reconstructs numpy arrays from bytes + shape/dtype metadata.
+    Nested dicts are recursively decoded.
     """
     encoded = msgpack.unpackb(data, raw=False)
-    decoded = {}
-
-    # Find all array keys (those with _shape suffix)
-    array_keys = {k[:-6] for k in encoded.keys() if k.endswith("_shape")}
-
-    for key, value in encoded.items():
-        if key.endswith("_shape") or key.endswith("_dtype"):
-            continue
-        if key in array_keys:
-            shape = tuple(encoded[f"{key}_shape"])
-            dtype = encoded[f"{key}_dtype"]
-            decoded[key] = np.frombuffer(value, dtype=dtype).reshape(shape)
-        else:
-            decoded[key] = value
-
-    return decoded
+    return {k: _decode_value(v) for k, v in encoded.items()}
 
 
 # ==============================================================================
@@ -105,14 +113,13 @@ class MinecraftVPTProcessFullEpisode(grain.transforms.Map):
         vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(0), num_threads=1)
         frames = vr.get_batch(list(range(len(vr)))).asnumpy()
 
-        # Serialize actions to msgpack bytes to avoid grain batching issues
-        # with complex nested dicts (actions is a list of dicts with mouse, keyboard, etc.)
+        # Parse actions into Actions pytree
         actions = data.get("actions")
-        actions_bytes = msgpack.packb(actions, use_bin_type=True) if actions is not None else None
+        actions = parse_action_dicts(actions).to_dict()
 
         return {
             "videos": frames.astype(np.float32),  # (T, H, W, C) in [0, 255]
-            "actions_bytes": actions_bytes,  # Serialized to avoid batching issues
+            "actions": actions,  # Actions pytree
             "source": data.get("source"),
         }
 
@@ -308,7 +315,7 @@ def main():
         try:
             for batch in tqdm(dataloader, desc="Tokenizing"):
                 videos = batch["videos"]  # (B, T, H, W, C)
-                actions_bytes_batch = batch["actions_bytes"]  # (B,) - each is msgpack bytes
+                actions_batch = batch["actions"]  # Actions pytree with (B, T, ...) arrays
                 sources_batch = batch["source"]  # (B,)
 
                 batch_size = videos.shape[0]
@@ -331,9 +338,11 @@ def main():
 
                 # Write each record individually
                 for i in range(batch_size):
+                    # Extract i-th element from each array in the actions dict (handle None)
+                    actions_i = {k: v[i] if v is not None else None for k, v in actions_batch.items()}
                     record = {
                         "latents": latents_np[i],  # (T, n_latents, d_bottleneck)
-                        "actions_packed": actions_bytes_batch[i],  # Pre-packed msgpack bytes
+                        "actions": actions_i,
                         "source": sources_batch[i] if sources_batch is not None else None,
                     }
                     writer.write(record)

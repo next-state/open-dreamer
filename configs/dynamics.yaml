@@ -1,10 +1,10 @@
 defaults:
   - common
-  - dataset: coinrun
+  - dataset: coinruin
   - _self_
 
 run_name: dynamics
-tokenizer_ckpt: logs/tokenizer/checkpoints/
+tokenizer_ckpt: logs/tokenizer-512/checkpoints/
 
 ckpt:
   max_to_keep: 0

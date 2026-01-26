@@ -4,7 +4,6 @@ from typing import Any, Final
 
 import numpy as np
 import jax
-import jax.numpy as jnp
 from jax import Array
 from flax import struct
 
@@ -26,35 +25,15 @@ class Actions:
         """Slice Actions along batch/time dimensions."""
         return jax.tree.map(lambda x: x[key] if x is not None else None, self)
 
+    def to_dict(self) -> dict[str, Array | None]:
+        """Flatten Actions to a dict of arrays for serialization."""
+        actions = {"actions_binary": self.binary, "actions_categorical": self.categorical, "actions_continuous": self.continuous}
+        return actions
 
-def create_noop_action_like(template: Actions, categorical_action_dim: int) -> Actions:
-    """Creates a (B, 1, ...) no-op start action."""
-
-    def _create_action(arr, fill_value):
-        if arr is None: return None
-        return jnp.full_like(arr[:, 0:1], fill_value)
-
-    return Actions(
-        binary     = _create_action(template.binary, 0),
-        categorical = _create_action(template.categorical, categorical_action_dim - 1),
-        continuous  = _create_action(template.continuous, 0.0)
-    )
-
-
-def shift_actions(actions: Actions, categorical_action_dim: int) -> Actions:
-    """Shift actions right by 1, preprend noop action."""
-
-    noop_action = create_noop_action_like(actions, categorical_action_dim)
-    
-    def _shift(current_arr, start_arr):
-        if current_arr is None: return None
-        return jnp.concatenate([start_arr, current_arr[:, :-1]], axis=1)
-
-    return Actions(
-        binary      = _shift(actions.binary, noop_action.binary),
-        categorical = _shift(actions.categorical, noop_action.categorical),
-        continuous  = _shift(actions.continuous, noop_action.continuous)
-    )
+    @classmethod
+    def from_dict(cls, d: dict[str, Array | None]) -> Actions:
+        """Reconstruct Actions from a flattened dict."""
+        return cls(binary=d["actions_binary"], categorical=d["actions_categorical"], continuous=d["actions_continuous"])
 
 
 # ------------------------------------------------------------
@@ -105,7 +84,7 @@ NUM_CAMERA_CLASSES = NUM_CAMERA_BINS * NUM_CAMERA_BINS
 
 def mu_law_encode(x: Array, mu: float = CAMERA_MU) -> Array:
     """Apply mu-law compression for foveated discretization."""
-    return jnp.sign(x) * jnp.log(1.0 + mu * jnp.abs(x)) / jnp.log(1.0 + mu)
+    return np.sign(x) * np.log(1.0 + mu * np.abs(x)) / np.log(1.0 + mu)
 
 
 def mouse_movement_to_categorical(dx: Array, dy: Array) -> Array:
@@ -119,18 +98,18 @@ def mouse_movement_to_categorical(dx: Array, dy: Array) -> Array:
         Categorical index in [0, 120] representing the 11x11 camera action grid.
         Index is computed as: bin_y * 11 + bin_x. Same shape as input.
     """
-    dxy = jnp.stack([dx, dy], axis=-1)
+    dxy = np.stack([dx, dy], axis=-1)
     
     # Scale to degrees and clip to valid range
-    dxy_deg = jnp.clip(dxy * CAMERA_SCALER, -CAMERA_MAXVAL, CAMERA_MAXVAL)
+    dxy_deg = np.clip(dxy * CAMERA_SCALER, -CAMERA_MAXVAL, CAMERA_MAXVAL)
     
     # Normalize to [-1, 1] and apply mu-law encoding
     dxy_norm = dxy_deg / CAMERA_MAXVAL
     dxy_encoded = mu_law_encode(dxy_norm)
     
     # Map from [-1, 1] to bin indices [0, 10]
-    bins = jnp.round((dxy_encoded + 1.0) * (NUM_CAMERA_BINS - 1) / 2.0).astype(jnp.int32)
-    bins = jnp.clip(bins, 0, NUM_CAMERA_BINS - 1)
+    bins = np.round((dxy_encoded + 1.0) * (NUM_CAMERA_BINS - 1) / 2.0).astype(np.int32)
+    bins = np.clip(bins, 0, NUM_CAMERA_BINS - 1)
     
     return bins[..., 1] * NUM_CAMERA_BINS + bins[..., 0]
 
@@ -165,7 +144,7 @@ def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
         keyboard = action.get("keyboard", {})
         keys = keyboard.get("keys", [])
         for key in keys:
-            idx = key_to_index.get(key)
+            idx = key_to_index.get(key, 21)
             binary[t, idx] = 1
         
         # Parse mouse buttons
@@ -185,11 +164,11 @@ def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
     
     # Convert camera to categorical using mu-law foveated discretization
     categorical = mouse_movement_to_categorical(
-        jnp.array(camera_dx), 
-        jnp.array(camera_dy)
+        np.array(camera_dx), 
+        np.array(camera_dy)
     )
     
     return Actions(
-        binary=jnp.array(binary),
+        binary=np.array(binary),
         categorical=categorical,
     )

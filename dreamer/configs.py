@@ -85,8 +85,8 @@ class DecoderModelConfig:
     use_rmsnorm_scale: bool = True
     dtype: str = "float32"
     param_dtype: str = "float32"
-    padded_H: int = 64  # sum(DatasetConfig.padding_H, DatasetConfig.H)
-    padded_W: int = 64  # sum(DatasetConfig.padding_W, DatasetConfig.W)
+    H: int = 64  # sum(DatasetConfig.padding_H, DatasetConfig.H)
+    W: int = 64  # sum(DatasetConfig.padding_W, DatasetConfig.W)
 
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
