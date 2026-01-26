@@ -769,7 +769,7 @@ def run_evaluation(
                 tokenizer, dynamics, frames=None,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=rng, policy=policy, task_embedder=task_embedder,
-                latents=val_latents, packing_factor=dynamics.cfg.packing_factor
+                latents=val_latents
             )
             # For metrics, compare pred vs gt_decoded (both from latents)
             gt_frames_for_metrics = gt_decoded_frames

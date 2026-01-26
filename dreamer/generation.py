@@ -226,7 +226,6 @@ def next_frame(
     # Decoder call
     frame, tokenizer_cache_updated = tokenizer.decode(
         latent,
-        packing_factor=dynamics.cfg.packing_factor,
         caches=tokenizer_cache,
         deterministic=True,
     )
@@ -271,7 +270,7 @@ def latent_rollout(
     # Initialize caches and process context
     window_size = T_ctx + num_steps
     n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
-    caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
+    caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
 
     # Run dynamics on context to prefill caches and get last hidden state
     # Use clean signal for ground truth context
@@ -364,8 +363,7 @@ def video_rollout(
     rngs = nnx.Rngs(mae=mae_key)
 
     latents_ctx, _ = tokenizer.encode(
-        frames_ctx, 
-        packing_factor=dynamics.cfg.packing_factor, 
+        frames_ctx,
         deterministic=True,
         rngs=rngs
     )  # Encode returns (B, T, L, D)
@@ -387,7 +385,6 @@ def video_rollout(
     # Decode
     pred_frames, _ = tokenizer.decode(
         rollout_result['latents'],
-        packing_factor=dynamics.cfg.packing_factor,
         deterministic=True
     )
 

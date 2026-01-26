@@ -27,7 +27,6 @@ def sample_video(
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
     latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
-    packing_factor: int | None = None,  # required when using latents
 ) -> Tuple[jax.Array, jax.Array, jax.Array | None]:
     """
     Sample video predictions using Tokenizer and Dynamics.
@@ -45,8 +44,7 @@ def sample_video(
         task_embedder: Optional task embedder. Required when policy is provided to generate
                 agent tokens for the dynamics model.
         latents: Optional pre-tokenized latents (B, T, n_latents, d_bottleneck). If provided,
-                skips tokenizer encoding.
-        packing_factor: Required when using latents. Packing factor for latent packing.
+                skips tokenizer encoding. Latents should already be unpacked.
 
     Returns:
         pred_frames: (B, ctx+horizon, H, W, C) predicted frames [0, 255] uint8
@@ -57,11 +55,8 @@ def sample_video(
 
     if latents is not None:
         # Pre-tokenized latent path
-        assert packing_factor is not None, "packing_factor required when using latents"
-
-        # Cast and pack latents (same as tokenizer.encode does)
+        # Latents are already unpacked
         latents = latents.astype(jnp.bfloat16)
-        latents = rearrange(latents, "b t (n p) d -> b t n (p d)", p=packing_factor)
         B, T = latents.shape[:2]
     else:
         # Video path - encode frames
@@ -70,10 +65,9 @@ def sample_video(
         rng, mae_key = jax.random.split(rng)
         rngs = nnx.Rngs(mae=mae_key)
 
-        # Encode frames to clean latents
+        # Encode frames to clean latents (returns unpacked)
         latents, _ = tokenizer.encode(
             frames,
-            packing_factor=dynamics.cfg.packing_factor,
             deterministic=True,
             rngs=rngs
         )
@@ -93,11 +87,9 @@ def sample_video(
     #     latents_ctx = tau * latents_ctx_clean + (1.0 - tau) * noise
 
     # Decode GT latents for visualization
-    pf = packing_factor if packing_factor is not None else dynamics.cfg.packing_factor
     latents_for_gt_frames = jnp.concatenate([latents_ctx, latents_future], axis=1)
     gt_decoded_frames, _ = tokenizer.decode(
         latents_for_gt_frames,
-        packing_factor=pf,
         deterministic=True
     )
     gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
@@ -144,7 +136,6 @@ def sample_video(
         # Decode predicted latents to frames
         pred_frames, _ = tokenizer.decode(
             rollout_result['latents'],
-            packing_factor=pf,
             deterministic=True
         )
         pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)

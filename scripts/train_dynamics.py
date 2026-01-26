@@ -47,7 +47,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # Training Step
 # ---------------------------
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "B_img", "T"))
+@nnx.jit(static_argnames=("k_max", "B_img", "T"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -58,7 +58,6 @@ def encode_and_train_step(
     tokenizer_key: jax.Array,
     master_key: jax.Array,
     step: int,
-    packing_factor: int,
     B_img: int,               # Number of samples to treat as images
     T: int,
     k_max: int,
@@ -77,9 +76,9 @@ def encode_and_train_step(
     videos_batch = videos[B_img:]
     actions_batch = actions[B_img:]
 
-    # Encode both batches
-    latents_img, _ = tokenizer.encode(images, packing_factor=packing_factor, deterministic=True, rngs=rngs)
-    latents_vid, _ = tokenizer.encode(videos_batch, packing_factor=packing_factor, deterministic=True, rngs=rngs)
+    # Encode both batches (returns unpacked latents)
+    latents_img, _ = tokenizer.encode(images, deterministic=True, rngs=rngs)
+    latents_vid, _ = tokenizer.encode(videos_batch, deterministic=True, rngs=rngs)
 
     # Compute B_self values
     B_self_img = B_img * T // 2
@@ -128,7 +127,7 @@ def encode_and_train_step(
     return aux_img, aux_vid
 
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "B_img", "T"))
+@nnx.jit(static_argnames=("k_max", "B_img", "T"))
 def latent_train_step(
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
@@ -137,7 +136,6 @@ def latent_train_step(
     *,
     master_key: jax.Array,
     step: int,
-    packing_factor: int,
     B_img: int,               # Number of samples to treat as images
     T: int,
     k_max: int,
@@ -147,8 +145,7 @@ def latent_train_step(
     # Cast latents to model dtype (bf16)
     latents = latents.astype(jnp.bfloat16)
 
-    # Pack latents (same as tokenizer.encode does)
-    latents = rearrange(latents, "b t (n p) d -> b t n (p d)", p=packing_factor)
+    # Latents are already unpacked from the dataloader
 
     # Split batch:
     # Images (T=1) - rearrange latents and actions to treat each frame as independent
@@ -241,11 +238,12 @@ def run(cfg: DynamicsConfig):
         print(f"Parameter counts: {param_counts['total']:,}")
 
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
-        n_spatial = tokenizer_cfg.encoder.n_latents // cfg.dynamics.packing_factor
+        n_latents = tokenizer_cfg.encoder.n_latents
+        n_spatial = n_latents // cfg.dynamics.packing_factor
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T, n_spatial=n_spatial),
+            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T, n_latents=n_latents),
             data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_spatial + 1),  # spatial + action
             total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
             logger=logger,
@@ -320,7 +318,6 @@ def run(cfg: DynamicsConfig):
                         latents, actions,
                         master_key=master_key,
                         step=step,
-                        packing_factor=cfg.dynamics.packing_factor,
                         B_img=B_img,
                         T=T,
                         k_max=cfg.dynamics.k_max,
@@ -335,7 +332,6 @@ def run(cfg: DynamicsConfig):
                         tokenizer_key=tokenizer_key,
                         master_key=master_key,
                         step=step,
-                        packing_factor=cfg.dynamics.packing_factor,
                         B_img=B_img,
                         T=T,
                         k_max=cfg.dynamics.k_max,

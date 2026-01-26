@@ -106,16 +106,15 @@ def input_to_action(controller_state: Dict[str, Any]) -> jax.Array:
 def create_update_caches_fn(tokenizer:Tokenizer, dynamics: Dynamics, schedule:DenoiseSchedule, task_embeddings: None | jax.Array):
     """
     Create a function that updates KV caches by processing a frame through the model.
-    
+
     This function encodes a frame to latent, processes it through dynamics,
     and decodes to update both caches. This keeps the world model synchronized
     with the procgen environment frames.
     """
-    packing_factor = dynamics.cfg.packing_factor
     step_idx_ctx = schedule.step_idx_ctx
     tau_idx_ctx = schedule.tau_idx_ctx
     tau_ctx = schedule.tau_ctx
-    
+
     def update_caches(
         frame: jax.Array,           # (1, 1, H, W, C)
         action: jax.Array,          # (1, 1)
@@ -124,23 +123,22 @@ def create_update_caches_fn(tokenizer:Tokenizer, dynamics: Dynamics, schedule:De
         rng: jax.Array,
     ):
         rng, enc_key, noise_key = jax.random.split(rng, 3)
-        
-        # 1. Encode frame to latent
+
+        # 1. Encode frame to latent (returns unpacked)
         latent, _ = tokenizer.encode(
             frame,
             deterministic=True,
-            packing_factor=packing_factor,
             rngs=nnx.Rngs(mae=enc_key),
-        )  # Shape: (1, 1, n_spatial, D_s*packing)
-        
+        )  # Shape: (1, 1, n_latents, D_s)
+
         # 2. Add noise per tau_ctx (90% signal, 10% noise)
         noise = jax.random.normal(noise_key, latent.shape, dtype=latent.dtype)
         latent_noised = latent * tau_ctx + (1 - tau_ctx) * noise
-        
+
         # 3. Process through dynamics to update dynamics cache
         step_indices = jnp.full((1, 1), step_idx_ctx, dtype=jnp.int32)
         tau_indices = jnp.full((1, 1), tau_idx_ctx, dtype=jnp.int32)
-        
+
         _, (h_new, dynamics_cache_new) = dynamics(
             action,
             step_indices,
@@ -150,16 +148,15 @@ def create_update_caches_fn(tokenizer:Tokenizer, dynamics: Dynamics, schedule:De
             deterministic=True,
             caches=dynamics_cache,
         )
-        
+
         # 4. Update tokenizer cache by decoding
         _, tokenizer_cache_new = tokenizer.decode(
             latent,
-            packing_factor=packing_factor,
             caches=tokenizer_cache,
             deterministic=True,
             rngs=None,
         )
-        
+
         return h_new, dynamics_cache_new, tokenizer_cache_new, rng
     
     return update_caches
@@ -293,14 +290,13 @@ class HybridVideoModel(VideoModel):
             )
             
             # Compute latent shape from configs
-            packing_factor = self.dynamics.cfg.packing_factor
             n_latents = self.tokenizer_cfg.decoder.n_latents
             D_s = self.tokenizer_cfg.encoder.d_bottleneck
-            
-            self.n_spatial = n_latents // packing_factor
-            self.window_size = self.tokenizer_cfg.dataset.T // packing_factor
-            self.latent_shape = (1, 1, n_latents // packing_factor, D_s * packing_factor)
-            
+
+            # Latents are now unpacked
+            self.latent_shape = (1, 1, n_latents, D_s)
+            self.window_size = self.tokenizer_cfg.dataset.T
+
             # Random key
             self.rng = jax.random.PRNGKey(0)
             
@@ -349,7 +345,7 @@ class HybridVideoModel(VideoModel):
             n_agent = 0 if self.policy_head is None else self.policy_head.L
             self.initial_dynamics_cache = self.dynamics.create_static_caches(
                 batch_size=1,
-                n_spatial=self.n_spatial,
+                n_latents=n_latents,
                 window_size=self.window_size,
                 n_agent=n_agent,
                 dtype=self.dynamics_cfg.dtype,

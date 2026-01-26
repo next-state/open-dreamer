@@ -150,30 +150,26 @@ class DreamerVideoModel(VideoModel):
             
             # Compute latent shape from dynamics config
             H, W = self.size
-            packing_factor = self.dynamics.cfg.packing_factor
             n_latents = self.tokenizer_cfg.decoder.n_latents
-            
-            # Calculate number of spatial tokens
-            self.n_spatial = n_latents // packing_factor
-            self.window_size = self.tokenizer_cfg.dataset.T//packing_factor
-            
+
             # Get bottleneck dimension from encoder config
             D_s = self.tokenizer_cfg.encoder.d_bottleneck
-            
-            # Set latent shape: (1, 1, n_spatial, D_s)
-            self.latent_shape = (1, 1, n_latents//packing_factor, D_s*packing_factor)
-            
+
+            # Set latent shape (unpacked): (1, 1, n_latents, D_s)
+            self.latent_shape = (1, 1, n_latents, D_s)
+            self.window_size = self.tokenizer_cfg.dataset.T
+
             # Initialize use_agent flag
             self.use_agent = self.policy is not None
-            
+
             # Random key
             self.rng = jax.random.PRNGKey(0)
-            
+
             # Initialize KV caches for both dynamics and tokenizer
             logger.info("Initializing KV caches...")
             self.initial_dynamics_cache = self.dynamics.create_static_caches(
                 batch_size=1,
-                n_spatial=self.n_spatial,
+                n_latents=n_latents,
                 window_size=self.window_size,
                 dtype=self.dynamics_cfg.dtype,
             )
@@ -242,9 +238,8 @@ class DreamerVideoModel(VideoModel):
         init_latents, _ = self.tokenizer.encode(
             init_frames_jax,
             deterministic=True,
-            packing_factor=self.dynamics.cfg.packing_factor,
             rngs=nnx.Rngs(mae=rng_encoder),
-        )  # Shape: (1, T//packing, n_spatial, D_s*packing)
+        )  # Shape: (1, T, n_latents, D_s) - unpacked
         
         # Warm up dynamics cache by processing context latents
         logger.info("Warming up dynamics cache...")
@@ -274,7 +269,6 @@ class DreamerVideoModel(VideoModel):
         logger.info("Warming up tokenizer cache...")
         _, self.tokenizer_cache = self.tokenizer.decode(
             init_latents,
-            packing_factor=self.dynamics.cfg.packing_factor,
             caches=self.tokenizer_cache,
             deterministic=True,
             rngs=None,

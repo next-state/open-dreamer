@@ -126,7 +126,7 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, BTL: tuple[int, int, int]) ->
 # Training step
 # ---------------------------
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "L_mtp", "B_self"))
+@nnx.jit(static_argnames=("k_max", "L_mtp", "B_self"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -145,7 +145,6 @@ def encode_and_train_step(
     tokenizer_key: jax.Array,
     master_key: jax.Array,
     step: int,
-    packing_factor: int,
     k_max: int,
     L_mtp: int,
     B_self: int,
@@ -158,8 +157,7 @@ def encode_and_train_step(
     """
     # Phase 1: Encode (tokenizer frozen)
     rngs = nnx.Rngs(mae=tokenizer_key)
-    latents, _ = tokenizer.encode(videos, packing_factor=packing_factor,
-                                  deterministic=True, rngs=rngs)
+    latents, _ = tokenizer.encode(videos, deterministic=True, rngs=rngs)
 
     # Phase 2: Train
     metrics = train_step(
@@ -391,7 +389,6 @@ def run(cfg: HeadsConfig):
                     tokenizer_key=tokenizer_key,
                     master_key=master_key,
                     step=step,
-                    packing_factor=dynamics_cfg.packing_factor,
                     k_max=bundle.dynamics.cfg.k_max,
                     L_mtp=cfg.policy_head.L,
                     B_self=(B // 2) * (step >= cfg.bootstrap_start),  # This will make the function compile twice. TODO: see if it's worth fixing this

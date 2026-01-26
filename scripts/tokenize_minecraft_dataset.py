@@ -245,12 +245,6 @@ def parse_args():
         help="Videos to encode per batch",
     )
     parser.add_argument(
-        "--packing_factor",
-        type=int,
-        default=None,
-        help="Optional latent packing factor",
-    )
-    parser.add_argument(
         "--num_workers",
         type=int,
         default=16,
@@ -302,9 +296,9 @@ def main():
         # JIT-compile encode function
         @nnx.jit
         def encode_batch(videos):
+            # Returns unpacked latents: (B, T, n_latents, d_bottleneck)
             latents, _ = tokenizer.encode(
                 videos,
-                packing_factor=args.packing_factor,
                 deterministic=True,
                 rngs=nnx.Rngs(0),
             )

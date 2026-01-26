@@ -1,3 +1,4 @@
+from numpy.distutils.unixccompiler import UnixCCompiler__compile
 import einops
 import jax.numpy as jnp
 from flax import nnx
@@ -698,7 +699,7 @@ class Encoder(nnx.Module):
         self.mask_and_replace = MAEReplacer(D=cfg.d_model, p_min=cfg.mae_p_min, p_max=cfg.mae_p_max, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
         self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_latents, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
-    def __call__(self, videos, *, deterministic: bool = True, packing_factor = None, rngs: nnx.Rngs | None = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
         # Videos in the [0, 255] range
         B, T, H, W, C = videos.shape
 
@@ -736,9 +737,7 @@ class Encoder(nnx.Module):
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
         proj_tokens = nnx.tanh(self.bottleneck_proj(latent_tokens))
 
-        if packing_factor is not None:
-            proj_tokens = rearrange(proj_tokens, "b t (n p) d -> b t n (p d)", p=packing_factor)
-
+        # Always return unpacked: (B, T, n_latents, d_bottleneck)
         return proj_tokens, (frame_mask, keep_prob)
 
 
@@ -785,13 +784,10 @@ class Decoder(nnx.Module):
             z: jnp.ndarray,
             *,
             deterministic: bool = True,
-            packing_factor = None,
             caches: KVCachesDict | None = None,
             rngs: nnx.Rngs | None = None
         ):
-        if packing_factor is not None:
-            z = rearrange(z, "... n (p d) -> ... (n p) d", p=packing_factor)
-
+        # Always expect unpacked input: (B, T, n_latents, d_bottleneck)
         B, T, N_l, d_bottleneck = z.shape
 
         # Up-project latent bottleneck to d_model (per latent token)
@@ -831,11 +827,13 @@ class Tokenizer(nnx.Module):
         recon, _ = self.decoder(z, deterministic=deterministic, rngs=rngs)
         return recon, aux
 
-    def encode(self, videos, *, deterministic: bool = True, packing_factor = None, rngs: nnx.Rngs | None = None):
-        return self.encoder(videos, deterministic=deterministic, packing_factor=packing_factor, rngs=rngs)
+    def encode(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None):
+        # Always returns unpacked: (B, T, n_latents, d_bottleneck)
+        return self.encoder(videos, deterministic=deterministic, rngs=rngs)
 
-    def decode(self, z, *, deterministic: bool = True, caches: KVCachesDict | None = None, packing_factor = None, rngs: nnx.Rngs | None = None):
-        frames, caches = self.decoder(z, deterministic=deterministic, packing_factor=packing_factor, caches=caches, rngs=rngs)
+    def decode(self, z, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None):
+        # Always expects unpacked: (B, T, n_latents, d_bottleneck)
+        frames, caches = self.decoder(z, deterministic=deterministic, caches=caches, rngs=rngs)
         return frames, caches
 
     def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
@@ -1078,7 +1076,14 @@ class Dynamics(nnx.Module):
             dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs
         )
 
-    def get_token_layout(self, n_spatial: int, n_agent: int = 0) -> TokenLayout:
+    def get_token_layout(self, n_latents: int, n_agent: int = 0) -> TokenLayout:
+        """Get token layout.
+
+        Args:
+            n_latents: Number of unpacked latent tokens (will be packed internally)
+            n_agent: Number of agent tokens
+        """
+        n_spatial = n_latents // self.packing_factor
         segments = [
             (Modality.ACTION, 1),
             (Modality.SHORTCUT, 1),
@@ -1089,10 +1094,18 @@ class Dynamics(nnx.Module):
             segments.append((Modality.AGENT, n_agent))
         return TokenLayout(tuple(segments))
 
-    def create_static_caches(self, batch_size: int, n_spatial: int, window_size: int = 1024,
+    def create_static_caches(self, batch_size: int, n_latents: int, window_size: int = 1024,
                            n_agent: int = 0, dtype=jnp.float32) -> KVCachesDict:
-        """Creates concrete, zero-filled buffers for JIT compilation."""
-        layout = self.get_token_layout(n_spatial=n_spatial, n_agent=n_agent)
+        """Creates concrete, zero-filled buffers for JIT compilation.
+
+        Args:
+            batch_size: Batch size
+            n_latents: Number of unpacked latent tokens (will be packed internally)
+            window_size: Maximum temporal sequence length
+            n_agent: Number of agent tokens
+            dtype: Data type for cache buffers
+        """
+        layout = self.get_token_layout(n_latents=n_latents, n_agent=n_agent)
 
         return create_transformer_caches(
             depth=self.cfg.depth,
@@ -1109,7 +1122,7 @@ class Dynamics(nnx.Module):
         actions: Actions,
         step_indices,
         tau_indices,
-        packed_enc_tokens,
+        unpacked_enc_tokens,
         *,
         context_length: int | None = None,
         task_embeddings: jnp.ndarray | None = None,
@@ -1122,19 +1135,21 @@ class Dynamics(nnx.Module):
             actions: Actions object
             step_indices: (B, T) int32 — step indices for embedding lookup
             tau_indices: (B, T) int32 - signal indices for embedding lookup
-            packed_enc_tokens: (B, T, n_spatial, d_spatial) packed encoder tokens
+            unpacked_enc_tokens: (B, T, n_latents, d_bottleneck) unpacked encoder tokens
             context_length: optional context length for sliding window attention. If provided,
                            creates local_window_size=(context_length - 1, 0) for causal sliding window.
             task_embeddings: (B, T, n_agent, d_model) optional agent tokens
             caches: optional dict of KVCache for each layer
 
-        Shapes produced:
+        Shapes produced (internal):
             spatial_tokens: (B, T, n_spatial, d_model)
             action_token:  (B, T, 1, d_model)
             shortcut_token: (B, T, 1, d_model)
         """
-        B, T = packed_enc_tokens.shape[:2]
+        B, T = unpacked_enc_tokens.shape[:2]
 
+        # Pack tokens internally for processing
+        packed_enc_tokens = rearrange(unpacked_enc_tokens, "b t (n p) d -> b t n (p d)", p=self.packing_factor)
         # Project spatial tokens to d_model
         spatial_tokens = self.spatial_proj(packed_enc_tokens)  # (B, T, n_spatial, d_model)
 
@@ -1165,7 +1180,8 @@ class Dynamics(nnx.Module):
 
         # Make the layout for masking
         n_agent = task_embeddings.shape[2] if task_embeddings is not None else 0
-        layout = self.get_token_layout(n_spatial=spatial_tokens.shape[2], n_agent=n_agent)
+        n_latents = unpacked_enc_tokens.shape[2]
+        layout = self.get_token_layout(n_latents=n_latents, n_agent=n_agent)
         space_mask = layout.build_space_mask("wm_agent")
 
         # Compute local_window_size from context_length for sliding window causal attention
@@ -1182,7 +1198,11 @@ class Dynamics(nnx.Module):
         )
 
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
-        x1_hat = self.flow_x_head(spatial_tokens)
+        x1_hat_packed = self.flow_x_head(spatial_tokens)  # (B, T, n_spatial, d_spatial)
+
+        # Unpack before returning
+        x1_hat = rearrange(x1_hat_packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
+        
         h_t = x[:, :, layout.slices()[Modality.AGENT], :] if task_embeddings is not None else None  # (B,T,n_agent,D) or None
         return x1_hat, (h_t, new_caches)
 
@@ -1211,12 +1231,17 @@ class Dynamics(nnx.Module):
         excluded += self.transformer.count_excluded_params()
         return excluded
 
-    def estimate_flops(self, batch_size: int, seq_length: int, n_spatial: int) -> int:
+    def estimate_flops(self, batch_size: int, seq_length: int, n_latents: int) -> int:
         """FLOPs per training step (forward + backward).
+
+        Args:
+            batch_size: Batch size
+            seq_length: Sequence length
+            n_latents: Number of unpacked latent tokens (will be packed internally)
 
         Follows https://github.com/karpathy/nanochat/discussions/420.
         """
-        S = self.get_token_layout(n_spatial=n_spatial).S
+        S = self.get_token_layout(n_latents=n_latents).S
 
         # Weight FLOPs (excluding embeddings/scalars)
         total_params = self.num_scaling_params()
