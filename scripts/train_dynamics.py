@@ -42,7 +42,10 @@ OmegaConf.register_new_resolver("max", lambda *args: max(args))
 # Training Step
 # ---------------------------
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "B_img", "T", "categorical_action_dim"))
+@nnx.jit(
+    static_argnames=("packing_factor", "k_max", "B_img", "T", "categorical_action_dim", "context_length"),
+    donate_argnames=("videos", "actions"),
+)
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -79,9 +82,12 @@ def encode_and_train_step(
     latents_vid, _ = tokenizer.encode(videos_batch, packing_factor=packing_factor, deterministic=True, rngs=rngs)
 
     # Compute B_self values
-    B_self_img = B_img * T // 2
-    B_vid = videos.shape[0] - B_img
-    B_self_vid = B_vid // 2
+    B_img_actual = latents_img.shape[0]
+    B_vid_actual = latents_vid.shape[0]
+    total_B = B_img_actual + B_vid_actual
+
+    B_self_img = B_img_actual // 2
+    B_self_vid = B_vid_actual // 2
 
     # Training step
     step_key = jax.random.fold_in(master_key, step)
@@ -111,9 +117,6 @@ def encode_and_train_step(
     )
 
     # Aggregate gradients
-    B_img_actual = latents_img.shape[0]
-    B_vid_actual = latents_vid.shape[0]
-    total_B = B_img_actual + B_vid_actual
     combined_grads = jax.tree.map(
         lambda g1, g2: (g1 * B_img_actual + g2 * B_vid_actual) / total_B,
         grads_img, grads_vid
