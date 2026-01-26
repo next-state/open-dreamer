@@ -555,7 +555,7 @@ class BlockCausalLayer(nnx.Module):
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
         if self.use_time:
-            attn_mask = time_mask if time_local_window_size is None else None
+            attn_mask = time_mask
             local_window_size = time_local_window_size
         else:
             attn_mask = space_mask
@@ -1112,6 +1112,7 @@ class Dynamics(nnx.Module):
         packed_enc_tokens,
         *,
         context_length: int | None = None,
+        time_mask: jnp.ndarray | None = None,
         task_embeddings: jnp.ndarray | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
@@ -1125,6 +1126,7 @@ class Dynamics(nnx.Module):
             packed_enc_tokens: (B, T, n_spatial, d_spatial) packed encoder tokens
             context_length: optional context length for sliding window attention. If provided,
                            creates local_window_size=(context_length - 1, 0) for causal sliding window.
+            time_mask: optional (B, 1, T, T) boolean mask for temporal attention
             task_embeddings: (B, T, n_agent, d_model) optional agent tokens
             caches: optional dict of KVCache for each layer
 
@@ -1175,6 +1177,7 @@ class Dynamics(nnx.Module):
 
         x, new_caches = self.transformer(
             tokens, space_mask=space_mask,
+            time_mask=time_mask,
             time_local_window_size=time_local_window_size,
             deterministic=deterministic,
             caches=caches,

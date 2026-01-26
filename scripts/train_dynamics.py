@@ -65,67 +65,46 @@ def encode_and_train_step(
 ):
     rngs = nnx.Rngs(mae=tokenizer_key)
 
-    # TODO: handle edge cases B_img = 0 or B_img = B
+    # Encode
+    latents, _ = tokenizer.encode(videos, packing_factor=packing_factor, deterministic=True, rngs=rngs)
+    
+    B = latents.shape[0]
+    B_self = B // 2    # Split batch for empirical and bootstrap learning
+    B_vid = B - B_img  # Number of samples to treat as videos
 
-    # Split batch:
-    # Images (T=1)
-    images = rearrange(videos[:B_img], 'B_img T H W C -> (B_img T) 1 H W C')
-    noop_actions = create_noop_action_like(actions[:B_img], categorical_action_dim)
-    noop_actions = jax.tree.map(lambda x: repeat(x, 'B_img 1 ... -> (B_img T) 1 ...', T=T), noop_actions)
-
-    # Videos (T=T)
-    videos_batch = videos[B_img:]
-    actions_batch = actions[B_img:]
-
-    # Encode both batches
-    latents_img, _ = tokenizer.encode(images, packing_factor=packing_factor, deterministic=True, rngs=rngs)
-    latents_vid, _ = tokenizer.encode(videos_batch, packing_factor=packing_factor, deterministic=True, rngs=rngs)
-
-    # Compute B_self values
-    B_img_actual = latents_img.shape[0]
-    B_vid_actual = latents_vid.shape[0]
-    total_B = B_img_actual + B_vid_actual
-
-    B_self_img = B_img_actual // 2
-    B_self_vid = B_vid_actual // 2
+    # Build time mask for [Img_Empirical, Vid_Empirical, Img_Bootstrap, Vid_Bootstrap]
+    mask_img = jnp.eye(T, dtype=jnp.bool_)[None, None, :, :]                  # independent tokens (1, 1, T, T)
+    mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))[None, None, :, :]  # causal tokens (1, 1, T, T)
+    time_mask_half = [mask_img] * (B_img // 2) + [mask_vid] * (B_vid // 2)    # (B/2, 1, 1, T, T)
+    time_mask = repeat(time_mask_half, 'half 1 1 T1 T2 -> (2 half) 1 T1 T2')  # (B, 1, T, T)
 
     # Training step
     step_key = jax.random.fold_in(master_key, step)
-    key_img, key_vid = jax.random.split(step_key, 2)
 
-    def loss_fn(model: Dynamics, latents, actions, rng, B_self, ctx_len):
+    def loss_fn(model: Dynamics, latents, actions, mask, context_length):
         losses, aux = shortcut_forcing_step(
             dynamics_model=model,
             actions=actions,
             latents=latents,
-            rng=rng,
+            rng=step_key,
             k_max=k_max,
             B_self=B_self,
-            context_length=ctx_len,
+            context_length=context_length, # Builds sliding window attention
             task_embeddings=None,  # Not used in dynamics pretraining
         )
+
         return losses['total'], aux
 
-    # Compute gradients for images
-    (loss_img, aux_img), grads_img = nnx.value_and_grad(loss_fn, has_aux=True)(
-        dynamics, latents_img, noop_actions, key_img, B_self_img, None  # Images: T=1, no context_length
-    )
-
-    # Compute gradients for videos
-    (loss_vid, aux_vid), grads_vid = nnx.value_and_grad(loss_fn, has_aux=True)(
-        dynamics, latents_vid, actions_batch, key_vid, B_self_vid, context_length
-    )
-
-    # Aggregate gradients
-    combined_grads = jax.tree.map(
-        lambda g1, g2: (g1 * B_img_actual + g2 * B_vid_actual) / total_B,
-        grads_img, grads_vid
+    (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
+        dynamics, 
+        latents, actions, time_mask, context_length
     )
 
     # Update model with optimizer
-    optimizer.update(dynamics, combined_grads)
+    optimizer.update(dynamics, grads)
 
-    return aux_img, aux_vid
+    return metrics
+
 
 # ---------------------------
 # Main
@@ -240,7 +219,7 @@ def run(cfg: DynamicsConfig):
 
                 # Training step
                 B_img = int(cfg.dataset.B * cfg.image_fraction)
-                aux_img, aux_vid = encode_and_train_step(
+                metrics = encode_and_train_step(
                     bundle.tokenizer, bundle.dynamics, bundle.dynamics_optimizer,
                     videos, actions,
                     tokenizer_key=tokenizer_key,
@@ -256,16 +235,13 @@ def run(cfg: DynamicsConfig):
 
                 # Logging
                 if logger.should_log(step):
-                    metrics_img_cpu = jax.device_get(aux_img)
-                    metrics_vid_cpu = jax.device_get(aux_vid)
-                    scaling.on_step(step, metrics_vid_cpu)
+                    metrics_cpu = jax.device_get(metrics)
+                    scaling.on_step(step, metrics_cpu)
                     logger.log(
                         step,
                         metrics={
-                            "image/flow_mse": metrics_img_cpu["flow_mse"],
-                            "image/boot_mse": metrics_img_cpu["bootstrap_mse"],
-                            "video/flow_mse": metrics_vid_cpu["flow_mse"],
-                            "video/boot_mse": metrics_vid_cpu["bootstrap_mse"],
+                            "flow_mse": metrics_cpu["flow_mse"],
+                            "boot_mse": metrics_cpu["bootstrap_mse"],
                             "lr": lr_schedule(step),
                             "batch_type": 1.0 if use_long else 0.0,
                             **scaling.get_step_metrics(step),
