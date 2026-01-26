@@ -12,11 +12,10 @@ ckpt:
 
 dataset:
   B: 8
-  T: 8
 
 dynamics:
     d_bottleneck: 16
-    depth: 4
+    depth: 12
     d_model: ${mul:64,${dynamics.depth}}
     n_heads: ${floordiv:${dynamics.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${dynamics.n_heads},8}}
@@ -73,4 +72,4 @@ optimizer:
   muon_ns_steps: 5
   muon_nesterov: true
 
-write_video_every: 5_000
+write_video_every: 500

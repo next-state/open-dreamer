@@ -719,13 +719,14 @@ def run_evaluation(
     step: int,
     tokenizer,
     dynamics,
-    val_videos: jnp.ndarray,
+    val_videos: jnp.ndarray | None,
     val_actions: Actions,
     vis_dir: Path,
     rng: jax.Array,
     logger,
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
+    val_latents: jnp.ndarray | None = None,
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
@@ -737,14 +738,17 @@ def run_evaluation(
         step: Current training step
         tokenizer: Tokenizer NNX model instance
         dynamics: Dynamics NNX model instance
-        val_videos: (B, T, H, W, C) Validation videos
+        val_videos: (B, T, H, W, C) Validation videos. None if using latents.
         val_actions: (B, T) Validation actions
         vis_dir: Directory to save visualizations
         rng: Random key
         logger: Logger instance for logging metrics and videos
         policy: Optional policy model for action sampling
         task_embedder: Optional task embedder for agent tokens
+        val_latents: (B, T, n_latents, d_bottleneck) Pre-tokenized validation latents. None if using videos.
     """
+    assert (val_videos is not None) ^ (val_latents is not None), "Provide either val_videos or val_latents, not both"
+    use_latent_data = val_latents is not None
     k_max = dynamics.cfg.k_max
     schedule_shortcut = DenoiseSchedule.init(4, k_max)
     schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
@@ -753,34 +757,54 @@ def run_evaluation(
 
     for tag, schedule_config in evaluation_schedules.items():
         t0 = time.time()
-        # FIXME: only temporary for debugging
-        assert val_videos.shape[1] > 5
+        # Determine sequence length and horizon
+        T = val_latents.shape[1] if use_latent_data else val_videos.shape[1]
+        assert T > 5, f"Sequence length {T} must be > 5"
         ctx_length = 4
-        horizon = val_videos.shape[1] - ctx_length
+        horizon = T - ctx_length
 
-        pred_frames, floor_frames, gt_frames = sample_video(
-            tokenizer, dynamics, val_videos, 
-            val_actions, horizon, schedule_config, rng, policy, task_embedder
-        )
+        # Sample video predictions
+        if use_latent_data:
+            pred_frames, gt_decoded_frames, _ = sample_video(
+                tokenizer, dynamics, frames=None,
+                actions=val_actions, horizon=horizon, schedule_config=schedule_config,
+                rng=rng, policy=policy, task_embedder=task_embedder,
+                latents=val_latents, packing_factor=dynamics.cfg.packing_factor
+            )
+            # For metrics, compare pred vs gt_decoded (both from latents)
+            gt_frames_for_metrics = gt_decoded_frames
+        else:
+            pred_frames, gt_decoded_frames, original_frames = sample_video(
+                tokenizer, dynamics, frames=val_videos,
+                actions=val_actions, horizon=horizon, schedule_config=schedule_config,
+                rng=rng, policy=policy, task_embedder=task_embedder
+            )
+            # For metrics, compare pred vs original frames
+            gt_frames_for_metrics = original_frames
 
         # Compute metrics
         dt = time.time() - t0
         dataset_std = cfg.dataset.dataset_std[0]
         normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
-        normalized_gt = normalize_with_dataset_stats(gt_frames[:, -horizon:], mean=0, std=dataset_std)
+        normalized_gt = normalize_with_dataset_stats(gt_frames_for_metrics[:, -horizon:], mean=0, std=dataset_std)
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
-        psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames[:, -horizon:]/255))
-        
+        psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames_for_metrics[:, -horizon:]/255))
+
         print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
 
         # Build visualization
         num_videos = min(4, pred_frames.shape[0])
-        
+
         # Add red border to context frames in prediction
         pred_frames = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
-        
-        frames = [floor_frames, gt_frames, pred_frames]
-        stacked_frames = jnp.stack(frames)[:, :num_videos]
+
+        if use_latent_data:
+            # 2-column grid: [gt_decoded, pred]
+            frames_list = [gt_decoded_frames, pred_frames]
+        else:
+            # 3-column grid: [floor (tokenizer reconstruction), gt, pred]
+            frames_list = [gt_decoded_frames, original_frames, pred_frames]
+        stacked_frames = jnp.stack(frames_list)[:, :num_videos]
         videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
 
         # Save artifacts

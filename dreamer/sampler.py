@@ -4,11 +4,12 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+from einops import rearrange
 from flax import nnx
 
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
-from .generation import DenoiseSchedule, video_rollout
+from .generation import DenoiseSchedule, video_rollout, latent_rollout
 
 
 # ---------------------------
@@ -18,21 +19,23 @@ from .generation import DenoiseSchedule, video_rollout
 def sample_video(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
-    frames: jax.Array,     # (B, T, H, W, C) in [0, 255]
-    actions: Actions,      # (B, T)
+    frames: jax.Array | None,   # (B, T, H, W, C) in [0, 255] - None if using latents
+    actions: Actions,           # (B, T)
     horizon: int,
     schedule_config: DenoiseSchedule,
     rng: jax.Array,
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
-) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
+    packing_factor: int | None = None,  # required when using latents
+) -> Tuple[jax.Array, jax.Array, jax.Array | None]:
     """
     Sample video predictions using Tokenizer and Dynamics.
 
     Args:
         tokenizer: Tokenizer NNX model (has encode/decode methods)
         dynamics: Dynamics NNX model
-        frames: Input video frames (B, T, H, W, C) in [0, 255] uint8
+        frames: Input video frames (B, T, H, W, C) in [0, 255] uint8. None if using latents.
         actions: Action sequence (B, T)
         horizon: Number of future frames to predict
         schedule_config: DenoiseSchedule with rollout parameters
@@ -41,27 +44,41 @@ def sample_video(
                 during rollout instead of using ground truth future actions.
         task_embedder: Optional task embedder. Required when policy is provided to generate
                 agent tokens for the dynamics model.
-    
+        latents: Optional pre-tokenized latents (B, T, n_latents, d_bottleneck). If provided,
+                skips tokenizer encoding.
+        packing_factor: Required when using latents. Packing factor for latent packing.
+
     Returns:
         pred_frames: (B, ctx+horizon, H, W, C) predicted frames [0, 255] uint8
-        tokenized_frames: (B, ctx+horizon, H, W, C) tokenizer reconstruction (GT latents decoded) [0, 255] uint8
-        frames: (B, ctx+horizon, H, W, C) ground truth frames [0, 255] uint8
+        gt_decoded_frames: (B, ctx+horizon, H, W, C) GT latents decoded [0, 255] uint8
+        original_frames: (B, ctx+horizon, H, W, C) original frames [0, 255] uint8, or None if using latents
     """
-    B, T, H, W, C = frames.shape
+    assert (frames is not None) ^ (latents is not None), "Provide either frames or latents, not both"
 
-    rng, mae_key = jax.random.split(rng)
-    rngs = nnx.Rngs(mae=mae_key)
+    if latents is not None:
+        # Pre-tokenized latent path
+        assert packing_factor is not None, "packing_factor required when using latents"
 
-    # Encode frames to clean latents
-    latents, _ = tokenizer.encode(
-        frames,
-        packing_factor=dynamics.cfg.packing_factor,
-        deterministic=True,
-        rngs=rngs
-    )
+        # Cast and pack latents (same as tokenizer.encode does)
+        latents = latents.astype(jnp.bfloat16)
+        latents = rearrange(latents, "b t (n p) d -> b t n (p d)", p=packing_factor)
+        B, T = latents.shape[:2]
+    else:
+        # Video path - encode frames
+        B, T, H, W, C = frames.shape
+
+        rng, mae_key = jax.random.split(rng)
+        rngs = nnx.Rngs(mae=mae_key)
+
+        # Encode frames to clean latents
+        latents, _ = tokenizer.encode(
+            frames,
+            packing_factor=dynamics.cfg.packing_factor,
+            deterministic=True,
+            rngs=rngs
+        )
 
     # Split context vs future
-    frames_ctx = frames[:, :-horizon, :, :, :]
     latents_ctx_clean = latents[:, :-horizon, :, :]
     latents_future = latents[:, -horizon:, :, :]
     actions_ctx = actions[:, :-horizon]
@@ -75,19 +92,20 @@ def sample_video(
     #     tau = jnp.asarray(schedule_config.tau_ctx, latents_ctx_clean.dtype)
     #     latents_ctx = tau * latents_ctx_clean + (1.0 - tau) * noise
 
-    # Tokenized frames for visualization
-    latents_for_tokenized_frames = jnp.concatenate([latents_ctx, latents_future], axis=1)
-    tokenized_frames, _ = tokenizer.decode(
-        latents_for_tokenized_frames,
-        packing_factor=dynamics.cfg.packing_factor,
+    # Decode GT latents for visualization
+    pf = packing_factor if packing_factor is not None else dynamics.cfg.packing_factor
+    latents_for_gt_frames = jnp.concatenate([latents_ctx, latents_future], axis=1)
+    gt_decoded_frames, _ = tokenizer.decode(
+        latents_for_gt_frames,
+        packing_factor=pf,
         deterministic=True
     )
-    tokenized_frames = jnp.clip(tokenized_frames, 0, 255).astype(jnp.uint8)
+    gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
     # Use policy if provided, otherwise use ground truth future actions
     # When using a policy, we need agent tokens for the dynamics model to produce hidden states
-    T_ctx = frames_ctx.shape[1]
+    T_ctx = latents_ctx.shape[1]
     if policy is not None:
         assert task_embedder is not None, "task_embedder is required when policy is provided"
         task = jnp.zeros((B,), dtype=jnp.int32)  # Use task ID 0 for all samples
@@ -95,17 +113,41 @@ def sample_video(
     else:
         initial_agent_tokens = None
 
-    pred_frames = video_rollout(
-        tokenizer,
-        dynamics,
-        policy = actions_future if policy is None else policy,
-        schedule=schedule_config,
-        frames_ctx=frames_ctx,
-        actions_ctx=actions_ctx,
-        num_steps=horizon,
-        rng=rng,
-        initial_task_embedding=initial_agent_tokens,
-    )
+    if frames is not None:
+        # Video path: use video_rollout which encodes context frames
+        frames_ctx = frames[:, :-horizon, :, :, :]
+        pred_frames = video_rollout(
+            tokenizer,
+            dynamics,
+            policy=actions_future if policy is None else policy,
+            schedule=schedule_config,
+            frames_ctx=frames_ctx,
+            actions_ctx=actions_ctx,
+            num_steps=horizon,
+            rng=rng,
+            initial_task_embedding=initial_agent_tokens,
+        )
+        original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8)
+    else:
+        # Latent path: use latent_rollout directly (context already encoded)
+        rollout_result = latent_rollout(
+            dynamics,
+            policy=actions_future if policy is None else policy,
+            schedule=schedule_config,
+            latents_ctx=latents_ctx,
+            actions_ctx=actions_ctx,
+            num_steps=horizon,
+            rng=rng,
+            initial_task_embedding=initial_agent_tokens,
+            greedy=True,
+        )
+        # Decode predicted latents to frames
+        pred_frames, _ = tokenizer.decode(
+            rollout_result['latents'],
+            packing_factor=pf,
+            deterministic=True
+        )
+        pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
+        original_frames = None
 
-    frames = jnp.clip(frames, 0, 255).astype(jnp.uint8)
-    return pred_frames, tokenized_frames, frames
+    return pred_frames, gt_decoded_frames, original_frames

@@ -37,6 +37,11 @@ OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
 OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
 OmegaConf.register_new_resolver("max", lambda *args: max(args))
 
+jax.config.update("jax_compilation_cache_dir", "/scratch/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+
 
 # ---------------------------
 # Training Step
@@ -360,16 +365,20 @@ def run(cfg: DynamicsConfig):
                 iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
                 bundle.maybe_save(checkpoint_manager, step, iterators, rng)
 
-                # Periodic lightweight AR eval (only for video data, not latent)
+                # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
-                    if not use_latent_data:
-                        # Use subset of batch for visualization
-                        val_videos = videos[:4]
-                        val_actions = actions[:4]
-
+                    val_actions = actions[:4]
+                    if use_latent_data:
                         run_evaluation(
                             cfg, step, bundle.tokenizer, bundle.dynamics,
-                            val_videos, val_actions, vis_dir, rng, logger
+                            val_videos=None, val_actions=val_actions, vis_dir=vis_dir,
+                            rng=rng, logger=logger, val_latents=latents[:4]
+                        )
+                    else:
+                        run_evaluation(
+                            cfg, step, bundle.tokenizer, bundle.dynamics,
+                            val_videos=videos[:4], val_actions=val_actions,
+                            vis_dir=vis_dir, rng=rng, logger=logger
                         )
 
             scaling.finalize()
