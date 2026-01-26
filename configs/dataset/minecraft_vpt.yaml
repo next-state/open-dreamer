@@ -3,10 +3,10 @@ defaults:
 
 name: minecraft_vpt
 
-array_record_path: /home/minecraft-vpt/contractor_demos/8xx_Jun_29/
-index_max: 10000
+array_record_path: /home/ubuntu/minecraft-vpt/arrayrecords-mp4
+index_max: 15
 
-B: 4
+B: 8
 T: 4
 H: 360
 W: 640
@@ -20,7 +20,7 @@ num_binary_actions: 23  # keyboard actions
 categorical_action_dim: 121  # mouse actions
 continuous_action_dim: 0
 
-dataset_mean: [0.5, 0.5, 0.5]
-dataset_std: [0.288675, 0.288675, 0.288675]
+dataset_mean: [0.2241, 0.2348, 0.2086]
+dataset_std: [0.1809, 0.1874, 0.2282]
 
 p_include_reward: 0.0

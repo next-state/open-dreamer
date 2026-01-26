@@ -1,10 +1,15 @@
 import copy
+import io
+
 import jax
 import numpy as np
 import grain
 from typing import Any, Tuple
 import pickle
 import os
+
+import decord
+decord.bridge.set_bridge("native")
 
 from .configs import DatasetConfig
 from .actions import Actions
@@ -30,13 +35,13 @@ class EpisodeLengthFilter(grain.transforms.Filter):
 
     def filter(self, element: Any) -> bool:
         assert isinstance(element, bytes)
-        element = pickle.loads(element)
+        data = pickle.loads(element)
 
         # Handle both CoinRun and Minecraft VPT formats
-        if "sequence_length" in element:
-            current_episode_len = element["sequence_length"]
-        elif "video_shape" in element:
-            current_episode_len = element["video_shape"][0]
+        if "sequence_length" in data:
+            current_episode_len = data["sequence_length"]
+        elif "video_shape" in data:
+            current_episode_len = data["video_shape"][0]
         else:
             raise ValueError("Unknown episode format: missing 'sequence_length' or 'video_shape'")
 
@@ -139,7 +144,7 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
 class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
     # TODO: consolidate with ProcessEpisodeAndSlice
-    """Parse video bytes, random slice for Minecraft VPT dataset."""
+    """Parse MP4 video bytes using decord, random slice for Minecraft VPT dataset."""
 
     def __init__(
         self,
@@ -162,24 +167,31 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
     def random_map(self, element: bytes, rng: np.random.Generator) -> dict[str, Any]:
         data = pickle.loads(element)
 
-        video_shape = data["video_shape"]
-        video = np.frombuffer(data["video"], dtype=np.uint8).reshape(video_shape)
+        # Decode MP4 bytes using decord (create cpu context here to avoid pickling issues with grain workers)
+        # num_threads=1 to avoid oversubscription since grain already uses multiple workers
+        mp4_bytes = io.BytesIO(data["video"])
+        vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(0), num_threads=1)
 
-        episode_len = video_shape[0]
+        episode_len = len(vr)
         max_start = episode_len - self.seq_len
         start = int(rng.integers(0, max_start + 1))
 
-        seq = video[start : start + self.seq_len]
+        # Get frame indices for the slice
+        frame_indices = list(range(start, start + self.seq_len))
+        video_slice = vr.get_batch(frame_indices).asnumpy()  # (T, H, W, C)
 
-        seq = np.pad(
-            seq,
+        # Keep as float32 in [0, 255] range (consistent with CoinRun loader)
+        video = video_slice.astype(np.float32)
+
+        video = np.pad(
+            video,
             ((0, 0), self.padding_h, self.padding_w, (0, 0)),
             mode='constant',
             constant_values=0
         )
 
         return {
-            "videos": seq,
+            "videos": video,
             "actions_categorical": None,
             "actions_binary": None,
             "actions_continuous": None,
@@ -204,8 +216,8 @@ class CreateActions(grain.transforms.Map):
 
 def make_iterator(
     cfg: DatasetConfig,
-    num_workers: int = 22,
-    prefetch_buffer_size: int = 1,
+    num_workers: int = 128,
+    prefetch_buffer_size: int = 4,
     seed: int = 42,
     print_filter_warnings: bool = False,
 ):

@@ -31,6 +31,7 @@ from dreamer.utils import (
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
 
+# Register OmegaConf resolver for arithmetic expressions
 OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
 OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
 OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
