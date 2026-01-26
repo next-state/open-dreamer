@@ -202,15 +202,28 @@ class CheckpointBundle:
             restore_kwargs[name] = grain.checkpoint.CheckpointRestore(iterator)
         restore_kwargs["rngs"] = ocp.args.StandardRestore({"key": rng})
 
-        restore_args = ocp.args.Composite(**restore_kwargs)
-        restored = checkpoint_manager.restore(step, args=restore_args)
+        # Try to restore with iterators first
+        try: # I don't really like this try catch thing. we might just avoid restoring the sampler tbh
+            restore_args = ocp.args.Composite(**restore_kwargs)
+            restored = checkpoint_manager.restore(step, args=restore_args)
+        except ValueError as e:
+            if "sampler" in str(e).lower():
+                print(f"Warning: Failed to restore iterators due to sampler mismatch: {e}")
+                print("Restarting iterators from scratch.")
+                # Remove iterator restore kwargs and retry
+                for name in iterators.keys():
+                    restore_kwargs.pop(name, None)
+                restore_args = ocp.args.Composite(**restore_kwargs)
+                restored = checkpoint_manager.restore(step, args=restore_args)
+            else:
+                raise
 
         # Update bundle fields in-place
         for field in fields(self):
             field_value = getattr(self, field.name)
             nnx.update(field_value, restored[field.name])
 
-        # Update iterators
+        # Update iterators (only if they were restored)
         for name in iterators.keys():
             if name in restored:
                 iterators[name] = restored[name]

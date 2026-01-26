@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt
   - _self_
 
-run_name: tokenizer
+run_name: tokenizer-512
 
 dataset:
   B: 16
@@ -15,7 +15,7 @@ ckpt:
 
 tokenizer:
   encoder:
-    n_latents: 16
+    n_latents: 512
     d_bottleneck: 16
     depth: 7
     d_model: ${mul:64,${sum:${tokenizer.encoder.depth},${tokenizer.decoder.depth}}}
@@ -49,8 +49,8 @@ tokenizer:
     qk_norm_type: ${tokenizer.encoder.qk_norm_type}
     rope_theta: ${tokenizer.encoder.rope_theta}
     time_every: ${tokenizer.encoder.time_every}
-    padded_H: ${sum:${dataset.padding_H[0]},${dataset.padding_H[1]},${dataset.H}}
-    padded_W: ${sum:${dataset.padding_W[0]},${dataset.padding_W[1]},${dataset.W}}
+    H: ${sum:${dataset.padding_H[0]},${dataset.padding_H[1]},${dataset.H}}
+    W: ${sum:${dataset.padding_W[0]},${dataset.padding_W[1]},${dataset.W}}
     patch_size: ${dataset.patch_size}
     d_patch: ${mul:${dataset.patch_size},${dataset.patch_size},${dataset.C}}
     use_residual_lambdas: ${tokenizer.encoder.use_residual_lambdas}

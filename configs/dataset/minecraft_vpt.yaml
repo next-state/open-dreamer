@@ -2,6 +2,7 @@ defaults:
   - _self_
 
 name: minecraft_vpt
+data_type: video
 
 array_record_path: /home/ubuntu/minecraft-vpt/arrayrecords-mp4
 index_max: 1500
@@ -12,9 +13,9 @@ H: 360
 W: 640
 C: 3
 
-padding_H: [4, 4]
+padding_H: [0, 0]
 padding_W: [0, 0]
-patch_size: 16
+patch_size: 20
 
 num_binary_actions: 23  # keyboard actions
 categorical_action_dim: 121  # mouse actions
