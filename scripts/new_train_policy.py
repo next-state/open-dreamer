@@ -307,7 +307,6 @@ def train_step(
         # Get RNG for imagination
         rng_imag = rngs()
         
-        
         rollout_result = latent_rollout(
             dynamics=dynamics,  
             policy=policy_head,  
@@ -316,7 +315,8 @@ def train_step(
             actions_ctx=actions[:, :T_ctx],
             num_steps=horizon,
             rng=rng_imag,
-            initial_agent_latents=agent_tokens_ctx,
+            initial_task_embedding=agent_tokens_ctx,
+            greedy=False,
         )
         
         # Extract results

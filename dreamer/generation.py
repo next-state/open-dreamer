@@ -1,13 +1,10 @@
 import math
 import einops
 import jax
-import numpy as np
 import jax.numpy as jnp
-from typing import Any, Dict, Tuple 
-
-from .models import Dynamics, KVCache, PolicyHeadMTP, TaskEmbedder, Tokenizer
-
-
+from typing import Any, Tuple
+from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
+from .actions import Actions
 from flax.struct import dataclass
 
 
@@ -69,26 +66,26 @@ class DenoiseSchedule:
 def next_latent(
     dynamics: Dynamics,
     schedule: DenoiseSchedule,
-    action: jax.Array,                 # (B, 1)
+    action: Actions,
     latent_shape: Tuple,                   # (B, 1, n_spatial, D_s)
     rng: jax.Array,
     prefill_length: int | None = None,
     task_embedding: jax.Array | None = None,  # (B, T_ctx+1, n_agent, d_model)
-    caches: KVCache | None = None,
+    caches: KVCachesDict | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
-    actions_ctx: jax.Array | None = None,                 # (B, T_ctx)
-) -> Tuple[jax.Array, jax.Array | None, KVCache | None, jax.Array]:
+    actions_ctx: Actions | None = None,
+) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
 
     Args:
         dynamics: Dynamics NNX model
         schedule: Precomputed DenoiseSchedule
-        action: (B, 1) action for current step
+        action: action for current step
         latent_shape: Tuple representing the shape of the latent (B, 1, n_spatial, D_s)
         prefill_length: Number of ground truth latents passed during prefill.
         rng: Random number generator key
-        agent_tokens: Optional agent tokens (B, T_ctx+1, n_agent, d_model)
+        task_embedding: Optional agent tokens (B, T_ctx+1, n_agent, d_model)
         caches: KV cache for context frames (from previous finalized frames)
         latents_ctx: Optional context latents (B, T_ctx, n_spatial, D_s) used for debugging/non-cached mode
         actions_ctx: Optional context actions (B, T_ctx) used for debugging/non-cached mode
@@ -105,19 +102,19 @@ def next_latent(
 
     latents_ctx_noised = None
     if latents_ctx is not None and caches is None:
-        noise_prefill= jnp.zeros(latents_ctx[:, :prefill_length].shape)
+        noise_prefill = jnp.zeros(latents_ctx[:, :prefill_length].shape)
         noise_decode = jax.random.normal(rng_ctx, latents_ctx[:, prefill_length:].shape)
-        noise_ctx    = jnp.concatenate([noise_prefill, noise_decode], axis=1)
+        noise_ctx = jnp.concatenate([noise_prefill, noise_decode], axis=1)
         latents_ctx_noised = latents_ctx + (1 - schedule.tau_ctx) * noise_ctx
 
-    action = action[:, None] if action.ndim == 1 else action 
+    action = action[:, None, ...]  # expand squeezed-out time dimension
     
     def refinement_step(latent_t, s):
         tau_prev, tau_curr = schedule.tau_values[s], schedule.tau_values[s+1]
         alpha = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
-        
+
         step_idx = schedule.step_idx
-        tau_idx_val = schedule.tau_indices[s] 
+        tau_idx_val = schedule.tau_indices[s]
 
         if caches is not None:
             latent_input, actions_input = latent_t, action
@@ -130,7 +127,7 @@ def next_latent(
         else: # Used only for debugging.
             assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None
             latent_input  = jnp.concatenate([latents_ctx_noised, latent_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
-            actions_input = jnp.concatenate([actions_ctx, action],   axis=1)  # (B, T_ctx+1)
+            actions_input = jax.tree.map(lambda x, y: jnp.concatenate([x, y], axis=1), actions_ctx, action)  # (B, T_ctx+1)
 
             decode_length = latents_ctx_noised.shape[1] - prefill_length
             step_idx_prefill= jnp.full((B, prefill_length), step_idx, dtype=jnp.int32)
@@ -141,7 +138,7 @@ def next_latent(
             tau_idx_prefill= jnp.full((B, prefill_length), schedule.k_max - 1, dtype=jnp.int32)
             tau_idx_decode = jnp.full((B, decode_length), schedule.tau_idx_ctx, dtype=jnp.int32)
             tau_idx_curr   = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
-            tau_indices    = jnp.concatenate([tau_idx_prefill, tau_idx_decode, tau_idx_curr], axis=1) # (B, T_ctx+1)
+            tau_indices    = jnp.concatenate([tau_idx_prefill, tau_idx_decode, tau_idx_curr], axis=1)  # (B, T_ctx+1)
 
         # Dynamics call
         latent_clean_pred_seq, (h_seq, _) = dynamics(
@@ -150,7 +147,7 @@ def next_latent(
         )
 
         latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
-        h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq # (B, n_agent, d_model)
+        h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
 
         # Per-step mixing toward clean latent
         latent_t_new = (1.0 - alpha) * latent_t + alpha * latent_clean_pred
@@ -170,7 +167,7 @@ def next_latent(
         tau_indices = jnp.full((B, 1), schedule.tau_idx_ctx,  dtype=jnp.int32)
         
         rng, new_random_key = jax.random.split(rng)
-        latent_noised_caching = latent_t_final*schedule.tau_ctx + (1-schedule.tau_ctx)*jax.random.normal(new_random_key, shape=latent_t_final.shape, dtype=latent_t_final.dtype)
+        latent_noised_caching = latent_t_final * schedule.tau_ctx + (1 - schedule.tau_ctx) * jax.random.normal(new_random_key, shape=latent_t_final.shape, dtype=latent_t_final.dtype)
 
         # Dynamics call
         _, (h_seq_final, caches_new) = dynamics(
@@ -190,26 +187,26 @@ def next_frame(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
     schedule: DenoiseSchedule,
-    action: jax.Array,
+    action: Actions,
     latent_shape: Tuple,
     dynamics_cache: Any,
     tokenizer_cache: Any,
     rng: jax.Array,
     task_embedding: jax.Array | None = None,
-) -> Tuple[jax.Array, jax.Array | None, KVCache | None, Any, jax.Array]:
+) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, Any, jax.Array]:
     """
     Generate next frame using dynamics model and decode to pixels.
-    
+
     Args:
         tokenizer: Tokenizer NNX model for decoding
         dynamics: Dynamics NNX model
         schedule: Denoising schedule
-        action: Action to condition on (B,) - categorical integer array
+        action: Single action to condition on where the time dimension is squeezed (B, ...)
         latent_shape: Shape of latent (B, 1, n_spatial, D_s)
         dynamics_cache: KV cache for dynamics model from previous steps
         tokenizer_cache: KV cache for tokenizer decoder from previous steps
         rng: Random key
-        task: Optional task embedding (currently unused)
+        task_embedding: Optional task embedding (currently unused)
         
     Returns:
         Tuple of (frame as jax.Array, h_last, updated dynamics cache, updated tokenizer cache, updated rng)
@@ -218,7 +215,7 @@ def next_frame(
     latent, h_last, dynamics_cache_updated, rng = next_latent(
         dynamics=dynamics,
         schedule=schedule,
-        action=action,  # Shape (1,) - categorical integer
+        action=action,
         latent_shape=latent_shape,
         rng=rng,
         prefill_length=None,  # No prefill for interactive generation
@@ -242,78 +239,74 @@ def next_frame(
 
 def latent_rollout(
     dynamics: Dynamics,
-    policy: PolicyHeadMTP | jax.Array,
+    policy: PolicyHeadMTP | Actions,
     schedule: DenoiseSchedule,
     latents_ctx: jax.Array,
-    actions_ctx: jax.Array,
+    actions_ctx: Actions,
     num_steps: int,
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
+    greedy: bool = False,
 ):
     """
     Autoregressive rollout in latent space.
 
     Args:
         dynamics: Dynamics NNX model.
-        policy: Policy NNX model or array of fixed actions (B, num_steps, ...).
+        policy: Policy NNX model or sequence of actions.
         schedule: DenoiseSchedule.
         latents_ctx: (B, T_ctx, n_spatial, D_s) Context latents.
-        actions_ctx: (B, T_ctx, ...) Context actions.
+        actions_ctx: Context actions.
         num_steps: Number of steps to unroll.
         rng: Random number generator key
-        initial_agent_tokens: Optional (B, T_ctx, n_agent, D) agent tokens for context.
+        initial_task_embedding: Optional (B, T_ctx, n_agent, D) agent tokens for context.
+        greedy: Whether to sample greedy actions from the policy.
         
     Returns:
-        latents: (B, T_ctx + num_steps, n_spatial, D_s)
+        Dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
     """
     B, T_ctx, n_spatial, D_s = latents_ctx.shape
     latent_shape = (B, 1, n_spatial, D_s)
-    # 1. Initialize caches and process context
-    # We need to compute the max window size needed: context + rollout
+
+    # Initialize caches and process context
     window_size = T_ctx + num_steps
     n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
     caches = dynamics.create_static_caches(batch_size=B, n_spatial=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
-    
+
     # Run dynamics on context to prefill caches and get last hidden state
-    # Use clean signal for ground truth context 
-    step_idx_ctx= jnp.full((B, T_ctx), schedule.step_idx, dtype=jnp.int32)
+    # Use clean signal for ground truth context
+    step_idx_ctx = jnp.full((B, T_ctx), schedule.step_idx, dtype=jnp.int32)
     tau_idx_ctx = jnp.full((B, T_ctx), schedule.k_max - 1, dtype=jnp.int32)
-    
-    # Dynamics call
+
+    # Dynamics call for prefill
     _, (h_seq, caches) = dynamics(
         actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx,
         task_embeddings=initial_task_embedding, caches=caches, deterministic=True
     )
 
     # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
-    task_embedding = initial_task_embedding[:,-1:] if isinstance(initial_task_embedding, jax.Array) else None
-    h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None # (B, n_agent, D)
-    
+    task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
+    h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
+
     # 2. Scan loop for rollout
     def scan_step(carry, step_idx):
         h_t, caches_t, rng = carry
-        
+
         # Sample action
-        rng, rng_action = jax.random.split(rng)
+        rng, rng_policy = jax.random.split(rng)
         
-        if isinstance(policy, jax.Array):
-            action = policy[:, step_idx]
+        if isinstance(policy, Actions):
+            action = policy[:, step_idx]  # (B, ...)
         else:
-            # Policy call - returns (B, T, L, A) logits for L future actions
-            logits = policy(h_t, deterministic=False)
-            assert isinstance(logits, jax.Array), "Logits should be a JAX array"
-            # Sample from all L action heads, but only use the first one for this step
-            all_actions = jax.random.categorical(rng_action, logits)  # (B, T, L)
-            action = all_actions[:, :, 0]  # (B, T) - use first predicted action
+            all_actions = policy.sample(h_t, greedy=greedy, rng=rng_policy)  # (B, T, L, ...)
+            action = all_actions[:, 0, 0, ...]  # (B, ...) - use first predicted action
         
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng = next_latent(
-            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding = task_embedding
+            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
         )
         
-        # Squeeze action to (B,) for consistent output shape
-        action_out = action[:, 0] if action.ndim == 2 else action
-        return (h_next, caches_next, rng), (latent_next[:,0], action_out, h_next) # latent_next is (B, 1, n_spatial, D_s) 
+        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
 
     # Run scan
     _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
@@ -321,13 +314,13 @@ def latent_rollout(
         (h_last, caches, rng),
         jnp.arange(num_steps)
     )
-    
+
     # Unpack results
     rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
-    rollout_actions = einops.rearrange(rollout_actions, 't b -> b t')
+    rollout_actions = jax.tree.map(lambda x: einops.rearrange(x, 't b ... -> b t ...'), rollout_actions)
     # h_next has shape (B, 1, n_agent, d_model), so scan output is (t, B, 1, n_agent, d_model)
     rollout_hidden = einops.rearrange(rollout_hidden, 't b 1 n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
-    
+
     out_latents = jnp.concatenate((latents_ctx, rollout_latents), axis=1)
 
     return {
@@ -340,10 +333,10 @@ def latent_rollout(
 def video_rollout(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
-    policy: PolicyHeadMTP | jax.Array,
+    policy: PolicyHeadMTP | Actions,
     schedule: DenoiseSchedule,
     frames_ctx: jax.Array,
-    actions_ctx: jax.Array,
+    actions_ctx: Actions,
     num_steps: int,
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
@@ -354,29 +347,29 @@ def video_rollout(
     Args:
         tokenizer: Tokenizer NNX model.
         dynamics: Dynamics NNX model.
-        policy: Policy NNX model or array of fixed actions.
+        policy: Policy NNX model or sequence of actions.
         schedule: DenoiseSchedule.
         frames_ctx: (B, T_ctx, H, W, C) context frames (0-255 range).
-        actions_ctx: (B, T_ctx, ...) Context actions.
+        actions_ctx: Context actions.
         num_steps: Number of steps to unroll.
         rng: Random number generator key.
-        initial_agent_tokens: Optional agent tokens for context.
+        initial_task_embedding: Optional task tokens for context.
     Returns:
         pred_frames: (B, T_ctx + num_steps, H, W, C)
     """
     from flax import nnx
-    
+
     # Tokenize
     rng, mae_key = jax.random.split(rng)
     rngs = nnx.Rngs(mae=mae_key)
-    
+
     latents_ctx, _ = tokenizer.encode(
         frames_ctx, 
         packing_factor=dynamics.cfg.packing_factor, 
         deterministic=True,
         rngs=rngs
-    ) # Encode returns (B, T, L, D)
-        
+    )  # Encode returns (B, T, L, D)
+
     # Latent Rollout
     # Returns dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
     rollout_result = latent_rollout(
@@ -388,6 +381,7 @@ def video_rollout(
         num_steps,
         rng,
         initial_task_embedding,
+        greedy=True,  # use greedy policy for visualization
     )
 
     # Decode
@@ -396,5 +390,5 @@ def video_rollout(
         packing_factor=dynamics.cfg.packing_factor,
         deterministic=True
     )
-        
+
     return jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)

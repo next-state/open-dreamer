@@ -27,12 +27,14 @@ from dreamer.configs import HeadsConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
+from dreamer.actions import Actions, shift_actions
 from dreamer.parallel import build_parallel
 from dreamer.training import (
     compute_policy_loss,
     compute_reward_loss,
     run_evaluation,
     shortcut_forcing_step,
+    RMSLossNormalizer,
 )
 from dreamer.checkpointing import (
     DynamicsCheckpointBundle,
@@ -53,36 +55,44 @@ logging.getLogger('absl').setLevel(logging.WARNING)
 # Multi-token prediction (MTP) helpers
 # ---------------------------
 
-def gather_future_actions(actions_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+def gather_future_actions(actions: Actions, BTL: tuple[int, int, int]) -> tuple[Actions, jnp.ndarray]:
     """
     Gather future actions for multi-token prediction.
-    
+
     At timestep t, predicts actions[t+1], actions[t+2], ..., actions[t+L]
     (Following Dreamer convention: action a_i happens before state s_i)
-    
-    Note: Paper equation uses n=0..L, but with Dreamer's convention where a_t is the 
+
+    Note: Paper equation uses n=0..L, but with Dreamer's convention where a_t is the
     action TO TAKE from state s_t, we predict L future actions starting from a_{t+1}.
-    
+
     Args:
-        actions_bt: (B, T) action labels
-        L: number of future steps to predict
-        
+        actions: Actions object with (B, T, ...) shaped arrays
+        BTL: tuple containing (B, T, L)
+
     Returns:
-        actions_btL: (B, T, L) future actions
-        valid_btL: (B, T, L) mask (0 for out-of-range)
+        actions_btL: Actions object with (B, T, L, ...) future actions
+        valid_btL: (B, T, L) mask (False for out-of-range)
     """
-    B, T = actions_bt.shape
-    actions_pad = jnp.pad(actions_bt, ((0, 0), (0, L)), constant_values=-1)
+    B, T, L = BTL
+
+    starts = jnp.arange(T)                               # [0, 1, ..., T-1]
+    offsets = jnp.arange(1, L + 1)                       # [1, 2, ..., L]
+    gather_indices = starts[:, None] + offsets[None, :]  # (T, L)
+    valid_mask_tl = gather_indices < T
+    valid_btL = jnp.broadcast_to(valid_mask_tl[None, ...], (B, T, L))
+
+    def pad_and_gather(x):
+        pad_width = [(0, 0), (0, L)] + [(0, 0)] * (x.ndim - 2)
+        x_pad = jnp.pad(x, pad_width, mode='constant', constant_values=0)
+        
+        # We slice axis 1 using (T, L) indices -> resulting in (B, T, L, ...)
+        return x_pad[:, gather_indices]
     
-    offsets = jnp.arange(1, L + 1)  # [1, 2, ..., L]
-    indices = jnp.arange(T)[:, None] + offsets[None, :]  # (T, L)
-    actions_btL = actions_pad[:, indices]  # (B, T, L)
-    valid_btL = (actions_btL >= 0)
-    
+    actions_btL = jax.tree.map(pad_and_gather, actions)
     return actions_btL, valid_btL
 
 
-def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+def gather_future_rewards(rewards_bt: jnp.ndarray, BTL: tuple[int, int, int]) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Gather future rewards for multi-token prediction.
     
@@ -97,18 +107,18 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, L: int) -> tuple[jnp.ndarray,
         rewards_btL: (B, T, L) future rewards
         valid_btL: (B, T, L) mask (0 for invalid)
     """
-    B, T = rewards_bt.shape
-    rewards_pad = jnp.pad(rewards_bt, ((0, 0), (0, L - 1)), constant_values=0.0)
+    B, T, L = BTL
     
-    offsets = jnp.arange(0, L)  # [0, 1, ..., L-1]
-    indices = jnp.arange(T)[:, None] + offsets[None, :]  # (T, L)
-    rewards_btL = rewards_pad[:, indices]  # (B, T, L)
+    starts = jnp.arange(T)                               # [0, 1, ..., T-1]
+    offsets = jnp.arange(0, L)                           # [0, 1, ..., L-1]
+    gather_indices = starts[:, None] + offsets[None, :]  # (T, L)
+    valid_mask_tl = (gather_indices < T) & (gather_indices > 0)
+    valid_btL = jnp.broadcast_to(valid_mask_tl[None, ...], (B, T, L))
+
+    pad_width = ((0, 0), (0, L))
+    rewards_pad = jnp.pad(rewards_bt, pad_width, constant_values=0.0)
     
-    # Valid when: t >= 1 AND 1 <= t+offset < T
-    # (skip r0 which is dummy, and stay in bounds)
-    valid_btL = (indices >= 1) & (indices < T) & (jnp.arange(T)[:, None] >= 1)
-    valid_btL = jnp.broadcast_to(valid_btL[None, :, :], (B, T, L))
-    
+    rewards_btL = rewards_pad[:, gather_indices]
     return rewards_btL, valid_btL
 
 
@@ -127,8 +137,9 @@ def encode_and_train_step(
     task_embedder_optimizer: nnx.Optimizer,
     policy_optimizer: nnx.Optimizer,
     reward_optimizer: nnx.Optimizer,
+    loss_normalizer: RMSLossNormalizer,
     videos: jax.Array,
-    actions: jax.Array,
+    actions: Actions,
     rewards: jax.Array,
     *,
     tokenizer_key: jax.Array,
@@ -155,6 +166,7 @@ def encode_and_train_step(
         dynamics, task_embedder, policy_head, reward_head,
         dynamics_optimizer, task_embedder_optimizer,
         policy_optimizer, reward_optimizer,
+        loss_normalizer,
         latents, actions, rewards,
         master_key=master_key, step=step,
         k_max=k_max, L_mtp=L_mtp, B_self=B_self,
@@ -173,8 +185,9 @@ def train_step(
     task_embedder_optimizer: nnx.Optimizer,
     policy_optimizer: nnx.Optimizer,
     reward_optimizer: nnx.Optimizer,
+    loss_normalizer: RMSLossNormalizer,
     latents: jax.Array,
-    actions: jax.Array,
+    actions: Actions,
     rewards: jax.Array,
     *,
     master_key: jax.Array,
@@ -202,8 +215,8 @@ def train_step(
     agent_tokens_bt = task_embedder(task=task, B=B, T=T_video)
 
     # Gather future actions and rewards for MTP
-    actions_btL, actions_valid = gather_future_actions(actions, L_mtp)
-    rewards_btL, rewards_valid = gather_future_rewards(rewards, L_mtp)
+    actions_btL, actions_valid = gather_future_actions(actions, (B, T_video, L_mtp))
+    rewards_btL, rewards_valid = gather_future_rewards(rewards, (B, T_video, L_mtp))
 
     # Define combined loss
     # Takes all models as a tuple to enable differentiation w.r.t. all of them
@@ -218,13 +231,30 @@ def train_step(
 
         # TODO: See if we should compute the losses and the gradients sequentially (see figure 2 of https://arxiv.org/pdf/2404.19737 and comment in pull request #16)
         # TODO: put gather_future_rewards and gather_future_actions inside of the compute_policy_loss function and compute_future_actions functions
-        policy_loss = compute_policy_loss(pol, h_states, actions_btL, actions_valid)
+        policy_losses = compute_policy_loss(pol, h_states, actions_btL, actions_valid)
         reward_loss, reward_metrics = compute_reward_loss(rew, h_states, rewards_btL, rewards_valid)
 
-        # Combine losses
-        total_loss = policy_loss + reward_loss + dynamics_loss_weight * dynamics_loss
 
-        aux = {"policy_loss": policy_loss, "reward_loss": reward_loss, "dynamics_loss": dynamics_loss, "flow_mse": dyn_aux["flow_mse"], "bootstrap_mse": dyn_aux["bootstrap_mse"], **reward_metrics}
+        raw_losses = {
+            "reward": reward_loss,
+            "dynamics": dynamics_loss,
+            **{f"policy_{k}": v for k, v in policy_losses.items()},
+        }
+        normalized, rms_info = loss_normalizer(raw_losses)
+
+        # Combine normalized losses
+        policy_loss_normalized = sum(v for k, v in normalized.items() if k.startswith("policy_"))
+        total_loss = policy_loss_normalized + normalized["reward"] + dynamics_loss_weight * normalized["dynamics"]
+
+        aux = {
+            "reward_loss": reward_loss,
+            "dynamics_loss": dynamics_loss,
+            "flow_mse": dyn_aux["flow_mse"],
+            "bootstrap_mse": dyn_aux["bootstrap_mse"],
+            **{f"policy_loss_{k}": v for k, v in policy_losses.items()},
+            **{f"rms_{k}": v for k, v in rms_info.items()},
+            **reward_metrics,
+        }
 
         return total_loss, aux
 
@@ -296,7 +326,13 @@ def run(cfg: HeadsConfig):
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
-        train_iterator = iter(train_dataloader)  # type: ignore
+        train_iterator = iter(train_dataloader)
+
+        # Create RMS loss normalizer for balancing policy/reward/dynamics losses
+        loss_normalizer = RMSLossNormalizer(loss_names=[
+            'policy_binary', 'policy_categorical', 'policy_continuous',
+            'reward', 'dynamics'
+        ])
 
         # Create checkpoint bundle (includes frozen tokenizer for self-contained checkpoints)
         bundle = HeadsCheckpointBundle(
@@ -309,18 +345,23 @@ def run(cfg: HeadsConfig):
             task_embedder_optimizer=task_embedder_optimizer,
             policy_optimizer=policy_optimizer,
             reward_optimizer=reward_optimizer,
+            loss_normalizer=loss_normalizer,
         )
 
         # Checkpointing
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
-            item_names=HeadsCheckpointBundle.get_item_names()
+            item_names=HeadsCheckpointBundle.get_item_names(
+                iterator_names=("train_dataloader_state",)
+            )
         ) as checkpoint_manager:
 
             # Restore from checkpoint
-            start_step, bundle, train_iterator, rng = bundle.restore(
-                checkpoint_manager, train_iterator, rng
+            iterators = {"train_dataloader_state": train_iterator}
+            start_step, bundle, iterators, rng = bundle.restore(
+                checkpoint_manager, iterators, rng
             )
+            train_iterator = iterators["train_dataloader_state"]
 
             # Training loop
             pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step, total=cfg.max_steps)
@@ -336,15 +377,16 @@ def run(cfg: HeadsConfig):
                 actions = jax.device_put(batch["actions"], data_sharding)
                 rewards = jax.device_put(batch["rewards"], data_sharding)
 
-                # Action shifting: prepend "first action token" = 15
-                B, T = actions.shape
-                actions = jnp.concatenate((jnp.full_like(actions[:, 0:1], fill_value=15), actions[:, :-1]), axis=1)
+                # Action shifting: prepend "first action token" (noop) so action[t] aligns with state[t]
+                actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
 
                 # Training step (encodes videos and trains)
+                B = cfg.dataset.B
                 metrics = encode_and_train_step(
                     bundle.tokenizer, bundle.dynamics, bundle.task_embedder, bundle.policy_head, bundle.reward_head,
                     bundle.dynamics_optimizer, bundle.task_embedder_optimizer,
                     bundle.policy_optimizer, bundle.reward_optimizer,
+                    bundle.loss_normalizer,
                     videos, actions, rewards,
                     tokenizer_key=tokenizer_key,
                     master_key=master_key,
@@ -362,7 +404,8 @@ def run(cfg: HeadsConfig):
                     logger.log(step, metrics=metrics_cpu, pbar=pbar)
 
                 # Checkpointing
-                bundle.maybe_save(checkpoint_manager, step, train_iterator, rng)
+                iterators = {"train_dataloader_state": train_iterator}
+                bundle.maybe_save(checkpoint_manager, step, iterators, rng)
 
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:

@@ -11,6 +11,14 @@ H: 64
 W: 64
 C: 3
 
+padding_H: [0, 0]
+padding_W: [0, 0]
+patch_size: 8
+
+num_binary_actions: 0
+categorical_action_dim: 16  # keyboard actions # TODO: do binary as convention, so that game can be played in reactor frontend
+continuous_action_dim: 0
+
 dataset_mean: [0.5, 0.5, 0.5]
 dataset_std: [0.288675, 0.288675, 0.288675]
 

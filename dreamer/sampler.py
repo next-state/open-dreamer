@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
+from dreamer.actions import Actions
 from .generation import DenoiseSchedule, video_rollout
 
 
@@ -18,7 +19,7 @@ def sample_video(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
     frames: jax.Array,     # (B, T, H, W, C) in [0, 255]
-    actions: jax.Array,    # (B, T)
+    actions: Actions,      # (B, T)
     horizon: int,
     schedule_config: DenoiseSchedule,
     rng: jax.Array,
@@ -58,7 +59,7 @@ def sample_video(
         deterministic=True,
         rngs=rngs
     )
-    
+
     # Split context vs future
     frames_ctx = frames[:, :-horizon, :, :, :]
     latents_ctx_clean = latents[:, :-horizon, :, :]
@@ -93,7 +94,7 @@ def sample_video(
         initial_agent_tokens = task_embedder(task=task, B=B, T=T_ctx)
     else:
         initial_agent_tokens = None
-    
+
     pred_frames = video_rollout(
         tokenizer,
         dynamics,

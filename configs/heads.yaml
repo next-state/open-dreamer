@@ -4,7 +4,7 @@ defaults:
   - _self_
 
 run_name: heads
-dynamics_ckpt: "logs/dynamics_new/checkpoints"
+dynamics_ckpt: logs/dynamics/checkpoints
 
 ckpt:
   save_interval_steps: 100_000
@@ -23,20 +23,25 @@ task_embedder:
   use_ids: true
   n_tasks: 128
   d_task: 64
+  use_bias: false
   dtype: ${dtype}
   param_dtype: ${param_dtype}
 
 policy_head:
   d_model: ${d_model}
-  action_dim: 16
   L: ${n_agent}
   kind: categorical
   mlp_ratio: 2.0
   dropout_rate: 0.0
   swiglu: true
   parity_2over3: false
+  use_bias: false
   dtype: ${dtype}
   param_dtype: ${param_dtype}
+
+  num_binary_actions: ${dataset.num_binary_actions}
+  categorical_action_dim: ${dataset.categorical_action_dim}
+  continuous_action_dim: ${dataset.continuous_action_dim}
 
 reward_head:
   d_model: ${d_model}
@@ -48,6 +53,7 @@ reward_head:
   dropout_rate: 0.0
   swiglu: true
   parity_2over3: false
+  use_bias: false
   dtype: ${dtype}
   param_dtype: ${param_dtype}
 

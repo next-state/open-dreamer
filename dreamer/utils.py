@@ -1,19 +1,14 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-import orbax.checkpoint as ocp
 from pathlib import Path
 import optax
-import grain
 import operator
 from einops import rearrange
 from enum import IntEnum
-from typing import Tuple, TypeVar
-import numpy as np
-from omegaconf import OmegaConf
-from dataclasses import asdict, fields, is_dataclass
+from typing import Tuple
 from hydra.core.hydra_config import HydraConfig
-from dreamer.configs import CheckpointConfig, LRScheduleConfig, OptimizerConfig
+from dreamer.configs import LRScheduleConfig, OptimizerConfig
 
 
 # --- dtype helpers ---
@@ -76,10 +71,8 @@ class Modality(IntEnum):
     PROPRIO  = 2
     REGISTER = 3
     SPATIAL = 4
-    SHORTCUT_SIGNAL = 5
-    SHORTCUT_STEP = 6
-    AGENT = 7
-    # add more as needed
+    SHORTCUT = 5
+    AGENT = 6
 
 @jax.tree_util.register_pytree_node_class
 class TokenLayout:
@@ -106,7 +99,7 @@ class TokenLayout:
             idx += n
         return out
 
-    def make_mask(self, mode: str):
+    def build_space_mask(self, mode: str):
         """
         Returns a (1, 1, S, S) boolean mask indicating allowed key for each query index, per mode.
         S = number of tokens in a single frame.

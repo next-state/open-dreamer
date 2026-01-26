@@ -1,0 +1,10 @@
+defaults:
+  - dynamics
+  - _self_
+
+run_name: dynamics_finetune
+
+# Finetune on long batches only
+long_batch_ratio: 1.0
+
+# TODO: change lr_schedule and max_steps for finetuning

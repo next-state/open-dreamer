@@ -33,6 +33,7 @@ from dreamer.models import (
     TaskEmbedder,
     Tokenizer,
 )
+from dreamer.training import RMSLossNormalizer
 from dreamer.parallel import MeshRules
 from dreamer.utils import from_dict
 
@@ -80,10 +81,14 @@ class CheckpointBundle:
     _model_registry: ClassVar[dict[str, tuple[type, type]]] = {}
 
     @classmethod
-    def get_item_names(cls) -> tuple[str, ...]:
+    def get_item_names(cls, iterator_names: Optional[tuple[str, ...]] = None) -> tuple[str, ...]:
         """Get checkpoint item names for this bundle.
 
         Introspects the dataclass fields and adds standard items.
+
+        Args:
+            iterator_names: Optional tuple of iterator names to include in checkpoint.
+                          If None, defaults to ("train_dataloader_state",) for backward compatibility.
 
         Returns:
             Tuple of item names for checkpoint manager
@@ -92,7 +97,10 @@ class CheckpointBundle:
             raise TypeError(f"CheckpointBundle subclass must be a dataclass, got {cls}")
 
         item_names = [field.name for field in fields(cls)]
-        item_names.extend(["train_dataloader_state", "rngs", "meta"])
+        if iterator_names is None:
+            iterator_names = ("train_dataloader_state",)
+        item_names.extend(iterator_names)
+        item_names.extend(["rngs", "meta"])
         return tuple(item_names)
 
     @classmethod
@@ -164,23 +172,23 @@ class CheckpointBundle:
     def restore(
         self,
         checkpoint_manager: ocp.CheckpointManager,
-        train_iterator: grain.DataLoaderIterator,
+        iterators: dict[str, grain.DataLoaderIterator],
         rng: jax.Array,
-    ) -> tuple[int, Self, grain.DataLoaderIterator, jax.Array]:
+    ) -> tuple[int, Self, dict[str, grain.DataLoaderIterator], jax.Array]:
         """Restore checkpoint state into this bundle (in-place update).
 
         Args:
             checkpoint_manager: Checkpoint manager
-            train_iterator: Data iterator
+            iterators: Dict mapping iterator names to DataLoaderIterator instances
             rng: Random number generator state
 
         Returns:
-            Tuple of (start_step, self, train_iterator, rng)
+            Tuple of (start_step, self, iterators, rng) where iterators is the updated dict
         """
         step = checkpoint_manager.latest_step()
         if step is None:
             print("No checkpoint found, starting from scratch.")
-            return 0, self, train_iterator, rng
+            return 0, self, iterators, rng
 
         # Build restore args dynamically by introspecting bundle fields
         restore_kwargs = {}
@@ -189,8 +197,9 @@ class CheckpointBundle:
             field_value = getattr(self, field.name)
             restore_kwargs[field.name] = ocp.args.StandardRestore(nnx.state(field_value))
 
-        # Add iterator and rngs
-        restore_kwargs["train_dataloader_state"] = grain.checkpoint.CheckpointRestore(train_iterator)
+        # Add iterators and rngs
+        for name, iterator in iterators.items():
+            restore_kwargs[name] = grain.checkpoint.CheckpointRestore(iterator)
         restore_kwargs["rngs"] = ocp.args.StandardRestore({"key": rng})
 
         restore_args = ocp.args.Composite(**restore_kwargs)
@@ -201,17 +210,20 @@ class CheckpointBundle:
             field_value = getattr(self, field.name)
             nnx.update(field_value, restored[field.name])
 
-        train_iterator = restored["train_dataloader_state"]
+        # Update iterators
+        for name in iterators.keys():
+            if name in restored:
+                iterators[name] = restored[name]
         rng = restored["rngs"]["key"]
         print(f"Restored checkpoint from step {step}.")
 
-        return step + 1, self, train_iterator, rng
+        return step + 1, self, iterators, rng
 
     def maybe_save(
         self,
         checkpoint_manager: ocp.CheckpointManager,
         step: int,
-        train_iterator: grain.DataLoaderIterator,
+        iterators: dict[str, grain.DataLoaderIterator],
         rngs: jax.Array,
     ) -> None:
         """Save checkpoint if checkpoint_manager.should_save(step).
@@ -219,7 +231,7 @@ class CheckpointBundle:
         Args:
             checkpoint_manager: Checkpoint manager
             step: Current training step
-            train_iterator: Data iterator
+            iterators: Dict mapping iterator names to DataLoaderIterator instances
             rngs: Random number generator state
         """
         if not checkpoint_manager.should_save(step):
@@ -235,8 +247,9 @@ class CheckpointBundle:
                 cfg = field_value.cfg
                 meta[field.name] = asdict(cfg) if is_dataclass(cfg) else OmegaConf.to_container(cfg, resolve=True)
 
-        # Add iterator, rngs, and meta
-        save_kwargs["train_dataloader_state"] = grain.checkpoint.CheckpointSave(train_iterator)
+        # Add iterators, rngs, and meta
+        for name, iterator in iterators.items():
+            save_kwargs[name] = grain.checkpoint.CheckpointSave(iterator)
         save_kwargs["rngs"] = ocp.args.StandardSave({'key': rngs})
         save_kwargs["meta"] = ocp.args.JsonSave(meta)
 
@@ -298,3 +311,4 @@ class HeadsCheckpointBundle(CheckpointBundle):
     task_embedder_optimizer: Optional[nnx.Optimizer] = None
     policy_optimizer: Optional[nnx.Optimizer] = None
     reward_optimizer: Optional[nnx.Optimizer] = None
+    loss_normalizer: Optional[RMSLossNormalizer] = None

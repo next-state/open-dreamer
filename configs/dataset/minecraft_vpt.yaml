@@ -12,6 +12,14 @@ H: 360
 W: 640
 C: 3
 
+padding_H: [4, 4]
+padding_W: [0, 0]
+patch_size: 16
+
+num_binary_actions: 23  # keyboard actions
+categorical_action_dim: 121  # mouse actions
+continuous_action_dim: 0
+
 dataset_mean: [0.2241, 0.2348, 0.2086]
 dataset_std: [0.1809, 0.1874, 0.2282]
 

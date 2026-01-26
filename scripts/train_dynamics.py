@@ -6,11 +6,13 @@ import jax.numpy as jnp
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
+from einops import rearrange, repeat
 
 from dreamer.configs import DynamicsConfig
-from dreamer.data import make_iterator
+from dreamer.data import make_dual_iterators
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
+from dreamer.actions import Actions, create_noop_action_like
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
@@ -40,74 +42,87 @@ OmegaConf.register_new_resolver("max", lambda *args: max(args))
 # Training Step
 # ---------------------------
 
-@nnx.jit(static_argnames=("packing_factor", "k_max", "B_self"))
+@nnx.jit(static_argnames=("packing_factor", "k_max", "B_img", "T", "categorical_action_dim"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
-    videos: jnp.ndarray,
-    actions: jnp.ndarray,
+    videos: jnp.ndarray,      # Full batch (B, T, H, W, C)
+    actions: Actions,         # Full batch (B, T, ...)
     *,
     tokenizer_key: jax.Array,
     master_key: jax.Array,
     step: int,
-    packing_factor:int,
-    B_self:int,
-    k_max:int,
-
-):
-    # Phase 1: Encode videos to latents
-    rngs = nnx.Rngs(mae=tokenizer_key)
-    latents, _ = tokenizer.encode(
-        videos,
-        packing_factor=packing_factor,
-        deterministic=True,
-        rngs=rngs
-    )
-
-    # Phase 2: Training step
-    metrics = train_step(
-        dynamics, optimizer, latents, actions,
-        B_self=B_self, k_max=k_max, master_key=master_key, step=step
-    )
-
-    return metrics
-
-
-@nnx.jit(static_argnames=("k_max", "B_self"))
-def train_step(
-    dynamics: Dynamics,
-    optimizer: nnx.Optimizer,
-    latents: jnp.ndarray,
-    actions: jnp.ndarray,
-    *,
-    B_self: int,
+    packing_factor: int,
+    B_img: int,               # Number of samples to treat as images
+    T: int,
+    categorical_action_dim: int,
     k_max: int,
-    master_key: jax.Array,
-    step: int
+    context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
 ):
-    # Generate step-specific key
-    step_key = jax.random.fold_in(master_key, step)
+    rngs = nnx.Rngs(mae=tokenizer_key)
 
-    def loss_and_aux(dynamics_model: Dynamics):
-        """Loss function that takes the model and returns (loss, aux)."""
+    # TODO: handle edge cases B_img = 0 or B_img = B
+
+    # Split batch:
+    # Images (T=1)
+    images = rearrange(videos[:B_img], 'B_img T H W C -> (B_img T) 1 H W C')
+    noop_actions = create_noop_action_like(actions[:B_img], categorical_action_dim)
+    noop_actions = jax.tree.map(lambda x: repeat(x, 'B_img 1 ... -> (B_img T) 1 ...', T=T), noop_actions)
+
+    # Videos (T=T)
+    videos_batch = videos[B_img:]
+    actions_batch = actions[B_img:]
+
+    # Encode both batches
+    latents_img, _ = tokenizer.encode(images, packing_factor=packing_factor, deterministic=True, rngs=rngs)
+    latents_vid, _ = tokenizer.encode(videos_batch, packing_factor=packing_factor, deterministic=True, rngs=rngs)
+
+    # Compute B_self values
+    B_self_img = B_img * T // 2
+    B_vid = videos.shape[0] - B_img
+    B_self_vid = B_vid // 2
+
+    # Training step
+    step_key = jax.random.fold_in(master_key, step)
+    key_img, key_vid = jax.random.split(step_key, 2)
+
+    def loss_fn(model: Dynamics, latents, actions, rng, B_self, ctx_len):
         losses, aux = shortcut_forcing_step(
-            dynamics_model=dynamics_model,
+            dynamics_model=model,
             actions=actions,
             latents=latents,
-            rng=step_key,
+            rng=rng,
             k_max=k_max,
             B_self=B_self,
+            context_length=ctx_len,
             task_embeddings=None,  # Not used in dynamics pretraining
         )
         return losses['total'], aux
 
-    (loss_val, metrics), grads = nnx.value_and_grad(loss_and_aux, has_aux=True)(dynamics)
+    # Compute gradients for images
+    (loss_img, aux_img), grads_img = nnx.value_and_grad(loss_fn, has_aux=True)(
+        dynamics, latents_img, noop_actions, key_img, B_self_img, None  # Images: T=1, no context_length
+    )
 
-    # Update model with optimizer 
-    optimizer.update(dynamics, grads)
+    # Compute gradients for videos
+    (loss_vid, aux_vid), grads_vid = nnx.value_and_grad(loss_fn, has_aux=True)(
+        dynamics, latents_vid, actions_batch, key_vid, B_self_vid, context_length
+    )
 
-    return metrics
+    # Aggregate gradients
+    B_img_actual = latents_img.shape[0]
+    B_vid_actual = latents_vid.shape[0]
+    total_B = B_img_actual + B_vid_actual
+    combined_grads = jax.tree.map(
+        lambda g1, g2: (g1 * B_img_actual + g2 * B_vid_actual) / total_B,
+        grads_img, grads_vid
+    )
+
+    # Update model with optimizer
+    optimizer.update(dynamics, combined_grads)
+
+    return aux_img, aux_vid
 
 # ---------------------------
 # Main
@@ -166,71 +181,100 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        # Data iterator
-        train_dataloader = make_iterator(cfg.dataset)
-        train_iterator = iter(train_dataloader)  # type: ignore
+        # Data iterators
+        short_T = cfg.short_T
+        long_T = cfg.long_T
+        short_dataloader, long_dataloader = make_dual_iterators(cfg.dataset, short_T=short_T, long_T=long_T)
+        short_iterator = iter(short_dataloader)
+        long_iterator = iter(long_dataloader)
 
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
-            item_names=DynamicsCheckpointBundle.get_item_names()
+            item_names=DynamicsCheckpointBundle.get_item_names(
+                iterator_names=("short_dataloader_state", "long_dataloader_state")
+            )
         ) as checkpoint_manager:
             # Resume from checkpoint
-            start_step, bundle, train_iterator, rng = bundle.restore(
-                checkpoint_manager, train_iterator, rng
+            iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
+            start_step, bundle, iterators, rng = bundle.restore(
+                checkpoint_manager, iterators, rng
             )
+            short_iterator = iterators["short_dataloader_state"]
+            long_iterator = iterators["long_dataloader_state"]
 
             scaling.start_training()
 
             # Training loop
-            pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step, total=cfg.max_steps)
-            for step, batch in pbar:
+            pbar = tqdm(range(start_step, cfg.max_steps), initial=start_step, total=cfg.max_steps)
+            for step in pbar:
                 if step >= cfg.max_steps:
                     break
 
+                rng, dispatch_key, tokenizer_key, master_key = jax.random.split(rng, num=4)
+
+                use_long = float(jax.random.uniform(dispatch_key)) < cfg.long_batch_ratio
+                if use_long:
+                    batch = next(long_iterator)
+                    T = long_T
+                    context_length = cfg.dynamics.context_length
+                else:
+                    batch = next(short_iterator)
+                    T = short_T
+                    context_length = None  # Use default causal attention
+
                 # Shard batch data
-                rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
                 videos = jax.device_put(batch["videos"], data_sharding)
                 actions = jax.device_put(batch["actions"], data_sharding)
 
                 # Training step
-                aux = encode_and_train_step(
+                B_img = int(cfg.dataset.B * cfg.image_fraction)
+
+                aux_img, aux_vid = encode_and_train_step(
                     bundle.tokenizer, bundle.dynamics, bundle.dynamics_optimizer,
                     videos, actions,
                     tokenizer_key=tokenizer_key,
                     master_key=master_key,
                     step=step,
                     packing_factor=cfg.dynamics.packing_factor,
-                    B_self=cfg.dataset.B//2,
+                    B_img=B_img,
+                    T=T,
+                    categorical_action_dim=cfg.dataset.categorical_action_dim,
                     k_max=cfg.dynamics.k_max,
+                    context_length=context_length,
                 )
 
                 # Logging
                 if logger.should_log(step):
-                    metrics_cpu = jax.device_get(aux)
-                    scaling.on_step(step, metrics_cpu)
+                    metrics_img_cpu = jax.device_get(aux_img)
+                    metrics_vid_cpu = jax.device_get(aux_vid)
+                    scaling.on_step(step, metrics_vid_cpu)
                     logger.log(
                         step,
                         metrics={
-                            "flow_mse": metrics_cpu["flow_mse"],
-                            "boot_mse": metrics_cpu["bootstrap_mse"],
+                            "image/flow_mse": metrics_img_cpu["flow_mse"],
+                            "image/boot_mse": metrics_img_cpu["bootstrap_mse"],
+                            "video/flow_mse": metrics_vid_cpu["flow_mse"],
+                            "video/boot_mse": metrics_vid_cpu["bootstrap_mse"],
                             "lr": lr_schedule(step),
+                            "batch_type": 1.0 if use_long else 0.0,
                             **scaling.get_step_metrics(step),
                         },
                         pbar=pbar,
                     )
 
                 # Checkpointing
-                bundle.maybe_save(checkpoint_manager, step, train_iterator, rng)
+                iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
+                bundle.maybe_save(checkpoint_manager, step, iterators, rng)
 
                 # Periodic lightweight AR eval
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
                     # Use subset of batch for visualization
-                    val_videos = batch["videos"][:4]
-                    val_actions = batch["actions"][:4]
+                    val_videos = videos[:4]
+                    val_actions = actions[:4]
 
                     run_evaluation(
                         cfg, step, bundle.tokenizer, bundle.dynamics,
-                        val_videos, jnp.asarray(val_actions), vis_dir, rng, logger
+                        val_videos, val_actions, vis_dir, rng, logger
                     )
 
             scaling.finalize()

@@ -217,16 +217,20 @@ def run(cfg: TokenizerConfig):
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset)
-        train_iterator = iter(train_dataloader)  # type: ignore
+        train_iterator = iter(train_dataloader)
 
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
-            item_names=TokenizerCheckpointBundle.get_item_names()
+            item_names=TokenizerCheckpointBundle.get_item_names(
+                iterator_names=("train_dataloader_state",)
+            )
         ) as checkpoint_manager:
             # Resume from checkpoint
-            start_step, bundle, train_iterator, rng = bundle.restore(
-                checkpoint_manager, train_iterator, rng
+            iterators = {"train_dataloader_state": train_iterator}
+            start_step, bundle, iterators, rng = bundle.restore(
+                checkpoint_manager, iterators, rng
             )
+            train_iterator = iterators["train_dataloader_state"]
 
             scaling.start_training()
 
@@ -280,7 +284,8 @@ def run(cfg: TokenizerConfig):
                     )
 
                 # Checkpointing
-                bundle.maybe_save(checkpoint_manager, step, train_iterator, rng)
+                iterators = {"train_dataloader_state": train_iterator}
+                bundle.maybe_save(checkpoint_manager, step, iterators, rng)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization

@@ -4,6 +4,7 @@ from flax import nnx
 from dreamer.models import Dynamics, PolicyHeadMTP
 from dreamer.generation import DenoiseSchedule, next_frame
 from dreamer.parallel import create_data_model_parallel, MeshRules
+from dreamer.actions import Actions
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
 import numpy as np
@@ -43,7 +44,7 @@ class ReactorConfig:
     batch_size: int = 1
 
 
-def input_to_action(controller_state: Dict[str, Any]) -> jax.Array:
+def input_to_action(controller_state: Dict[str, Any]) -> Actions:
     """
     Convert keyboard input to CoinRun action.
     Used https://github.com/openai/coinrun/blob/master/coinrun/coinrun.cpp for reference
@@ -55,7 +56,7 @@ def input_to_action(controller_state: Dict[str, Any]) -> jax.Array:
         action_dim: Dimension of action space (7 for CoinRun)
 
     Returns:
-        Categorical integer action index of shape (1,)
+        Actions object *without time dimension*: (B=1, ...)
     """
     # Key to action mapping (priority order: diagonals first, then cardinals)
     key_map = [
@@ -73,32 +74,14 @@ def input_to_action(controller_state: Dict[str, Any]) -> jax.Array:
             action_idx = action
             break
     
-    # Return categorical integer (not one-hot)
-    return jnp.full((1,1), action_idx, dtype=jnp.int32)
+    return Actions(
+        categorical=jnp.array([action_idx], dtype=jnp.int32)
+    )
 
 
-def policy(policy_model: PolicyHeadMTP, policy_vars: Dict, agent_tokens: jax.Array, rng: jax.Array) -> jax.Array:
-    """
-    Run policy model to select actions from agent tokens.
-    
-    Args:
-        policy_model: Policy head model
-        policy_vars: Policy model parameters
-        agent_tokens: Agent token representations from dynamics (B, n_agent, d_model)
-        rng: Random key for sampling
-        
-    Returns:
-        Sampled action as JAX array
-    """
-    # Get action logits from policy head
-    logits = policy_model.apply(policy_vars, agent_tokens, deterministic=False)
-    
-    # Sample action from categorical distribution
-    action = jax.random.categorical(rng, logits)
-    
-    return action
-
-
+def policy(policy_model: PolicyHeadMTP, h_t: jax.Array, rng: jax.Array, greedy: bool = True) -> Actions:
+    # TODO: condition on task embeddings
+    return policy_model.sample(h_t, greedy=greedy, rng=rng)
 
 
 class DreamerVideoModel(VideoModel):
@@ -156,11 +139,11 @@ class DreamerVideoModel(VideoModel):
             
             # Load policy if checkpoint provided
             self.policy = None
-            self.policy_vars = None
             if cfg.policy_ckpt is not None:
                 raise NotImplementedError("Loading policy from checkpoint is not implemented yet")
-                logger.info(f"Loading policy from {cfg.policy_ckpt}")
-                self.policy, self.policy_vars, self.policy_cfg = PolicyHeadMTP.from_pretrained(cfg.policy_ckpt)
+                # TODO: Implement policy loading from checkpoint
+                # logger.info(f"Loading policy from {cfg.policy_ckpt}")
+                # self.policy = PolicyHeadMTP.from_pretrained(cfg.policy_ckpt, mesh_rules=mesh_rules, rngs=nnx.Rngs(0))
             
             # Initialize denoising schedule
             self.schedule = DenoiseSchedule.init(num_steps=cfg.num_steps, k_max=self.dynamics_cfg.k_max, tau_ctx=cfg.tau_ctx)
