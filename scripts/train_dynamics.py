@@ -229,9 +229,17 @@ def run(cfg: DynamicsConfig):
                 videos = jax.device_put(batch["videos"], data_sharding)
                 actions = jax.device_put(batch["actions"], data_sharding)
 
+                # Validation step before training (as input buffers might be donated)
+                if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
+                    val_videos = videos[:4]
+                    val_actions = actions[:4]
+                    run_evaluation(
+                        cfg, step, bundle.tokenizer, bundle.dynamics,
+                        val_videos, val_actions, vis_dir, rng, logger
+                    )
+
                 # Training step
                 B_img = int(cfg.dataset.B * cfg.image_fraction)
-
                 aux_img, aux_vid = encode_and_train_step(
                     bundle.tokenizer, bundle.dynamics, bundle.dynamics_optimizer,
                     videos, actions,
@@ -268,17 +276,6 @@ def run(cfg: DynamicsConfig):
                 # Checkpointing
                 iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
                 bundle.maybe_save(checkpoint_manager, step, iterators, rng)
-
-                # Periodic lightweight AR eval
-                if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
-                    # Use subset of batch for visualization
-                    val_videos = videos[:4]
-                    val_actions = actions[:4]
-
-                    run_evaluation(
-                        cfg, step, bundle.tokenizer, bundle.dynamics,
-                        val_videos, val_actions, vis_dir, rng, logger
-                    )
 
             scaling.finalize()
 
