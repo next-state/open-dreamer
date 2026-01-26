@@ -751,8 +751,8 @@ class Decoder(nnx.Module):
     def __init__(self, cfg: DecoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
-        self.H = cfg.H
-        self.W = cfg.W
+        self.H = cfg.padded_H
+        self.W = cfg.padded_W
         self.dataset_mean = cfg.dataset_mean
         self.dataset_std = cfg.dataset_std
         dtype = to_jnp_dtype(cfg.dtype)

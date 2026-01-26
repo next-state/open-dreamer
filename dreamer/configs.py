@@ -15,9 +15,11 @@ class DatasetConfig:
     # Batch and sequence dimensions
     B: int = 32  # batch size
     T: int = 64  # sequence length
-    H: int = 64  # height
-    W: int = 64  # width
+    H: int = 64  # frame height
+    W: int = 64  # frame width
     C: int = 3   # channels
+    padding_H: list[int] = field(default_factory=lambda: [0, 0])  # how much to pad each frame along the height axis
+    padding_W: list[int] = field(default_factory=lambda: [0, 0])  # how much to pad each frame along the width axis
 
     patch_size: int = 8
 
@@ -73,7 +75,7 @@ class DecoderModelConfig:
     n_heads: int = 8
     n_kv_heads: int = 1
     patch_size: int = 8
-    d_patch: int = 192    # Will be computed from patch_size, C
+    d_patch: int = 192  # DatasetConfig.patch_size**2 * DatasetConfig.C
     dropout_rate: float = 0.05
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
@@ -83,8 +85,8 @@ class DecoderModelConfig:
     use_rmsnorm_scale: bool = True
     dtype: str = "float32"
     param_dtype: str = "float32"
-    H: int = 64
-    W: int = 64
+    padded_H: int = 64  # sum(DatasetConfig.padding_H, DatasetConfig.H)
+    padded_W: int = 64  # sum(DatasetConfig.padding_W, DatasetConfig.W)
 
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)

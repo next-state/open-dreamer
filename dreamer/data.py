@@ -62,26 +62,22 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         image_h: int,
         image_w: int,
         image_c: int,
+        padding_h: list[int],
+        padding_w: list[int],
         *,
         p_include_reward: float = 0.0,
-        patch_size: int | None = None,
+        patch_size: int,
     ):
         self.seq_len = seq_len
         self.image_h = image_h
         self.image_w = image_w
         self.image_c = image_c
         self.p_include_reward = float(p_include_reward)
-        self.pad_h = 0
-        self.pad_w = 0
+        self.padding_h = tuple(padding_h)
+        self.padding_w = tuple(padding_w)
 
-        if patch_size is not None:
-            assert image_h % 2 == 0 and image_w % 2 == 0 and patch_size % 2 == 0
-            remainder_h = image_h % patch_size
-            remainder_w = image_w % patch_size
-            if remainder_h > 0:
-                self.pad_h = (patch_size - remainder_h) // 2
-            if remainder_w > 0:
-                self.pad_w = (patch_size - remainder_w) // 2
+        assert sum(padding_h, image_h) % patch_size == 0
+        assert sum(padding_w, image_w) % patch_size == 0
 
     def random_map(self, element: dict, rng: np.random.Generator) -> Any:
         assert isinstance(element, bytes)
@@ -120,13 +116,12 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
         seq = episode_tensor[start_idx : start_idx + self.seq_len]
 
-        if self.pad_h > 0 or self.pad_w > 0:
-            seq = np.pad(
-                seq,
-                ((0, 0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w), (0, 0)),
-                mode='constant',
-                constant_values=0
-            )
+        seq = np.pad(
+            seq,
+            ((0, 0), self.padding_h, self.padding_w, (0, 0)),
+            mode='constant',
+            constant_values=0
+        )
 
         data_dict: dict[str, Any] = {"videos": seq}
         actions_tensor = np.array(element["actions"])
@@ -152,21 +147,17 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
         image_h: int,
         image_w: int,
         image_c: int,
+        padding_h: list[int],
+        padding_w: list[int],
         *,
-        patch_size: int | None = None,
+        patch_size: int,
     ):
         self.seq_len = seq_len
-        self.pad_h = 0
-        self.pad_w = 0
+        self.padding_h = tuple(padding_h)
+        self.padding_w = tuple(padding_w)
 
-        if patch_size is not None:
-            assert image_h % 2 == 0 and image_w % 2 == 0 and patch_size % 2 == 0
-            remainder_h = image_h % patch_size
-            remainder_w = image_w % patch_size
-            if remainder_h > 0:
-                self.pad_h = (patch_size - remainder_h) // 2
-            if remainder_w > 0:
-                self.pad_w = (patch_size - remainder_w) // 2
+        assert sum(padding_h, image_h) % patch_size == 0
+        assert sum(padding_w, image_w) % patch_size == 0
 
     def random_map(self, element: bytes, rng: np.random.Generator) -> dict[str, Any]:
         data = pickle.loads(element)
@@ -180,13 +171,12 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
         seq = video[start : start + self.seq_len]
 
-        if self.pad_h > 0 or self.pad_w > 0:
-            seq = np.pad(
-                seq,
-                ((0, 0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w), (0, 0)),
-                mode='constant',
-                constant_values=0
-            )
+        seq = np.pad(
+            seq,
+            ((0, 0), self.padding_h, self.padding_w, (0, 0)),
+            mode='constant',
+            constant_values=0
+        )
 
         return {
             "videos": seq,
@@ -280,6 +270,8 @@ def make_iterator(
                 image_h=cfg.H,
                 image_w=cfg.W,
                 image_c=cfg.C,
+                padding_h=cfg.padding_H,
+                padding_w=cfg.padding_W,
                 patch_size=cfg.patch_size,
             ),
             grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
@@ -296,6 +288,8 @@ def make_iterator(
                 image_h=cfg.H,
                 image_w=cfg.W,
                 image_c=cfg.C,
+                padding_h=cfg.padding_H,
+                padding_w=cfg.padding_W,
                 p_include_reward=cfg.p_include_reward,
                 patch_size=cfg.patch_size,
             ),
