@@ -85,7 +85,13 @@ def sample_video(
     #     latents_ctx = tau * latents_ctx_clean + (1.0 - tau) * noise
 
     # Decode GT latents for visualization
-    gt_decoded_frames, _ = tokenizer.decode(latents, deterministic=True)
+    # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
+    @nnx.jit
+    def decode_jit(z):
+        frames, _ = tokenizer.decode(z, deterministic=True)
+        return frames
+
+    gt_decoded_frames = decode_jit(latents)
     gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
@@ -111,11 +117,10 @@ def sample_video(
         initial_task_embedding=initial_agent_tokens,
         greedy=True,
     )
+
     # Decode predicted latents to frames
-    pred_frames, _ = tokenizer.decode(
-        rollout_result['latents'],
-        deterministic=True
-    )
+    # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
+    pred_frames = decode_jit(rollout_result['latents'])
     pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
 
