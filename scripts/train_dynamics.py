@@ -12,7 +12,7 @@ from dreamer.configs import DynamicsConfig
 from dreamer.data import make_dual_iterators
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.actions import Actions
+from dreamer.actions import Actions, create_noop_action_like, shift_actions
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
@@ -47,7 +47,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # Training Step
 # ---------------------------
 
-@nnx.jit(static_argnames=("k_max", "B_img", "T"))
+@nnx.jit(static_argnames=("k_max", "B_img", "T", "context_length"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -60,19 +60,26 @@ def encode_and_train_step(
     step: int,
     B_img: int,               # Number of samples to treat as images
     T: int,
+    categorical_action_dim: int,
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
 ):
     rngs = nnx.Rngs(mae=tokenizer_key)
+
+    # Encode
     latents, _ = tokenizer.encode(videos, deterministic=True, rngs=rngs)
+
     return latent_train_step(
         dynamics, optimizer, latents, actions,
         master_key=master_key, step=step, B_img=B_img, T=T,
-        k_max=k_max, context_length=context_length,
+        categorical_action_dim=categorical_action_dim, k_max=k_max, context_length=context_length,
     )
 
 
-@nnx.jit(static_argnames=("k_max", "B_img", "T"))
+@nnx.jit(
+        static_argnames=("k_max", "B_img", "T", "categorical_action_dim", "context_length"),
+        donate_argnames=("latents", "actions"),
+)
 def latent_train_step(
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
@@ -83,69 +90,61 @@ def latent_train_step(
     step: int,
     B_img: int,               # Number of samples to treat as images
     T: int,
+    categorical_action_dim: int,
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
 ):
     """Training step for pre-tokenized latent data (skips tokenizer encoding)."""
-    # Cast latents to model dtype (bf16)
-    latents = latents.astype(jnp.bfloat16)
+    latents = latents.astype(dynamics.dtype)
 
-    # Latents are already unpacked from the dataloader
+    B = latents.shape[0]
+    B_self = B // 2    # Split batch for empirical and bootstrap learning
 
-    # Split batch:
-    # Images (T=1) - rearrange latents and actions to treat each frame as independent
-    latents_img = rearrange(latents[:B_img], 'B_img T n d -> (B_img T) 1 n d')
-    actions_img = jax.tree.map(lambda x: rearrange(x, 'B_img T ... -> (B_img T) 1 ...') if x is not None else None, actions[:B_img])
+    # Identify image samples (across both empirical and bootstrap halves)
+    idx = jnp.arange(B)
+    is_img = (idx < (B_img // 2)) | ((idx >= B_self) & (idx < (B_self + B_img // 2)))
 
-    # Videos (T=T)
-    latents_vid = latents[B_img:]
-    actions_batch = actions[B_img:]
+    # Build time mask for full batch
+    mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
+    mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))  # causal tokens
+    time_mask = jnp.where(
+        is_img[:, None, None, None],
+        mask_img[None, None, :, :],
+        mask_vid[None, None, :, :]
+    )
 
-    # Compute B_self values
-    B_self_img = B_img * T // 2
-    B_vid = latents.shape[0] - B_img
-    B_self_vid = B_vid // 2
+    # Replace actions with no-ops for image samples
+    noop = create_noop_action_like(actions, categorical_action_dim)
+    actions = jax.tree.map(lambda a, n: jnp.where(is_img.reshape((B,) + (1,) * (a.ndim - 1)), n, a) if a is not None else None, actions, noop)
 
     # Training step
     step_key = jax.random.fold_in(master_key, step)
-    key_img, key_vid = jax.random.split(step_key, 2)
 
-    def loss_fn(model: Dynamics, lats, acts, rng, B_self, ctx_len):
+    def loss_fn(model: Dynamics, latents, actions, mask, context_length):
         losses, aux = shortcut_forcing_step(
             dynamics_model=model,
-            actions=acts,
-            latents=lats,
-            rng=rng,
+            actions=actions,
+            latents=latents,
+            rng=step_key,
             k_max=k_max,
             B_self=B_self,
-            context_length=ctx_len,
+            context_length=context_length, # Builds sliding window attention
+            time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
         )
+
         return losses['total'], aux
 
-    # Compute gradients for images
-    (loss_img, aux_img), grads_img = nnx.value_and_grad(loss_fn, has_aux=True)(
-        dynamics, latents_img, actions_img, key_img, B_self_img, None  # Images: T=1, no context_length
-    )
-
-    # Compute gradients for videos
-    (loss_vid, aux_vid), grads_vid = nnx.value_and_grad(loss_fn, has_aux=True)(
-        dynamics, latents_vid, actions_batch, key_vid, B_self_vid, context_length
-    )
-
-    # Aggregate gradients
-    B_img_actual = latents_img.shape[0]
-    B_vid_actual = latents_vid.shape[0]
-    total_B = B_img_actual + B_vid_actual
-    combined_grads = jax.tree.map(
-        lambda g1, g2: (g1 * B_img_actual + g2 * B_vid_actual) / total_B,
-        grads_img, grads_vid
+    (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
+        dynamics, 
+        latents, actions, time_mask, context_length
     )
 
     # Update model with optimizer
-    optimizer.update(dynamics, combined_grads)
+    optimizer.update(dynamics, grads)
 
-    return aux_img, aux_vid
+    return metrics
+
 
 # ---------------------------
 # Main
@@ -185,12 +184,13 @@ def run(cfg: DynamicsConfig):
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
+        avg_T = int(cfg.long_batch_ratio * cfg.long_T + (1 - cfg.long_batch_ratio) * cfg.short_T)
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T, n_latents=n_latents),
-            data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_spatial + 1),  # spatial + action
-            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
+            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T, n_latents=n_latents),
+            data_tokens_per_step=cfg.dataset.B * avg_T * (n_spatial + 1),  # spatial + action
+            total_tokens_per_step=cfg.dataset.B * avg_T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
             logger=logger,
             run_dir=run_dir,
         )
@@ -251,27 +251,43 @@ def run(cfg: DynamicsConfig):
 
                 # Shard batch data
                 actions = jax.device_put(batch["actions"], data_sharding)
+                videos = None if use_latent_data else jax.device_put(batch["videos"], data_sharding)
+                latents = jax.device_put(batch["latents"], data_sharding) if use_latent_data else None
+
+                # Action shifting: prepend "first action token" (noop) so action[t] aligns with state[t]
+                actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
+
+                # Validation step before training (as input buffers might be donated)
+                if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
+                    val_videos = None if use_latent_data else videos[:4]
+                    val_latents = latents[:4] if use_latent_data else None
+                    val_actions = actions[:4]
+                    run_evaluation(
+                        cfg, step, bundle.tokenizer, bundle.dynamics,
+                        val_videos=val_videos, val_latents=val_latents,
+                        val_actions=val_actions, 
+                        vis_dir=vis_dir, rng=rng, logger=logger
+                    )
 
                 # Training step
                 B_img = int(cfg.dataset.B * cfg.image_fraction)
 
                 if use_latent_data:
                     # Pre-tokenized latent data path
-                    latents = jax.device_put(batch["latents"], data_sharding)
-                    aux_img, aux_vid = latent_train_step(
+                    metrics = latent_train_step(
                         bundle.dynamics, bundle.dynamics_optimizer,
                         latents, actions,
                         master_key=master_key,
                         step=step,
                         B_img=B_img,
                         T=T,
+                        categorical_action_dim=cfg.dataset.categorical_action_dim,
                         k_max=cfg.dynamics.k_max,
                         context_length=context_length,
                     )
                 else:
                     # Video data path (requires tokenizer encoding)
-                    videos = jax.device_put(batch["videos"], data_sharding)
-                    aux_img, aux_vid = encode_and_train_step(
+                    metrics = encode_and_train_step(
                         bundle.tokenizer, bundle.dynamics, bundle.dynamics_optimizer,
                         videos, actions,
                         tokenizer_key=tokenizer_key,
@@ -279,22 +295,20 @@ def run(cfg: DynamicsConfig):
                         step=step,
                         B_img=B_img,
                         T=T,
+                        categorical_action_dim=cfg.dataset.categorical_action_dim,
                         k_max=cfg.dynamics.k_max,
                         context_length=context_length,
                     )
 
                 # Logging
                 if logger.should_log(step):
-                    metrics_img_cpu = jax.device_get(aux_img)
-                    metrics_vid_cpu = jax.device_get(aux_vid)
-                    scaling.on_step(step, metrics_vid_cpu)
+                    metrics_cpu = jax.device_get(metrics)
+                    scaling.on_step(step, metrics_cpu)
                     logger.log(
                         step,
                         metrics={
-                            "image/flow_mse": metrics_img_cpu["flow_mse"],
-                            "image/boot_mse": metrics_img_cpu["bootstrap_mse"],
-                            "video/flow_mse": metrics_vid_cpu["flow_mse"],
-                            "video/boot_mse": metrics_vid_cpu["bootstrap_mse"],
+                            "flow_mse": metrics_cpu["flow_mse"],
+                            "boot_mse": metrics_cpu["bootstrap_mse"],
                             "lr": lr_schedule(step),
                             "batch_type": 1.0 if use_long else 0.0,
                             **scaling.get_step_metrics(step),
@@ -305,16 +319,6 @@ def run(cfg: DynamicsConfig):
                 # Checkpointing
                 iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
                 bundle.maybe_save(checkpoint_manager, step, iterators, rng)
-
-                # Periodic lightweight AR eval
-                if cfg.write_video_every and (step % cfg.write_video_every == 0):
-                    run_evaluation(
-                        cfg, step, bundle.tokenizer, bundle.dynamics,
-                        val_videos=None if use_latent_data else videos[:4],
-                        val_actions=actions[:4],
-                        vis_dir=vis_dir, rng=rng, logger=logger,
-                        val_latents=latents[:4] if use_latent_data else None,
-                    )
 
             scaling.finalize()
 

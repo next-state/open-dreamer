@@ -847,7 +847,7 @@ def sample_action_from_policy(
     policy_head: PolicyHeadMTP,
     pi_vars: dict,
     rng: jax.Array | None = None,
-    greedy: bool = True,
+    deterministic: bool = True,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Sample an action from the policy head given the current hidden state.
@@ -861,15 +861,16 @@ def sample_action_from_policy(
     """
     del rng  # currently unused (deterministic eval by default)
 
-    h_for_policy = h_t[:, None, :]  # (B, 1, d_model)
-    pi_logits = policy_head.apply(
+    pi_logits, _ = policy_head.apply(
         pi_vars,
-        h_for_policy,
-        deterministic=True,
+        h_t,
+        deterministic=deterministic,
+        rng=rng,
+        method=policy_head.sample,
     )  # (B, 1, L, A)
     logits_t0 = pi_logits[:, 0, 0, :]  # (B, A)
 
-    if greedy:
+    if deterministic:
         actions = jnp.argmax(logits_t0, axis=-1).astype(jnp.int32)
     else:
         logp = jax.nn.log_softmax(logits_t0, axis=-1)
@@ -981,7 +982,7 @@ def eval_rollout_real_env(
             policy_head=policy_head,
             pi_vars=pi_vars,
             rng=policy_rng,
-            greedy=True,
+            deterministic=True,
         )
 
         # Environment step.

@@ -79,9 +79,9 @@ def input_to_action(controller_state: Dict[str, Any]) -> Actions:
     )
 
 
-def policy(policy_model: PolicyHeadMTP, h_t: jax.Array, rng: jax.Array, greedy: bool = True) -> Actions:
+def policy(policy_model: PolicyHeadMTP, h_t: jax.Array, rng: jax.Array, deterministic: bool = True) -> Actions:
     # TODO: condition on task embeddings
-    return policy_model.sample(h_t, greedy=greedy, rng=rng)
+    return policy_model.sample(h_t, deterministic=deterministic, rng=rng)
 
 
 class DreamerVideoModel(VideoModel):
