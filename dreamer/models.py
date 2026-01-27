@@ -641,11 +641,11 @@ class BlockCausalTransformer(nnx.Module):
         if use_residual_lambdas:
             self.resid_lambdas = nnx.Param(
                 jnp.ones(depth, dtype=param_dtype),
-                sharding_names=None
+                sharding_names=(None,)  # Small per-layer params, no sharding needed
             )
             self.x0_lambdas = nnx.Param(
                 jnp.zeros(depth, dtype=param_dtype),
-                sharding_names=None
+                sharding_names=(None,)  # Small per-layer params, no sharding needed
             )
 
         # Create layers
