@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import jax
 from dataclasses import dataclass
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P

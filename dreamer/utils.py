@@ -1,12 +1,16 @@
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from pathlib import Path
 import optax
+from dataclasses import Field
+from typing import Protocol, cast
 import operator
 from einops import rearrange
 from enum import IntEnum
-from typing import Tuple
+from typing import Callable, Mapping, Sequence, Tuple
 from hydra.core.hydra_config import HydraConfig
 from dreamer.configs import LRScheduleConfig, OptimizerConfig
 
@@ -54,12 +58,12 @@ def unpatchify(patches: jnp.ndarray, patch: int, H: int, W: int) -> jnp.ndarray:
     return image
     
     
-temporal_patchify = jax.jit(
+temporal_patchify: Callable[[jnp.ndarray, int], jnp.ndarray] = jax.jit(
     jax.vmap(patchify, in_axes=(1, None), out_axes=1),  # (B,T,H,W,C) -> (B,T,Np,Dp)
     static_argnames=("patch",),
 )
 
-temporal_unpatchify = jax.jit(
+temporal_unpatchify: Callable[[jnp.ndarray, int, int, int], jnp.ndarray] = jax.jit(
     jax.vmap(unpatchify, in_axes=(1, None, None, None), out_axes=1),
     static_argnames=("patch", "H", "W"),
 )
@@ -79,7 +83,7 @@ class TokenLayout:
     """
     Ordered token layout for a single timestep: segments define the order.
     """
-    def __init__(self, segments: Tuple[Tuple[Modality, int], ...]):
+    def __init__(self, segments: Tuple[Tuple[Modality, int], ...]) -> None:
         self.segments = segments  # e.g. ((Modality.LATENT, n_latents), (Modality.IMAGE, n_patches), ...)
 
     @property
@@ -90,16 +94,16 @@ class TokenLayout:
         parts = [jnp.full((n,), int(m), dtype=jnp.int32) for m, n in self.segments]
         return jnp.concatenate(parts)
 
-    def slices(self) -> dict:
+    def slices(self) -> dict[Modality, slice]:
         """Convenience: start/stop indices per modality (first occurrence if repeated)."""
         idx = 0
-        out = {}
+        out: dict[Modality, slice] = {}
         for m, n in self.segments:
             out[m] = slice(idx, idx + n)
             idx += n
         return out
 
-    def build_space_mask(self, mode: str):
+    def build_space_mask(self, mode: str) -> jnp.ndarray:
         """
         Returns a (1, 1, S, S) boolean mask indicating allowed key for each query index, per mode.
         S = number of tokens in a single frame.
@@ -138,7 +142,7 @@ class TokenLayout:
             # Hierarchy levels: Action=0, Obs=1, Agent=2
             # mask = level(q) >= level(k)
 
-            def get_level(mod):
+            def get_level(mod: jnp.ndarray) -> jnp.ndarray:
                 # Default to 1 (Obs)
                 lvl = jnp.ones_like(mod, dtype=jnp.int32) # Default to 1 (Obs)
                 lvl = jnp.where(mod == Modality.ACTION, 0, lvl) # Set to 0 if Action
@@ -158,15 +162,24 @@ class TokenLayout:
         mask = jax.lax.stop_gradient(mask)
         return mask
 
-    def tree_flatten(self):
+    def tree_flatten(self) -> tuple[tuple[()], Tuple[Tuple[Modality, int], ...]]:
         return ((), self.segments)
     
     @classmethod
-    def tree_unflatten(cls, aux_data, children):
+    def tree_unflatten(
+        cls,
+        aux_data: Tuple[Tuple[Modality, int], ...],
+        children: tuple[()],
+    ) -> TokenLayout:
         return cls(aux_data)
 
 
-def normalize_with_dataset_stats(videos, *, mean, std):
+def normalize_with_dataset_stats(
+    videos: jnp.ndarray,
+    *,
+    mean: Sequence[float],
+    std: Sequence[float],
+) -> jnp.ndarray:
     """
     Normalize videos using dataset-level statistics.
 
@@ -189,7 +202,12 @@ def normalize_with_dataset_stats(videos, *, mean, std):
 
     return (videos - mean_c) / std_c
 
-def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
+def unnormalize_with_dataset_stats(
+    normalized_videos: jnp.ndarray,
+    *,
+    mean: Sequence[float],
+    std: Sequence[float],
+) -> jnp.ndarray:
     """
     Unnormalize videos using dataset-level statistics.
 
@@ -211,14 +229,24 @@ def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
 
     return (normalized_videos * std_c + mean_c)*255
 
-def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
+def pack_bottleneck_to_spatial(
+    z_btLd: jnp.ndarray,
+    *,
+    n_spatial: int,
+    k: int,
+) -> jnp.ndarray:
     """
     (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
     Requires: N_b == n_spatial * k  (e.g., 512 -> 256 with k=2).
     """
     return rearrange(z_btLd, '... (n_spatial k) d -> ... n_spatial (k d)', n_spatial=n_spatial, k=k)
 
-def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
+def unpack_spatial_to_bottleneck(
+    z_btLd: jnp.ndarray,
+    *,
+    n_spatial: int,
+    k: int,
+) -> jnp.ndarray:
     """
     (B,T,S_z, D_z_pre) -> (B,T,N_b,D_b) by splitting D_z_pre into k channels along N_b.
     Requires: N_b == n_spatial * k  (e.g., 256 -> 512 with k=2).
@@ -234,7 +262,7 @@ def _ensure_dir(p: Path) -> Path:
     return p
 
 
-def setup_training_directories(cfg) -> tuple[Path, Path, Path]:
+def setup_training_directories(cfg: object) -> tuple[Path, Path, Path]:
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
@@ -243,7 +271,11 @@ def setup_training_directories(cfg) -> tuple[Path, Path, Path]:
 
 
 
-def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jnp.ndarray:
+def apply_border(
+    frames: jnp.ndarray,
+    color: Sequence[int] | jnp.ndarray = (255, 0, 0),
+    width: int = 2,
+) -> jnp.ndarray:
     """
     Add a colored border to a batch of frames.
     """
@@ -255,26 +287,33 @@ def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jn
     return frames
 
 
-def from_dict(cls, d):
-    field_types = {f.name: f.type for f in cls.__dataclass_fields__.values()}
-    kwargs = {}
+def from_dict(cls: type[object], d: Mapping[str, object]) -> object:
+    class _DataclassType(Protocol):
+        __dataclass_fields__: dict[str, Field[object]]
+
+    dataclass_cls = cast(_DataclassType, cls)
+    field_types = {f.name: f.type for f in dataclass_cls.__dataclass_fields__.values()}
+    kwargs: dict[str, object] = {}
     for k, v in d.items():
         t = field_types[k]
-        if hasattr(t, "__dataclass_fields__"):
-            kwargs[k] = from_dict(t, v)
+        if isinstance(t, type) and hasattr(t, "__dataclass_fields__"):
+            if isinstance(v, Mapping):
+                kwargs[k] = from_dict(t, cast(Mapping[str, object], v))
+            else:
+                kwargs[k] = v
         else:
             kwargs[k] = v
     return cls(**kwargs)
 
 
-def _count_component(component_params):
+def _count_component(component_params: object) -> int:
     """Count total parameters in a component."""
     params_sizes = jax.tree.map(jax.numpy.size, component_params)
     total_parameters = jax.tree.reduce(operator.add, params_sizes)
     return total_parameters
 
 
-def count_parameters_by_component(model):
+def count_parameters_by_component(model: nnx.Module) -> dict[str, int]:
     """
     Count parameters for each component of an NNX model.
 
@@ -288,7 +327,7 @@ def count_parameters_by_component(model):
     graphdef, state, _ = nnx.split(model, nnx.Param, ...)
 
     # Count parameters for each top-level component
-    counts = {}
+    counts: dict[str, int] = {}
     total_params = 0
 
     for name, component in state.items():
@@ -348,7 +387,7 @@ def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
         )
 
 
-def _muon_weight_dims(params):
+def _muon_weight_dims(params: optax.Params) -> optax.Params | None:
     """Map params to Muon dimension numbers, excluding embeddings.
 
     Returns pytree where:
@@ -358,7 +397,7 @@ def _muon_weight_dims(params):
     """
     from optax.contrib._muon import MuonDimensionNumbers
 
-    def mapper(path, x):
+    def mapper(path: tuple[object, ...], x: jax.Array) -> object:
         path_str = ".".join(str(getattr(k, "key", k)) for k in path)
         if "embedding" in path_str:
             return None
@@ -389,13 +428,15 @@ def build_optimizer(
     if optimizer_cfg.mup_scaling:
         mup_scale = (d_model / optimizer_cfg.mup_base_dim) ** -0.5
 
+    import optax as _optax
+
     if optimizer_cfg.optimizer_type == "adamw":
         if optimizer_cfg.mup_scaling:
             scaled_schedule = lambda step, s=lr_schedule, m=mup_scale: s(step) * m
         else:
             scaled_schedule = lr_schedule
 
-        tx = optax.adamw(
+        tx = _optax.adamw(
             scaled_schedule,
             b1=optimizer_cfg.adam_b1,
             b2=optimizer_cfg.adam_b2,

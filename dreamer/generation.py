@@ -1,11 +1,22 @@
+from __future__ import annotations
+
 import math
 import einops
 import jax
 import jax.numpy as jnp
-from typing import Any, Tuple
+from typing import Tuple, TypedDict
 from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 from .actions import Actions
 from flax.struct import dataclass
+
+Array = jax.Array
+
+
+class LatentRolloutResult(TypedDict):
+    latents: Array
+    actions: Actions
+    hidden_states: Array | None
+    context_hidden: Array | None
 
 
 @dataclass
@@ -36,7 +47,7 @@ class DenoiseSchedule:
     tau_ctx: float
 
     @classmethod
-    def init(cls, num_steps: int, k_max: int = 256, tau_ctx=0.9) -> "DenoiseSchedule":
+    def init(cls, num_steps: int, k_max: int = 256, tau_ctx: float = 0.9) -> "DenoiseSchedule":
         """
         Create a DenoiseSchedule object.
         Args:
@@ -67,12 +78,12 @@ def next_latent(
     dynamics: Dynamics,
     schedule: DenoiseSchedule,
     action: Actions,
-    latent_shape: Tuple,                   # (B, 1, n_spatial, D_s)
+    latent_shape: Tuple[int, ...],                   # (B, 1, n_spatial, D_s)
     rng: jax.Array,
     prefill_length: int | None = None,
     task_embedding: jax.Array | None = None,  # (B, T_ctx+1, n_agent, d_model)
     caches: KVCachesDict | None = None,
-    latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
+    latents_ctx: jax.Array | None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: Actions | None = None,
 ) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array]:
     """
@@ -109,7 +120,7 @@ def next_latent(
 
     action = action[:, None, ...]  # expand squeezed-out time dimension
     
-    def refinement_step(latent_t, s):
+    def refinement_step(latent_t: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         tau_prev, tau_curr = schedule.tau_values[s], schedule.tau_values[s+1]
         alpha = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
 
@@ -188,12 +199,12 @@ def next_frame(
     dynamics: Dynamics,
     schedule: DenoiseSchedule,
     action: Actions,
-    latent_shape: Tuple,
-    dynamics_cache: Any,
-    tokenizer_cache: Any,
+    latent_shape: Tuple[int, ...],
+    dynamics_cache: KVCachesDict | None,
+    tokenizer_cache: KVCachesDict | None,
     rng: jax.Array,
     task_embedding: jax.Array | None = None,
-) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, Any, jax.Array]:
+) -> tuple[Array, Array | None, KVCachesDict | None, KVCachesDict | None, Array]:
     """
     Generate next frame using dynamics model and decode to pixels.
 
@@ -246,7 +257,7 @@ def latent_rollout(
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
     deterministic: bool = False,
-):
+) -> LatentRolloutResult:
     """
     Autoregressive rollout in latent space.
 
@@ -288,7 +299,10 @@ def latent_rollout(
     h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
 
     # 2. Scan loop for rollout
-    def scan_step(carry, step_idx):
+    def scan_step(
+        carry: tuple[Array | None, KVCachesDict | None, Array],
+        step_idx: jax.Array,
+    ) -> tuple[tuple[Array | None, KVCachesDict | None, Array], tuple[Array, Actions, Array | None]]:
         h_t, caches_t, rng = carry
 
         # Sample action
@@ -297,6 +311,8 @@ def latent_rollout(
         if isinstance(policy, Actions):
             action = policy[:, step_idx]  # (B, ...)
         else:
+            if h_t is None:
+                raise ValueError("Policy sampling requires hidden states, but h_t is None.")
             all_actions = policy.sample(h_t, deterministic=deterministic, rng=rng_policy)  # (B, T, L, ...)
             action = all_actions[:, 0, 0, ...]  # (B, ...) - use first predicted action
         
@@ -327,7 +343,7 @@ def latent_rollout(
         'actions': rollout_actions,
         'hidden_states': rollout_hidden,
         'context_hidden': h_seq,
-    } 
+    }
 
 def video_rollout(
     tokenizer: Tokenizer,
@@ -339,7 +355,7 @@ def video_rollout(
     num_steps: int,
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
-):
+) -> jax.Array:
     """
     End-to-end video generation rollout.
 

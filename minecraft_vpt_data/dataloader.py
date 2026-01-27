@@ -1,3 +1,4 @@
+from __future__ import annotations
 import jax
 import numpy as np
 import grain

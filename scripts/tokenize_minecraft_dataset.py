@@ -12,6 +12,7 @@ Example usage:
         --output_dir /home/ubuntu/minecraft-vpt/arrayrecords-latents \
         --batch_size 8
 """
+from __future__ import annotations
 import argparse
 import io
 import logging

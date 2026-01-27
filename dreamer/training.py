@@ -7,9 +7,11 @@ This module contains:
 - Training step helpers that can be shared across training phases
 - Evaluation and visualization utilities
 """
+from __future__ import annotations
+
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Dict, Tuple, cast
 
 import einops
 import imageio.v3 as iio
@@ -22,10 +24,13 @@ import time
 
 from dreamer.configs import DynamicsConfig, HeadsConfig
 from dreamer.generation import DenoiseSchedule
-from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
+from dreamer.models import Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
+from dreamer.logging import Logger
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
 from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border
+
+DTypeLike = str | jnp.dtype
 
 
 # ---------------------------
@@ -40,7 +45,7 @@ class RMSLossNormalizer(nnx.Module):
         loss_names: list[str],
         beta: float = 0.95,
         eps: float = 1e-6,
-    ):
+    ) -> None:
         """
         Args:
             loss_names: List of loss term names to track
@@ -104,7 +109,7 @@ def sample_tau_for_step(
     k_max: int,
     step_idx: jnp.ndarray,
     *,
-    dtype=jnp.float32
+    dtype: DTypeLike = jnp.float32
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Sample tau (signal level) values aligned to step_idx grid.
@@ -142,7 +147,7 @@ def sample_step_excluding_dmin(
     shape_bt: Tuple[int, int],
     k_max: int,
     *,
-    dtype=jnp.float32
+    dtype: DTypeLike = jnp.float32
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Sample step indices excluding the finest level (for bootstrap loss).
@@ -180,7 +185,7 @@ def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float =
 # ---------------------------
 # Loss computation
 # ---------------------------
-def compute_psnr(pred, target):
+def compute_psnr(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
     """
     Assumes pred and target are in the [0, 1] pixel range.
     Computes PSNR per sample, then returns the mean PSNR. 
@@ -284,7 +289,7 @@ def shortcut_forcing_step(
     context_length: int | None = None,
     time_mask: jnp.ndarray | None = None,
     task_embeddings: jnp.ndarray | None = None,
-) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
+) -> Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray | None]]:
     """
     Compute shortcut forcing losses (flow + bootstrap) for a batch.
 
@@ -391,7 +396,7 @@ def shortcut_forcing_step(
     loss_total = ((loss_flow * (B - B_self)) + (loss_boot * B_self)) / B
     
     losses = { 'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
-    aux = {'flow_mse': flow_mse_unweighted * dynamics_model.cfg.latent_std**2, 'bootstrap_mse': boot_mse_unweighted * dynamics_model.cfg.latent_std**2, 'h_states': h_states}
+    aux = {'flow_mse': flow_mse_unweighted * dynamics_model.cfg.latent_std**-2, 'bootstrap_mse': boot_mse_unweighted * dynamics_model.cfg.latent_std**-2, 'h_states': h_states}
     
     
     return losses, aux
@@ -470,7 +475,7 @@ def compute_td_lambda_returns(
     Returns:
         td_returns: (B, T) TD(λ) targets for value training
     """
-    def step(carry, inputs):
+    def step(carry: jnp.ndarray, inputs: tuple[jnp.ndarray, jnp.ndarray]) -> tuple[jnp.ndarray, jnp.ndarray]:
         G_next = carry
         r_t1, v_t1 = inputs
         G_t = r_t1 + gamma * ((1 - lambda_) * v_t1 + lambda_ * G_next)
@@ -531,7 +536,7 @@ def compute_pmpo_loss(
     policy_prior_logits: jnp.ndarray,
     alpha: float = 0.5,
     beta: float = 0.3,
-) -> Tuple[jnp.ndarray, Dict[str, Any]]:
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
     Compute PMPO (Probabilistic Policy Optimization) loss.
     
@@ -617,7 +622,7 @@ def compute_pmpo_loss(
 # ---------------------------
 
 def compute_reward_loss(
-    reward_head,
+    reward_head: RewardHeadMTP,
     h_states: jnp.ndarray,
     rewards_btL: jnp.ndarray,
     rewards_valid: jnp.ndarray,
@@ -658,7 +663,7 @@ def compute_reward_loss(
 
 
 def compute_policy_loss(
-    policy_head,
+    policy_head: PolicyHeadMTP,
     h_states: jnp.ndarray,
     actions: Actions,
     actions_valid: jnp.ndarray,
@@ -719,17 +724,17 @@ def compute_policy_loss(
 def run_evaluation(
     cfg: DynamicsConfig | HeadsConfig,
     step: int,
-    tokenizer,
-    dynamics,
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
     val_videos: jnp.ndarray | None,
     val_actions: Actions,
     vis_dir: Path,
     rng: jax.Array,
-    logger,
+    logger: Logger,
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
     val_latents: jnp.ndarray | None = None,
-):
+) -> None:
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
 
@@ -751,6 +756,10 @@ def run_evaluation(
     """
     assert (val_videos is not None) ^ (val_latents is not None), "Provide either val_videos or val_latents, not both"
     use_latent_data = val_latents is not None
+    if use_latent_data:
+        assert val_latents is not None
+    else:
+        assert val_videos is not None
     k_max = dynamics.cfg.k_max
     schedule_shortcut = DenoiseSchedule.init(4, k_max)
     schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
@@ -760,7 +769,12 @@ def run_evaluation(
     for tag, schedule_config in evaluation_schedules.items():
         t0 = time.time()
         # Determine sequence length and horizon
-        T = val_latents.shape[1] if use_latent_data else val_videos.shape[1]
+        if use_latent_data:
+            val_latents = cast(jax.Array, val_latents)
+            T = val_latents.shape[1]
+        else:
+            val_videos = cast(jax.Array, val_videos)
+            T = val_videos.shape[1]
         assert T > 5, f"Sequence length {T} must be > 5"
         ctx_length = 4
         horizon = T - ctx_length
@@ -783,12 +797,15 @@ def run_evaluation(
             )
             # For metrics, compare pred vs original frames
             gt_frames_for_metrics = original_frames
+            assert gt_frames_for_metrics is not None
 
         # Compute metrics
         dt = time.time() - t0
         dataset_std = cfg.dataset.dataset_std[0]
-        normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
-        normalized_gt = normalize_with_dataset_stats(gt_frames_for_metrics[:, -horizon:], mean=0, std=dataset_std)
+        mean = (0.0, 0.0, 0.0)
+        std = (dataset_std, dataset_std, dataset_std)
+        normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=mean, std=std)
+        normalized_gt = normalize_with_dataset_stats(gt_frames_for_metrics[:, -horizon:], mean=mean, std=std)
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
         psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames_for_metrics[:, -horizon:]/255))
 
@@ -802,9 +819,10 @@ def run_evaluation(
 
         if use_latent_data:
             # 2-column grid: [gt_decoded, pred]
-            frames_list = [gt_decoded_frames, pred_frames]
+            frames_list: list[jax.Array] = [gt_decoded_frames, pred_frames]
         else:
             # 3-column grid: [floor (tokenizer reconstruction), gt, pred]
+            assert original_frames is not None
             frames_list = [gt_decoded_frames, original_frames, pred_frames]
         stacked_frames = jnp.stack(frames_list)[:, :num_videos]
         videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)

@@ -1,19 +1,37 @@
+from __future__ import annotations
+
 import copy
 import io
 
 import jax
+import jax.numpy as jnp
 import msgpack
 import numpy as np
 import grain
-from typing import Any, Tuple
+from typing import Tuple
 import pickle
 import os
+from typing import TypedDict, cast
+import numpy.typing as npt
 
 import decord
 decord.bridge.set_bridge("native")
 
 from .configs import DatasetConfig
 from .actions import Actions
+
+NDArray = npt.NDArray[np.generic]
+
+
+class LatentActionsDict(TypedDict, total=False):
+    binary: NDArray | None
+    categorical: NDArray | None
+    continuous: NDArray | None
+
+
+class LatentRecord(TypedDict, total=False):
+    latents: NDArray
+    actions: LatentActionsDict
 
 
 # ==============================================================================
@@ -30,11 +48,11 @@ class EpisodeLengthFilter(grain.transforms.Filter):
         seq_len: int,
         *,
         print_filter_warnings: bool = True,
-    ):
+    ) -> None:
         self.seq_len = seq_len
         self.print_filter_warnings = print_filter_warnings
 
-    def filter(self, element: Any) -> bool:
+    def filter(self, element: bytes) -> bool:
         assert isinstance(element, bytes)
         data = pickle.loads(element)
 
@@ -73,7 +91,7 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         *,
         p_include_reward: float = 0.0,
         patch_size: int,
-    ):
+    ) -> None:
         self.seq_len = seq_len
         self.image_h = image_h
         self.image_w = image_w
@@ -85,7 +103,7 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         assert sum(padding_h, image_h) % patch_size == 0
         assert sum(padding_w, image_w) % patch_size == 0
 
-    def random_map(self, element: dict, rng: np.random.Generator) -> Any:
+    def random_map(self, element: bytes, rng: np.random.Generator) -> dict[str, object]:
         assert isinstance(element, bytes)
         element = pickle.loads(element)
 
@@ -129,7 +147,7 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
             constant_values=0
         )
 
-        data_dict: dict[str, Any] = {"videos": seq}
+        data_dict: dict[str, object] = {"videos": seq}
         actions_tensor = np.array(element["actions"])
         data_dict["actions_categorical"] = actions_tensor[start_idx : start_idx + self.seq_len]
         data_dict["actions_binary"] = None
@@ -157,7 +175,7 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
         padding_w: list[int],
         *,
         patch_size: int,
-    ):
+    ) -> None:
         self.seq_len = seq_len
         self.padding_h = tuple(padding_h)
         self.padding_w = tuple(padding_w)
@@ -165,7 +183,7 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
         assert sum(padding_h, image_h) % patch_size == 0
         assert sum(padding_w, image_w) % patch_size == 0
 
-    def random_map(self, element: bytes, rng: np.random.Generator) -> dict[str, Any]:
+    def random_map(self, element: bytes, rng: np.random.Generator) -> dict[str, object]:
         data = pickle.loads(element)
 
         # Decode MP4 bytes using decord (create cpu context here to avoid pickling issues with grain workers)
@@ -204,11 +222,19 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
 class CreateActions(grain.transforms.Map):
     """Convert batched action arrays into Actions dataclass."""
-    def map(self, batch: dict) -> dict:
+    def map(self, element: object) -> object:
+        if not isinstance(element, dict):
+            return element
+
+        batch = cast(dict[str, object], element)
+        actions_binary = batch.pop("actions_binary", None)
+        actions_categorical = batch.pop("actions_categorical", None)
+        actions_continuous = batch.pop("actions_continuous", None)
+
         batch["actions"] = Actions(
-            binary=batch.pop("actions_binary", None),
-            categorical=batch.pop("actions_categorical", None),
-            continuous=batch.pop("actions_continuous", None),
+            binary=jnp.asarray(actions_binary) if actions_binary is not None else None,
+            categorical=jnp.asarray(actions_categorical) if actions_categorical is not None else None,
+            continuous=jnp.asarray(actions_continuous) if actions_continuous is not None else None,
         )
         return batch
 
@@ -217,33 +243,36 @@ class CreateActions(grain.transforms.Map):
 # Pre-tokenized Latent Dataset
 # ==============================================================================
 
-def _decode_value(value):
+def _decode_value(value: object) -> object:
     """Decode a single value, handling arrays and nested dicts."""
     if isinstance(value, dict):
-        if value.get("_type") == "ndarray":
-            shape = tuple(value["shape"])
-            dtype = value["dtype"]
-            return np.frombuffer(value["data"], dtype=dtype).reshape(shape)
-        else:
-            return {k: _decode_value(v) for k, v in value.items()}
+        value_dict = cast(dict[str, object], value)
+        if value_dict.get("_type") == "ndarray":
+            shape = tuple(cast(list[int], value_dict["shape"]))
+            dtype = cast(str, value_dict["dtype"])
+            data = cast(bytes, value_dict["data"])
+            return np.frombuffer(data, dtype=dtype).reshape(shape)
+        return {k: _decode_value(v) for k, v in value_dict.items()}
     return value
 
 
-def deserialize_latent_record(data: bytes) -> dict:
+def deserialize_latent_record(data: bytes) -> LatentRecord:
     """Deserialize latent record from msgpack format."""
     encoded = msgpack.unpackb(data, raw=False)
-    return {k: _decode_value(v) for k, v in encoded.items()}
+    decoded = {k: _decode_value(v) for k, v in encoded.items()}
+    return cast(LatentRecord, decoded)
 
 
 class LatentEpisodeLengthFilter(grain.transforms.Filter):
     """Filter latent episodes by sequence length."""
-    def __init__(self, seq_len: int, *, print_filter_warnings: bool = True):
+    def __init__(self, seq_len: int, *, print_filter_warnings: bool = True) -> None:
         self.seq_len = seq_len
         self.print_filter_warnings = print_filter_warnings
 
     def filter(self, element: bytes) -> bool:
         data = deserialize_latent_record(element)
-        episode_len = data["latents"].shape[0]
+        latents = data["latents"]
+        episode_len = latents.shape[0]
         if episode_len < self.seq_len:
             if self.print_filter_warnings:
                 print(f"Filtering latent episode: {episode_len} < {self.seq_len}")
@@ -253,10 +282,10 @@ class LatentEpisodeLengthFilter(grain.transforms.Filter):
 
 class ProcessLatentAndSlice(grain.transforms.RandomMap):
     """Random slice pre-tokenized latent episodes."""
-    def __init__(self, seq_len: int):
+    def __init__(self, seq_len: int) -> None:
         self.seq_len = seq_len
 
-    def random_map(self, element: bytes, rng: np.random.Generator) -> dict:
+    def random_map(self, element: bytes, rng: np.random.Generator) -> dict[str, object]:
         data = deserialize_latent_record(element)
         latents = data["latents"]  # (T, n_latents, d_bottleneck)
         actions = data["actions"]   # dict with action arrays
@@ -291,7 +320,7 @@ def make_iterator(
     prefetch_buffer_size: int = 1,
     seed: int = 42,
     print_filter_warnings: bool = False,
-):
+) -> grain.DataLoader:
     """
     Creates a data loading pipeline using Grain from a DatasetConfig.
     

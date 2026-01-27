@@ -1,5 +1,6 @@
 # sampling logic for debugging / visualization. Not JIT friendly.
 from __future__ import annotations
+
 from typing import Tuple
 
 import jax
@@ -87,7 +88,7 @@ def sample_video(
     # Decode GT latents for visualization
     # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
     @nnx.jit
-    def decode_jit(z):
+    def decode_jit(z: jax.Array) -> jax.Array:
         frames, _ = tokenizer.decode(z, deterministic=True)
         return frames
 

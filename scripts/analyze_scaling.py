@@ -10,6 +10,7 @@ This script:
    - Loss vs total FLOPs (compute scaling)
    - Loss vs training time (wall-clock scaling)
 """
+from __future__ import annotations
 import argparse
 from pathlib import Path
 

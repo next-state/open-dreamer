@@ -2,6 +2,7 @@
 Generates a dataset of random-action CoinRun episodes.
 Episodes are saved individually as memory-mapped files for efficient loading.
 """
+from __future__ import annotations
 
 from dataclasses import dataclass
 

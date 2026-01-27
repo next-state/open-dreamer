@@ -6,7 +6,6 @@ Bundles have `from_pretrained` class methods for loading checkpoints for inferen
 (without optimizers).
 """
 from __future__ import annotations
-from aiohttp.abc import AbstractAccessLogger
 
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
@@ -41,14 +40,21 @@ from dreamer.utils import from_dict
 
 class NoOpCheckpointManager(ocp.CheckpointManager):
     """No-op checkpoint manager that does nothing (used when max_to_keep == 0)."""
-    def should_save(self, step: int) -> bool: return False
+    def should_save(self, step: int) -> bool:
+        return False
 
 
 def build_checkpoint_manager(
-        ckpt_cfg: CheckpointConfig,
-        ckpt_dir: Path,
-        item_names=("model_state", "optimizer_state", "train_dataloader_state", "rngs", "meta"),
-    ) -> ocp.CheckpointManager:
+    ckpt_cfg: CheckpointConfig,
+    ckpt_dir: Path,
+    item_names: tuple[str, ...] = (
+        "model_state",
+        "optimizer_state",
+        "train_dataloader_state",
+        "rngs",
+        "meta",
+    ),
+) -> ocp.CheckpointManager:
 
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=ckpt_cfg.max_to_keep,
@@ -193,7 +199,7 @@ class CheckpointBundle:
         # Build restore args dynamically by introspecting bundle fields
         restore_kwargs = {}
 
-        for field in fields(self):
+        for field in fields(type(self)):
             field_value = getattr(self, field.name)
             restore_kwargs[field.name] = ocp.args.StandardRestore(nnx.state(field_value))
 
@@ -219,7 +225,7 @@ class CheckpointBundle:
                 raise
 
         # Update bundle fields in-place
-        for field in fields(self):
+        for field in fields(type(self)):
             field_value = getattr(self, field.name)
             nnx.update(field_value, restored[field.name])
 
@@ -253,7 +259,7 @@ class CheckpointBundle:
         # Build save args dynamically by introspecting bundle fields
         save_kwargs, meta = {}, {}
 
-        for field in fields(self):
+        for field in fields(type(self)):
             field_value = getattr(self, field.name)
             save_kwargs[field.name] = ocp.args.StandardSave(nnx.state(field_value))
             if hasattr(field_value, 'cfg'):

@@ -11,6 +11,7 @@ This script:
 4. Generates 3 Chinchilla-style plots
 5. Outputs the recommended tokens_per_param ratio
 """
+from __future__ import annotations
 import argparse
 from pathlib import Path
 

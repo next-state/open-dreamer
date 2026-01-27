@@ -16,6 +16,7 @@ REALITY MODE:
 IMAGINATION MODE:
     next_frame_compiled() -> emit_block(frame) -> User sees imagination
 """
+from __future__ import annotations
 
 import jax
 import jax.numpy as jnp

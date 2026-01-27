@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Mapping, Protocol
 
 
 def compute_max_steps(
@@ -57,6 +57,27 @@ def compute_steps_for_flops_budget(
     return int(total_flops / flops_per_step)
 
 
+class _LRScheduleLike(Protocol):
+    max_steps: int
+
+
+class _CheckpointLike(Protocol):
+    max_steps: int
+
+
+class ScalingConfigLike(Protocol):
+    scaling_flops_budget: float
+    scaling_tokens_per_param: float
+    max_steps: int
+    lr_schedule: _LRScheduleLike
+    ckpt: _CheckpointLike
+    run_name: str
+
+
+class LoggerLike(Protocol):
+    max_steps: int | None
+
+
 @dataclass
 class ScalingContext:
     """Encapsulates scaling experiment setup and tracking.
@@ -68,7 +89,7 @@ class ScalingContext:
     """
 
     # Configuration
-    cfg: Any
+    cfg: ScalingConfigLike
     param_count: int
     data_tokens_per_step: int
     total_tokens_per_step: int
@@ -85,12 +106,12 @@ class ScalingContext:
     @classmethod
     def create(
         cls,
-        cfg: Any,
+        cfg: ScalingConfigLike,
         param_count: int,
         flops_per_step: float,
         data_tokens_per_step: int,
         total_tokens_per_step: int,
-        logger: Any,
+        logger: LoggerLike,
         run_dir: Path,
     ) -> "ScalingContext":
         """Factory that applies scaling overrides to cfg if scaling mode is active.
@@ -144,7 +165,7 @@ class ScalingContext:
         """Call before the training loop starts."""
         self._start_time = time.time()
 
-    def on_step(self, step: int, metrics: dict) -> None:
+    def on_step(self, step: int, metrics: Mapping[str, float | int]) -> None:
         """Call during logging to track final metrics for CSV output.
 
         Args:
@@ -155,7 +176,7 @@ class ScalingContext:
         self._final_loss = float(metrics.get("loss_total", metrics.get("flow_mse", 0.0)))
         self._final_psnr = float(metrics.get("psnr", 0.0))
 
-    def get_step_metrics(self, step: int) -> dict:
+    def get_step_metrics(self, step: int) -> dict[str, float]:
         """Return extra metrics for W&B logging (always computed).
 
         Args:

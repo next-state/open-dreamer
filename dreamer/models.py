@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 from numpy.distutils.unixccompiler import UnixCCompiler__compile
+
 import einops
+import jax
 import jax.numpy as jnp
 from flax import nnx
-import jax
-from typing import Tuple, Any, Dict
+from typing import Dict, Tuple
 from einops import rearrange, repeat
 import math
 from .utils import (
@@ -20,6 +23,9 @@ from .configs import (
 from .parallel import MeshRules
 from .actions import Actions
 
+Array = jax.Array
+DTypeLike = str | jnp.dtype
+
 
 # ============================================================================
 # KV Cache
@@ -30,25 +36,32 @@ class KVCache:
     """
     Ring buffer KV cache for JIT compilation.
     """
-    def __init__(self, k, v, index, window_size):
+    def __init__(self, k: Array, v: Array, index: Array, window_size: int) -> None:
         self.k = k               # (B, Max_T, K, H)
         self.v = v               # (B, Max_T, K, H)
         self.index = index       # scalar integer (i32)
         self.window_size = window_size  # static int
 
-    def tree_flatten(self):
+    def tree_flatten(self) -> tuple[tuple[Array, Array, Array], tuple[int]]:
         children = (self.k, self.v, self.index)
         aux_data = (self.window_size,)
         return children, aux_data
 
     @classmethod
-    def tree_unflatten(cls, aux_data, children):
+    def tree_unflatten(cls, aux_data: tuple[int], children: tuple[Array, Array, Array]) -> KVCache:
         k, v, index = children
         window_size, = aux_data
         return cls(k, v, index, window_size)
 
     @classmethod
-    def init(cls, batch_size, window_size, num_kv_heads, head_dim, dtype=jnp.float32):
+    def init(
+        cls,
+        batch_size: int,
+        window_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: DTypeLike = jnp.float32,
+    ) -> KVCache:
         dtype = to_jnp_dtype(dtype)
         return cls(
             k=jnp.zeros((batch_size, window_size, num_kv_heads, head_dim), dtype=dtype),
@@ -57,7 +70,7 @@ class KVCache:
             window_size=window_size
         )
 
-    def update(self, k_new, v_new):
+    def update(self, k_new: Array, v_new: Array) -> KVCache:
         """
         Writes k_new/v_new into the buffer.
         Handles both contiguous writes and wrapping writes (T > 1) via branching.
@@ -66,11 +79,11 @@ class KVCache:
         T = k_new.shape[1]
         write_idx = self.index % self.window_size
 
-        def _update_contiguous(operand, update, start_idx):
+        def _update_contiguous(operand: Array, update: Array, start_idx: Array) -> Array:
             # Fast path
             return jax.lax.dynamic_update_slice(operand, update, (0, start_idx, 0, 0))
 
-        def _update_wrap(operand, update, start_idx):
+        def _update_wrap(operand: Array, update: Array, start_idx: Array) -> Array:
             # Slow path
             indices = (jnp.arange(T) + start_idx) % self.window_size
             return operand.at[:, indices, :, :].set(update)
@@ -92,7 +105,7 @@ class KVCache:
 
         return KVCache(k=k_updated, v=v_updated, index=self.index + T, window_size=self.window_size)
 
-    def get_ordered_kv(self, query_len):
+    def get_ordered_kv(self, query_len: int) -> tuple[Array, Array, Array]:
         """
         Returns rolled K, V, and a mask indicating valid data.
         """
@@ -130,7 +143,7 @@ def create_transformer_caches(
     window_size: int,
     num_kv_heads: int,
     head_dim: int,
-    dtype=jnp.float32,
+    dtype: DTypeLike = jnp.float32,
 ) -> KVCachesDict:
     """
     Creates KV cache dictionary for transformer layers.
@@ -168,7 +181,13 @@ def create_transformer_caches(
 class RotaryEmbedding1D(nnx.Module):
     """Rotary Position Embedding with precomputed frequencies."""
 
-    def __init__(self, dim: int, theta: float = 10000.0, dtype: Any = jnp.float32, param_dtype: Any = jnp.float32):
+    def __init__(
+        self,
+        dim: int,
+        theta: float = 10000.0,
+        dtype: DTypeLike = jnp.float32,
+        param_dtype: DTypeLike = jnp.float32,
+    ) -> None:
         self.dim = dim
         self.theta = theta
         self.dtype = to_jnp_dtype(dtype)
@@ -178,7 +197,7 @@ class RotaryEmbedding1D(nnx.Module):
         inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
         self.inv_freq = nnx.Variable(inv_freq)
 
-    def __call__(self, q, k, start_pos=0):
+    def __call__(self, q: Array, k: Array, start_pos: int | Array = 0) -> tuple[Array, Array]:
         """
         q: (B, T, N, H)
         k: (B, T, K, H)
@@ -197,7 +216,7 @@ class RotaryEmbedding1D(nnx.Module):
 
         return self._apply(q, k, freqs_cos, freqs_sin)
 
-    def _apply(self, xq, xk, freqs_cos, freqs_sin):
+    def _apply(self, xq: Array, xk: Array, freqs_cos: Array, freqs_sin: Array) -> tuple[Array, Array]:
         """
         Apply Rotary Positional Embeddings (RoPE) to queries and keys using real sin/cos.
         xq: (B, T, N, H)
@@ -234,9 +253,17 @@ class RotaryEmbedding1D(nnx.Module):
 class MAEReplacer(nnx.Module):
     """Masked Autoencoder token replacer for training."""
 
-    def __init__(self, D: int, p_min: float = 0.0, p_max: float = 0.9,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
-                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        D: int,
+        p_min: float = 0.0,
+        p_max: float = 0.9,
+        dtype: DTypeLike = jnp.float32,
+        param_dtype: DTypeLike = jnp.float32,
+        *,
+        mesh_rules: MeshRules,
+        rngs: nnx.Rngs,
+    ) -> None:
         self.p_min = p_min
         self.p_max = p_max
         self.dtype = to_jnp_dtype(dtype)
@@ -265,11 +292,22 @@ class MAEReplacer(nnx.Module):
 class MLP(nnx.Module):
     """Transformer MLP with optional SwiGLU gating."""
 
-    def __init__(self, d_model: int, mlp_ratio: float = 4.0, dropout_rate: float = 0.0,
-                 swiglu: bool = True, parity_2over3: bool = False, use_norm: bool = True,
-                 use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
-                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        d_model: int,
+        mlp_ratio: float = 4.0,
+        dropout_rate: float = 0.0,
+        swiglu: bool = True,
+        parity_2over3: bool = False,
+        use_norm: bool = True,
+        use_bias: bool = False,
+        use_rmsnorm_scale: bool = True,
+        dtype: DTypeLike = jnp.float32,
+        param_dtype: DTypeLike = jnp.float32,
+        *,
+        mesh_rules: MeshRules,
+        rngs: nnx.Rngs,
+    ) -> None:
         self.d_model = d_model
         self.mlp_ratio = mlp_ratio
         self.dropout_rate = dropout_rate
@@ -322,13 +360,24 @@ class MLP(nnx.Module):
 class GroupedQueryAttention(nnx.Module):
     """Grouped Query Attention with optional QK normalization and RoPE."""
 
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
-                 dropout_rate: float = 0.0, qk_norm_type: str | None = None,
-                 is_causal: bool = False, rope_theta: float = 10000.0,
-                 use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 use_seq_parallel: bool = False,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
-                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        dropout_rate: float = 0.0,
+        qk_norm_type: str | None = None,
+        is_causal: bool = False,
+        rope_theta: float = 10000.0,
+        use_bias: bool = False,
+        use_rmsnorm_scale: bool = True,
+        use_seq_parallel: bool = False,
+        dtype: DTypeLike = jnp.float32,
+        param_dtype: DTypeLike = jnp.float32,
+        *,
+        mesh_rules: MeshRules,
+        rngs: nnx.Rngs,
+    ) -> None:
         self.dim = dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -362,14 +411,14 @@ class GroupedQueryAttention(nnx.Module):
 
     def __call__(
             self,
-            x,
-            *args,
+            x: Array,
+            *args: Array,
             mask: jnp.ndarray | None = None,
             local_window_size: int | tuple[int, int] | None = None,
             deterministic: bool = True,
             cache: KVCache | None = None,
             rngs: nnx.Rngs | None = None
-        ):
+        ) -> tuple[Array, KVCache | None]:
         """
         https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html
         B = batch size
@@ -478,11 +527,22 @@ class GroupedQueryAttention(nnx.Module):
 class SpaceSelfAttention(nnx.Module):
     """Space self-attention with modality routing."""
 
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
-                 qk_norm_type: str | None = None, rope_theta: float = 10000.0,
-                 use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
-                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        dropout_rate: float = 0.0,
+        qk_norm_type: str | None = None,
+        rope_theta: float = 10000.0,
+        use_bias: bool = False,
+        use_rmsnorm_scale: bool = True,
+        dtype: DTypeLike = jnp.float32,
+        param_dtype: DTypeLike = jnp.float32,
+        *,
+        mesh_rules: MeshRules,
+        rngs: nnx.Rngs,
+    ) -> None:
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
@@ -494,14 +554,14 @@ class SpaceSelfAttention(nnx.Module):
 
     def __call__(
             self,
-            x,
+            x: Array,
             *,
             mask: jnp.ndarray | None = None,
             local_window_size: int | tuple[int, int] | None = None,
             deterministic: bool = True,
             cache: KVCache | None = None,
             rngs: nnx.Rngs | None = None
-        ):
+        ) -> tuple[Array, None]:
         # x: (B, T, S, D)  -> attention across S within each (B,T)
         # Note: local_window_size is ignored for space attention (just for compatibility)
         B, T, S, D = x.shape
@@ -515,12 +575,23 @@ class SpaceSelfAttention(nnx.Module):
 class TimeSelfAttention(nnx.Module):
     """Time self-attention."""
 
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
-                 qk_norm_type: str | None = None, rope_theta: float = 10000.0,
-                 use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 use_seq_parallel: bool = False,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
-                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        dropout_rate: float = 0.0,
+        qk_norm_type: str | None = None,
+        rope_theta: float = 10000.0,
+        use_bias: bool = False,
+        use_rmsnorm_scale: bool = True,
+        use_seq_parallel: bool = False,
+        dtype: DTypeLike = jnp.float32,
+        param_dtype: DTypeLike = jnp.float32,
+        *,
+        mesh_rules: MeshRules,
+        rngs: nnx.Rngs,
+    ) -> None:
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
@@ -533,14 +604,14 @@ class TimeSelfAttention(nnx.Module):
 
     def __call__(
         self,
-        x,
+        x: Array,
         *,
         mask: jnp.ndarray | None = None,
         local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None
-    ):
+    ) -> tuple[Array, KVCache | None]:
         # x: (B, T, S, D) -> attention across T, causal
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
@@ -556,13 +627,26 @@ class TimeSelfAttention(nnx.Module):
 class BlockCausalLayer(nnx.Module):
     """Single block-causal transformer layer (alternating space/time attention)."""
 
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
-                 dropout_rate: float = 0.0, qk_norm_type: str | None = None,
-                 mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4,
-                 rope_theta: float = 10000.0, use_bias: bool = False,
-                 use_rmsnorm_scale: bool = True, use_seq_parallel: bool = False,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
-                 rngs: nnx.Rngs, mesh_rules: MeshRules):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        dropout_rate: float = 0.0,
+        qk_norm_type: str | None = None,
+        mlp_ratio: float = 4.0,
+        layer_index: int = 0,
+        time_every: int = 4,
+        rope_theta: float = 10000.0,
+        use_bias: bool = False,
+        use_rmsnorm_scale: bool = True,
+        use_seq_parallel: bool = False,
+        dtype: DTypeLike = jnp.float32,
+        param_dtype: DTypeLike = jnp.float32,
+        *,
+        rngs: nnx.Rngs,
+        mesh_rules: MeshRules,
+    ) -> None:
         self.layer_index = layer_index
         self.time_every = time_every
         param_dtype = to_jnp_dtype(param_dtype)
@@ -596,7 +680,7 @@ class BlockCausalLayer(nnx.Module):
 
     def __call__(
         self,
-        x,
+        x: Array,
         *,
         space_mask: jnp.ndarray | None = None,
         time_mask: jnp.ndarray | None = None,
@@ -604,7 +688,7 @@ class BlockCausalLayer(nnx.Module):
         deterministic: bool = True,
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None
-    ):
+    ) -> tuple[Array, KVCache | None]:
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
         if self.use_time:
@@ -624,14 +708,27 @@ class BlockCausalLayer(nnx.Module):
 class BlockCausalTransformer(nnx.Module):
     """Stack of block-causal transformer layers."""
 
-    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, depth: int,
-                 dropout_rate: float = 0.0, qk_norm_type: str | None = None,
-                 mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
-                 use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 use_seq_parallel: bool = False,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
-                 use_residual_lambdas: bool = False, *,
-                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_kv_heads: int,
+        depth: int,
+        dropout_rate: float = 0.0,
+        qk_norm_type: str | None = None,
+        mlp_ratio: float = 4.0,
+        time_every: int = 4,
+        rope_theta: float = 10000.0,
+        use_bias: bool = False,
+        use_rmsnorm_scale: bool = True,
+        use_seq_parallel: bool = False,
+        dtype: DTypeLike = jnp.float32,
+        param_dtype: DTypeLike = jnp.float32,
+        use_residual_lambdas: bool = False,
+        *,
+        mesh_rules: MeshRules,
+        rngs: nnx.Rngs,
+    ) -> None:
         self.d_model = d_model
         self.depth = depth
         self.time_every = time_every
@@ -664,7 +761,7 @@ class BlockCausalTransformer(nnx.Module):
 
     def __call__(
         self,
-        x,
+        x: Array,
         *,
         space_mask: jnp.ndarray | None = None,
         time_mask: jnp.ndarray | None = None,
@@ -672,7 +769,7 @@ class BlockCausalTransformer(nnx.Module):
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
         rngs: nnx.Rngs | None = None
-    ) -> Tuple[jax.Array, KVCachesDict | None]:
+    ) -> tuple[Array, KVCachesDict | None]:
         """
         Args:
             x: (B, T, S, D) input tensor
@@ -732,7 +829,7 @@ class BlockCausalTransformer(nnx.Module):
 class Encoder(nnx.Module):
     """Vision encoder with MAE masking."""
 
-    def __init__(self, cfg: EncoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: EncoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs) -> None:
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
         self.dataset_mean = cfg.dataset_mean
@@ -757,7 +854,13 @@ class Encoder(nnx.Module):
         self.mask_and_replace = MAEReplacer(D=cfg.d_model, p_min=cfg.mae_p_min, p_max=cfg.mae_p_max, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
         self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_latents, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
-    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+    def __call__(
+        self,
+        videos: Array,
+        *,
+        deterministic: bool = True,
+        rngs: nnx.Rngs | None = None,
+    ) -> tuple[Array, tuple[Array, Array]]:
         # Videos in the [0, 255] range
         B, T, H, W, C = videos.shape
 
@@ -805,7 +908,7 @@ class Decoder(nnx.Module):
     reconstructions at per-patch query tokens.
     """
 
-    def __init__(self, cfg: DecoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: DecoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs) -> None:
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
         self.H = cfg.H
@@ -840,12 +943,12 @@ class Decoder(nnx.Module):
 
     def __call__(
             self,
-            z: jnp.ndarray,
+            z: Array,
             *,
             deterministic: bool = True,
             caches: KVCachesDict | None = None,
             rngs: nnx.Rngs | None = None
-        ):
+        ) -> tuple[Array, KVCachesDict | None]:
         # Always expect unpacked input: (B, T, n_latents, d_bottleneck)
         B, T, N_l, d_bottleneck = z.shape
 
@@ -874,28 +977,52 @@ class Decoder(nnx.Module):
 class Tokenizer(nnx.Module):
     """Complete tokenizer (encoder + decoder)."""
 
-    def __init__(self, cfg: TokenizerModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: TokenizerModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs) -> None:
         self.cfg = cfg
 
         # Create encoder and decoder
         self.encoder = Encoder(cfg.encoder, mesh_rules=mesh_rules, rngs=rngs)
         self.decoder = Decoder(cfg.decoder, mesh_rules=mesh_rules, rngs=rngs)
 
-    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None):
+    def __call__(
+        self,
+        videos: Array,
+        *,
+        deterministic: bool = True,
+        rngs: nnx.Rngs | None = None,
+    ) -> tuple[Array, tuple[Array, Array]]:
         z, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs)
         recon, _ = self.decoder(z, deterministic=deterministic, rngs=rngs)
         return recon, aux
 
-    def encode(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None):
+    def encode(
+        self,
+        videos: Array,
+        *,
+        deterministic: bool = True,
+        rngs: nnx.Rngs | None = None,
+    ) -> tuple[Array, tuple[Array, Array]]:
         # Always returns unpacked: (B, T, n_latents, d_bottleneck)
         return self.encoder(videos, deterministic=deterministic, rngs=rngs)
 
-    def decode(self, z, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None):
+    def decode(
+        self,
+        z: Array,
+        *,
+        deterministic: bool = True,
+        caches: KVCachesDict | None = None,
+        rngs: nnx.Rngs | None = None,
+    ) -> tuple[Array, KVCachesDict | None]:
         # Always expects unpacked: (B, T, n_latents, d_bottleneck)
         frames, caches = self.decoder(z, deterministic=deterministic, caches=caches, rngs=rngs)
         return frames, caches
 
-    def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
+    def create_static_caches(
+        self,
+        batch_size: int,
+        window_size: int = 1024,
+        dtype: DTypeLike = jnp.float32,
+    ) -> KVCachesDict:
         """Creates concrete, zero-filled KV cache buffers for JIT compilation."""
         layout = self.decoder.get_token_layout()
 
@@ -960,12 +1087,12 @@ class ActionEncoder(nnx.Module):
         categorical_action_dim: int = 0,
         continuous_action_dim: int = 0,
         use_bias: bool = False,
-        dtype: Any = jnp.float32,
-        param_dtype: Any = jnp.float32,
+        dtype: DTypeLike = jnp.float32,
+        param_dtype: DTypeLike = jnp.float32,
         *,
         mesh_rules: MeshRules,
         rngs: nnx.Rngs
-    ):
+    ) -> None:
         self.d_model = d_model
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
@@ -1019,7 +1146,7 @@ class ActionEncoder(nnx.Module):
         actions: Actions,
         batch_time_shape: Tuple[int, int],
         as_tokens: bool = True
-    ):
+    ) -> Array:
         """
         Encode actions into embeddings.
 
@@ -1062,7 +1189,7 @@ class ActionEncoder(nnx.Module):
 class Dynamics(nnx.Module):
     """Dynamics model (world model)."""
 
-    def __init__(self, cfg: DynamicsModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: DynamicsModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs) -> None:
         self.cfg = cfg
         self.dtype = to_jnp_dtype(cfg.dtype)
         self.param_dtype = to_jnp_dtype(cfg.param_dtype)
@@ -1155,7 +1282,7 @@ class Dynamics(nnx.Module):
         return TokenLayout(tuple(segments))
 
     def create_static_caches(self, batch_size: int, n_latents: int, window_size: int = 1024,
-                           n_agent: int = 0, dtype=jnp.float32) -> KVCachesDict:
+                           n_agent: int = 0, dtype: DTypeLike = jnp.float32) -> KVCachesDict:
         """Creates concrete, zero-filled buffers for JIT compilation.
 
         Args:
@@ -1180,9 +1307,9 @@ class Dynamics(nnx.Module):
     def __call__(
         self,
         actions: Actions,
-        step_indices,
-        tau_indices,
-        unpacked_enc_tokens,
+        step_indices: Array,
+        tau_indices: Array,
+        unpacked_enc_tokens: Array,
         *,
         context_length: int | None = None,
         time_mask: jnp.ndarray | None = None,
@@ -1190,7 +1317,7 @@ class Dynamics(nnx.Module):
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
         rngs: nnx.Rngs | None = None
-    ) -> Tuple[jax.Array, Tuple[jax.Array | None, KVCachesDict | None]]:
+    ) -> tuple[Array, tuple[Array | None, KVCachesDict | None]]:
         """
         Args:
             actions: Actions object
@@ -1322,7 +1449,7 @@ class Dynamics(nnx.Module):
 class TaskEmbedder(nnx.Module):
     """Task embedder for agent conditioning."""
 
-    def __init__(self, cfg: TaskEmbedderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: TaskEmbedderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs) -> None:
         self.cfg = cfg
         dtype = to_jnp_dtype(cfg.dtype)
         param_dtype = to_jnp_dtype(cfg.param_dtype)
@@ -1334,7 +1461,7 @@ class TaskEmbedder(nnx.Module):
 
         self.agent_base = nnx.Param(jax.random.normal(rngs.params(), (cfg.d_model,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
-    def __call__(self, task, B: int, T: int) -> jax.Array:
+    def __call__(self, task: Array, B: int, T: int) -> Array:
         """
         If use_ids=True:
             task: (B,) int32 ids in [0, n_tasks)
@@ -1355,7 +1482,7 @@ class TaskEmbedder(nnx.Module):
 class PolicyHeadMTP(nnx.Module):
     """Multi-Token action prediction."""
 
-    def __init__(self, cfg: PolicyHeadModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: PolicyHeadModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs) -> None:
         self.cfg = cfg
         self.L = cfg.L
         self.num_binary_actions = cfg.num_binary_actions
@@ -1403,11 +1530,11 @@ class PolicyHeadMTP(nnx.Module):
 
     def __call__(
         self,
-        h_t: jnp.ndarray,
+        h_t: Array,
         *,
         deterministic: bool = True,
-        rngs: nnx.Rngs | None = None
-    ) -> dict[str, jnp.ndarray]:
+        rngs: nnx.Rngs | None = None,
+    ) -> dict[str, Array]:
         """
         Forward pass.
 
@@ -1446,7 +1573,7 @@ class PolicyHeadMTP(nnx.Module):
 
     def sample(
         self,
-        h_t: jnp.ndarray,
+        h_t: Array,
         *,
         deterministic: bool = True,
         rng: jax.Array,
@@ -1463,7 +1590,8 @@ class PolicyHeadMTP(nnx.Module):
         """
         rng_policy, rng_binary, rng_categorical, rng_continuous = jax.random.split(rng, num=4)
 
-        outputs = self(h_t, deterministic=deterministic, rngs=rng_policy)
+        rngs = nnx.Rngs(dropout=rng_policy)
+        outputs = self(h_t, deterministic=deterministic, rngs=rngs)
         actions = Actions()
 
         if "binary_logits" in outputs:
@@ -1496,7 +1624,7 @@ class PolicyHeadMTP(nnx.Module):
 class RewardHeadMTP(nnx.Module):
     """Multi-Token reward prediction with symexp twohot bins."""
 
-    def __init__(self, cfg: RewardHeadModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: RewardHeadModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs) -> None:
         self.cfg = cfg
         dtype = to_jnp_dtype(cfg.dtype)
         param_dtype = to_jnp_dtype(cfg.param_dtype)
@@ -1512,7 +1640,13 @@ class RewardHeadMTP(nnx.Module):
         # Precompute bin centers as a constant
         self.symexp_centers_log = jnp.linspace(cfg.log_low, cfg.log_high, cfg.num_bins)
 
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: nnx.Rngs | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(
+        self,
+        h_t: Array,
+        *,
+        deterministic: bool = True,
+        rngs: nnx.Rngs | None = None,
+    ) -> tuple[Array, Array]:
         h_t = einops.rearrange(h_t, '... n c -> ... (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L*K)
@@ -1526,8 +1660,8 @@ class ValueHead(nnx.Module):
     def __init__(self, d_model: int, num_bins: int = 101, L: int = 1, mlp_ratio: float = 2.0,
                  dropout_rate: float = 0.0, swiglu: bool = True, parity_2over3: bool = False,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
-                 log_low: float = -8.0, log_high: float = 8.0, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+                 dtype: DTypeLike = jnp.float32, param_dtype: DTypeLike = jnp.float32,
+                 log_low: float = -8.0, log_high: float = 8.0, *, mesh_rules: MeshRules, rngs: nnx.Rngs) -> None:
         self.d_model = d_model
         self.L = L
         self.num_bins = num_bins
@@ -1549,7 +1683,13 @@ class ValueHead(nnx.Module):
         self.symexp_centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins)
 
 
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True, rngs: nnx.Rngs | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(
+        self,
+        h_t: Array,
+        *,
+        deterministic: bool = True,
+        rngs: nnx.Rngs | None = None,
+    ) -> tuple[Array, Array]:
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, K)

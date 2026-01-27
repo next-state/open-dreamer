@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Final
+from typing import Final, TypedDict
 
 import numpy as np
 import jax
@@ -22,7 +22,7 @@ class Actions:
     categorical: Array | None = None
     continuous: Array | None = None
 
-    def __getitem__(self, key) -> Actions:
+    def __getitem__(self, key: object) -> Actions:
         """Slice Actions along batch/time dimensions."""
         return jax.tree.map(lambda x: x[key] if x is not None else None, self)
 
@@ -40,8 +40,9 @@ class Actions:
 def create_noop_action_like(template: Actions, categorical_action_dim: int) -> Actions:
     """Creates a (B, 1, ...) no-op start action."""
 
-    def _create_action(arr, fill_value):
-        if arr is None: return None
+    def _create_action(arr: Array | None, fill_value: int | float) -> Array | None:
+        if arr is None:
+            return None
         return jnp.full_like(arr[:, 0:1], fill_value)
 
     return Actions(
@@ -56,8 +57,9 @@ def shift_actions(actions: Actions, categorical_action_dim: int) -> Actions:
 
     noop_action = create_noop_action_like(actions, categorical_action_dim)
     
-    def _shift(current_arr, start_arr):
-        if current_arr is None: return None
+    def _shift(current_arr: Array | None, start_arr: Array | None) -> Array | None:
+        if current_arr is None or start_arr is None:
+            return None
         return jnp.concatenate([start_arr, current_arr[:, :-1]], axis=1)
 
     return Actions(
@@ -113,12 +115,12 @@ NUM_CAMERA_BINS = 11  # per axis
 NUM_CAMERA_CLASSES = NUM_CAMERA_BINS * NUM_CAMERA_BINS 
 
 
-def mu_law_encode(x: Array, mu: float = CAMERA_MU) -> Array:
+def mu_law_encode(x: np.ndarray, mu: float = CAMERA_MU) -> np.ndarray:
     """Apply mu-law compression for foveated discretization."""
     return np.sign(x) * np.log(1.0 + mu * np.abs(x)) / np.log(1.0 + mu)
 
 
-def mouse_movement_to_categorical(dx: Array, dy: Array) -> Array:
+def mouse_movement_to_categorical(dx: np.ndarray, dy: np.ndarray) -> np.ndarray:
     """Convert continuous mouse movement to categorical action index.
     
     Args:
@@ -148,7 +150,7 @@ def mouse_movement_to_categorical(dx: Array, dy: Array) -> Array:
 NUM_BINARY_ACTIONS: Final[int] = 23  # keyboard (20) + mouse buttons (3)
 
 
-def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
+def parse_action_dicts(action_dicts: list[ActionDict]) -> Actions:
     """Convert a list of VPT action dictionaries to an Actions pytree.
     
     Args:
@@ -195,11 +197,28 @@ def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
     
     # Convert camera to categorical using mu-law foveated discretization
     categorical = mouse_movement_to_categorical(
-        np.array(camera_dx), 
-        np.array(camera_dy)
+        np.array(camera_dx),
+        np.array(camera_dy),
     )
-    
+
     return Actions(
-        binary=np.array(binary),
-        categorical=categorical,
+        binary=jnp.asarray(binary),
+        categorical=jnp.asarray(categorical),
     )
+class MouseDict(TypedDict, total=False):
+    dx: float
+    dy: float
+    buttons: list[int]
+    newButtons: list[int]
+
+
+class KeyboardDict(TypedDict, total=False):
+    keys: list[str]
+    newKeys: list[str]
+
+
+class ActionDict(TypedDict, total=False):
+    mouse: MouseDict
+    keyboard: KeyboardDict
+    hotbar: int
+    isGuiOpen: bool
