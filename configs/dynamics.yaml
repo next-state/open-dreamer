@@ -43,8 +43,8 @@ self_fraction: 0.25
 image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
 
 # Alternating batch lengths (paper: "Sequence length" paragraph)
-short_T: 64  # Overrides dataset.T
-long_T: 256  # Overrides dataset.T
+short_T: 32  # Overrides dataset.T
+long_T: 32  # Overrides dataset.T
 long_batch_ratio: 0.1  # Fraction of batches that use long_T
 
 max_steps: 300_000

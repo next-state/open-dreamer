@@ -13,13 +13,14 @@ from flax import nnx
 from jaxlpips import LPIPS
 from omegaconf import OmegaConf
 from tqdm import tqdm
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dreamer.configs import TokenizerConfig
 from dreamer.training import compute_psnr
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
-from dreamer.parallel import build_parallel
+from dreamer.parallel import build_parallel, MeshRules
 from dreamer.scaling import ScalingContext
 
 from dreamer.checkpointing import (
@@ -153,7 +154,7 @@ def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger):
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
-    grid = viz_step_jit(model, videos[:8,:1], mae_key=mae_key, drop_key=drop_key)
+    grid = viz_step_jit(model, videos[:2,:64:16], mae_key=mae_key, drop_key=drop_key)
     grid = jax.device_get(grid)
 
     imageio.imwrite(vis_dir / f"step_{step:06d}.png", grid)
@@ -176,7 +177,9 @@ def run(cfg: TokenizerConfig):
     )
 
     # Parallelism
-    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
+    mesh = jax.make_mesh((2, jax.local_device_count()//2), ('data', 'seq'))
+    data_sharding = NamedSharding(mesh, P('data', 'seq', None, None))
+    mesh_rules = MeshRules(data='data', seq='seq')
 
     with logger, jax.set_mesh(mesh):
         key = jax.random.key(cfg.seed)

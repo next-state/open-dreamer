@@ -6,8 +6,8 @@ defaults:
 run_name: tokenizer-512
 
 dataset:
-  B: 16
-  T: 32
+  B: 2
+  T: 256
 
 ckpt:
   max_to_keep: 0
@@ -67,7 +67,7 @@ tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
-  lr: 0.003  # constant LR or peak LR for schedules
+  lr: 0.0003  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05
@@ -91,3 +91,4 @@ optimizer:
 lpips_weight: 0.2
 lpips_frac: 0.5
 visualize_every: 1000
+parallel_strategy: sp  # Parallelization strategy: "data", "fsdp", or "tp"

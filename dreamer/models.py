@@ -326,7 +326,8 @@ class GroupedQueryAttention(nnx.Module):
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  is_causal: bool = False, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 use_seq_parallel: bool = False,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.dim = dim
         self.num_heads = num_heads
@@ -337,10 +338,11 @@ class GroupedQueryAttention(nnx.Module):
         self.rope_theta = rope_theta
         self.use_bias = use_bias
         self.use_rmsnorm_scale = use_rmsnorm_scale
+        self.use_seq_parallel = use_seq_parallel
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
         self.dtype = dtype
-        
+
         assert self.dim % self.num_heads == 0
         assert self.num_heads % self.num_kv_heads == 0
 
@@ -392,38 +394,80 @@ class GroupedQueryAttention(nnx.Module):
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
             scale = 1.0
 
-        # RoPE
-        start_pos = cache.index if cache is not None else 0
-        q, k = self.rope(q, k, start_pos=start_pos)
+        # Sequence parallel path: all-gather K,V across sequence axis for training
+        if self.use_seq_parallel and cache is None:
+            # Get sequence axis info from the mesh
+            seq_axis_size = jax.lax.psum(1, axis_name='seq')
+            seq_axis_idx = jax.lax.axis_index('seq')
 
-        # KV cache
-        if self.is_causal and cache is not None:
-            # CACHED INFERENCE MODE
-            new_cache = cache.update(k, v)
+            T_local = k.shape[1]
+            T_global = T_local * seq_axis_size
 
-            T = q.shape[1]
-            k_attn, v_attn, cache_mask = new_cache.get_ordered_kv(query_len=T)
+            # Global position offset for RoPE
+            global_start_pos = seq_axis_idx * T_local
+            q, k = self.rope(q, k, start_pos=global_start_pos)
 
-            attn_is_causal = False # Handled manually by cache_mask
+            # All-gather K, V across sequence axis
+            # tiled=True means the results are concatenated along the axis rather than stacked
+            k_full = jax.lax.all_gather(k, axis_name='seq', axis=1, tiled=True)
+            v_full = jax.lax.all_gather(v, axis_name='seq', axis=1, tiled=True)
+
+            # Build causal mask for local Q vs full K
+            # q_pos: positions of local queries in global sequence
+            # k_pos: positions of all keys (0 to T_global-1)
+            q_pos = jnp.arange(T_local) + global_start_pos
+            k_pos = jnp.arange(T_global)
+            causal_mask = q_pos[:, None] >= k_pos[None, :]  # (T_local, T_global)
+            causal_mask = causal_mask[None, None, :, :]  # (1, 1, T_local, T_global)
+
+            # Combine with any input mask if provided
             if mask is not None:
-                mask_attn = jnp.logical_and(mask, cache_mask)
-            else:
-                mask_attn = cache_mask
-        else:
-            # TRAINING or NON-CAUSAL (SPACE) ATTENTION
-            new_cache = None
-            k_attn, v_attn = k, v
-            mask_attn = mask
-            attn_is_causal = self.is_causal and (mask is None)
+                causal_mask = jnp.logical_and(mask, causal_mask)
 
-        # SDPA
-        attn = jax.nn.dot_product_attention(
-            q, k_attn, v_attn,
-            mask=mask_attn,
-            scale=scale,
-            is_causal=attn_is_causal,
-            local_window_size=local_window_size
-        )  # TODO: try setting implementation="cudnn"
+            # SDPA with explicit causal mask (is_causal=False since we handle it)
+            attn = jax.nn.dot_product_attention(
+                q, k_full, v_full,
+                mask=causal_mask,
+                scale=scale,
+                is_causal=False,  # Handled by our custom mask
+            )
+            new_cache = None
+
+        else:
+            # Standard non-SP path
+            # RoPE
+            start_pos = cache.index if cache is not None else 0
+            q, k = self.rope(q, k, start_pos=start_pos)
+
+            # KV cache
+            if self.is_causal and cache is not None:
+                # CACHED INFERENCE MODE
+                new_cache = cache.update(k, v)
+
+                T = q.shape[1]
+                k_attn, v_attn, cache_mask = new_cache.get_ordered_kv(query_len=T)
+
+                attn_is_causal = False  # Handled manually by cache_mask
+                if mask is not None:
+                    mask_attn = jnp.logical_and(mask, cache_mask)
+                else:
+                    mask_attn = cache_mask
+            else:
+                # TRAINING or NON-CAUSAL (SPACE) ATTENTION
+                new_cache = None
+                k_attn, v_attn = k, v
+                mask_attn = mask
+                attn_is_causal = self.is_causal and (mask is None)
+
+            # SDPA
+            attn = jax.nn.dot_product_attention(
+                q, k_attn, v_attn,
+                mask=mask_attn,
+                scale=scale,
+                is_causal=attn_is_causal,
+                local_window_size=local_window_size
+            )  # TODO: try setting implementation="cudnn"
+
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
@@ -474,14 +518,16 @@ class TimeSelfAttention(nnx.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 use_seq_parallel: bool = False,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
             rope_theta=rope_theta, is_causal=True,
             use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
-            dtype=dtype, param_dtype=param_dtype, 
+            use_seq_parallel=use_seq_parallel,
+            dtype=dtype, param_dtype=param_dtype,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -510,10 +556,10 @@ class BlockCausalLayer(nnx.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4,
-                 rope_theta: float = 10000.0, use_bias: bool = False, 
-                 use_rmsnorm_scale: bool = True, dtype: Any = jnp.float32, 
-                 param_dtype: Any = jnp.float32, *, rngs: nnx.Rngs,
-                 mesh_rules: MeshRules):
+                 rope_theta: float = 10000.0, use_bias: bool = False,
+                 use_rmsnorm_scale: bool = True, use_seq_parallel: bool = False,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
+                 rngs: nnx.Rngs, mesh_rules: MeshRules):
         self.layer_index = layer_index
         self.time_every = time_every
         param_dtype = to_jnp_dtype(param_dtype)
@@ -527,15 +573,18 @@ class BlockCausalLayer(nnx.Module):
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
-                dtype=dtype, param_dtype=param_dtype, 
+                use_seq_parallel=use_seq_parallel,
+                dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             )
         else:
+            # SpaceSelfAttention doesn't need seq_parallel - it operates on (B*T, S, D)
+            # with T already in the batch dimension
             self.attn = SpaceSelfAttention(
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
-                dtype=dtype, param_dtype=param_dtype, 
+                dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             )
 
@@ -576,6 +625,7 @@ class BlockCausalTransformer(nnx.Module):
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
+                 use_seq_parallel: bool = False,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
                  use_residual_lambdas: bool = False, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
@@ -588,11 +638,11 @@ class BlockCausalTransformer(nnx.Module):
         if use_residual_lambdas:
             self.resid_lambdas = nnx.Param(
                 jnp.ones(depth, dtype=param_dtype),
-                sharding_names=mesh_rules('embed')
+                sharding_names=(None,)  # Small per-layer params, no sharding needed
             )
             self.x0_lambdas = nnx.Param(
                 jnp.zeros(depth, dtype=param_dtype),
-                sharding_names=mesh_rules('embed')
+                sharding_names=(None,)  # Small per-layer params, no sharding needed
             )
 
         # Create layers
@@ -602,6 +652,7 @@ class BlockCausalTransformer(nnx.Module):
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
+                use_seq_parallel=use_seq_parallel,
                 dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             ) for i in range(depth)
@@ -689,8 +740,9 @@ class Encoder(nnx.Module):
         self.transformer = BlockCausalTransformer(
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
             dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
-            time_every=cfg.time_every, rope_theta=cfg.rope_theta, 
+            time_every=cfg.time_every, rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
+            use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=dtype, param_dtype=param_dtype,
             use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
@@ -764,8 +816,9 @@ class Decoder(nnx.Module):
         self.transformer = BlockCausalTransformer(
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
             dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
-            time_every=cfg.time_every, rope_theta=cfg.rope_theta, 
+            time_every=cfg.time_every, rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
+            use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=dtype, param_dtype=param_dtype,
             use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
@@ -1040,6 +1093,7 @@ class Dynamics(nnx.Module):
             depth=cfg.depth, dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type,
             mlp_ratio=cfg.mlp_ratio, time_every=cfg.time_every, rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
+            use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=self.dtype, param_dtype=self.param_dtype,
             use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs

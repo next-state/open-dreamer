@@ -62,6 +62,7 @@ class EncoderModelConfig:
     use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
+    use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
 
@@ -86,6 +87,7 @@ class DecoderModelConfig:
     use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
+    use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
     H: int = 64  # sum(DatasetConfig.padding_H, DatasetConfig.H)
@@ -119,6 +121,7 @@ class DynamicsModelConfig:
     use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
+    use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
 
@@ -267,7 +270,7 @@ class BaseExperimentConfig:
     max_steps: int = 1_000_000_000
     log_every: int = 100
     seed: int = 0  # Random seed
-    parallel_strategy: str = "data"  # Parallelization strategy: "data", "fsdp", or "tp"
+    parallel_strategy: str = "data"  # Parallelization strategy: "data", "fsdp", "tp", or "sp"
 
     # Precision
     dtype: str = "bfloat16"
