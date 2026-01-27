@@ -74,6 +74,7 @@ def sample_video(
 
     # Split context vs future
     latents_ctx_clean, latent_future = latents[:, :-horizon, :, :], latents[:, -horizon:, :, :]
+    actions_ctx, actions_future = actions[:, :-horizon], actions[:, -horizon:]
 
     # Single-shot context corruption for visualization "floor" only
     latents_ctx = latents_ctx_clean
@@ -96,8 +97,6 @@ def sample_video(
         task = jnp.zeros((B,), dtype=jnp.int32)  # Use task ID 0 for all samples
         initial_agent_tokens = task_embedder(task=task, B=B, T=T_ctx)
     else:
-        actions_ctx = actions[:, :-horizon]
-        actions_future = actions[:, -horizon:]
         initial_agent_tokens = None
 
     # Use latent_rollout for both paths (frames already encoded to latents above)
