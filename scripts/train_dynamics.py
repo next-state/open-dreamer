@@ -140,12 +140,13 @@ def run(cfg: DynamicsConfig):
 
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_spatial = tokenizer_cfg.encoder.n_latents // cfg.dynamics.packing_factor
+        avg_T = cfg.long_batch_ratio * cfg.long_T + (1 - cfg.long_batch_ratio) * cfg.short_T
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T, n_spatial=n_spatial),
-            data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_spatial + 1),  # spatial + action
-            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
+            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T, n_spatial=n_spatial),
+            data_tokens_per_step=cfg.dataset.B * avg_T * (n_spatial + 1),  # spatial + action
+            total_tokens_per_step=cfg.dataset.B * avg_T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
             logger=logger,
             run_dir=run_dir,
         )
