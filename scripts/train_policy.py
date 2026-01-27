@@ -975,7 +975,7 @@ def eval_rollout_real_env(
             k_max=k_max,
         )
 
-        # Policy action (greedy by default).
+        # Policy action (deterministic by default).
         rng_t, policy_rng = jax.random.split(rng_t)
         actions_t, _ = sample_action_from_policy(
             h_t,

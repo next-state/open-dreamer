@@ -115,7 +115,7 @@ def sample_video(
         num_steps=horizon,
         rng=rng,
         initial_task_embedding=initial_agent_tokens,
-        greedy=True,
+        deterministic=True,
     )
 
     # Decode predicted latents to frames
