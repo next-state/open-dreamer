@@ -64,67 +64,12 @@ def encode_and_train_step(
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
 ):
     rngs = nnx.Rngs(mae=tokenizer_key)
-
-    # TODO: handle edge cases B_img = 0 or B_img = B
-
-    # Split batch:
-    # Images (T=1) - rearrange videos and actions to treat each frame as independent
-    images = rearrange(videos[:B_img], 'B_img T H W C -> (B_img T) 1 H W C')
-    actions_img = jax.tree.map(lambda x: rearrange(x, 'B_img T ... -> (B_img T) 1 ...') if x is not None else None, actions[:B_img])
-
-    # Videos (T=T)
-    videos_batch = videos[B_img:]
-    actions_batch = actions[B_img:]
-
-    # Encode both batches (returns unpacked latents)
-    latents_img, _ = tokenizer.encode(images, deterministic=True, rngs=rngs)
-    latents_vid, _ = tokenizer.encode(videos_batch, deterministic=True, rngs=rngs)
-
-    # Compute B_self values
-    B_self_img = B_img * T // 2
-    B_vid = videos.shape[0] - B_img
-    B_self_vid = B_vid // 2
-
-    # Training step
-    step_key = jax.random.fold_in(master_key, step)
-    key_img, key_vid = jax.random.split(step_key, 2)
-
-    def loss_fn(model: Dynamics, latents, actions, rng, B_self, ctx_len):
-        losses, aux = shortcut_forcing_step(
-            dynamics_model=model,
-            actions=actions,
-            latents=latents,
-            rng=rng,
-            k_max=k_max,
-            B_self=B_self,
-            context_length=ctx_len,
-            task_embeddings=None,  # Not used in dynamics pretraining
-        )
-        return losses['total'], aux
-
-    # Compute gradients for images
-    (loss_img, aux_img), grads_img = nnx.value_and_grad(loss_fn, has_aux=True)(
-        dynamics, latents_img, actions_img, key_img, B_self_img, None  # Images: T=1, no context_length
+    latents, _ = tokenizer.encode(videos, deterministic=True, rngs=rngs)
+    return latent_train_step(
+        dynamics, optimizer, latents, actions,
+        master_key=master_key, step=step, B_img=B_img, T=T,
+        k_max=k_max, context_length=context_length,
     )
-
-    # Compute gradients for videos
-    (loss_vid, aux_vid), grads_vid = nnx.value_and_grad(loss_fn, has_aux=True)(
-        dynamics, latents_vid, actions_batch, key_vid, B_self_vid, context_length
-    )
-
-    # Aggregate gradients
-    B_img_actual = latents_img.shape[0]
-    B_vid_actual = latents_vid.shape[0]
-    total_B = B_img_actual + B_vid_actual
-    combined_grads = jax.tree.map(
-        lambda g1, g2: (g1 * B_img_actual + g2 * B_vid_actual) / total_B,
-        grads_img, grads_vid
-    )
-
-    # Update model with optimizer
-    optimizer.update(dynamics, combined_grads)
-
-    return aux_img, aux_vid
 
 
 @nnx.jit(static_argnames=("k_max", "B_img", "T"))
@@ -362,20 +307,14 @@ def run(cfg: DynamicsConfig):
                 bundle.maybe_save(checkpoint_manager, step, iterators, rng)
 
                 # Periodic lightweight AR eval
-                if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
-                    val_actions = actions[:4]
-                    if use_latent_data:
-                        run_evaluation(
-                            cfg, step, bundle.tokenizer, bundle.dynamics,
-                            val_videos=None, val_actions=val_actions, vis_dir=vis_dir,
-                            rng=rng, logger=logger, val_latents=latents[:4]
-                        )
-                    else:
-                        run_evaluation(
-                            cfg, step, bundle.tokenizer, bundle.dynamics,
-                            val_videos=videos[:4], val_actions=val_actions,
-                            vis_dir=vis_dir, rng=rng, logger=logger
-                        )
+                if cfg.write_video_every and (step % cfg.write_video_every == 0):
+                    run_evaluation(
+                        cfg, step, bundle.tokenizer, bundle.dynamics,
+                        val_videos=None if use_latent_data else videos[:4],
+                        val_actions=actions[:4],
+                        vis_dir=vis_dir, rng=rng, logger=logger,
+                        val_latents=latents[:4] if use_latent_data else None,
+                    )
 
             scaling.finalize()
 

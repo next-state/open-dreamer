@@ -51,7 +51,6 @@ def sample_video(
         gt_decoded_frames: (B, ctx+horizon, H, W, C) GT latents decoded [0, 255] uint8
         original_frames: (B, ctx+horizon, H, W, C) original frames [0, 255] uint8, or None if using latents
     """
-    assert (frames is not None) ^ (latents is not None), "Provide either frames or latents, not both"
 
     if latents is not None:
         # Pre-tokenized latent path
@@ -59,6 +58,7 @@ def sample_video(
         latents = latents.astype(jnp.bfloat16)
         B, T = latents.shape[:2]
     else:
+        assert frames is not None
         # Video path - encode frames
         B, T, H, W, C = frames.shape
 
@@ -73,10 +73,7 @@ def sample_video(
         )
 
     # Split context vs future
-    latents_ctx_clean = latents[:, :-horizon, :, :]
-    latents_future = latents[:, -horizon:, :, :]
-    actions_ctx = actions[:, :-horizon]
-    actions_future = actions[:, -horizon:]
+    latents_ctx_clean, latent_future = latents[:, :-horizon, :, :], latents[:, -horizon:, :, :]
 
     # Single-shot context corruption for visualization "floor" only
     latents_ctx = latents_ctx_clean
@@ -87,11 +84,7 @@ def sample_video(
     #     latents_ctx = tau * latents_ctx_clean + (1.0 - tau) * noise
 
     # Decode GT latents for visualization
-    latents_for_gt_frames = jnp.concatenate([latents_ctx, latents_future], axis=1)
-    gt_decoded_frames, _ = tokenizer.decode(
-        latents_for_gt_frames,
-        deterministic=True
-    )
+    gt_decoded_frames, _ = tokenizer.decode(latents, deterministic=True)
     gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
@@ -103,42 +96,28 @@ def sample_video(
         task = jnp.zeros((B,), dtype=jnp.int32)  # Use task ID 0 for all samples
         initial_agent_tokens = task_embedder(task=task, B=B, T=T_ctx)
     else:
+        actions_ctx = actions[:, :-horizon]
+        actions_future = actions[:, -horizon:]
         initial_agent_tokens = None
 
-    if frames is not None:
-        # Video path: use video_rollout which encodes context frames
-        frames_ctx = frames[:, :-horizon, :, :, :]
-        pred_frames = video_rollout(
-            tokenizer,
-            dynamics,
-            policy=actions_future if policy is None else policy,
-            schedule=schedule_config,
-            frames_ctx=frames_ctx,
-            actions_ctx=actions_ctx,
-            num_steps=horizon,
-            rng=rng,
-            initial_task_embedding=initial_agent_tokens,
-        )
-        original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8)
-    else:
-        # Latent path: use latent_rollout directly (context already encoded)
-        rollout_result = latent_rollout(
-            dynamics,
-            policy=actions_future if policy is None else policy,
-            schedule=schedule_config,
-            latents_ctx=latents_ctx,
-            actions_ctx=actions_ctx,
-            num_steps=horizon,
-            rng=rng,
-            initial_task_embedding=initial_agent_tokens,
-            greedy=True,
-        )
-        # Decode predicted latents to frames
-        pred_frames, _ = tokenizer.decode(
-            rollout_result['latents'],
-            deterministic=True
-        )
-        pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
-        original_frames = None
+    # Use latent_rollout for both paths (frames already encoded to latents above)
+    rollout_result = latent_rollout(
+        dynamics,
+        policy=actions_future if policy is None else policy,
+        schedule=schedule_config,
+        latents_ctx=latents_ctx,
+        actions_ctx=actions_ctx,
+        num_steps=horizon,
+        rng=rng,
+        initial_task_embedding=initial_agent_tokens,
+        greedy=True,
+    )
+    # Decode predicted latents to frames
+    pred_frames, _ = tokenizer.decode(
+        rollout_result['latents'],
+        deterministic=True
+    )
+    pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
+    original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
 
     return pred_frames, gt_decoded_frames, original_frames

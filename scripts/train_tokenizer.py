@@ -147,14 +147,14 @@ def viz_step_jit(model: Tokenizer, videos, *, mae_key, drop_key):
     recon_masked = masked + recon * mask
 
     grid = jnp.concatenate([videos, masked, recon_masked, recon], axis=2)
-    grid = einops.rearrange(grid[:, 0], "b h w c -> h (b w) c")
+    grid = einops.rearrange(grid, "b t h w c -> h (b t w) c")
     return grid.clip(0, 255).astype(jnp.uint8)
 
 def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger):
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
-    grid = viz_step_jit(model, videos[:2,:64:16], mae_key=mae_key, drop_key=drop_key)
+    grid = viz_step_jit(model, videos[:2,:256:256//4], mae_key=mae_key, drop_key=drop_key)
     grid = jax.device_get(grid)
 
     imageio.imwrite(vis_dir / f"step_{step:06d}.png", grid)

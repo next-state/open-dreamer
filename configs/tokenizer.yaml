@@ -10,7 +10,7 @@ dataset:
   T: 256
 
 ckpt:
-  max_to_keep: 0
+  max_to_keep: 1
   save_interval_steps: 10_000
 
 tokenizer:
