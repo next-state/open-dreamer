@@ -7,8 +7,8 @@ run_name: dynamics
 tokenizer_ckpt: logs/tokenizer-512/checkpoints/
 
 ckpt:
-  max_to_keep: 0
-  save_interval_steps: 100
+  max_to_keep: 1
+  save_interval_steps: 10_000
 
 dataset:
   B: 8
@@ -33,6 +33,9 @@ dynamics:
     use_rmsnorm_scale: true
     dtype: ${dtype}
     param_dtype: ${param_dtype}
+    
+    latent_mean: ${dataset.latent_mean}
+    latent_std: ${dataset.latent_std}
 
     num_binary_actions: ${dataset.num_binary_actions}
     categorical_action_dim: ${dataset.categorical_action_dim}

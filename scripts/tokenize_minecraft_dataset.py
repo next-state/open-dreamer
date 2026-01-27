@@ -166,6 +166,60 @@ def make_tokenization_iterator(
     )
 
 
+class DeviceShardedIterator:
+    """Wraps a dataloader to yield device-sharded JAX arrays.
+
+    Handles padding and direct per-device transfers to avoid GPU 0 memory spikes.
+    """
+
+    def __init__(
+        self,
+        dataloader,
+        sharding: jax.sharding.NamedSharding,
+        sharded_keys: tuple[str, ...] = ("videos",),
+    ):
+        self.dataloader = dataloader
+        self.sharding = sharding
+        self.sharded_keys = sharded_keys
+        self.devices = list(sharding.mesh.devices.flat)
+        self.num_devices = len(self.devices)
+
+    def _shard_array(self, array: np.ndarray) -> tuple[jax.Array, int]:
+        """Shard array across devices, returning (sharded_array, pad_size)."""
+        batch_size = array.shape[0]
+        pad_size = (self.num_devices - batch_size % self.num_devices) % self.num_devices
+
+        if pad_size > 0:
+            padding = np.zeros((pad_size,) + array.shape[1:], dtype=array.dtype)
+            array = np.concatenate([array, padding], axis=0)
+
+        # Transfer each shard directly to its target device
+        per_device = array.shape[0] // self.num_devices
+        shards = [
+            jax.device_put(array[i * per_device : (i + 1) * per_device], d)
+            for i, d in enumerate(self.devices)
+        ]
+        sharded = jax.make_array_from_single_device_arrays(
+            array.shape, self.sharding, shards
+        )
+        return sharded, pad_size
+
+    def __iter__(self):
+        for batch in self.dataloader:
+            pad_size = 0
+            sharded_batch = {}
+
+            for key, value in batch.items():
+                if key in self.sharded_keys:
+                    sharded_batch[key], pad_size = self._shard_array(value)
+                else:
+                    sharded_batch[key] = value
+
+            sharded_batch["_pad_size"] = pad_size
+            sharded_batch["_batch_size"] = batch[self.sharded_keys[0]].shape[0]
+            yield sharded_batch
+
+
 # ==============================================================================
 # Shard Writing
 # ==============================================================================
@@ -281,12 +335,17 @@ def main():
         print(f"[tokenize] n_latents: {tokenizer.encoder.n_latents}")
         print(f"[tokenize] d_bottleneck: {tokenizer.cfg.encoder.d_bottleneck}")
 
-        # Create dataloader
-        dataloader = make_tokenization_iterator(
+        # Create dataloader with device sharding
+        base_dataloader = make_tokenization_iterator(
             input_dir=args.input_dir,
             num_shards=args.num_shards,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+        )
+        dataloader = DeviceShardedIterator(
+            base_dataloader,
+            sharding=data_sharding,
+            sharded_keys=("videos",),
         )
 
         # Create shard writer
@@ -306,25 +365,34 @@ def main():
 
         # Process all batches
         total_videos = 0
+        all_channel_means = []
+        all_channel_stds = []
+
         try:
-            for batch in tqdm(dataloader, desc="Tokenizing"):
-                videos = batch["videos"]  # (B, T, H, W, C)
-                actions_batch = batch["actions"]  # Actions pytree with (B, T, ...) arrays
-                sources_batch = batch["source"]  # (B,)
+            pbar = tqdm(dataloader, desc="Tokenizing")
+            for batch in pbar:
+                videos = batch["videos"]  # Already sharded JAX array
+                actions_batch = batch["actions"]
+                sources_batch = batch["source"]
+                batch_size = batch["_batch_size"]
+                pad_size = batch["_pad_size"]
 
-                batch_size = videos.shape[0]
+                latents = encode_batch(videos)
 
-                # Pad batch to be divisible by device count for proper sharding
-                num_devices = jax.device_count()
-                pad_size = (num_devices - batch_size % num_devices) % num_devices
-                if pad_size > 0:
-                    # Pad with zeros (or repeat last video)
-                    padding = np.zeros((pad_size,) + videos.shape[1:], dtype=videos.dtype)
-                    videos = np.concatenate([videos, padding], axis=0)
+                # Compute per-channel stats on GPU (over B, T, n_latents)
+                channel_mean = latents[:batch_size].mean(axis=(0, 1, 2))
+                channel_std = latents[:batch_size].std(axis=(0, 1, 2))
+                all_channel_means.append(np.asarray(channel_mean))
+                all_channel_stds.append(np.asarray(channel_std))
 
-                videos_device = jax.device_put(videos, data_sharding)
-                latents = encode_batch(videos_device)
-                latents_np = np.asarray(latents)  # (B + pad, T, n_latents, d_bottleneck)
+                # Update tqdm with scalar stats
+                pbar.set_postfix(mean=f"{float(channel_mean.mean()):.4f}", std=f"{float(channel_std.mean()):.4f}")
+
+                # Gather latents from each device shard separately to avoid GPU 0 spike
+                latents_np = np.concatenate(
+                    [np.asarray(shard.data) for shard in latents.addressable_shards],
+                    axis=0,
+                )
 
                 # Remove padding
                 if pad_size > 0:
@@ -349,6 +417,15 @@ def main():
         print(f"[tokenize] Done! Processed {total_videos} videos")
         print(f"[tokenize] Wrote {writer.shard_idx} shards to {args.output_dir}")
         print(f"[tokenize] Total records: {writer.total_records}")
+        
+        # Print final channel-wise statistics
+        if all_channel_means:
+            mean_of_means = np.stack(all_channel_means).mean(axis=0)
+            mean_of_stds = np.stack(all_channel_stds).mean(axis=0)
+            
+            print(f"\n[tokenize] Latent statistics ({len(all_channel_means)} batches):")
+            print(f"[tokenize] Channel-wise mean: {mean_of_means}")
+            print(f"[tokenize] Channel-wise std: {mean_of_stds}")
 
 
 if __name__ == "__main__":

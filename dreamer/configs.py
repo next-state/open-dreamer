@@ -35,6 +35,9 @@ class DatasetConfig:
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] = (0.288675, 0.288675, 0.288675)  # sqrt(1/12)
+    
+    latent_mean: float = 0
+    latent_std: float = 1
 
     # Reward-biased slicing probability (0.0 = disabled, 0.8 = 80% chance to include windows with nonzero reward)
     p_include_reward: float = 0.0
@@ -135,6 +138,9 @@ class DynamicsModelConfig:
     num_binary_actions: int = 0
     categorical_action_dim: int = 0
     continuous_action_dim: int = 0
+    
+    latent_mean: float = 0
+    latent_std: float = 1
 
 
 @dataclass(frozen=False)

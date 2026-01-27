@@ -1203,6 +1203,7 @@ class Dynamics(nnx.Module):
         B, T = unpacked_enc_tokens.shape[:2]
 
         # Pack tokens internally for processing
+        unpacked_enc_tokens = (unpacked_enc_tokens - self.cfg.latent_mean) / self.cfg.latent_std
         packed_enc_tokens = rearrange(unpacked_enc_tokens, "b t (n p) d -> b t n (p d)", p=self.packing_factor)
         # Project spatial tokens to d_model
         spatial_tokens = self.spatial_proj(packed_enc_tokens)  # (B, T, n_spatial, d_model)
@@ -1256,6 +1257,7 @@ class Dynamics(nnx.Module):
 
         # Unpack before returning
         x1_hat = rearrange(x1_hat_packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
+        x1_hat = x1_hat*self.cfg.latent_std + self.cfg.latent_mean
         
         h_t = x[:, :, layout.slices()[Modality.AGENT], :] if task_embeddings is not None else None  # (B,T,n_agent,D) or None
         return x1_hat, (h_t, new_caches)
