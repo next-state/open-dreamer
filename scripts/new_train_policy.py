@@ -316,7 +316,7 @@ def train_step(
             num_steps=horizon,
             rng=rng_imag,
             initial_task_embedding=agent_tokens_ctx,
-            greedy=False,
+            deterministic=False,
         )
         
         # Extract results

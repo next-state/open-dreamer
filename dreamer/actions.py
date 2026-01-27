@@ -4,6 +4,7 @@ from typing import Any, Final
 
 import numpy as np
 import jax
+import jax.numpy as jnp
 from jax import Array
 from flax import struct
 
@@ -34,6 +35,36 @@ class Actions:
     def from_dict(cls, d: dict[str, Array | None]) -> Actions:
         """Reconstruct Actions from a flattened dict."""
         return cls(binary=d["actions_binary"], categorical=d["actions_categorical"], continuous=d["actions_continuous"])
+
+
+def create_noop_action_like(template: Actions, categorical_action_dim: int) -> Actions:
+    """Creates a (B, 1, ...) no-op start action."""
+
+    def _create_action(arr, fill_value):
+        if arr is None: return None
+        return jnp.full_like(arr[:, 0:1], fill_value)
+
+    return Actions(
+        binary     = _create_action(template.binary, 0),
+        categorical = _create_action(template.categorical, categorical_action_dim - 1),
+        continuous  = _create_action(template.continuous, 0.0)
+    )
+
+
+def shift_actions(actions: Actions, categorical_action_dim: int) -> Actions:
+    """Shift actions right by 1, preprend noop action."""
+
+    noop_action = create_noop_action_like(actions, categorical_action_dim)
+    
+    def _shift(current_arr, start_arr):
+        if current_arr is None: return None
+        return jnp.concatenate([start_arr, current_arr[:, :-1]], axis=1)
+
+    return Actions(
+        binary      = _shift(actions.binary, noop_action.binary),
+        categorical = _shift(actions.categorical, noop_action.categorical),
+        continuous  = _shift(actions.continuous, noop_action.continuous)
+    )
 
 
 # ------------------------------------------------------------

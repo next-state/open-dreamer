@@ -23,6 +23,7 @@ dependencies = [
     "reactor-runtime>=0.0.4",
     "pandas>=2.3.3",
     "awscli>=1.27.0",
+    "decord>=0.6.0",
 ]
 
 [dependency-groups]

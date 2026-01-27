@@ -308,7 +308,6 @@ class DynamicsConfig(BaseExperimentConfig):
 
     # Training
     bootstrap_start: int = 5_000
-    self_fraction: float = 0.25
     image_fraction: float = 0.3
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
@@ -337,7 +336,6 @@ class HeadsConfig(BaseExperimentConfig):
 
     # Training hyperparameters
     bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
-    self_fraction: float = 0.25   # used once we pass bootstrap_start
     dynamics_loss_weight: float = 0.1
 
     # Learning rate schedules (one per component)

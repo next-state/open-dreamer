@@ -545,6 +545,9 @@ class TimeSelfAttention(nnx.Module):
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
 
+        if mask is not None and mask.ndim >= 3 and mask.shape[0] == B:
+            mask = repeat(mask, 'B ... -> (B S) ...', S=S)
+
         out, new_cache = self.attn(x, mask=mask, local_window_size=local_window_size, cache=cache, deterministic=deterministic, rngs=rngs)
 
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
@@ -605,7 +608,7 @@ class BlockCausalLayer(nnx.Module):
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
         if self.use_time:
-            attn_mask = time_mask if time_local_window_size is None else None
+            attn_mask = time_mask
             local_window_size = time_local_window_size
         else:
             attn_mask = space_mask
@@ -638,11 +641,11 @@ class BlockCausalTransformer(nnx.Module):
         if use_residual_lambdas:
             self.resid_lambdas = nnx.Param(
                 jnp.ones(depth, dtype=param_dtype),
-                sharding_names=(None,)  # Small per-layer params, no sharding needed
+                sharding_names=None
             )
             self.x0_lambdas = nnx.Param(
                 jnp.zeros(depth, dtype=param_dtype),
-                sharding_names=(None,)  # Small per-layer params, no sharding needed
+                sharding_names=None
             )
 
         # Create layers
@@ -1179,6 +1182,7 @@ class Dynamics(nnx.Module):
         unpacked_enc_tokens,
         *,
         context_length: int | None = None,
+        time_mask: jnp.ndarray | None = None,
         task_embeddings: jnp.ndarray | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
@@ -1192,6 +1196,7 @@ class Dynamics(nnx.Module):
             unpacked_enc_tokens: (B, T, n_latents, d_bottleneck) unpacked encoder tokens
             context_length: optional context length for sliding window attention. If provided,
                            creates local_window_size=(context_length - 1, 0) for causal sliding window.
+            time_mask: optional (B, 1, T, T) boolean mask for temporal attention
             task_embeddings: (B, T, n_agent, d_model) optional agent tokens
             caches: optional dict of KVCache for each layer
 
@@ -1245,6 +1250,7 @@ class Dynamics(nnx.Module):
 
         x, new_caches = self.transformer(
             tokens, space_mask=space_mask,
+            time_mask=time_mask,
             time_local_window_size=time_local_window_size,
             deterministic=deterministic,
             caches=caches,
@@ -1437,7 +1443,7 @@ class PolicyHeadMTP(nnx.Module):
         self,
         h_t: jnp.ndarray,
         *,
-        greedy: bool = True,
+        deterministic: bool = True,
         rng: jax.Array,
     ) -> Actions:
         """
@@ -1445,19 +1451,19 @@ class PolicyHeadMTP(nnx.Module):
 
         Args:
             h_t: (B, T, n_agent, d_model) hidden states
-            greedy: whether to do greedy sampling
+            deterministic: whether to do deterministic sampling (greedy)
             rng: Random key for sampling
 
         Returns: Action object with actions sampled from policy
         """
         rng_policy, rng_binary, rng_categorical, rng_continuous = jax.random.split(rng, num=4)
 
-        outputs = self(h_t, deterministic=greedy, rngs=rng_policy)
+        outputs = self(h_t, deterministic=deterministic, rngs=rng_policy)
         actions = Actions()
 
         if "binary_logits" in outputs:
             binary_logits = outputs["binary_logits"]
-            if greedy:
+            if deterministic:
                 actions.binary = (binary_logits > 0).astype(jnp.int32)
             else:
                 probs = jax.nn.sigmoid(binary_logits)
@@ -1465,14 +1471,14 @@ class PolicyHeadMTP(nnx.Module):
 
         if "categorical_logits" in outputs:
             categorical_logits = outputs["categorical_logits"]
-            if greedy:
+            if deterministic:
                 actions.categorical = jnp.argmax(categorical_logits, axis=-1)
             else:
                 actions.categorical = jax.random.categorical(rng_categorical, categorical_logits, axis=-1)
 
         if "continuous_mean" in outputs:
             mean = outputs["continuous_mean"]
-            if greedy:
+            if deterministic:
                 actions.continuous = mean
             else:
                 log_var = outputs["continuous_log_var"]
