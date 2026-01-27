@@ -12,7 +12,7 @@ from dreamer.configs import DynamicsConfig
 from dreamer.data import make_dual_iterators
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.actions import Actions, create_noop_action_like
+from dreamer.actions import Actions, create_noop_action_like, shift_actions
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
@@ -72,11 +72,22 @@ def encode_and_train_step(
     B_self = B // 2    # Split batch for empirical and bootstrap learning
     B_vid = B - B_img  # Number of samples to treat as videos
 
-    # Build time mask for [Img_Empirical, Vid_Empirical, Img_Bootstrap, Vid_Bootstrap]
-    mask_img = jnp.eye(T, dtype=jnp.bool_)[None, None, :, :]                  # independent tokens (1, 1, T, T)
-    mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))[None, None, :, :]  # causal tokens (1, 1, T, T)
-    time_mask_half = [mask_img] * (B_img // 2) + [mask_vid] * (B_vid // 2)    # (B/2, 1, 1, T, T)
-    time_mask = repeat(time_mask_half, 'half 1 1 T1 T2 -> (2 half) 1 T1 T2')  # (B, 1, T, T)
+    # Identify image samples (across both empirical and bootstrap halves)
+    idx = jnp.arange(B)
+    is_img = (idx < (B_img // 2)) | ((idx >= B_self) & (idx < (B_self + B_img // 2)))
+
+    # Build time mask for full batch
+    mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
+    mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))  # causal tokens
+    time_mask = jnp.where(
+        is_img[:, None, None, None],
+        mask_img[None, None, :, :],
+        mask_vid[None, None, :, :]
+    )
+
+    # Replace actions with no-ops for image samples
+    noop = create_noop_action_like(actions, categorical_action_dim)
+    actions = jax.tree.map(lambda a, n: jnp.where(is_img.reshape((B,) + (1,) * (a.ndim - 1)), n, a) if a is not None else None, actions, noop)
 
     # Training step
     step_key = jax.random.fold_in(master_key, step)
@@ -90,6 +101,7 @@ def encode_and_train_step(
             k_max=k_max,
             B_self=B_self,
             context_length=context_length, # Builds sliding window attention
+            time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
         )
 
@@ -208,6 +220,9 @@ def run(cfg: DynamicsConfig):
                 # Shard batch data
                 videos = jax.device_put(batch["videos"], data_sharding)
                 actions = jax.device_put(batch["actions"], data_sharding)
+
+                # Action shifting: prepend "first action token" (noop) so action[t] aligns with state[t]
+                actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
 
                 # Validation step before training (as input buffers might be donated)
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
