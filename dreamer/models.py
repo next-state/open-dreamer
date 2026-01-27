@@ -636,6 +636,7 @@ class BlockCausalTransformer(nnx.Module):
         self.depth = depth
         self.time_every = time_every
         self.use_residual_lambdas = use_residual_lambdas
+        self.dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
 
         if use_residual_lambdas:
@@ -690,7 +691,9 @@ class BlockCausalTransformer(nnx.Module):
 
         for i, layer in enumerate(self.layers):
             if self.use_residual_lambdas:
-                x = self.resid_lambdas.value[i] * x + self.x0_lambdas.value[i] * x0
+                resid_lambda = self.resid_lambdas.value[i].astype(self.dtype)
+                x0_lambda = self.x0_lambdas.value[i].astype(self.dtype)
+                x = resid_lambda * x + x0_lambda * x0
 
             time_index = i // self.time_every
             is_time_layer = (i + 1) % self.time_every == 0

@@ -95,6 +95,8 @@ def latent_train_step(
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
 ):
     """Training step for pre-tokenized latent data (skips tokenizer encoding)."""
+    latents = latents.astype(dynamics.dtype)
+
     B = latents.shape[0]
     B_self = B // 2    # Split batch for empirical and bootstrap learning
 
