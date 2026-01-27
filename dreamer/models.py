@@ -1361,7 +1361,7 @@ class PolicyHeadMTP(nnx.Module):
         self,
         h_t: jnp.ndarray,
         *,
-        greedy: bool = True,
+        deterministic: bool = True,
         rng: jax.Array,
     ) -> Actions:
         """
@@ -1369,19 +1369,19 @@ class PolicyHeadMTP(nnx.Module):
 
         Args:
             h_t: (B, T, n_agent, d_model) hidden states
-            greedy: whether to do greedy sampling
+            deterministic: whether to do deterministic sampling (greedy)
             rng: Random key for sampling
 
         Returns: Action object with actions sampled from policy
         """
         rng_policy, rng_binary, rng_categorical, rng_continuous = jax.random.split(rng, num=4)
 
-        outputs = self(h_t, deterministic=greedy, rngs=rng_policy)
+        outputs = self(h_t, deterministic=deterministic, rngs=rng_policy)
         actions = Actions()
 
         if "binary_logits" in outputs:
             binary_logits = outputs["binary_logits"]
-            if greedy:
+            if deterministic:
                 actions.binary = (binary_logits > 0).astype(jnp.int32)
             else:
                 probs = jax.nn.sigmoid(binary_logits)
@@ -1389,14 +1389,14 @@ class PolicyHeadMTP(nnx.Module):
 
         if "categorical_logits" in outputs:
             categorical_logits = outputs["categorical_logits"]
-            if greedy:
+            if deterministic:
                 actions.categorical = jnp.argmax(categorical_logits, axis=-1)
             else:
                 actions.categorical = jax.random.categorical(rng_categorical, categorical_logits, axis=-1)
 
         if "continuous_mean" in outputs:
             mean = outputs["continuous_mean"]
-            if greedy:
+            if deterministic:
                 actions.continuous = mean
             else:
                 log_var = outputs["continuous_log_var"]

@@ -246,7 +246,7 @@ def latent_rollout(
     num_steps: int,
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
-    greedy: bool = False,
+    deterministic: bool = False,
 ):
     """
     Autoregressive rollout in latent space.
@@ -260,7 +260,7 @@ def latent_rollout(
         num_steps: Number of steps to unroll.
         rng: Random number generator key
         initial_task_embedding: Optional (B, T_ctx, n_agent, D) agent tokens for context.
-        greedy: Whether to sample greedy actions from the policy.
+        deterministic: Whether to sample deterministic actions from the policy.
         
     Returns:
         Dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
@@ -298,7 +298,7 @@ def latent_rollout(
         if isinstance(policy, Actions):
             action = policy[:, step_idx]  # (B, ...)
         else:
-            all_actions = policy.sample(h_t, greedy=greedy, rng=rng_policy)  # (B, T, L, ...)
+            all_actions = policy.sample(h_t, deterministic=deterministic, rng=rng_policy)  # (B, T, L, ...)
             action = all_actions[:, 0, 0, ...]  # (B, ...) - use first predicted action
         
         # Predict next latent (denoising)
@@ -381,7 +381,7 @@ def video_rollout(
         num_steps,
         rng,
         initial_task_embedding,
-        greedy=True,  # use greedy policy for visualization
+        deterministic=True,  # use deterministic policy for visualization
     )
 
     # Decode
