@@ -6,13 +6,12 @@ import jax.numpy as jnp
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
-from einops import rearrange, repeat
 
 from dreamer.configs import DynamicsConfig
 from dreamer.data import make_dual_iterators
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.actions import Actions, create_noop_action_like, shift_actions
+from dreamer.actions import Actions
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
@@ -47,7 +46,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # Training Step
 # ---------------------------
 
-@nnx.jit(static_argnames=("k_max", "B_img", "T", "context_length"))
+@nnx.jit(static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_start", "bootstrap_fraction"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -60,9 +59,10 @@ def encode_and_train_step(
     step: int,
     B_img: int,               # Number of samples to treat as images
     T: int,
-    categorical_action_dim: int,
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
+    bootstrap_start: int,
+    bootstrap_fraction: float,
 ):
     rngs = nnx.Rngs(mae=tokenizer_key)
 
@@ -72,12 +72,13 @@ def encode_and_train_step(
     return latent_train_step(
         dynamics, optimizer, latents, actions,
         master_key=master_key, step=step, B_img=B_img, T=T,
-        categorical_action_dim=categorical_action_dim, k_max=k_max, context_length=context_length,
+        k_max=k_max, context_length=context_length,
+        bootstrap_start=bootstrap_start, bootstrap_fraction=bootstrap_fraction,
     )
 
 
 @nnx.jit(
-        static_argnames=("k_max", "B_img", "T", "categorical_action_dim", "context_length"),
+        static_argnames=("k_max", "B_img", "T", "categorical_action_dim", "context_length", "bootstrap_start", "bootstrap_fraction"),
         donate_argnames=("latents", "actions"),
 )
 def latent_train_step(
@@ -90,19 +91,24 @@ def latent_train_step(
     step: int,
     B_img: int,               # Number of samples to treat as images
     T: int,
-    categorical_action_dim: int,
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
+    bootstrap_start: int,
+    bootstrap_fraction: float,
 ):
     """Training step for pre-tokenized latent data (skips tokenizer encoding)."""
     latents = latents.astype(dynamics.dtype)
 
     B = latents.shape[0]
-    B_self = B // 2    # Split batch for empirical and bootstrap learning
+    bootstrap_active = step >= bootstrap_start
+    B_self = int(B * bootstrap_fraction) * bootstrap_active
+    B_emp = B - B_self
 
-    # Identify image samples (across both empirical and bootstrap halves)
+    # Identify image samples (split with same bootstrap ratio)
     idx = jnp.arange(B)
-    is_img = (idx < (B_img // 2)) | ((idx >= B_self) & (idx < (B_self + B_img // 2)))
+    B_img_boot = int(B_img * bootstrap_fraction) * bootstrap_active
+    B_img_emp = B_img - B_img_boot
+    is_img = (idx < B_img_emp) | ((idx >= B_emp) & (idx < (B_emp + B_img_boot)))
 
     # Build time mask for full batch
     mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
@@ -274,9 +280,10 @@ def run(cfg: DynamicsConfig):
                         step=step,
                         B_img=B_img,
                         T=T,
-                        categorical_action_dim=cfg.dataset.categorical_action_dim,
                         k_max=cfg.dynamics.k_max,
                         context_length=context_length,
+                        bootstrap_start=cfg.bootstrap_start,
+                        bootstrap_fraction=cfg.bootstrap_fraction,
                     )
                 else:
                     # Video data path (requires tokenizer encoding)
@@ -288,9 +295,10 @@ def run(cfg: DynamicsConfig):
                         step=step,
                         B_img=B_img,
                         T=T,
-                        categorical_action_dim=cfg.dataset.categorical_action_dim,
                         k_max=cfg.dynamics.k_max,
                         context_length=context_length,
+                        bootstrap_start=cfg.bootstrap_start,
+                        bootstrap_fraction=cfg.bootstrap_fraction,
                     )
 
                 # Logging

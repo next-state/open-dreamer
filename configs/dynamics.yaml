@@ -41,7 +41,8 @@ dynamics:
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
 
-bootstrap_start: 5_000
+bootstrap_start: 5_000  # Number of start steps trained exclusively on flow-matching objective
+bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
 image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
 
 # Alternating batch lengths (paper: "Sequence length" paragraph)
