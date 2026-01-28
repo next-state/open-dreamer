@@ -21,8 +21,8 @@ from .path_utils import build_dataset_paths
 
 def make_iterator(
     cfg: DatasetConfig,
-    num_workers: int = 64,
-    prefetch_buffer_size: int = 1,
+    num_workers: int = 16,
+    prefetch_buffer_size: int = 10,
     seed: int = 42,
     print_filter_warnings: bool = False,
 ):
@@ -122,7 +122,7 @@ def make_iterator(
         sampler=sampler,
         operations=operations,
         worker_count=num_workers,
-        worker_buffer_size=1,
+        worker_buffer_size=10,
         read_options=grain.ReadOptions(
             prefetch_buffer_size=prefetch_buffer_size,
             num_threads=1,

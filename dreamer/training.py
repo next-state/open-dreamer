@@ -391,7 +391,7 @@ def shortcut_forcing_step(
     loss_total = ((loss_flow * (B - B_self)) + (loss_boot * B_self)) / B
     
     losses = { 'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
-    aux = {'flow_mse': flow_mse_unweighted * dynamics_model.cfg.latent_std**2, 'bootstrap_mse': boot_mse_unweighted * dynamics_model.cfg.latent_std**2, 'h_states': h_states}
+    aux = {'flow_mse': flow_mse_unweighted / dynamics_model.cfg.latent_std**2, 'bootstrap_mse': boot_mse_unweighted / dynamics_model.cfg.latent_std**2, 'h_states': h_states}
     
     
     return losses, aux

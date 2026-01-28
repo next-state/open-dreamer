@@ -381,3 +381,28 @@ class CreateActions(grain.transforms.Map):
             continuous=batch.pop("actions_continuous", None),
         )
         return batch
+
+
+class NumpyToJax(grain.transforms.Map):
+    """Convert numpy arrays to JAX arrays."""
+
+    def map(self, batch: dict) -> dict:
+        """Convert numpy arrays in batch to JAX arrays.
+
+        Args:
+            batch: Batch dictionary with numpy arrays
+
+        Returns:
+            Batch with JAX arrays
+        """
+        import jax.numpy as jnp
+
+        result = {}
+        for key, value in batch.items():
+            if isinstance(value, np.ndarray):
+                result[key] = jnp.array(value)
+            elif hasattr(value, '__dict__'):  # Handle dataclasses like Actions
+                result[key] = value
+            else:
+                result[key] = value
+        return result
