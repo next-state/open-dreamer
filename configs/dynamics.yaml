@@ -11,8 +11,8 @@ ckpt:
   save_interval_steps: 10_000
 
 dataset:
-  B: 128
-  T: 256
+  B: 32
+  T: 32
   C: 16
 
 dynamics:

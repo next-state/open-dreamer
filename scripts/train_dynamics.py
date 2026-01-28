@@ -9,7 +9,7 @@ from tqdm import tqdm
 from einops import rearrange, repeat
 
 from dreamer.configs import DynamicsConfig
-from dreamer.data import make_dual_iterator
+from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, create_noop_action_like
@@ -182,13 +182,12 @@ def run(cfg: DynamicsConfig):
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
-        avg_T = int(cfg.long_batch_ratio * cfg.long_T + (1 - cfg.long_batch_ratio) * cfg.short_T)
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T, n_latents=n_latents),
-            data_tokens_per_step=cfg.dataset.B * avg_T * (n_spatial + 1),  # spatial + action
-            total_tokens_per_step=cfg.dataset.B * avg_T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
+            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T, n_latents=n_latents),
+            data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_spatial + 1),  # spatial + action
+            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
             logger=logger,
             run_dir=run_dir,
         )
@@ -207,58 +206,35 @@ def run(cfg: DynamicsConfig):
         )
 
         # Data iterator
-        short_T = cfg.short_T
-        long_T = cfg.long_T
-        batch_iterator = make_dual_iterator(
-            cfg.dataset,
-            short_T=short_T,
-            long_T=long_T,
-            long_ratio=cfg.long_batch_ratio,
-        )
+        dataloader = make_iterator(cfg.dataset)
+        batch_iterator = iter(dataloader)
 
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
             item_names=DynamicsCheckpointBundle.get_item_names(
-                iterator_names=("short_dataloader_state", "long_dataloader_state")
+                iterator_names=("dataloader_state",)
             )
         ) as checkpoint_manager:
             # Resume from checkpoint
-            iterators = batch_iterator.iterators
-            start_step, bundle, iterators, rng = bundle.restore(
-                checkpoint_manager, iterators, rng
+            start_step, bundle, restored_iterators, rng = bundle.restore(
+                checkpoint_manager, batch_iterator, rng
             )
-            batch_iterator = make_dual_iterator(
-                cfg.dataset,
-                short_T=short_T,
-                long_T=long_T,
-                long_ratio=cfg.long_batch_ratio,
-                start_step=start_step,
-                iterators=iterators,
-            )
-
             scaling.start_training()
 
             # Training loop
-            pbar = tqdm(range(start_step, cfg.max_steps), initial=start_step, total=cfg.max_steps)
-            for step in pbar:
+            pbar = tqdm(enumerate(batch_iterator, start = start_step), initial=start_step, total=cfg.max_steps)
+            for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
-
-                rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
-
-                use_long, batch = next(batch_iterator)
-                if use_long:
-                    T = long_T
-                    context_length = cfg.dynamics.context_length
-                else:
-                    T = short_T
-                    context_length = None  # Use default causal attention
 
                 # Shard batch data
                 actions = jax.device_put(batch["actions"], data_sharding)
                 videos = None if use_latent_data else jax.device_put(batch["videos"], data_sharding)
                 latents = jax.device_put(batch["latents"], data_sharding) if use_latent_data else None
+                
+                rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
 
+                context_length = cfg.dynamics.context_length
                 # Action shifting: prepend "first action token" (noop) so action[t] aligns with state[t]
 
                 # Validation step before training (as input buffers might be donated)
@@ -282,7 +258,7 @@ def run(cfg: DynamicsConfig):
                     master_key=master_key,
                     step=step,
                     B_img=B_img,
-                    T=T,
+                    T=cfg.dataset.T,
                     categorical_action_dim=cfg.dataset.categorical_action_dim,
                     k_max=cfg.dynamics.k_max,
                     context_length=context_length,
@@ -298,14 +274,13 @@ def run(cfg: DynamicsConfig):
                             "flow_mse": metrics_cpu["flow_mse"],
                             "boot_mse": metrics_cpu["bootstrap_mse"],
                             "lr": lr_schedule(step),
-                            "batch_type": 1.0 if use_long else 0.0,
                             **scaling.get_step_metrics(step),
                         },
                         pbar=pbar,
                     )
 
                 # Checkpointing
-                # iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
+                iterators = {"dataloader_state": batch_iterator}
                 bundle.maybe_save(checkpoint_manager, step, iterators, rng)
 
             scaling.finalize()

@@ -172,9 +172,9 @@ class CheckpointBundle:
     def restore(
         self,
         checkpoint_manager: ocp.CheckpointManager,
-        iterators: dict[str, grain.DataLoaderIterator],
+        iterators: dict[str, grain.DataLoaderIterator] | grain.DataLoaderIterator,
         rng: jax.Array,
-    ) -> tuple[int, Self, dict[str, grain.DataLoaderIterator], jax.Array]:
+    ) -> tuple[int, Self, dict[str, grain.DataLoaderIterator] | grain.DataLoaderIterator, jax.Array]:
         """Restore checkpoint state into this bundle (in-place update).
 
         Args:
@@ -198,6 +198,9 @@ class CheckpointBundle:
             restore_kwargs[field.name] = ocp.args.StandardRestore(nnx.state(field_value))
 
         # Add iterators and rngs
+        extract_iterator = isinstance(iterators, grain.DataLoaderIterator)
+        if extract_iterator: iterators = {'iter':iterators}
+        
         for name, iterator in iterators.items():
             restore_kwargs[name] = grain.checkpoint.CheckpointRestore(iterator)
         restore_kwargs["rngs"] = ocp.args.StandardRestore({"key": rng})
@@ -230,6 +233,7 @@ class CheckpointBundle:
         rng = restored["rngs"]["key"]
         print(f"Restored checkpoint from step {step}.")
 
+        iterators = iterators['iter'] if extract_iterator else iterators
         return step + 1, self, iterators, rng
 
     def maybe_save(

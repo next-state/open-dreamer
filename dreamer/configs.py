@@ -18,8 +18,8 @@ class DatasetConfig:
     H: int = 64  # frame height
     W: int = 64  # frame width
     C: int = 3   # channels
-    padding_H: list[int] = field(default_factory=lambda: [0, 0])  # how much to pad each frame along the height axis
-    padding_W: list[int] = field(default_factory=lambda: [0, 0])  # how much to pad each frame along the width axis
+    padding_H: tuple[int,int] = field(default_factory=lambda: (0, 0))  # how much to pad each frame along the height axis
+    padding_W: tuple[int,int] = field(default_factory=lambda: (0, 0))  # how much to pad each frame along the width axis
 
     patch_size: int = 8
 
