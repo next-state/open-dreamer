@@ -352,6 +352,11 @@ def main():
         output_dir = Path(args.output_dir)
         writer = ShardWriter(output_dir, records_per_shard=args.records_per_shard)
 
+        # Create metadata directory for stats
+        metadata_dir = output_dir / "metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+        stats_path = metadata_dir / "latent_stats.npz"
+
         # JIT-compile encode function
         @nnx.jit
         def encode_batch(videos):
@@ -411,21 +416,35 @@ def main():
 
                 total_videos += batch_size
 
+                # Periodically save stats (every 100 batches)
+                if len(all_channel_means) % 100 == 0:
+                    np.savez(
+                        stats_path,
+                        mean=np.stack(all_channel_means).mean(axis=0).astype(np.float32),
+                        std=np.stack(all_channel_stds).mean(axis=0).astype(np.float32),
+                        num_batches=len(all_channel_means),
+                        num_videos=total_videos,
+                    )
+
         finally:
             writer.close()
+            # Save final stats
+            if all_channel_means:
+                np.savez(
+                    stats_path,
+                    mean=np.stack(all_channel_means).mean(axis=0).astype(np.float32),
+                    std=np.stack(all_channel_stds).mean(axis=0).astype(np.float32),
+                    num_batches=len(all_channel_means),
+                    num_videos=total_videos,
+                )
 
         print(f"[tokenize] Done! Processed {total_videos} videos")
         print(f"[tokenize] Wrote {writer.shard_idx} shards to {args.output_dir}")
         print(f"[tokenize] Total records: {writer.total_records}")
-        
-        # Print final channel-wise statistics
-        if all_channel_means:
-            mean_of_means = np.stack(all_channel_means).mean(axis=0)
-            mean_of_stds = np.stack(all_channel_stds).mean(axis=0)
-            
-            print(f"\n[tokenize] Latent statistics ({len(all_channel_means)} batches):")
-            print(f"[tokenize] Channel-wise mean: {mean_of_means}")
-            print(f"[tokenize] Channel-wise std: {mean_of_stds}")
+        print(f"[tokenize] Latent stats saved to: {stats_path}")
+
+        # stats = np.load("output_dir/metadata/latent_stats.npz")                                                                                            
+        # print(stats["mean"], stats["std"], stats["num_batches"])    
 
 
 if __name__ == "__main__":

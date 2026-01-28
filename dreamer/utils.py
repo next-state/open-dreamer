@@ -211,6 +211,46 @@ def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
 
     return (normalized_videos * std_c + mean_c)*255
 
+
+def normalize_latents(latents, mean, std, eps=1e-8):
+    """
+    Normalize latents to zero mean, unit std per dimension.
+
+    Args:
+        latents: (..., D) latent tokens where D matches len(mean) and len(std)
+        mean: tuple of D floats or None
+        std: tuple of D floats or None
+        eps: small constant for numerical stability
+
+    Returns:
+        normalized latents, or unchanged if mean/std are None
+    """
+    if mean is None or std is None:
+        return latents
+    mean = jnp.asarray(mean, dtype=latents.dtype)
+    std = jnp.asarray(std, dtype=latents.dtype)
+    return (latents - mean) / jnp.maximum(std, eps)
+
+
+def unnormalize_latents(latents, mean, std):
+    """
+    Unnormalize latents back to original distribution.
+
+    Args:
+        latents: (..., D) normalized latent tokens
+        mean: tuple of D floats or None
+        std: tuple of D floats or None
+
+    Returns:
+        unnormalized latents, or unchanged if mean/std are None
+    """
+    if mean is None or std is None:
+        return latents
+    mean = jnp.asarray(mean, dtype=latents.dtype)
+    std = jnp.asarray(std, dtype=latents.dtype)
+    return latents * std + mean
+
+
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.

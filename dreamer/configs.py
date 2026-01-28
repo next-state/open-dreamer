@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 # ---- Dataset Configs ----
@@ -36,8 +37,8 @@ class DatasetConfig:
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] = (0.288675, 0.288675, 0.288675)  # sqrt(1/12)
     
-    latent_mean: float = 0
-    latent_std: float = 1
+    latent_mean: tuple[float, ...] | None = None
+    latent_std: tuple[float, ...] | None = None
 
     # Reward-biased slicing probability (0.0 = disabled, 0.8 = 80% chance to include windows with nonzero reward)
     p_include_reward: float = 0.0
@@ -139,8 +140,8 @@ class DynamicsModelConfig:
     categorical_action_dim: int = 0
     continuous_action_dim: int = 0
     
-    latent_mean: float = 0
-    latent_std: float = 1
+    latent_mean: tuple[float, ...] | None = None
+    latent_std: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=False)
@@ -276,7 +277,7 @@ class BaseExperimentConfig:
     max_steps: int = 1_000_000_000
     log_every: int = 100
     seed: int = 0  # Random seed
-    parallel_strategy: str = "data"  # Parallelization strategy: "data", "fsdp", "tp", or "sp"
+    parallel_strategy: Literal["data", "fsdp", "tp", "sp"]  = "data"  # data | fsdp | tp | sp
 
     # Precision
     dtype: str = "bfloat16"

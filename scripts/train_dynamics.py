@@ -113,10 +113,6 @@ def latent_train_step(
         mask_vid[None, None, :, :]
     )
 
-    # Replace actions with no-ops for image samples
-    noop = create_noop_action_like(actions, categorical_action_dim)
-    actions = jax.tree.map(lambda a, n: jnp.where(is_img.reshape((B,) + (1,) * (a.ndim - 1)), n, a) if a is not None else None, actions, noop)
-
     # Training step
     step_key = jax.random.fold_in(master_key, step)
 
@@ -253,9 +249,6 @@ def run(cfg: DynamicsConfig):
                 actions = jax.device_put(batch["actions"], data_sharding)
                 videos = None if use_latent_data else jax.device_put(batch["videos"], data_sharding)
                 latents = jax.device_put(batch["latents"], data_sharding) if use_latent_data else None
-
-                # Action shifting: prepend "first action token" (noop) so action[t] aligns with state[t]
-                actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
 
                 # Validation step before training (as input buffers might be donated)
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:

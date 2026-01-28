@@ -28,7 +28,7 @@ dtype: bfloat16
 param_dtype: float32
 
 # Parallel
-parallel_strategy: data  # data | fsdp | tp
+parallel_strategy: data  # data | fsdp | tp | sp
 
 # Random seed
 seed: 0

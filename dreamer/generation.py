@@ -5,6 +5,7 @@ import jax.numpy as jnp
 from typing import Any, Tuple
 from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 from .actions import Actions
+from .utils import normalize_latents, unnormalize_latents
 from flax.struct import dataclass
 
 
@@ -181,7 +182,10 @@ def next_latent(
 
     assert isinstance(h_last, jax.Array) or h_last is None
 
-    return latent_t_final, h_last, caches_new, rng  
+    # Unnormalize output so caller receives latents in original space
+    latent_t_final = unnormalize_latents(latent_t_final, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+
+    return latent_t_final, h_last, caches_new, rng
 
 def next_frame(
     tokenizer: Tokenizer,
@@ -267,6 +271,10 @@ def latent_rollout(
     B, T_ctx, n_spatial, D_s = latents_ctx.shape
     latent_shape = (B, 1, n_spatial, D_s)
 
+    # Normalize context latents for dynamics (keep original for output)
+    latents_ctx_orig = latents_ctx
+    latents_ctx = normalize_latents(latents_ctx, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+
     # Initialize caches and process context
     window_size = T_ctx + num_steps
     n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
@@ -320,7 +328,7 @@ def latent_rollout(
     # h_next has shape (B, 1, n_agent, d_model), so scan output is (t, B, 1, n_agent, d_model)
     rollout_hidden = einops.rearrange(rollout_hidden, 't b 1 n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
 
-    out_latents = jnp.concatenate((latents_ctx, rollout_latents), axis=1)
+    out_latents = jnp.concatenate((latents_ctx_orig, rollout_latents), axis=1)
 
     return {
         'latents': out_latents,

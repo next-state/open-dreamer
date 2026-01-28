@@ -25,7 +25,7 @@ from dreamer.generation import DenoiseSchedule
 from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
-from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border
+from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents
 
 
 # ---------------------------
@@ -312,6 +312,9 @@ def shortcut_forcing_step(
     B_emp = B - B_self
     emax = jnp.log2(k_max).astype(jnp.int32)
 
+    # Normalize latents before corruption (all operations happen in normalized space)
+    latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
+
     # Split RNG
     key_sigma, key_step, key_noise, key_dropout1, key_dropout2, key_dropout3 = jax.random.split(rng, 6)
 
@@ -390,8 +393,8 @@ def shortcut_forcing_step(
     # Weight by batch composition to keep scale constant
     loss_total = ((loss_flow * (B - B_self)) + (loss_boot * B_self)) / B
     
-    losses = { 'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
-    aux = {'flow_mse': flow_mse_unweighted * dynamics_model.cfg.latent_std**2, 'bootstrap_mse': boot_mse_unweighted * dynamics_model.cfg.latent_std**2, 'h_states': h_states}
+    losses = {'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
+    aux = {'flow_mse': flow_mse_unweighted, 'bootstrap_mse': boot_mse_unweighted, 'h_states': h_states}
     
     
     return losses, aux
