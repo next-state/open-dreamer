@@ -3,19 +3,21 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics
+run_name: dynamics-test
 tokenizer_ckpt: logs/tokenizer-512/checkpoints/
 
 ckpt:
-  max_to_keep: 1
+  max_to_keep: 0
   save_interval_steps: 10_000
 
 dataset:
-  B: 8
+  B: 128
+  T: 256
+  C: 16
 
 dynamics:
     d_bottleneck: 16
-    depth: 12
+    depth: 16
     d_model: ${mul:64,${dynamics.depth}}
     n_heads: ${floordiv:${dynamics.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${dynamics.n_heads},8}}

@@ -12,7 +12,7 @@ from dreamer.configs import DynamicsConfig
 from dreamer.data import make_dual_iterators
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.actions import Actions, create_noop_action_like, shift_actions
+from dreamer.actions import Actions, create_noop_action_like
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
@@ -81,6 +81,7 @@ def encode_and_train_step(
         donate_argnames=("latents", "actions"),
 )
 def latent_train_step(
+    tokenizer: Tokenizer,
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
     latents: jnp.ndarray,     # Full batch (B, T, n_latents, d_bottleneck)
@@ -112,10 +113,6 @@ def latent_train_step(
         mask_img[None, None, :, :],
         mask_vid[None, None, :, :]
     )
-
-    # Replace actions with no-ops for image samples
-    noop = create_noop_action_like(actions, categorical_action_dim)
-    actions = jax.tree.map(lambda a, n: jnp.where(is_img.reshape((B,) + (1,) * (a.ndim - 1)), n, a) if a is not None else None, actions, noop)
 
     # Training step
     step_key = jax.random.fold_in(master_key, step)
@@ -170,6 +167,7 @@ def run(cfg: DynamicsConfig):
 
         # Check if using latent data (pre-tokenized)
         use_latent_data = cfg.dataset.data_type == "latent"
+        train_step = latent_train_step if use_latent_data else encode_and_train_step
 
         # Load pretrained tokenizer (required for video data, optional for latent data checkpoints)
         tokenizer_bundle = TokenizerCheckpointBundle.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
@@ -255,7 +253,6 @@ def run(cfg: DynamicsConfig):
                 latents = jax.device_put(batch["latents"], data_sharding) if use_latent_data else None
 
                 # Action shifting: prepend "first action token" (noop) so action[t] aligns with state[t]
-                actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
 
                 # Validation step before training (as input buffers might be donated)
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
@@ -272,33 +269,17 @@ def run(cfg: DynamicsConfig):
                 # Training step
                 B_img = int(cfg.dataset.B * cfg.image_fraction)
 
-                if use_latent_data:
-                    # Pre-tokenized latent data path
-                    metrics = latent_train_step(
-                        bundle.dynamics, bundle.dynamics_optimizer,
-                        latents, actions,
-                        master_key=master_key,
-                        step=step,
-                        B_img=B_img,
-                        T=T,
-                        categorical_action_dim=cfg.dataset.categorical_action_dim,
-                        k_max=cfg.dynamics.k_max,
-                        context_length=context_length,
-                    )
-                else:
-                    # Video data path (requires tokenizer encoding)
-                    metrics = encode_and_train_step(
-                        bundle.tokenizer, bundle.dynamics, bundle.dynamics_optimizer,
-                        videos, actions,
-                        tokenizer_key=tokenizer_key,
-                        master_key=master_key,
-                        step=step,
-                        B_img=B_img,
-                        T=T,
-                        categorical_action_dim=cfg.dataset.categorical_action_dim,
-                        k_max=cfg.dynamics.k_max,
-                        context_length=context_length,
-                    )
+                metrics = train_step(
+                    bundle.tokenizer, bundle.dynamics, 
+                    bundle.dynamics_optimizer, latents, actions,
+                    master_key=master_key,
+                    step=step,
+                    B_img=B_img,
+                    T=T,
+                    categorical_action_dim=cfg.dataset.categorical_action_dim,
+                    k_max=cfg.dynamics.k_max,
+                    context_length=context_length,
+                )
 
                 # Logging
                 if logger.should_log(step):
@@ -317,7 +298,7 @@ def run(cfg: DynamicsConfig):
                     )
 
                 # Checkpointing
-                iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
+                # iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
                 bundle.maybe_save(checkpoint_manager, step, iterators, rng)
 
             scaling.finalize()
