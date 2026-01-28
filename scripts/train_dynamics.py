@@ -61,7 +61,6 @@ def encode_and_train_step(
     T: int,
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
-    bootstrap_start: int,
     bootstrap_fraction: float,
 ):
     rngs = nnx.Rngs(mae=tokenizer_key)
@@ -73,12 +72,12 @@ def encode_and_train_step(
         dynamics, optimizer, latents, actions,
         master_key=master_key, step=step, B_img=B_img, T=T,
         k_max=k_max, context_length=context_length,
-        bootstrap_start=bootstrap_start, bootstrap_fraction=bootstrap_fraction,
+        bootstrap_fraction=bootstrap_fraction,
     )
 
 
 @nnx.jit(
-        static_argnames=("k_max", "B_img", "T", "categorical_action_dim", "context_length", "bootstrap_start", "bootstrap_fraction"),
+        static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_start", "bootstrap_fraction"),
         donate_argnames=("latents", "actions"),
 )
 def latent_train_step(
@@ -93,20 +92,18 @@ def latent_train_step(
     T: int,
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
-    bootstrap_start: int,
     bootstrap_fraction: float,
 ):
     """Training step for pre-tokenized latent data (skips tokenizer encoding)."""
     latents = latents.astype(dynamics.dtype)
 
     B = latents.shape[0]
-    bootstrap_active = step >= bootstrap_start
-    B_self = int(B * bootstrap_fraction) * bootstrap_active
+    B_self = int(B * bootstrap_fraction)
     B_emp = B - B_self
 
     # Identify image samples (split with same bootstrap ratio)
     idx = jnp.arange(B)
-    B_img_boot = int(B_img * bootstrap_fraction) * bootstrap_active
+    B_img_boot = int(B_img * bootstrap_fraction)
     B_img_emp = B_img - B_img_boot
     is_img = (idx < B_img_emp) | ((idx >= B_emp) & (idx < (B_emp + B_img_boot)))
 
@@ -257,7 +254,7 @@ def run(cfg: DynamicsConfig):
                 latents = jax.device_put(batch["latents"], data_sharding) if use_latent_data else None
 
                 # Validation step before training (as input buffers might be donated)
-                if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
+                if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
                     val_videos = None if use_latent_data else videos[:4]
                     val_latents = latents[:4] if use_latent_data else None
                     val_actions = actions[:4]
@@ -282,8 +279,7 @@ def run(cfg: DynamicsConfig):
                         T=T,
                         k_max=cfg.dynamics.k_max,
                         context_length=context_length,
-                        bootstrap_start=cfg.bootstrap_start,
-                        bootstrap_fraction=cfg.bootstrap_fraction,
+                        bootstrap_fraction=cfg.bootstrap_fraction if step >= cfg.bootstrap_start else 0.0,
                     )
                 else:
                     # Video data path (requires tokenizer encoding)
@@ -297,8 +293,7 @@ def run(cfg: DynamicsConfig):
                         T=T,
                         k_max=cfg.dynamics.k_max,
                         context_length=context_length,
-                        bootstrap_start=cfg.bootstrap_start,
-                        bootstrap_fraction=cfg.bootstrap_fraction,
+                        bootstrap_fraction=cfg.bootstrap_fraction if step >= cfg.bootstrap_start else 0.0,
                     )
 
                 # Logging
