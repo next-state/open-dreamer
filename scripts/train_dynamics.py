@@ -9,7 +9,7 @@ from tqdm import tqdm
 from einops import rearrange, repeat
 
 from dreamer.configs import DynamicsConfig
-from dreamer.data import make_dual_iterators
+from dreamer.data import make_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, create_noop_action_like
@@ -206,12 +206,15 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        # Data iterators
+        # Data iterator
         short_T = cfg.short_T
         long_T = cfg.long_T
-        short_dataloader, long_dataloader = make_dual_iterators(cfg.dataset, short_T=short_T, long_T=long_T)
-        short_iterator = iter(short_dataloader)
-        long_iterator = iter(long_dataloader)
+        batch_iterator = make_dual_iterator(
+            cfg.dataset,
+            short_T=short_T,
+            long_T=long_T,
+            long_ratio=cfg.long_batch_ratio,
+        )
 
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
@@ -220,12 +223,18 @@ def run(cfg: DynamicsConfig):
             )
         ) as checkpoint_manager:
             # Resume from checkpoint
-            iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
+            iterators = batch_iterator.iterators
             start_step, bundle, iterators, rng = bundle.restore(
                 checkpoint_manager, iterators, rng
             )
-            short_iterator = iterators["short_dataloader_state"]
-            long_iterator = iterators["long_dataloader_state"]
+            batch_iterator = make_dual_iterator(
+                cfg.dataset,
+                short_T=short_T,
+                long_T=long_T,
+                long_ratio=cfg.long_batch_ratio,
+                start_step=start_step,
+                iterators=iterators,
+            )
 
             scaling.start_training()
 
@@ -235,15 +244,13 @@ def run(cfg: DynamicsConfig):
                 if step >= cfg.max_steps:
                     break
 
-                rng, dispatch_key, tokenizer_key, master_key = jax.random.split(rng, num=4)
+                rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
 
-                use_long = float(jax.random.uniform(dispatch_key)) < cfg.long_batch_ratio
+                use_long, batch = next(batch_iterator)
                 if use_long:
-                    batch = next(long_iterator)
                     T = long_T
                     context_length = cfg.dynamics.context_length
                 else:
-                    batch = next(short_iterator)
                     T = short_T
                     context_length = None  # Use default causal attention
 
