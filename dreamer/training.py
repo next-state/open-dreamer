@@ -724,14 +724,14 @@ def run_evaluation(
     step: int,
     tokenizer,
     dynamics,
-    val_videos: jnp.ndarray | None,
+    val_data: jnp.ndarray,
     val_actions: Actions,
+    use_latent_data: bool,
     vis_dir: Path,
     rng: jax.Array,
     logger,
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
-    val_latents: jnp.ndarray | None = None,
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
@@ -743,17 +743,16 @@ def run_evaluation(
         step: Current training step
         tokenizer: Tokenizer NNX model instance
         dynamics: Dynamics NNX model instance
-        val_videos: (B, T, H, W, C) Validation videos. None if using latents.
+        val_data: (B, T, H, W, C) Validation videos if use_latent_data=False,
+                  or (B, T, n_latents, d_bottleneck) pre-tokenized validation latents if use_latent_data=True
         val_actions: (B, T) Validation actions
+        use_latent_data: Whether val_data contains latents (True) or videos (False)
         vis_dir: Directory to save visualizations
         rng: Random key
         logger: Logger instance for logging metrics and videos
         policy: Optional policy model for action sampling
         task_embedder: Optional task embedder for agent tokens
-        val_latents: (B, T, n_latents, d_bottleneck) Pre-tokenized validation latents. None if using videos.
     """
-    assert (val_videos is not None) ^ (val_latents is not None), "Provide either val_videos or val_latents, not both"
-    use_latent_data = val_latents is not None
     k_max = dynamics.cfg.k_max
     schedule_shortcut = DenoiseSchedule.init(4, k_max)
     schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
@@ -763,7 +762,7 @@ def run_evaluation(
     for tag, schedule_config in evaluation_schedules.items():
         t0 = time.time()
         # Determine sequence length and horizon
-        T = val_latents.shape[1] if use_latent_data else val_videos.shape[1]
+        T = val_data.shape[1]
         assert T > 5, f"Sequence length {T} must be > 5"
         ctx_length = 4
         horizon = T - ctx_length
@@ -774,13 +773,13 @@ def run_evaluation(
                 tokenizer, dynamics, frames=None,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=rng, policy=policy, task_embedder=task_embedder,
-                latents=val_latents
+                latents=val_data
             )
             # For metrics, compare pred vs gt_decoded (both from latents)
             gt_frames_for_metrics = gt_decoded_frames
         else:
             pred_frames, gt_decoded_frames, original_frames = sample_video(
-                tokenizer, dynamics, frames=val_videos,
+                tokenizer, dynamics, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=rng, policy=policy, task_embedder=task_embedder
             )
