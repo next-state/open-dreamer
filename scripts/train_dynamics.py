@@ -163,10 +163,22 @@ def run(cfg: DynamicsConfig):
         n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
         avg_T = int(cfg.long_batch_ratio * cfg.long_T + (1 - cfg.long_batch_ratio) * cfg.short_T)
+
+        # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
+        dynamics_flops = dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T, n_latents=n_latents)
+        bootstrap_multiplier = 1 + 2 * cfg.bootstrap_fraction
+        total_dynamics_flops = dynamics_flops * bootstrap_multiplier
+
+        # Encoder FLOPs: forward-only (no gradients) when using video data
+        encoder_flops = 0
+        if not use_latent_data:
+            tokenizer_training_flops = tokenizer.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T)
+            encoder_flops = tokenizer_training_flops // 12  # ~1/12 of tokenizer training FLOPs (half for encoder, 1/6 for inference)
+
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T, n_latents=n_latents),
+            flops_per_step=total_dynamics_flops + encoder_flops,
             data_tokens_per_step=cfg.dataset.B * avg_T * (n_spatial + 1),  # spatial + action
             total_tokens_per_step=cfg.dataset.B * avg_T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
             logger=logger,
