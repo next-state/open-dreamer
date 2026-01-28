@@ -7,11 +7,11 @@ run_name: dynamics-test
 tokenizer_ckpt: logs/tokenizer-512/checkpoints/
 
 ckpt:
-  max_to_keep: 1
+  max_to_keep: 0
   save_interval_steps: 10_000
 
 dataset:
-  B: 64
+  B: 32
   T: 64
   C: 16
 

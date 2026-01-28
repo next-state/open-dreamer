@@ -3,13 +3,14 @@ import logging
 import hydra
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from einops import rearrange, repeat
 
 from dreamer.configs import DynamicsConfig
-from dreamer.data import make_iterator
+from dreamer.data import make_iterator  # Removed for dummy dataloader
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, create_noop_action_like
@@ -142,7 +143,6 @@ def latent_train_step(
 
     return metrics
 
-
 # ---------------------------
 # Main
 # ---------------------------
@@ -205,10 +205,11 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        # Data iterator
-        dataloader = make_iterator(cfg.dataset)
-        batch_iterator = iter(dataloader)
-
+        # Data iterator (replaced with dummy random iterator)
+        dataloader = make_iterator(cfg.dataset, device=data_sharding, num_workers= 8, prefetch_buffer_size=10, device_prefetch_buffer_size=2)
+        start_step = 0
+        # batch_iterator = iter(dataloader)
+        # batch_iterator = make_dummy_iterator(cfg, tokenizer_cfg)
         with build_checkpoint_manager(
             cfg.ckpt, ckpt_dir,
             item_names=DynamicsCheckpointBundle.get_item_names(
@@ -216,42 +217,43 @@ def run(cfg: DynamicsConfig):
             )
         ) as checkpoint_manager:
             # Resume from checkpoint
-            start_step, bundle, restored_iterators, rng = bundle.restore(
-                checkpoint_manager, batch_iterator, rng
-            )
+            # start_step, bundle, restored_iterators, rng = bundle.restore(
+            #     checkpoint_manager, batch_iterator, rng
+            # )
             scaling.start_training()
 
             # Training loop with prefetching
             # Prefetch first batch to GPU before loop starts
-            batch = next(batch_iterator)
-            next_actions = jax.device_put(batch["actions"], data_sharding)
-            next_videos = None if use_latent_data else jax.device_put(batch["videos"], data_sharding)
-            next_latents = jax.device_put(batch["latents"], data_sharding) if use_latent_data else None
+            # batch = next(batch_iterator)
+            # next_actions = jax.device_put(batch["actions"], data_sharding)
+            # next_videos = None if use_latent_data else jax.device_put(batch["videos"], data_sharding)
+            # next_latents = jax.device_put(batch["latents"], data_sharding) if use_latent_data else None
 
-            pbar = tqdm(range(start_step, cfg.max_steps), initial=start_step, total=cfg.max_steps)
-            for step in pbar:
+            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps)
+            for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
 
                 rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
 
-                # Use pre-loaded batch from previous iteration
-                actions = next_actions
-                videos = next_videos
-                latents = next_latents
-
-                # Prefetch NEXT batch to GPU while current batch trains
-                # This device_put returns immediately (async) and transfers in background
-                try:
-                    batch = next(batch_iterator)
-                    next_actions = jax.device_put(batch["actions"], data_sharding)
-                    next_videos = None if use_latent_data else jax.device_put(batch["videos"], data_sharding)
-                    next_latents = jax.device_put(batch["latents"], data_sharding) if use_latent_data else None
-                except StopIteration:
-                    break
-
-                context_length = cfg.dynamics.context_length
-                # Action shifting: prepend "first action token" (noop) so action[t] aligns with state[t]
+                # Use pre-allocated batch
+                actions = batch["actions"]
+                videos = batch.get("videos")
+                latents = batch.get("latents")
+                input_tensor = latents if latents is not None else videos
+                
+                # Training step
+                metrics = train_step(
+                    bundle.tokenizer, bundle.dynamics, 
+                    bundle.dynamics_optimizer, input_tensor, actions,
+                    master_key=master_key,
+                    step=step,
+                    B_img=int(cfg.dataset.B * cfg.image_fraction),
+                    T=cfg.dataset.T,
+                    categorical_action_dim=cfg.dataset.categorical_action_dim,
+                    k_max=cfg.dynamics.k_max,
+                    context_length=cfg.dynamics.context_length,
+                )
 
                 # Validation step before training (as input buffers might be donated)
                 if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
@@ -265,20 +267,6 @@ def run(cfg: DynamicsConfig):
                         vis_dir=vis_dir, rng=rng, logger=logger
                     )
 
-                # Training step
-                B_img = int(cfg.dataset.B * cfg.image_fraction)
-
-                metrics = train_step(
-                    bundle.tokenizer, bundle.dynamics, 
-                    bundle.dynamics_optimizer, latents, actions,
-                    master_key=master_key,
-                    step=step,
-                    B_img=B_img,
-                    T=cfg.dataset.T,
-                    categorical_action_dim=cfg.dataset.categorical_action_dim,
-                    k_max=cfg.dynamics.k_max,
-                    context_length=context_length,
-                )
 
                 # Logging
                 if logger.should_log(step):
@@ -296,8 +284,9 @@ def run(cfg: DynamicsConfig):
                     )
 
                 # Checkpointing
-                iterators = {"dataloader_state": batch_iterator}
-                bundle.maybe_save(checkpoint_manager, step, iterators, rng)
+                # TODO: checkpointing with DevicePutIterator needs iterator state access
+                # iterators = {"dataloader_state": batch_iterator}
+                # bundle.maybe_save(checkpoint_manager, step, iterators, rng)
 
             scaling.finalize()
 

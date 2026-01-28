@@ -3,6 +3,7 @@ import copy
 import jax
 import numpy as np
 import grain
+from grain._src.python.dataset import dataset as grain_dataset
 
 from ..configs import DatasetConfig
 from .transforms import (
@@ -13,6 +14,45 @@ from .transforms import (
     CreateActions,
 )
 from .path_utils import build_dataset_paths
+from grain.experimental import device_put
+from grain.transforms import Batch
+
+
+# ==============================================================================
+# DataLoader to IterDataset Wrapper
+# ==============================================================================
+
+class DataLoaderIteratorWrapper(grain_dataset.DatasetIterator):
+    """Wraps a DataLoader iterator as a DatasetIterator for use with grain.experimental.device_put."""
+    
+    def __init__(self, dataloader_iterator):
+        super().__init__()
+        self._iterator = dataloader_iterator
+        self._count = 0
+    
+    def __next__(self):
+        self._assert_not_closed()
+        self._count += 1
+        return next(self._iterator)
+    
+    def get_state(self):
+        # Basic state - just track count for debugging
+        # Full checkpointing would need access to underlying dataloader state
+        return {"count": self._count}
+    
+    def set_state(self, state):
+        self._count = state.get("count", 0)
+
+
+class DataLoaderIterDataset(grain_dataset.IterDataset):
+    """Wraps a DataLoader as an IterDataset for use with grain.experimental.device_put."""
+    
+    def __init__(self, dataloader):
+        super().__init__()
+        self._dataloader = dataloader
+    
+    def __iter__(self):
+        return DataLoaderIteratorWrapper(iter(self._dataloader))
 
 
 # ==============================================================================
@@ -25,6 +65,8 @@ def make_iterator(
     prefetch_buffer_size: int = 10,
     seed: int = 42,
     print_filter_warnings: bool = False,
+    device = None,
+    device_prefetch_buffer_size: int = 1
 ):
     """Creates a data loading pipeline using Grain from a DatasetConfig.
 
@@ -68,14 +110,14 @@ def make_iterator(
     if use_latent_data:
         # Pre-tokenized latent data path
         operations = [
-            EpisodeLengthFilter(
-                seq_len=cfg.T,
-                format_hint="latent",
-                print_filter_warnings=print_filter_warnings,
-            ),
+            # EpisodeLengthFilter(
+            #     seq_len=cfg.T,
+            #     format_hint="latent",
+            #     print_filter_warnings=print_filter_warnings,
+            # ),
             ProcessLatentAndSlice(seq_len=cfg.T),
-            grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
-            CreateActions(),
+            Batch(batch_size=per_process_batch_size, drop_remainder=True),
+            CreateActions()
         ]
     elif cfg.name == "minecraft_vpt":
         operations = [
@@ -93,7 +135,7 @@ def make_iterator(
                 padding_w=cfg.padding_W,
                 patch_size=cfg.patch_size,
             ),
-            grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
+            Batch(batch_size=per_process_batch_size, drop_remainder=True),
             CreateActions(),
         ]
     else:
@@ -113,7 +155,7 @@ def make_iterator(
                 p_include_reward=cfg.p_include_reward,
                 patch_size=cfg.patch_size,
             ),
-            grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
+            Batch(batch_size=per_process_batch_size, drop_remainder=True),
             CreateActions(),
         ]
 
@@ -122,15 +164,26 @@ def make_iterator(
         sampler=sampler,
         operations=operations,
         worker_count=num_workers,
-        worker_buffer_size=10,
+        worker_buffer_size=1,
         read_options=grain.ReadOptions(
-            prefetch_buffer_size=prefetch_buffer_size,
+            prefetch_buffer_size=prefetch_buffer_size if device is None else 1,
             num_threads=1,
         ),
     )
-
-    return dataloader
-
+    
+    if device is None:
+        return iter(dataloader)
+    
+    # Wrap DataLoader as IterDataset for compatibility with grain.experimental.device_put
+    iter_dataset = DataLoaderIterDataset(dataloader)
+    iter_dataset = device_put(
+        iter_dataset,
+        device,
+        cpu_buffer_size=prefetch_buffer_size,
+        device_buffer_size=device_prefetch_buffer_size if prefetch_buffer_size is not None else prefetch_buffer_size,
+    )
+    
+    return iter_dataset
 
 class AlternatingIterator:
     def __init__(
