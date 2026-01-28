@@ -72,7 +72,8 @@ def train_step(
     else:
         rngs = nnx.Rngs(mae=tokenizer_key)
         latents, _ = tokenizer.encode(data, deterministic=True, rngs=rngs)
-    
+        latents = jax.lax.stop_gradient(latents)
+
     latents = latents.astype(dynamics.dtype)
 
     B = latents.shape[0]
