@@ -12,7 +12,7 @@ parameters:
   logger.log_every:
     value: 100
 
-  dataset.B:
+  dataset.dataloader_cfg.B:
     value: 256
   #  values: [8, 16, 32, 64, 128, 256, 512]
 

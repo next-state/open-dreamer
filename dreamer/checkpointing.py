@@ -12,7 +12,6 @@ from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import ClassVar, Optional, Self
 
-import grain
 import jax
 import orbax.checkpoint as ocp
 from flax import nnx
@@ -47,7 +46,7 @@ class NoOpCheckpointManager(ocp.CheckpointManager):
 def build_checkpoint_manager(
         ckpt_cfg: CheckpointConfig,
         ckpt_dir: Path,
-        item_names=("model_state", "optimizer_state", "train_dataloader_state", "rngs", "meta"),
+        item_names=("model_state", "optimizer_state", "rngs", "meta"),
     ) -> ocp.CheckpointManager:
 
     checkpoint_options = ocp.CheckpointManagerOptions(
@@ -81,14 +80,10 @@ class CheckpointBundle:
     _model_registry: ClassVar[dict[str, tuple[type, type]]] = {}
 
     @classmethod
-    def get_item_names(cls, iterator_names: Optional[tuple[str, ...]] = None) -> tuple[str, ...]:
+    def get_item_names(cls) -> tuple[str, ...]:
         """Get checkpoint item names for this bundle.
 
         Introspects the dataclass fields and adds standard items.
-
-        Args:
-            iterator_names: Optional tuple of iterator names to include in checkpoint.
-                          If None, defaults to ("train_dataloader_state",) for backward compatibility.
 
         Returns:
             Tuple of item names for checkpoint manager
@@ -97,9 +92,6 @@ class CheckpointBundle:
             raise TypeError(f"CheckpointBundle subclass must be a dataclass, got {cls}")
 
         item_names = [field.name for field in fields(cls)]
-        if iterator_names is None:
-            iterator_names = ("train_dataloader_state",)
-        item_names.extend(iterator_names)
         item_names.extend(["rngs", "meta"])
         return tuple(item_names)
 
@@ -172,23 +164,21 @@ class CheckpointBundle:
     def restore(
         self,
         checkpoint_manager: ocp.CheckpointManager,
-        iterators: dict[str, grain.DataLoaderIterator],
         rng: jax.Array,
-    ) -> tuple[int, Self, dict[str, grain.DataLoaderIterator], jax.Array]:
+    ) -> tuple[int, Self, jax.Array]:
         """Restore checkpoint state into this bundle (in-place update).
 
         Args:
             checkpoint_manager: Checkpoint manager
-            iterators: Dict mapping iterator names to DataLoaderIterator instances
             rng: Random number generator state
 
         Returns:
-            Tuple of (start_step, self, iterators, rng) where iterators is the updated dict
+            Tuple of (start_step, self, rng)
         """
         step = checkpoint_manager.latest_step()
         if step is None:
             print("No checkpoint found, starting from scratch.")
-            return 0, self, iterators, rng
+            return 0, self, rng
 
         # Build restore args dynamically by introspecting bundle fields
         restore_kwargs = {}
@@ -197,46 +187,25 @@ class CheckpointBundle:
             field_value = getattr(self, field.name)
             restore_kwargs[field.name] = ocp.args.StandardRestore(nnx.state(field_value))
 
-        # Add iterators and rngs
-        for name, iterator in iterators.items():
-            restore_kwargs[name] = grain.checkpoint.CheckpointRestore(iterator)
         restore_kwargs["rngs"] = ocp.args.StandardRestore({"key": rng})
 
-        # Try to restore with iterators first
-        try: # I don't really like this try catch thing. we might just avoid restoring the sampler tbh
-            restore_args = ocp.args.Composite(**restore_kwargs)
-            restored = checkpoint_manager.restore(step, args=restore_args)
-        except ValueError as e:
-            if "sampler" in str(e).lower():
-                print(f"Warning: Failed to restore iterators due to sampler mismatch: {e}")
-                print("Restarting iterators from scratch.")
-                # Remove iterator restore kwargs and retry
-                for name in iterators.keys():
-                    restore_kwargs.pop(name, None)
-                restore_args = ocp.args.Composite(**restore_kwargs)
-                restored = checkpoint_manager.restore(step, args=restore_args)
-            else:
-                raise
+        restore_args = ocp.args.Composite(**restore_kwargs)
+        restored = checkpoint_manager.restore(step, args=restore_args)
 
         # Update bundle fields in-place
         for field in fields(self):
             field_value = getattr(self, field.name)
             nnx.update(field_value, restored[field.name])
 
-        # Update iterators (only if they were restored)
-        for name in iterators.keys():
-            if name in restored:
-                iterators[name] = restored[name]
         rng = restored["rngs"]["key"]
         print(f"Restored checkpoint from step {step}.")
 
-        return step + 1, self, iterators, rng
+        return step + 1, self, rng
 
     def maybe_save(
         self,
         checkpoint_manager: ocp.CheckpointManager,
         step: int,
-        iterators: dict[str, grain.DataLoaderIterator],
         rngs: jax.Array,
     ) -> None:
         """Save checkpoint if checkpoint_manager.should_save(step).
@@ -244,7 +213,6 @@ class CheckpointBundle:
         Args:
             checkpoint_manager: Checkpoint manager
             step: Current training step
-            iterators: Dict mapping iterator names to DataLoaderIterator instances
             rngs: Random number generator state
         """
         if not checkpoint_manager.should_save(step):
@@ -260,9 +228,6 @@ class CheckpointBundle:
                 cfg = field_value.cfg
                 meta[field.name] = asdict(cfg) if is_dataclass(cfg) else OmegaConf.to_container(cfg, resolve=True)
 
-        # Add iterators, rngs, and meta
-        for name, iterator in iterators.items():
-            save_kwargs[name] = grain.checkpoint.CheckpointSave(iterator)
         save_kwargs["rngs"] = ocp.args.StandardSave({'key': rngs})
         save_kwargs["meta"] = ocp.args.JsonSave(meta)
 

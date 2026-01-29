@@ -1,30 +1,3 @@
-import copy
-import io
-import pickle
-from typing import Any
-
-import decord
-import grain
-import jax
-import numpy as np
-from grain._src.python.dataset import dataset as grain_dataset
-from grain.experimental import device_put
-from grain.transforms import Batch
-
-from dreamer.actions import Actions
-from dreamer.configs import DatasetConfig, DataloaderConfig
-from dreamer.data.path_utils import build_dataset_paths
-from dreamer.data.serialization import deserialize_msgpack_record
-from dreamer.data.transforms import (
-    CastDtype,
-    CreateActions,
-    EpisodeLengthFilter,
-    ProcessEpisodeAndSlice,
-    ProcessLatentAndSlice,
-    ProcessMinecraftEpisodeAndSlice,
-)
-
-
 """Unified Grain transforms for all dataset types.
 
 Provides flexible, reusable transforms that handle:
@@ -34,6 +7,17 @@ Provides flexible, reusable transforms that handle:
 - Pre-tokenized latent episode processing
 - Action dataclass creation
 """
+
+import io
+import pickle
+from typing import Any
+
+import decord
+import grain
+import numpy as np
+
+from ..actions import Actions
+from .serialization import deserialize_msgpack_record
 
 decord.bridge.set_bridge("native")
 
@@ -150,9 +134,9 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         self.image_h = image_h
         self.image_w = image_w
         self.image_c = image_c
+        self.padding_h = tuple(padding_h) if isinstance(padding_h, list) else padding_h
+        self.padding_w = tuple(padding_w) if isinstance(padding_w, list) else padding_w
         self.p_include_reward = float(p_include_reward)
-        self.padding_h = padding_h
-        self.padding_w = padding_w
 
         # Validate padding alignment with patch_size
         if patch_size is not None:
@@ -217,14 +201,14 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
             constant_values=0
         )
 
-        actions_tensor = np.array(element["actions"])
+        # Extract actions and rewards
+        actions_tensor = np.array(data["actions"])
+
         return {
             "videos": seq,
-            "actions": Actions(
-                binary=None,
-                categorical=actions_tensor[start_idx : start_idx + self.seq_len],
-                continuous=None,
-            ),
+            "actions_categorical": actions_tensor[start_idx : start_idx + self.seq_len],
+            "actions_binary": None,
+            "actions_continuous": None,
             "rewards": rewards_tensor[start_idx : start_idx + self.seq_len],
         }
 
@@ -266,8 +250,8 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             full_episode: If True, return full episode without slicing (for tokenization)
         """
         self.seq_len = seq_len
-        self.padding_h = padding_h
-        self.padding_w = padding_w
+        self.padding_h = tuple(padding_h) if isinstance(padding_h, list) else padding_h
+        self.padding_w = tuple(padding_w) if isinstance(padding_w, list) else padding_w
         self.full_episode = full_episode
 
         # Validate padding alignment with patch_size
@@ -319,7 +303,9 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
 
         return {
             "videos": video,
-            "actions": Actions(binary=None, categorical=None, continuous=None),  # FIXME: no actions returned!!
+            "actions_categorical": None,
+            "actions_binary": None,
+            "actions_continuous": None,
             "rewards": None,
         }
 
@@ -351,16 +337,25 @@ class ProcessLatentAndSlice(grain.transforms.RandomMap):
         """
         data = deserialize_msgpack_record(element)
         latents = data["latents"]  # (T, n_latents, d_bottleneck)
-        actions = data["actions"]  # dict with action arrays
+        actions = data["actions"]   # dict with action arrays
 
         episode_len = latents.shape[0]
         max_start = episode_len - self.seq_len
         start = int(rng.integers(0, max_start + 1))
-        end = start + self.seq_len
+
+        # Slice latents
+        sliced_latents = latents[start:start + self.seq_len].astype(np.float32)
+
+        # Slice actions (handle None values)
+        actions_binary = actions.get("binary")
+        actions_categorical = actions.get("categorical")
+        actions_continuous = actions.get("continuous")
 
         return {
-            "latents": latents[start:end].astype(np.float32),
-            "actions": Actions.from_dict(actions)[start:end],
+            "latents": sliced_latents,
+            "actions_binary": actions_binary[start:start + self.seq_len] if actions_binary is not None else None,
+            "actions_categorical": actions_categorical[start:start + self.seq_len] if actions_categorical is not None else None,
+            "actions_continuous": actions_continuous[start:start + self.seq_len] if actions_continuous is not None else None,
         }
 
 
@@ -368,7 +363,24 @@ class ProcessLatentAndSlice(grain.transforms.RandomMap):
 # Action Processing
 # ==============================================================================
 
+class CreateActions(grain.transforms.Map):
+    """Convert batched action arrays into Actions dataclass."""
 
+    def map(self, batch: dict) -> dict:
+        """Convert action arrays to Actions dataclass.
+
+        Args:
+            batch: Batch dictionary with actions_* keys
+
+        Returns:
+            Batch with actions field as Actions dataclass
+        """
+        batch["actions"] = Actions(
+            binary=batch.pop("actions_binary", None),
+            categorical=batch.pop("actions_categorical", None),
+            continuous=batch.pop("actions_continuous", None),
+        )
+        return batch
 
 
 class NumpyToJax(grain.transforms.Map):
@@ -396,229 +408,54 @@ class NumpyToJax(grain.transforms.Map):
         return result
 
 
-# ==============================================================================
-# DataLoader to IterDataset Wrapper
-# ==============================================================================
+class CastDtype(grain.transforms.Map):
+    """Cast floating-point arrays to a specified dtype."""
 
-class DataLoaderIteratorWrapper(grain_dataset.IterDataset):
-    """Wraps a DataLoader iterator as a DatasetIterator for use with grain.experimental.device_put."""
-    
-    def __init__(self, dataloader):
-        super().__init__()
-        self._iterator = iter(dataloader)
-        self._count = 0
-    
-    def __iter__(self):
-        return self
-    
-    def __next__(self):
-        self._count += 1
-        return next(self._iterator)
-        
-    def get_state(self):
-        # Basic state - just track count for debugging
-        # Full checkpointing would need access to underlying dataloader state
-        return {"count": self._count}
-    
-    def set_state(self, state):
-        self._count = state.get("count", 0)
+    DTYPE_MAP = {
+        "float32": np.float32,
+        "float16": np.float16,
+        "bfloat16": np.float32,  # numpy doesn't support bfloat16, keep as float32 for now
+    }
 
-# ==============================================================================
-# Factory
-# ==============================================================================
+    def __init__(self, dtype: str):
+        """Initialize dtype caster.
 
-def make_iterator(
-    cfg: DatasetConfig,
-    *,
-    seed: int = 42,
-    print_filter_warnings: bool = False,
-    device = None,
-):
-    """Creates a data loading pipeline using Grain from a DatasetConfig.
+        Args:
+            dtype: Target dtype string (e.g., "float32", "float16", "bfloat16")
+        """
+        self.dtype_str = dtype
+        self.dtype = self.DTYPE_MAP.get(dtype, np.float32)
 
-    Args:
-        cfg: Dataset configuration
-        dataloader_cfg: Dataloader configuration (defaults to cfg.dataloader_cfg if None)
-        seed: Random seed
-        print_filter_warnings: Whether to print filter warnings
-        device: Device for prefetching
-    """
-    dataloader_cfg = cfg.dataloader_cfg
-    
-    num_workers = dataloader_cfg.num_workers
-    prefetch_buffer_size = dataloader_cfg.prefetch_buffer_size
-    device_prefetch_buffer_size = dataloader_cfg.device_prefetch_buffer_size
-    # Build array record paths using utility
-    use_latent_data = cfg.data_type == "latent"
-    dataset_type = "latent" if use_latent_data else cfg.name
+    def _cast_array(self, arr: np.ndarray) -> np.ndarray:
+        """Cast array if it's a floating-point type."""
+        if arr is None:
+            return None
+        if np.issubdtype(arr.dtype, np.floating):
+            return arr.astype(self.dtype)
+        return arr
 
-    array_record_paths = build_dataset_paths(
-        cfg.array_record_path,
-        dataset_type=dataset_type,
-        index_max=cfg.index_max if use_latent_data or cfg.name == "minecraft_vpt" else None,
-    )
+    def map(self, batch: dict) -> dict:
+        """Cast floating-point arrays in batch to target dtype.
 
-    num_processes = jax.process_count()
+        Args:
+            batch: Batch dictionary
 
-    if dataloader_cfg.B % num_processes != 0:
-        raise ValueError(
-            f"Global batch size {dataloader_cfg.B} must be divisible by "
-            f"the number of JAX processes {num_processes}."
-        )
-    per_process_batch_size = dataloader_cfg.B // num_processes
+        Returns:
+            Batch with cast arrays
+        """
+        from ..actions import Actions
 
-    source = grain.sources.ArrayRecordDataSource(array_record_paths)
-
-    sampler = grain.samplers.IndexSampler(
-        num_records=len(source),
-        shard_options=grain.sharding.ShardByJaxProcess(drop_remainder=True),
-        shuffle=True,
-        num_epochs=None,
-        seed=seed,
-    )
-
-    # Build operations based on dataset type and data type
-    if use_latent_data:
-        # Pre-tokenized latent data path
-        operations = [ProcessLatentAndSlice(seq_len=dataloader_cfg.T)]
-    elif cfg.name == "minecraft_vpt":
-        operations = [
-            EpisodeLengthFilter(
-                seq_len=dataloader_cfg.T,
-                format_hint="vpt",
-                print_filter_warnings=print_filter_warnings,
-            ),
-            ProcessMinecraftEpisodeAndSlice(
-                seq_len=dataloader_cfg.T,
-                image_h=cfg.H,
-                image_w=cfg.W,
-                image_c=cfg.C,
-                padding_h=cfg.padding_H,
-                padding_w=cfg.padding_W,
-                patch_size=cfg.patch_size,
-            )
-        ]
-    else:
-        operations = [
-            EpisodeLengthFilter(
-                seq_len=dataloader_cfg.T,
-                format_hint="coinrun",
-                print_filter_warnings=print_filter_warnings,
-            ),
-            ProcessEpisodeAndSlice(
-                seq_len=dataloader_cfg.T,
-                image_h=cfg.H,
-                image_w=cfg.W,
-                image_c=cfg.C,
-                padding_h=cfg.padding_H,
-                padding_w=cfg.padding_W,
-                p_include_reward=cfg.p_include_reward,
-                patch_size=cfg.patch_size,
-            ),
-        ]
-            
-    common_ops = [Batch(batch_size=per_process_batch_size, drop_remainder=True), CastDtype(dataloader_cfg.dtype)]
-    operations = operations + common_ops
-
-    dataloader = grain.DataLoader(
-        data_source=source,
-        sampler=sampler,
-        operations=operations,
-        worker_count=num_workers,
-        worker_buffer_size=1,
-        read_options=grain.ReadOptions(
-            prefetch_buffer_size=prefetch_buffer_size if device is None else 1,
-            num_threads=1,
-        ),
-    )
-    
-    if device is None:
-        return iter(dataloader)
-    
-    # Wrap DataLoader as IterDataset for compatibility with grain.experimental.device_put
-    iter_dataset = DataLoaderIteratorWrapper(dataloader)
-    iter_dataset = device_put(
-        iter_dataset,
-        device,
-        cpu_buffer_size=prefetch_buffer_size,
-        device_buffer_size=device_prefetch_buffer_size if prefetch_buffer_size is not None else prefetch_buffer_size,
-    )
-    
-    return iter_dataset
-
-
-
-
-class AlternatingIterator(grain.IterDataset):
-    def __init__(self, short_iterator, long_iterator, long_ratio: float, seed: int) -> None:
-        self.short_iterator = short_iterator
-        self.long_iterator = long_iterator
-        self.long_ratio = long_ratio
-        self._rng_key = jax.random.key(seed)
-
-    def __next__(self):
-        self._rng_key, subkey = jax.random.split(self._rng_key)
-        if float(jax.random.uniform(subkey)) < self.long_ratio:
-            return True, next(self.long_iterator)
-        return False, next(self.short_iterator)
-
-    def __iter__(self):
-        return self
-
-def make_dual_iterator(
-    cfg: DatasetConfig,
-    *,
-    seed: int = 42,
-    print_filter_warnings: bool = False,
-    device = None,
-    ) -> grain.IterDataset:
-    """Create alternating iterator over short and long sequences.
-    
-    Args:
-        cfg: Dataset configuration
-        dataloader_cfg: Dataloader configuration (defaults to cfg.dataloader_cfg if None)
-        seed: Random seed
-        print_filter_warnings: Whether to print filter warnings
-        device: Device for prefetching
-    """
-    dataloader_cfg = cfg.dataloader_cfg
-    
-    short_T = dataloader_cfg.short_T
-    long_T = dataloader_cfg.long_T
-    long_ratio = dataloader_cfg.long_ratio
-    num_workers = dataloader_cfg.num_workers
-    prefetch_buffer_size = dataloader_cfg.prefetch_buffer_size
-    device_prefetch_buffer_size = dataloader_cfg.device_prefetch_buffer_size
-    
-    if short_T == long_T:
-        iterator = make_iterator(
-            cfg,
-            seed=seed,
-            print_filter_warnings=print_filter_warnings,
-        )
-        return iterator
-        
-    # Create iterators for short and long sequences
-    iterators = []
-    for T in [short_T, long_T]:
-        # Create a modified dataloader config with the specific T
-        dl_cfg = DataloaderConfig(
-            B=dataloader_cfg.B,
-            T=T,
-            num_workers=num_workers // 2,
-            prefetch_buffer_size=(prefetch_buffer_size + 1) // 2,
-            device_prefetch_buffer_size=(device_prefetch_buffer_size + 1) // 2,
-            start_step=dataloader_cfg.start_step,
-            dtype=dataloader_cfg.dtype,
-        )
-        it = make_iterator(
-            cfg=cfg,
-            seed=seed + T,
-            print_filter_warnings=print_filter_warnings,
-            device=device,
-        )
-        iterators.append(it)
-
-    iterator = AlternatingIterator(iterators[0], iterators[1], long_ratio, seed)
-    return iterator
-    
+        result = {}
+        for key, value in batch.items():
+            if isinstance(value, np.ndarray):
+                result[key] = self._cast_array(value)
+            elif isinstance(value, Actions):
+                # Cast action arrays within the Actions dataclass
+                result[key] = Actions(
+                    binary=self._cast_array(value.binary) if value.binary is not None else None,
+                    categorical=self._cast_array(value.categorical) if value.categorical is not None else None,
+                    continuous=self._cast_array(value.continuous) if value.continuous is not None else None,
+                )
+            else:
+                result[key] = value
+        return result

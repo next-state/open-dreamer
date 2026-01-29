@@ -3,12 +3,13 @@ import logging
 import hydra
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import DynamicsConfig
-from dreamer.data import make_dual_iterators
+from dreamer.data import make_iterator  
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions
@@ -57,7 +58,6 @@ def train_step(
     data: jnp.ndarray,        # Full batch: videos (B, T, H, W, C) or latents (B, T, n_latents, d_bottleneck)
     actions: Actions,         # Full batch (B, T, ...)
     *,
-    tokenizer_key: jax.Array,
     master_key: jax.Array,
     step: int,
     B_img: int,               # Number of samples to treat as images
@@ -70,8 +70,7 @@ def train_step(
     if use_latent_data:
         latents = data
     else:
-        rngs = nnx.Rngs(mae=tokenizer_key)
-        latents, _ = tokenizer.encode(data, deterministic=True, rngs=rngs)
+        latents, _ = tokenizer.encode(data, deterministic=True)
         latents = jax.lax.stop_gradient(latents)
 
     latents = latents.astype(dynamics.dtype)
@@ -123,7 +122,6 @@ def train_step(
 
     return metrics
 
-
 # ---------------------------
 # Main
 # ---------------------------
@@ -162,25 +160,26 @@ def run(cfg: DynamicsConfig):
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
+        B, T = cfg.dataset.dataloader_cfg.B, cfg.dataset.dataloader_cfg.T
         avg_T = int(cfg.long_batch_ratio * cfg.long_T + (1 - cfg.long_batch_ratio) * cfg.short_T)
 
         # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
-        dynamics_flops = dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T, n_latents=n_latents)
-        bootstrap_multiplier = 1 + 2 * cfg.bootstrap_fraction
+        dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
+        bootstrap_multiplier = 1 + cfg.bootstrap_fraction * (2/3)  # two additional gradientless calls to dynamics model, 1/6 for inference
         total_dynamics_flops = dynamics_flops * bootstrap_multiplier
 
         # Encoder FLOPs: forward-only (no gradients) when using video data
         encoder_flops = 0
         if not use_latent_data:
-            tokenizer_training_flops = tokenizer.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T)
-            encoder_flops = tokenizer_training_flops // 12  # ~1/12 of tokenizer training FLOPs (half for encoder, 1/6 for inference)
+            tokenizer_training_flops = tokenizer.estimate_flops(batch_size=B, seq_length=avg_T)
+            encoder_flops = tokenizer_training_flops // 6  # ~1/6 of tokenizer training FLOPs (half for encoder, 1/3 for inference)
 
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=total_dynamics_flops + encoder_flops,
-            data_tokens_per_step=cfg.dataset.B * avg_T * (n_spatial + 1),  # spatial + action
-            total_tokens_per_step=cfg.dataset.B * avg_T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
+            flops_per_step=dynamics_flops + encoder_flops,
+            data_tokens_per_step=B * avg_T * (n_spatial + 1),  # spatial + action
+            total_tokens_per_step=B * avg_T * (2 + n_spatial + cfg.dynamics.n_register),  # action + shortcut + spatial + register
             logger=logger,
             run_dir=run_dir,
         )
@@ -198,54 +197,30 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        # Data iterators
-        short_T = cfg.short_T
-        long_T = cfg.long_T
-        short_dataloader, long_dataloader = make_dual_iterators(cfg.dataset, short_T=short_T, long_T=long_T)
-        short_iterator = iter(short_dataloader)
-        long_iterator = iter(long_dataloader)
-
-        with build_checkpoint_manager(
-            cfg.ckpt, ckpt_dir,
-            item_names=DynamicsCheckpointBundle.get_item_names(
-                iterator_names=("short_dataloader_state", "long_dataloader_state")
-            )
-        ) as checkpoint_manager:
+        dataloader = make_iterator(cfg.dataset, device=data_sharding)
+        with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
-            iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
-            start_step, bundle, iterators, rng = bundle.restore(
-                checkpoint_manager, iterators, rng
-            )
-            short_iterator = iterators["short_dataloader_state"]
-            long_iterator = iterators["long_dataloader_state"]
-
+            start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
             scaling.start_training()
 
-            # Training loop
-            pbar = tqdm(range(start_step, cfg.max_steps), initial=start_step, total=cfg.max_steps)
-            for step in pbar:
+
+            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps)
+            for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
 
-                rng, dispatch_key, tokenizer_key, master_key = jax.random.split(rng, num=4)
+                rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
 
-                use_long = float(jax.random.uniform(dispatch_key)) < cfg.long_batch_ratio
-                if use_long:
-                    batch = next(long_iterator)
-                    T = long_T
-                    context_length = cfg.dynamics.context_length
-                else:
-                    batch = next(short_iterator)
-                    T = short_T
-                    context_length = None  # Use default causal attention
-
-                # Shard batch data
-                actions = jax.device_put(batch["actions"], data_sharding)
-                data = jax.device_put(batch["latents"] if use_latent_data else batch["videos"], data_sharding)
+                # Use pre-allocated batch
+                actions = batch["actions"]
+                videos = batch.get("videos")
+                latents = batch.get("latents")
+                input_tensor = latents if latents is not None else videos
+                
 
                 # Validation step before training (as input buffers might be donated)
                 if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
-                    val_data = data[:4]
+                    val_data = input_tensor[:4]
                     val_actions = actions[:4]
                     run_evaluation(
                         cfg, step, bundle.tokenizer, bundle.dynamics,
@@ -255,18 +230,16 @@ def run(cfg: DynamicsConfig):
                     )
 
                 # Training step
-                B_img = int(cfg.dataset.B * cfg.image_fraction)
                 metrics = train_step(
-                    bundle.tokenizer, bundle.dynamics, bundle.dynamics_optimizer,
-                    data, actions,
-                    tokenizer_key=tokenizer_key,
+                    bundle.tokenizer, bundle.dynamics, 
+                    bundle.dynamics_optimizer, input_tensor, actions,
                     master_key=master_key,
                     step=step,
-                    B_img=B_img,
+                    B_img=int(B * cfg.image_fraction),
                     T=T,
                     k_max=cfg.dynamics.k_max,
-                    context_length=context_length,
-                    bootstrap_fraction=cfg.bootstrap_fraction if step >= cfg.bootstrap_start else 0.0,
+                    context_length=cfg.dynamics.context_length,
+                    bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                     use_latent_data=use_latent_data,
                 )
 
@@ -280,15 +253,14 @@ def run(cfg: DynamicsConfig):
                             "flow_mse": metrics_cpu["flow_mse"],
                             "boot_mse": metrics_cpu["bootstrap_mse"],
                             "lr": lr_schedule(step),
-                            "batch_type": 1.0 if use_long else 0.0,
+                            # "batch_type": 1. if use_long else 0,
                             **scaling.get_step_metrics(step),
                         },
                         pbar=pbar,
                     )
 
                 # Checkpointing
-                iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
-                bundle.maybe_save(checkpoint_manager, step, iterators, rng)
+                bundle.maybe_save(checkpoint_manager, step, rng)
 
             scaling.finalize()
 
