@@ -148,6 +148,7 @@ def run(cfg: DynamicsConfig):
 
         # Check if using latent data (pre-tokenized)
         use_latent_data = cfg.dataset.data_type == "latent"
+        train_step = latent_train_step if use_latent_data else encode_and_train_step
 
         # Load pretrained tokenizer (required for video data, optional for latent data checkpoints)
         tokenizer_bundle = TokenizerCheckpointBundle.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
@@ -287,7 +288,7 @@ def run(cfg: DynamicsConfig):
                     )
 
                 # Checkpointing
-                iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
+                # iterators = {"short_dataloader_state": short_iterator, "long_dataloader_state": long_iterator}
                 bundle.maybe_save(checkpoint_manager, step, iterators, rng)
 
             scaling.finalize()
