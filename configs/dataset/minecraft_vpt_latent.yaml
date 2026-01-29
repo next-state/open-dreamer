@@ -3,8 +3,8 @@ defaults:
 
 name: minecraft_vpt_latent
 data_type: latent
-array_record_path: /scratch/tokenized_dataset
-index_max: 30
+array_record_path: /scratch/arrayrecords-latents-diego
+index_max: 60
 
 num_binary_actions: 23
 categorical_action_dim: 121
