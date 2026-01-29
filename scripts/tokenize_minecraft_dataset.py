@@ -370,8 +370,12 @@ def main():
 
         # Process all batches
         total_videos = 0
-        all_channel_means = []
-        all_channel_stds = []
+        # Welford's online algorithm for numerically stable mean/variance
+        # Accumulate per-channel: count, mean, M2 (sum of squared deviations)
+        n_channels = tokenizer.cfg.encoder.d_bottleneck
+        welford_count = 0
+        welford_mean = np.zeros(n_channels, dtype=np.float64)
+        welford_m2 = np.zeros(n_channels, dtype=np.float64)
 
         try:
             pbar = tqdm(dataloader, desc="Tokenizing")
@@ -384,14 +388,19 @@ def main():
 
                 latents = encode_batch(videos)
 
-                # Compute per-channel stats on GPU (over B, T, n_latents)
-                channel_mean = latents[:batch_size].mean(axis=(0, 1, 2))
-                channel_std = latents[:batch_size].std(axis=(0, 1, 2))
-                all_channel_means.append(np.asarray(channel_mean))
-                all_channel_stds.append(np.asarray(channel_std))
+                # Update Welford stats with this batch (flatten B, T, n_latents into samples)
+                latents_valid = np.asarray(latents[:batch_size])  # (B, T, n_latents, D)
+                latents_flat = latents_valid.reshape(-1, n_channels)  # (N, D)
+                for sample in latents_flat:
+                    welford_count += 1
+                    delta = sample - welford_mean
+                    welford_mean += delta / welford_count
+                    delta2 = sample - welford_mean
+                    welford_m2 += delta * delta2
 
-                # Update tqdm with scalar stats
-                pbar.set_postfix(mean=f"{float(channel_mean.mean()):.4f}", std=f"{float(channel_std.mean()):.4f}")
+                # Compute running stats for display
+                current_std = np.sqrt(welford_m2 / welford_count) if welford_count > 0 else np.zeros(n_channels)
+                pbar.set_postfix(mean=f"{float(welford_mean.mean()):.4f}", std=f"{float(current_std.mean()):.4f}")
 
                 # Gather latents from each device shard separately to avoid GPU 0 spike
                 latents_np = np.concatenate(
@@ -417,24 +426,26 @@ def main():
                 total_videos += batch_size
 
                 # Periodically save stats (every 100 batches)
-                if len(all_channel_means) % 100 == 0:
+                if total_videos % (100 * batch_size) < batch_size:
+                    current_std = np.sqrt(welford_m2 / welford_count) if welford_count > 0 else np.zeros(n_channels)
                     np.savez(
                         stats_path,
-                        mean=np.stack(all_channel_means).mean(axis=0).astype(np.float32),
-                        std=np.stack(all_channel_stds).mean(axis=0).astype(np.float32),
-                        num_batches=len(all_channel_means),
+                        mean=welford_mean.astype(np.float32),
+                        std=current_std.astype(np.float32),
+                        num_samples=welford_count,
                         num_videos=total_videos,
                     )
 
         finally:
             writer.close()
             # Save final stats
-            if all_channel_means:
+            if welford_count > 0:
+                final_std = np.sqrt(welford_m2 / welford_count)
                 np.savez(
                     stats_path,
-                    mean=np.stack(all_channel_means).mean(axis=0).astype(np.float32),
-                    std=np.stack(all_channel_stds).mean(axis=0).astype(np.float32),
-                    num_batches=len(all_channel_means),
+                    mean=welford_mean.astype(np.float32),
+                    std=final_std.astype(np.float32),
+                    num_samples=welford_count,
                     num_videos=total_videos,
                 )
 
