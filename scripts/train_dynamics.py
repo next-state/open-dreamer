@@ -184,12 +184,13 @@ def run(cfg: DynamicsConfig):
         n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
         B, T = cfg.dataset.dataloader_cfg.B, cfg.dataset.dataloader_cfg.T
+        avg_T = int(cfg.long_batch_ratio * cfg.long_T + (1 - cfg.long_batch_ratio) * cfg.short_T)
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=dynamics.estimate_flops(batch_size=B, seq_length=T, n_latents=n_latents),
-            data_tokens_per_step=B * T * (n_spatial + 1),  # spatial + action
-            total_tokens_per_step=B * T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
+            flops_per_step=dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents),
+            data_tokens_per_step=B * avg_T * (n_spatial + 1),  # spatial + action
+            total_tokens_per_step=B * avg_T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
             logger=logger,
             run_dir=run_dir,
         )

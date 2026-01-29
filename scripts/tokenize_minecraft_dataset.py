@@ -16,6 +16,7 @@ import argparse
 import io
 import logging
 import os
+import pickle
 from pathlib import Path
 
 import decord
@@ -74,7 +75,6 @@ class MinecraftVPTProcessFullEpisode(grain.transforms.Map):
         )
 
     def map(self, element: bytes) -> dict:
-        import pickle
         # Create a dummy RNG for the processor
         rng = np.random.default_rng(0)
 
@@ -187,13 +187,6 @@ class DeviceShardedIterator:
             sharded_batch["_pad_size"] = pad_size
             sharded_batch["_batch_size"] = batch[self.sharded_keys[0]].shape[0]
             yield sharded_batch
-
-
-# ==============================================================================
-# Shard Writing (imported from shared module)
-# ==============================================================================
-
-# ShardWriter is imported at the top of the file
 
 
 # ==============================================================================
