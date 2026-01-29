@@ -193,12 +193,13 @@ def run(cfg: TokenizerConfig):
 
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_patches = (cfg.dataset.H // cfg.tokenizer.encoder.patch_size) * (cfg.dataset.W // cfg.tokenizer.encoder.patch_size)
+        B, T = cfg.dataset.dataloader_cfg.B, cfg.dataset.dataloader_cfg.T
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=tokenizer.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T),
-            data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * n_patches,
-            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.tokenizer.encoder.n_latents),
+            flops_per_step=tokenizer.estimate_flops(batch_size=B, seq_length=T),
+            data_tokens_per_step=B * T * n_patches,
+            total_tokens_per_step=B * T * (n_patches + cfg.tokenizer.encoder.n_latents),
             logger=logger,
             run_dir=run_dir,
         )
@@ -229,11 +230,7 @@ def run(cfg: TokenizerConfig):
             )
         ) as checkpoint_manager:
             # Resume from checkpoint
-            iterators = {"train_dataloader_state": train_iterator}
-            start_step, bundle, iterators, rng = bundle.restore(
-                checkpoint_manager, iterators, rng
-            )
-            train_iterator = iterators["train_dataloader_state"]
+            start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
 
             scaling.start_training()
 

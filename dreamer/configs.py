@@ -3,6 +3,24 @@ from dataclasses import dataclass, field
 
 # ---- Dataset Configs ----
 
+@dataclass(frozen=True, unsafe_hash=True)
+class DataloaderConfig:
+    """Configuration for dataloader parameters."""
+    # Batch and sequence dimensions
+    B: int = 32  # batch size
+    T: int = 64  # sequence length
+    
+    # Common parameters
+    num_workers: int = 16
+    prefetch_buffer_size: int = 10
+    device_prefetch_buffer_size: int = 1
+    
+    # Dual iterator parameters (for alternating short/long sequences)
+    short_T: int = 64
+    long_T: int = 64
+    long_ratio: float = 0.0
+    start_step: int = 0
+    
 @dataclass(frozen=False, unsafe_hash=True)
 class DatasetConfig:
     """Configuration for dataset parameters.
@@ -12,9 +30,8 @@ class DatasetConfig:
     """
     name: str = "coinrun"
 
-    # Batch and sequence dimensions
-    B: int = 32  # batch size
-    T: int = 64  # sequence length
+    dataloader_cfg: DataloaderConfig = field(default_factory=DataloaderConfig)
+    # Frame dimensions
     H: int = 64  # frame height
     W: int = 64  # frame width
     C: int = 3   # channels
@@ -44,6 +61,7 @@ class DatasetConfig:
 
     # Data type: "video" (default) or "latent" (pre-tokenized)
     data_type: str = "video"
+    
 
 # ---- Model Configs ----
 

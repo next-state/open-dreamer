@@ -6,8 +6,9 @@ defaults:
 run_name: tokenizer-512
 
 dataset:
-  B: 2
-  T: 256
+  dataloader_cfg:
+    B: 2
+    T: 256
 
 ckpt:
   max_to_keep: 1

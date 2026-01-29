@@ -5,7 +5,7 @@ import numpy as np
 import grain
 from grain._src.python.dataset import dataset as grain_dataset
 
-from ..configs import DatasetConfig
+from ..configs import DatasetConfig, DataloaderConfig
 from .transforms import (
     EpisodeLengthFilter,
     ProcessEpisodeAndSlice,
@@ -22,19 +22,21 @@ from grain.transforms import Batch
 # DataLoader to IterDataset Wrapper
 # ==============================================================================
 
-class DataLoaderIteratorWrapper(grain_dataset.DatasetIterator):
+class DataLoaderIteratorWrapper(grain_dataset.IterDataset):
     """Wraps a DataLoader iterator as a DatasetIterator for use with grain.experimental.device_put."""
     
-    def __init__(self, dataloader_iterator):
+    def __init__(self, dataloader):
         super().__init__()
-        self._iterator = dataloader_iterator
+        self._iterator = iter(dataloader)
         self._count = 0
     
+    def __iter__(self):
+        return self
+    
     def __next__(self):
-        self._assert_not_closed()
         self._count += 1
         return next(self._iterator)
-    
+        
     def get_state(self):
         # Basic state - just track count for debugging
         # Full checkpointing would need access to underlying dataloader state
@@ -43,40 +45,31 @@ class DataLoaderIteratorWrapper(grain_dataset.DatasetIterator):
     def set_state(self, state):
         self._count = state.get("count", 0)
 
-
-class DataLoaderIterDataset(grain_dataset.IterDataset):
-    """Wraps a DataLoader as an IterDataset for use with grain.experimental.device_put."""
-    
-    def __init__(self, dataloader):
-        super().__init__()
-        self._dataloader = dataloader
-    
-    def __iter__(self):
-        return DataLoaderIteratorWrapper(iter(self._dataloader))
-
-
 # ==============================================================================
 # Factory
 # ==============================================================================
 
 def make_iterator(
     cfg: DatasetConfig,
-    num_workers: int = 16,
-    prefetch_buffer_size: int = 10,
+    *,
     seed: int = 42,
     print_filter_warnings: bool = False,
     device = None,
-    device_prefetch_buffer_size: int = 1
 ):
     """Creates a data loading pipeline using Grain from a DatasetConfig.
 
     Args:
         cfg: Dataset configuration
-        num_workers: Number of worker processes
-        prefetch_buffer_size: Prefetch buffer size
+        dataloader_cfg: Dataloader configuration (defaults to cfg.dataloader_cfg if None)
         seed: Random seed
         print_filter_warnings: Whether to print filter warnings
+        device: Device for prefetching
     """
+    dataloader_cfg = cfg.dataloader_cfg
+    
+    num_workers = dataloader_cfg.num_workers
+    prefetch_buffer_size = dataloader_cfg.prefetch_buffer_size
+    device_prefetch_buffer_size = dataloader_cfg.device_prefetch_buffer_size
     # Build array record paths using utility
     use_latent_data = cfg.data_type == "latent"
     dataset_type = "latent" if use_latent_data else cfg.name
@@ -89,12 +82,12 @@ def make_iterator(
 
     num_processes = jax.process_count()
 
-    if cfg.B % num_processes != 0:
+    if dataloader_cfg.B % num_processes != 0:
         raise ValueError(
-            f"Global batch size {cfg.B} must be divisible by "
+            f"Global batch size {dataloader_cfg.B} must be divisible by "
             f"the number of JAX processes {num_processes}."
         )
-    per_process_batch_size = cfg.B // num_processes
+    per_process_batch_size = dataloader_cfg.B // num_processes
 
     source = grain.sources.ArrayRecordDataSource(array_record_paths)
 
@@ -111,23 +104,23 @@ def make_iterator(
         # Pre-tokenized latent data path
         operations = [
             # EpisodeLengthFilter(
-            #     seq_len=cfg.T,
+            #     seq_len=dataloader_cfg.T,
             #     format_hint="latent",
             #     print_filter_warnings=print_filter_warnings,
             # ),
-            ProcessLatentAndSlice(seq_len=cfg.T),
+            ProcessLatentAndSlice(seq_len=dataloader_cfg.T),
             Batch(batch_size=per_process_batch_size, drop_remainder=True),
             CreateActions()
         ]
     elif cfg.name == "minecraft_vpt":
         operations = [
             EpisodeLengthFilter(
-                seq_len=cfg.T,
+                seq_len=dataloader_cfg.T,
                 format_hint="vpt",
                 print_filter_warnings=print_filter_warnings,
             ),
             ProcessMinecraftEpisodeAndSlice(
-                seq_len=cfg.T,
+                seq_len=dataloader_cfg.T,
                 image_h=cfg.H,
                 image_w=cfg.W,
                 image_c=cfg.C,
@@ -141,12 +134,12 @@ def make_iterator(
     else:
         operations = [
             EpisodeLengthFilter(
-                seq_len=cfg.T,
+                seq_len=dataloader_cfg.T,
                 format_hint="coinrun",
                 print_filter_warnings=print_filter_warnings,
             ),
             ProcessEpisodeAndSlice(
-                seq_len=cfg.T,
+                seq_len=dataloader_cfg.T,
                 image_h=cfg.H,
                 image_w=cfg.W,
                 image_c=cfg.C,
@@ -175,7 +168,7 @@ def make_iterator(
         return iter(dataloader)
     
     # Wrap DataLoader as IterDataset for compatibility with grain.experimental.device_put
-    iter_dataset = DataLoaderIterDataset(dataloader)
+    iter_dataset = DataLoaderIteratorWrapper(dataloader)
     iter_dataset = device_put(
         iter_dataset,
         device,
@@ -185,100 +178,81 @@ def make_iterator(
     
     return iter_dataset
 
-class AlternatingIterator:
-    def __init__(
-        self,
-        short_iterator,
-        long_iterator,
-        long_ratio: float,
-        *,
-        start_step: int = 0,
-    ) -> None:
+
+
+
+class AlternatingIterator(grain.IterDataset):
+    def __init__(self, short_iterator, long_iterator, long_ratio: float, seed: int) -> None:
         self.short_iterator = short_iterator
         self.long_iterator = long_iterator
         self.long_ratio = long_ratio
+        self._rng_key = jax.random.key(seed)
 
-        if long_ratio <= 0.0:
-            self._mode = "short"
-            self._long_budget = 0.0
-        elif long_ratio >= 1.0:
-            self._mode = "long"
-            self._long_budget = 0.0
-        else:
-            self._mode = "mixed"
-            self._long_budget = (start_step * long_ratio) % 1.0
+    def __next__(self):
+        self._rng_key, subkey = jax.random.split(self._rng_key)
+        if float(jax.random.uniform(subkey)) < self.long_ratio:
+            return True, next(self.long_iterator)
+        return False, next(self.short_iterator)
 
     def __iter__(self):
         return self
 
-    def __next__(self):
-        if self._mode == "short":
-            return False, next(self.short_iterator)
-        if self._mode == "long":
-            return True, next(self.long_iterator)
-
-        self._long_budget += self.long_ratio
-        if self._long_budget >= 1.0:
-            self._long_budget -= 1.0
-            return True, next(self.long_iterator)
-        return False, next(self.short_iterator)
-
-    @property
-    def iterators(self) -> dict[str, grain.DataLoaderIterator]:
-        return {
-            "short_dataloader_state": self.short_iterator,
-            "long_dataloader_state": self.long_iterator,
-        }
-
-
 def make_dual_iterator(
     cfg: DatasetConfig,
-    short_T: int,
-    long_T: int,
-    long_ratio: float,
     *,
-    start_step: int = 0,
-    iterators: dict[str, grain.DataLoaderIterator] | None = None,
-    num_workers: int = 22,
-    prefetch_buffer_size: int = 1,
     seed: int = 42,
     print_filter_warnings: bool = False,
-) -> AlternatingIterator:
-    """Create alternating iterator over short and long sequences."""
-    if iterators is None:
-        # Create config for short sequences
-        cfg_short = copy.copy(cfg)
-        cfg_short.T = short_T
-
-        # Create config for long sequences
-        cfg_long = copy.copy(cfg)
-        cfg_long.T = long_T
-
-        # Use different seeds to avoid correlation between iterators
-        short_loader = make_iterator(
-            cfg_short,
-            num_workers=num_workers,
-            prefetch_buffer_size=prefetch_buffer_size,
+    device = None,
+    ) -> grain.IterDataset:
+    """Create alternating iterator over short and long sequences.
+    
+    Args:
+        cfg: Dataset configuration
+        dataloader_cfg: Dataloader configuration (defaults to cfg.dataloader_cfg if None)
+        seed: Random seed
+        print_filter_warnings: Whether to print filter warnings
+        device: Device for prefetching
+    """
+    dataloader_cfg = cfg.dataloader_cfg
+    
+    short_T = dataloader_cfg.short_T
+    long_T = dataloader_cfg.long_T
+    long_ratio = dataloader_cfg.long_ratio
+    num_workers = dataloader_cfg.num_workers
+    prefetch_buffer_size = dataloader_cfg.prefetch_buffer_size
+    device_prefetch_buffer_size = dataloader_cfg.device_prefetch_buffer_size
+    
+    if short_T == long_T:
+        iterator = make_iterator(
+            cfg,
             seed=seed,
             print_filter_warnings=print_filter_warnings,
         )
-        long_loader = make_iterator(
-            cfg_long,
-            num_workers=num_workers,
-            prefetch_buffer_size=prefetch_buffer_size,
-            seed=seed + 1,  # Different seed for variety
-            print_filter_warnings=print_filter_warnings,
+        return iterator
+        
+    # Create iterators for short and long sequences
+    iterators = []
+    for T in [short_T, long_T]:
+        # Create a modified dataloader config with the specific T
+        dl_cfg = DataloaderConfig(
+            B=dataloader_cfg.B,
+            T=T,
+            num_workers=num_workers // 2,
+            prefetch_buffer_size=(prefetch_buffer_size + 1) // 2,
+            device_prefetch_buffer_size=(device_prefetch_buffer_size + 1) // 2,
+            short_T=short_T,
+            long_T=long_T,
+            long_ratio=long_ratio,
+            start_step=dataloader_cfg.start_step,
         )
+        it = make_iterator(
+            cfg=cfg,
+            seed=seed + T,
+            print_filter_warnings=print_filter_warnings,
+            device=device,
+        )
+        iterators.append(it)
 
-        short_iterator = iter(short_loader)
-        long_iterator = iter(long_loader)
-    else:
-        short_iterator = iterators["short_dataloader_state"]
-        long_iterator = iterators["long_dataloader_state"]
-
-    return AlternatingIterator(
-        short_iterator,
-        long_iterator,
-        long_ratio,
-        start_step=start_step,
-    )
+    iterator = AlternatingIterator(iterators[0], iterators[1], long_ratio, seed)
+    return iterator
+    

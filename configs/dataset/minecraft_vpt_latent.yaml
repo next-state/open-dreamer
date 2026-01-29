@@ -10,8 +10,17 @@ num_binary_actions: 23
 categorical_action_dim: 121
 continuous_action_dim: 0
 
-B: 8
-T: 4
+dataloader_cfg:
+  B: 8
+  T: 4
+  num_workers: 16
+  prefetch_buffer_size: 10
+  device_prefetch_buffer_size: 1
+  short_T: 4
+  long_T: 4
+  long_ratio: 0.0
+  start_step: 0
+
 H: 360
 W: 640
 C: 3

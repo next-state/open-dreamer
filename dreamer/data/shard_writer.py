@@ -7,8 +7,9 @@ with automatic rotation based on records_per_shard limit.
 from array_record.python.array_record_module import ArrayRecordWriter
 from pathlib import Path
 from typing import Literal
+import pickle
 
-from .serialization import serialize_pickle_record, serialize_msgpack_record
+from .serialization import serialize_msgpack_record
 
 
 class ShardWriter:
@@ -50,7 +51,7 @@ class ShardWriter:
 
         # Select serializer
         if serialization_format == "pickle":
-            self._serializer = serialize_pickle_record
+            self._serializer = lambda x: pickle.dumps(x)
         elif serialization_format == "msgpack":
             self._serializer = serialize_msgpack_record
         else:
@@ -93,12 +94,3 @@ class ShardWriter:
         """Context manager exit - ensures writer is closed."""
         self.close()
 
-    @property
-    def total_records(self) -> int:
-        """Total number of records written across all shards."""
-        return self._total_records
-
-    @property
-    def num_shards(self) -> int:
-        """Number of shards created (including current open shard)."""
-        return self.shard_idx

@@ -11,8 +11,12 @@ ckpt:
   save_interval_steps: 10_000
 
 dataset:
-  B: 32
-  T: 64
+  dataloader_cfg:
+    B: 32
+    T: 64
+    short_T: ${short_T}
+    long_T: ${long_T}
+    long_ratio: ${long_batch_ratio}
   C: 16
 
 dynamics:

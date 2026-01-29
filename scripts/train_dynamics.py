@@ -3,6 +3,7 @@ import logging
 import hydra
 import jax
 import jax.numpy as jnp
+from jax.experimental.multihost_utils import sync_global_devices
 import numpy as np
 from flax import nnx
 from omegaconf import OmegaConf
@@ -182,12 +183,13 @@ def run(cfg: DynamicsConfig):
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
+        B, T = cfg.dataset.dataloader_cfg.B, cfg.dataset.dataloader_cfg.T
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T, n_latents=n_latents),
-            data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_spatial + 1),  # spatial + action
-            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
+            flops_per_step=dynamics.estimate_flops(batch_size=B, seq_length=T, n_latents=n_latents),
+            data_tokens_per_step=B * T * (n_spatial + 1),  # spatial + action
+            total_tokens_per_step=B * T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
             logger=logger,
             run_dir=run_dir,
         )
@@ -206,7 +208,7 @@ def run(cfg: DynamicsConfig):
         )
 
         # Data iterator (replaced with dummy random iterator)
-        dataloader = make_iterator(cfg.dataset, device=data_sharding, num_workers= 8, prefetch_buffer_size=10, device_prefetch_buffer_size=2)
+        dataloader = make_iterator(cfg.dataset, device=data_sharding)
         start_step = 0
         # batch_iterator = iter(dataloader)
         # batch_iterator = make_dummy_iterator(cfg, tokenizer_cfg)
@@ -242,14 +244,15 @@ def run(cfg: DynamicsConfig):
                 latents = batch.get("latents")
                 input_tensor = latents if latents is not None else videos
                 
+                sync_global_devices("sync")
                 # Training step
                 metrics = train_step(
                     bundle.tokenizer, bundle.dynamics, 
                     bundle.dynamics_optimizer, input_tensor, actions,
                     master_key=master_key,
                     step=step,
-                    B_img=int(cfg.dataset.B * cfg.image_fraction),
-                    T=cfg.dataset.T,
+                    B_img=int(B * cfg.image_fraction),
+                    T=T,
                     categorical_action_dim=cfg.dataset.categorical_action_dim,
                     k_max=cfg.dynamics.k_max,
                     context_length=cfg.dynamics.context_length,
