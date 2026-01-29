@@ -368,24 +368,7 @@ class ProcessLatentAndSlice(grain.transforms.RandomMap):
 # Action Processing
 # ==============================================================================
 
-class CreateActions(grain.transforms.Map):
-    """Convert batched action arrays into Actions dataclass."""
 
-    def map(self, batch: dict) -> dict:
-        """Convert action arrays to Actions dataclass.
-
-        Args:
-            batch: Batch dictionary with actions_* keys
-
-        Returns:
-            Batch with actions field as Actions dataclass
-        """
-        batch["actions"] = Actions(
-            binary=batch.pop("actions_binary", None),
-            categorical=batch.pop("actions_categorical", None),
-            continuous=batch.pop("actions_continuous", None),
-        )
-        return batch
 
 
 class NumpyToJax(grain.transforms.Map):
@@ -534,7 +517,7 @@ def make_iterator(
             ),
         ]
             
-    common_ops = [Batch(batch_size=per_process_batch_size, drop_remainder=True), CreateActions(), CastDtype(dataloader_cfg.dtype)]
+    common_ops = [Batch(batch_size=per_process_batch_size, drop_remainder=True), CastDtype(dataloader_cfg.dtype)]
     operations = operations + common_ops
 
     dataloader = grain.DataLoader(

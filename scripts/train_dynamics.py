@@ -3,14 +3,13 @@ import logging
 import hydra
 import jax
 import jax.numpy as jnp
-from jax.experimental.multihost_utils import sync_global_devices
 import numpy as np
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import DynamicsConfig
-from dreamer.data import make_iterator  # Removed for dummy dataloader
+from dreamer.data import make_iterator  
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions
@@ -166,21 +165,21 @@ def run(cfg: DynamicsConfig):
 
         # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
         dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
-        bootstrap_multiplier = 1 + cfg.bootstrap_fraction * (2/6)
+        bootstrap_multiplier = 1 + cfg.bootstrap_fraction * (2/3)  # two additional gradientless calls to dynamics model, 1/6 for inference
         total_dynamics_flops = dynamics_flops * bootstrap_multiplier
 
         # Encoder FLOPs: forward-only (no gradients) when using video data
         encoder_flops = 0
         if not use_latent_data:
             tokenizer_training_flops = tokenizer.estimate_flops(batch_size=B, seq_length=avg_T)
-            encoder_flops = tokenizer_training_flops // 12  # ~1/12 of tokenizer training FLOPs (half for encoder, 1/6 for inference)
+            encoder_flops = tokenizer_training_flops // 6  # ~1/6 of tokenizer training FLOPs (half for encoder, 1/3 for inference)
 
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
             flops_per_step=dynamics_flops + encoder_flops,
             data_tokens_per_step=B * avg_T * (n_spatial + 1),  # spatial + action
-            total_tokens_per_step=B * avg_T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
+            total_tokens_per_step=B * avg_T * (2 + n_spatial + cfg.dynamics.n_register),  # action + shortcut + spatial + register
             logger=logger,
             run_dir=run_dir,
         )
@@ -198,7 +197,6 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        # Data iterator (replaced with dummy random iterator)
         dataloader = make_iterator(cfg.dataset, device=data_sharding)
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
@@ -219,7 +217,18 @@ def run(cfg: DynamicsConfig):
                 latents = batch.get("latents")
                 input_tensor = latents if latents is not None else videos
                 
-                sync_global_devices("sync")
+
+                # Validation step before training (as input buffers might be donated)
+                if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
+                    val_data = input_tensor[:4]
+                    val_actions = actions[:4]
+                    run_evaluation(
+                        cfg, step, bundle.tokenizer, bundle.dynamics,
+                        val_data=val_data, val_actions=val_actions,
+                        use_latent_data=use_latent_data,
+                        vis_dir=vis_dir, rng=rng, logger=logger
+                    )
+
                 # Training step
                 metrics = train_step(
                     bundle.tokenizer, bundle.dynamics, 
@@ -234,18 +243,6 @@ def run(cfg: DynamicsConfig):
                     use_latent_data=use_latent_data,
                 )
 
-                # Validation step before training (as input buffers might be donated)
-                if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
-                    val_data = input_tensor[:4]
-                    val_actions = actions[:4]
-                    run_evaluation(
-                        cfg, step, bundle.tokenizer, bundle.dynamics,
-                        val_data=val_data, val_actions=val_actions,
-                        use_latent_data=use_latent_data,
-                        vis_dir=vis_dir, rng=rng, logger=logger
-                    )
-
-
                 # Logging
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(metrics)
@@ -256,13 +253,13 @@ def run(cfg: DynamicsConfig):
                             "flow_mse": metrics_cpu["flow_mse"],
                             "boot_mse": metrics_cpu["bootstrap_mse"],
                             "lr": lr_schedule(step),
+                            # "batch_type": 1. if use_long else 0,
                             **scaling.get_step_metrics(step),
                         },
                         pbar=pbar,
                     )
 
                 # Checkpointing
-                # TODO: checkpointing with DevicePutIterator needs iterator state access
                 bundle.maybe_save(checkpoint_manager, step, rng)
 
             scaling.finalize()
