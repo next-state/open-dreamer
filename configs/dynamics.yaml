@@ -3,11 +3,11 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-test
+run_name: dynamics
 tokenizer_ckpt: logs/tokenizer-512/checkpoints/
 
 ckpt:
-  max_to_keep: 0
+  max_to_keep: 1
   save_interval_steps: 10_000
 
 dataset:
@@ -47,7 +47,8 @@ dynamics:
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
 
-bootstrap_start: 5_000
+bootstrap_start: 5_000  # Number of start steps trained exclusively on flow-matching objective
+bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
 image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
 
 # Alternating batch lengths (paper: "Sequence length" paragraph)
@@ -62,18 +63,18 @@ lr_schedule:
   lr: 3e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
-  warmup_ratio: 0.167
-  decay_ratio: 0.067
+  warmup_ratio: 0.05
+  decay_ratio: 0.5
   max_steps: ${max_steps}
 
 optimizer:
   optimizer_type: muon
-  weight_decay: 1e-4
+  weight_decay: 0.1
   # AdamW params (for embeddings/biases)
-  adam_lr_ratio: 0.01
+  adam_lr_ratio: 1.0
   adam_b1: 0.9
-  adam_b2: 0.9
-  mup_scaling: true
+  adam_b2: 0.99
+  mup_scaling: false
   mup_base_dim: 512
   # Muon params (for 2D matrix weights)
   muon_beta: 0.95

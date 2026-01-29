@@ -286,6 +286,11 @@ def main():
             serialization_format="msgpack"
         )
 
+        # Create metadata directory for stats
+        metadata_dir = output_dir / "metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+        stats_path = metadata_dir / "latent_stats.npz"
+
         # JIT-compile encode function
         @nnx.jit
         def encode_batch(videos):
@@ -299,8 +304,12 @@ def main():
 
         # Process all batches
         total_videos = 0
-        all_channel_means = []
-        all_channel_stds = []
+        # Welford's online algorithm for numerically stable mean/variance
+        # Accumulate per-channel: count, mean, M2 (sum of squared deviations)
+        n_channels = tokenizer.cfg.encoder.d_bottleneck
+        welford_count = 0
+        welford_mean = np.zeros(n_channels, dtype=np.float64)
+        welford_m2 = np.zeros(n_channels, dtype=np.float64)
 
         try:
             pbar = tqdm(dataloader, desc="Tokenizing")
@@ -313,14 +322,19 @@ def main():
 
                 latents = encode_batch(videos)
 
-                # Compute per-channel stats on GPU (over B, T, n_latents)
-                channel_mean = latents[:batch_size].mean(axis=(0, 1, 2))
-                channel_std = latents[:batch_size].std(axis=(0, 1, 2))
-                all_channel_means.append(np.asarray(channel_mean))
-                all_channel_stds.append(np.asarray(channel_std))
+                # Update Welford stats with this batch (flatten B, T, n_latents into samples)
+                latents_valid = np.asarray(latents[:batch_size])  # (B, T, n_latents, D)
+                latents_flat = latents_valid.reshape(-1, n_channels)  # (N, D)
+                for sample in latents_flat:
+                    welford_count += 1
+                    delta = sample - welford_mean
+                    welford_mean += delta / welford_count
+                    delta2 = sample - welford_mean
+                    welford_m2 += delta * delta2
 
-                # Update tqdm with scalar stats
-                pbar.set_postfix(mean=f"{float(channel_mean.mean()):.4f}", std=f"{float(channel_std.mean()):.4f}")
+                # Compute running stats for display
+                current_std = np.sqrt(welford_m2 / welford_count) if welford_count > 0 else np.zeros(n_channels)
+                pbar.set_postfix(mean=f"{float(welford_mean.mean()):.4f}", std=f"{float(current_std.mean()):.4f}")
 
                 # Gather latents from each device shard separately to avoid GPU 0 spike
                 latents_np = np.concatenate(
@@ -345,21 +359,37 @@ def main():
 
                 total_videos += batch_size
 
+                # Periodically save stats (every 100 batches)
+                if total_videos % (100 * batch_size) < batch_size:
+                    current_std = np.sqrt(welford_m2 / welford_count) if welford_count > 0 else np.zeros(n_channels)
+                    np.savez(
+                        stats_path,
+                        mean=welford_mean.astype(np.float32),
+                        std=current_std.astype(np.float32),
+                        num_samples=welford_count,
+                        num_videos=total_videos,
+                    )
+
         finally:
             writer.close()
+            # Save final stats
+            if welford_count > 0:
+                final_std = np.sqrt(welford_m2 / welford_count)
+                np.savez(
+                    stats_path,
+                    mean=welford_mean.astype(np.float32),
+                    std=final_std.astype(np.float32),
+                    num_samples=welford_count,
+                    num_videos=total_videos,
+                )
 
         print(f"[tokenize] Done! Processed {total_videos} videos")
         print(f"[tokenize] Wrote {writer.shard_idx} shards to {args.output_dir}")
         print(f"[tokenize] Total records: {writer.total_records}")
-        
-        # Print final channel-wise statistics
-        if all_channel_means:
-            mean_of_means = np.stack(all_channel_means).mean(axis=0)
-            mean_of_stds = np.stack(all_channel_stds).mean(axis=0)
-            
-            print(f"\n[tokenize] Latent statistics ({len(all_channel_means)} batches):")
-            print(f"[tokenize] Channel-wise mean: {mean_of_means}")
-            print(f"[tokenize] Channel-wise std: {mean_of_stds}")
+        print(f"[tokenize] Latent stats saved to: {stats_path}")
+
+        # stats = np.load("output_dir/metadata/latent_stats.npz")                                                                                            
+        # print(stats["mean"], stats["std"], stats["num_batches"])    
 
 
 if __name__ == "__main__":

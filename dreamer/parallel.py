@@ -1,6 +1,7 @@
 import jax
 from dataclasses import dataclass
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from typing import Literal
 
 
 @dataclass(unsafe_hash=True)
@@ -15,7 +16,7 @@ class MeshRules:
     return tuple(getattr(self, key) for key in keys)
 
 
-def build_parallel(strategy: str) -> tuple[Mesh, NamedSharding, MeshRules]:
+def build_parallel(strategy: Literal["data", "fsdp", "tp", "sp"]) -> tuple[Mesh, NamedSharding, MeshRules]:
     """Build parallelization setup based on strategy."""
     n = len(jax.devices())
 

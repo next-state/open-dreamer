@@ -8,13 +8,12 @@ import numpy as np
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
-from einops import rearrange, repeat
 
 from dreamer.configs import DynamicsConfig
 from dreamer.data import make_iterator  # Removed for dummy dataloader
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.actions import Actions, create_noop_action_like
+from dreamer.actions import Actions
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
@@ -49,12 +48,15 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # Training Step
 # ---------------------------
 
-@nnx.jit(static_argnames=("k_max", "B_img", "T", "context_length"))
-def encode_and_train_step(
+@nnx.jit(
+    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_fraction", "use_latent_data"),
+    donate_argnames=("data", "actions"),
+)
+def train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
     optimizer: nnx.Optimizer,
-    videos: jnp.ndarray,      # Full batch (B, T, H, W, C)
+    data: jnp.ndarray,        # Full batch: videos (B, T, H, W, C) or latents (B, T, n_latents, d_bottleneck)
     actions: Actions,         # Full batch (B, T, ...)
     *,
     tokenizer_key: jax.Array,
@@ -62,50 +64,29 @@ def encode_and_train_step(
     step: int,
     B_img: int,               # Number of samples to treat as images
     T: int,
-    categorical_action_dim: int,
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
+    bootstrap_fraction: float,
+    use_latent_data: bool,    # True if data is already latents, False if data is videos
 ):
-    rngs = nnx.Rngs(mae=tokenizer_key)
+    if use_latent_data:
+        latents = data
+    else:
+        rngs = nnx.Rngs(mae=tokenizer_key)
+        latents, _ = tokenizer.encode(data, deterministic=True, rngs=rngs)
+        latents = jax.lax.stop_gradient(latents)
 
-    # Encode
-    latents, _ = tokenizer.encode(videos, deterministic=True, rngs=rngs)
-
-    return latent_train_step(
-        dynamics, optimizer, latents, actions,
-        master_key=master_key, step=step, B_img=B_img, T=T,
-        categorical_action_dim=categorical_action_dim, k_max=k_max, context_length=context_length,
-    )
-
-
-@nnx.jit(
-        static_argnames=("k_max", "B_img", "T", "categorical_action_dim", "context_length"),
-        donate_argnames=("latents", "actions"),
-)
-def latent_train_step(
-    tokenizer: Tokenizer,
-    dynamics: Dynamics,
-    optimizer: nnx.Optimizer,
-    latents: jnp.ndarray,     # Full batch (B, T, n_latents, d_bottleneck)
-    actions: Actions,         # Full batch (B, T, ...)
-    *,
-    master_key: jax.Array,
-    step: int,
-    B_img: int,               # Number of samples to treat as images
-    T: int,
-    categorical_action_dim: int,
-    k_max: int,
-    context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
-):
-    """Training step for pre-tokenized latent data (skips tokenizer encoding)."""
     latents = latents.astype(dynamics.dtype)
 
     B = latents.shape[0]
-    B_self = B // 2    # Split batch for empirical and bootstrap learning
+    B_self = int(B * bootstrap_fraction)
+    B_emp = B - B_self
 
-    # Identify image samples (across both empirical and bootstrap halves)
+    # Identify image samples (split with same bootstrap ratio)
     idx = jnp.arange(B)
-    is_img = (idx < (B_img // 2)) | ((idx >= B_self) & (idx < (B_self + B_img // 2)))
+    B_img_boot = int(B_img * bootstrap_fraction)
+    B_img_emp = B_img - B_img_boot
+    is_img = (idx < B_img_emp) | ((idx >= B_emp) & (idx < (B_emp + B_img_boot)))
 
     # Build time mask for full batch
     mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
@@ -168,7 +149,6 @@ def run(cfg: DynamicsConfig):
 
         # Check if using latent data (pre-tokenized)
         use_latent_data = cfg.dataset.data_type == "latent"
-        train_step = latent_train_step if use_latent_data else encode_and_train_step
 
         # Load pretrained tokenizer (required for video data, optional for latent data checkpoints)
         tokenizer_bundle = TokenizerCheckpointBundle.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
@@ -185,6 +165,18 @@ def run(cfg: DynamicsConfig):
         n_spatial = n_latents // cfg.dynamics.packing_factor
         B, T = cfg.dataset.dataloader_cfg.B, cfg.dataset.dataloader_cfg.T
         avg_T = int(cfg.long_batch_ratio * cfg.long_T + (1 - cfg.long_batch_ratio) * cfg.short_T)
+
+        # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
+        dynamics_flops = dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T, n_latents=n_latents)
+        bootstrap_multiplier = 1 + 2 * cfg.bootstrap_fraction
+        total_dynamics_flops = dynamics_flops * bootstrap_multiplier
+
+        # Encoder FLOPs: forward-only (no gradients) when using video data
+        encoder_flops = 0
+        if not use_latent_data:
+            tokenizer_training_flops = tokenizer.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T)
+            encoder_flops = tokenizer_training_flops // 12  # ~1/12 of tokenizer training FLOPs (half for encoder, 1/6 for inference)
+
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
@@ -244,14 +236,13 @@ def run(cfg: DynamicsConfig):
                 )
 
                 # Validation step before training (as input buffers might be donated)
-                if cfg.write_video_every and (step % cfg.write_video_every == 0) and step > 0:
-                    val_videos = None if use_latent_data else videos[:4]
-                    val_latents = latents[:4] if use_latent_data else None
+                if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
+                    val_data = data[:4]
                     val_actions = actions[:4]
                     run_evaluation(
                         cfg, step, bundle.tokenizer, bundle.dynamics,
-                        val_videos=val_videos, val_latents=val_latents,
-                        val_actions=val_actions, 
+                        val_data=val_data, val_actions=val_actions,
+                        use_latent_data=use_latent_data,
                         vis_dir=vis_dir, rng=rng, logger=logger
                     )
 

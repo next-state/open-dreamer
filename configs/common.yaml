@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 run_name: ???
-use_wandb: False
+use_wandb: True
 dataset: ???
 scaling_tokens_per_param: 0.0
 scaling_flops_budget: 0.0
@@ -28,7 +28,7 @@ dtype: bfloat16
 param_dtype: float32
 
 # Parallel
-parallel_strategy: data  # data | fsdp | tp
+parallel_strategy: data  # data | fsdp | tp | sp
 
 # Random seed
 seed: 0

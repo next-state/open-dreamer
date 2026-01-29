@@ -150,9 +150,9 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         self.image_h = image_h
         self.image_w = image_w
         self.image_c = image_c
-        self.padding_h = tuple(padding_h) if isinstance(padding_h, list) else padding_h
-        self.padding_w = tuple(padding_w) if isinstance(padding_w, list) else padding_w
         self.p_include_reward = float(p_include_reward)
+        self.padding_h = padding_h
+        self.padding_w = padding_w
 
         # Validate padding alignment with patch_size
         if patch_size is not None:
@@ -217,14 +217,14 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
             constant_values=0
         )
 
-        # Extract actions and rewards
-        actions_tensor = np.array(data["actions"])
-
+        actions_tensor = np.array(element["actions"])
         return {
             "videos": seq,
-            "actions_categorical": actions_tensor[start_idx : start_idx + self.seq_len],
-            "actions_binary": None,
-            "actions_continuous": None,
+            "actions": Actions(
+                binary=None,
+                categorical=actions_tensor[start_idx : start_idx + self.seq_len],
+                continuous=None,
+            ),
             "rewards": rewards_tensor[start_idx : start_idx + self.seq_len],
         }
 
@@ -266,8 +266,8 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             full_episode: If True, return full episode without slicing (for tokenization)
         """
         self.seq_len = seq_len
-        self.padding_h = tuple(padding_h) if isinstance(padding_h, list) else padding_h
-        self.padding_w = tuple(padding_w) if isinstance(padding_w, list) else padding_w
+        self.padding_h = padding_h
+        self.padding_w = padding_w
         self.full_episode = full_episode
 
         # Validate padding alignment with patch_size
@@ -319,9 +319,7 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
 
         return {
             "videos": video,
-            "actions_categorical": None,
-            "actions_binary": None,
-            "actions_continuous": None,
+            "actions": Actions(binary=None, categorical=None, continuous=None),  # FIXME: no actions returned!!
             "rewards": None,
         }
 
@@ -353,25 +351,16 @@ class ProcessLatentAndSlice(grain.transforms.RandomMap):
         """
         data = deserialize_msgpack_record(element)
         latents = data["latents"]  # (T, n_latents, d_bottleneck)
-        actions = data["actions"]   # dict with action arrays
+        actions = data["actions"]  # dict with action arrays
 
         episode_len = latents.shape[0]
         max_start = episode_len - self.seq_len
         start = int(rng.integers(0, max_start + 1))
-
-        # Slice latents
-        sliced_latents = latents[start:start + self.seq_len].astype(np.float32)
-
-        # Slice actions (handle None values)
-        actions_binary = actions.get("binary")
-        actions_categorical = actions.get("categorical")
-        actions_continuous = actions.get("continuous")
+        end = start + self.seq_len
 
         return {
-            "latents": sliced_latents,
-            "actions_binary": actions_binary[start:start + self.seq_len] if actions_binary is not None else None,
-            "actions_categorical": actions_categorical[start:start + self.seq_len] if actions_categorical is not None else None,
-            "actions_continuous": actions_continuous[start:start + self.seq_len] if actions_continuous is not None else None,
+            "latents": latents[start:end].astype(np.float32),
+            "actions": Actions.from_dict(actions)[start:end],
         }
 
 
@@ -642,7 +631,7 @@ def make_dual_iterator(
             start_step=dataloader_cfg.start_step,
         )
         it = make_iterator(
-            cfg=cfg,
+            cfg=dl_cfg,
             seed=seed + T,
             print_filter_warnings=print_filter_warnings,
             device=device,
