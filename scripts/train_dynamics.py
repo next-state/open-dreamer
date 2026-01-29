@@ -200,7 +200,7 @@ def run(cfg: DynamicsConfig):
 
         # Data iterator (replaced with dummy random iterator)
         dataloader = make_iterator(cfg.dataset, device=data_sharding)
-        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
+        with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
             scaling.start_training()
@@ -230,7 +230,7 @@ def run(cfg: DynamicsConfig):
                     T=T,
                     k_max=cfg.dynamics.k_max,
                     context_length=cfg.dynamics.context_length,
-                    bootstrap_fraction=cfg.bootstrap_fraction,
+                    bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                     use_latent_data=use_latent_data,
                 )
 

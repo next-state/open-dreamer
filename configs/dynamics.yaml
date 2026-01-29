@@ -31,7 +31,7 @@ dynamics:
     rope_theta: 10000.0
     time_every: 4
     mlp_ratio: 4
-    dropout_rate: 0.05
+    dropout_rate: 0.00
     k_max: 128
     context_length: 192  # Attention window for sliding window attention
     use_residual_lambdas: true
@@ -56,7 +56,7 @@ short_T: 32  # Overrides dataset.T
 long_T: 32  # Overrides dataset.T
 long_batch_ratio: 0.1  # Fraction of batches that use long_T
 
-max_steps: 300_000
+max_steps: 30_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
