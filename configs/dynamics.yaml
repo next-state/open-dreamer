@@ -57,22 +57,22 @@ lr_schedule:
   lr: 3e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
-  warmup_ratio: 0.167
-  decay_ratio: 0.067
+  warmup_ratio: 0.05
+  decay_ratio: 0.5
   max_steps: ${max_steps}
 
 optimizer:
   optimizer_type: muon
-  weight_decay: 1e-4
+  weight_decay: 0.1
   # AdamW params (for embeddings/biases)
-  adam_lr_ratio: 0.01
+  adam_lr_ratio: 1.0
   adam_b1: 0.9
-  adam_b2: 0.9
-  mup_scaling: true
+  adam_b2: 0.99
+  mup_scaling: false
   mup_base_dim: 512
   # Muon params (for 2D matrix weights)
   muon_beta: 0.95
   muon_ns_steps: 5
   muon_nesterov: true
 
-write_video_every: 500
+write_video_every: 5000

@@ -47,7 +47,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_start", "bootstrap_fraction", "use_latent_data"),
+    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_fraction", "use_latent_data"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
