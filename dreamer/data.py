@@ -16,6 +16,7 @@ from dreamer.configs import DatasetConfig, DataloaderConfig
 from dreamer.data.path_utils import build_dataset_paths
 from dreamer.data.serialization import deserialize_msgpack_record
 from dreamer.data.transforms import (
+    CastDtype,
     CreateActions,
     EpisodeLengthFilter,
     ProcessEpisodeAndSlice,
@@ -507,16 +508,7 @@ def make_iterator(
     # Build operations based on dataset type and data type
     if use_latent_data:
         # Pre-tokenized latent data path
-        operations = [
-            # EpisodeLengthFilter(
-            #     seq_len=dataloader_cfg.T,
-            #     format_hint="latent",
-            #     print_filter_warnings=print_filter_warnings,
-            # ),
-            ProcessLatentAndSlice(seq_len=dataloader_cfg.T),
-            Batch(batch_size=per_process_batch_size, drop_remainder=True),
-            CreateActions()
-        ]
+        operations = [ProcessLatentAndSlice(seq_len=dataloader_cfg.T)]
     elif cfg.name == "minecraft_vpt":
         operations = [
             EpisodeLengthFilter(
@@ -532,9 +524,7 @@ def make_iterator(
                 padding_h=cfg.padding_H,
                 padding_w=cfg.padding_W,
                 patch_size=cfg.patch_size,
-            ),
-            Batch(batch_size=per_process_batch_size, drop_remainder=True),
-            CreateActions(),
+            )
         ]
     else:
         operations = [
@@ -553,9 +543,10 @@ def make_iterator(
                 p_include_reward=cfg.p_include_reward,
                 patch_size=cfg.patch_size,
             ),
-            Batch(batch_size=per_process_batch_size, drop_remainder=True),
-            CreateActions(),
         ]
+            
+    common_ops = [Batch(batch_size=per_process_batch_size, drop_remainder=True), CreateActions(), CastDtype(dataloader_cfg.dtype)]
+    operations = operations + common_ops
 
     dataloader = grain.DataLoader(
         data_source=source,

@@ -17,6 +17,7 @@ dataloader_cfg:
   long_T: 4
   long_ratio: 0.0
   start_step: 0
+  dtype: bfloat16
 
 H: 360
 W: 640

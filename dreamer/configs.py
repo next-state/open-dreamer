@@ -21,6 +21,8 @@ class DataloaderConfig:
     long_ratio: float = 0.0
     start_step: int = 0
     
+    dtype: str = "bfloat16"
+    
 @dataclass(frozen=False, unsafe_hash=True)
 class DatasetConfig:
     """Configuration for dataset parameters.
