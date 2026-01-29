@@ -28,13 +28,13 @@ class Actions:
 
     def to_dict(self) -> dict[str, Array | None]:
         """Flatten Actions to a dict of arrays for serialization."""
-        actions = {"actions_binary": self.binary, "actions_categorical": self.categorical, "actions_continuous": self.continuous}
+        actions = {"binary": self.binary, "categorical": self.categorical, "continuous": self.continuous}
         return actions
 
     @classmethod
     def from_dict(cls, d: dict[str, Array | None]) -> Actions:
-        """Reconstruct Actions from a flattened dict."""
-        return cls(binary=d["actions_binary"], categorical=d["actions_categorical"], continuous=d["actions_continuous"])
+        """Reconstruct Actions from a flattened dict. Raise KeyError if a key is missing."""
+        return cls(binary=d["binary"], categorical=d["categorical"], continuous=d["continuous"])
 
 
 def create_noop_action_like(template: Actions, categorical_action_dim: int) -> Actions:

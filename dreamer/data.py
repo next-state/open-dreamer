@@ -57,7 +57,8 @@ class EpisodeLengthFilter(grain.transforms.Filter):
         return True
 
 
-class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
+class CoinrunProcessEpisodeAndSlice(grain.transforms.RandomMap):
+    # TODO: consolidate with other process and slice classes
     """
     A Grain Transformation that combines parsing, slicing, and normalizing.
     """
@@ -68,8 +69,8 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         image_h: int,
         image_w: int,
         image_c: int,
-        padding_h: list[int],
-        padding_w: list[int],
+        padding_h: tuple[int, int],
+        padding_w: tuple[int, int],
         *,
         p_include_reward: float = 0.0,
         patch_size: int,
@@ -79,8 +80,8 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         self.image_w = image_w
         self.image_c = image_c
         self.p_include_reward = float(p_include_reward)
-        self.padding_h = tuple(padding_h)
-        self.padding_w = tuple(padding_w)
+        self.padding_h = padding_h
+        self.padding_w = padding_w
 
         assert sum(padding_h, image_h) % patch_size == 0
         assert sum(padding_w, image_w) % patch_size == 0
@@ -129,14 +130,16 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
             constant_values=0
         )
 
-        data_dict: dict[str, Any] = {"videos": seq}
         actions_tensor = np.array(element["actions"])
-        data_dict["actions_categorical"] = actions_tensor[start_idx : start_idx + self.seq_len]
-        data_dict["actions_binary"] = None
-        data_dict["actions_continuous"] = None
-        data_dict["rewards"] = rewards_tensor[start_idx : start_idx + self.seq_len]
-
-        return data_dict
+        return {
+            "videos": seq,
+            "actions": Actions(
+                binary=None,
+                categorical=actions_tensor[start_idx : start_idx + self.seq_len],
+                continuous=None,
+            ),
+            "rewards": rewards_tensor[start_idx : start_idx + self.seq_len],
+        }
 
 
 # ==============================================================================
@@ -144,7 +147,7 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
 # ==============================================================================
 
 class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
-    # TODO: consolidate with ProcessEpisodeAndSlice
+    # TODO: consolidate with other process and slice classes
     """Parse MP4 video bytes using decord, random slice for Minecraft VPT dataset."""
 
     def __init__(
@@ -153,14 +156,14 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
         image_h: int,
         image_w: int,
         image_c: int,
-        padding_h: list[int],
-        padding_w: list[int],
+        padding_h: tuple[int, int],
+        padding_w: tuple[int, int],
         *,
         patch_size: int,
     ):
         self.seq_len = seq_len
-        self.padding_h = tuple(padding_h)
-        self.padding_w = tuple(padding_w)
+        self.padding_h = padding_h
+        self.padding_w = padding_w
 
         assert sum(padding_h, image_h) % patch_size == 0
         assert sum(padding_w, image_w) % patch_size == 0
@@ -195,22 +198,9 @@ class MinecraftVPTProcessEpisodeAndSlice(grain.transforms.RandomMap):
 
         return {
             "videos": video,
-            "actions_categorical": None,
-            "actions_binary": None,
-            "actions_continuous": None,
+            "actions": Actions(binary=None, categorical=None, continuous=None),  # FIXME: no actions returned!!
             "rewards": None,
         }
-
-
-class CreateActions(grain.transforms.Map):
-    """Convert batched action arrays into Actions dataclass."""
-    def map(self, batch: dict) -> dict:
-        batch["actions"] = Actions(
-            binary=batch.pop("actions_binary", None),
-            categorical=batch.pop("actions_categorical", None),
-            continuous=batch.pop("actions_continuous", None),
-        )
-        return batch
 
 
 # ==============================================================================
@@ -252,6 +242,7 @@ class LatentEpisodeLengthFilter(grain.transforms.Filter):
 
 
 class ProcessLatentAndSlice(grain.transforms.RandomMap):
+    # TODO: consolidate with other process and slice classes
     """Random slice pre-tokenized latent episodes."""
     def __init__(self, seq_len: int):
         self.seq_len = seq_len
@@ -259,25 +250,16 @@ class ProcessLatentAndSlice(grain.transforms.RandomMap):
     def random_map(self, element: bytes, rng: np.random.Generator) -> dict:
         data = deserialize_latent_record(element)
         latents = data["latents"]  # (T, n_latents, d_bottleneck)
-        actions = data["actions"]   # dict with action arrays
+        actions = data["actions"]  # dict with action arrays
 
         episode_len = latents.shape[0]
         max_start = episode_len - self.seq_len
         start = int(rng.integers(0, max_start + 1))
-
-        # Slice latents
-        sliced_latents = latents[start:start + self.seq_len].astype(np.float32)
-
-        # Slice actions (handle None values)
-        actions_binary = actions.get("binary")
-        actions_categorical = actions.get("categorical")
-        actions_continuous = actions.get("continuous")
+        end = start + self.seq_len
 
         return {
-            "latents": sliced_latents,
-            "actions_binary": actions_binary[start:start + self.seq_len] if actions_binary is not None else None,
-            "actions_categorical": actions_categorical[start:start + self.seq_len] if actions_categorical is not None else None,
-            "actions_continuous": actions_continuous[start:start + self.seq_len] if actions_continuous is not None else None,
+            "latents": latents[start:end].astype(np.float32),
+            "actions": Actions.from_dict(actions)[start:end],
         }
 
 
@@ -353,7 +335,6 @@ def make_iterator(
             ),
             ProcessLatentAndSlice(seq_len=cfg.T),
             grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
-            CreateActions(),
         ]
     elif cfg.name == "minecraft_vpt":
         operations = [
@@ -371,7 +352,6 @@ def make_iterator(
                 patch_size=cfg.patch_size,
             ),
             grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
-            CreateActions(),
         ]
     else:
         operations = [
@@ -379,7 +359,7 @@ def make_iterator(
                 seq_len=cfg.T,
                 print_filter_warnings=print_filter_warnings,
             ),
-            ProcessEpisodeAndSlice(
+            CoinrunProcessEpisodeAndSlice(
                 seq_len=cfg.T,
                 image_h=cfg.H,
                 image_w=cfg.W,
@@ -390,7 +370,6 @@ def make_iterator(
                 patch_size=cfg.patch_size,
             ),
             grain.transforms.Batch(batch_size=per_process_batch_size, drop_remainder=True),
-            CreateActions(),
         ]
 
     dataloader = grain.DataLoader(
