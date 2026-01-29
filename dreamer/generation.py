@@ -50,7 +50,7 @@ class DenoiseSchedule:
         
         d = 1 / num_steps
         step_idx = int(math.log2(num_steps))
-        tau_values = jnp.linspace(0.0, 1.0, num_steps)
+        tau_values = jnp.linspace(0.0, 1.0, num_steps + 1)
         tau_indices = jnp.arange(num_steps) * (k_max // num_steps)
         
         # Compute noise level for context during autoregressive rollout
@@ -106,7 +106,7 @@ def next_latent(
         noise_prefill = jnp.zeros(latents_ctx[:, :prefill_length].shape)
         noise_decode = jax.random.normal(rng_ctx, latents_ctx[:, prefill_length:].shape)
         noise_ctx = jnp.concatenate([noise_prefill, noise_decode], axis=1)
-        latents_ctx_noised = latents_ctx + (1 - schedule.tau_ctx) * noise_ctx
+        latents_ctx_noised = latents_ctx * schedule.tau_ctx + (1 - schedule.tau_ctx) * noise_ctx
 
     action = action[:, None, ...]  # expand squeezed-out time dimension
     
@@ -282,7 +282,8 @@ def latent_rollout(
 
     # Run dynamics on context to prefill caches and get last hidden state
     # Use clean signal for ground truth context
-    step_idx_ctx = jnp.full((B, T_ctx), schedule.step_idx, dtype=jnp.int32)
+    emax = int(math.log2(schedule.k_max))  # Use finest step size (emax) for prefill
+    step_idx_ctx = jnp.full((B, T_ctx), emax, dtype=jnp.int32)
     tau_idx_ctx = jnp.full((B, T_ctx), schedule.k_max - 1, dtype=jnp.int32)
 
     # Dynamics call for prefill
