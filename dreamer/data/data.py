@@ -625,13 +625,11 @@ def make_dual_iterator(
             num_workers=num_workers // 2,
             prefetch_buffer_size=(prefetch_buffer_size + 1) // 2,
             device_prefetch_buffer_size=(device_prefetch_buffer_size + 1) // 2,
-            short_T=short_T,
-            long_T=long_T,
-            long_ratio=long_ratio,
             start_step=dataloader_cfg.start_step,
+            dtype=dataloader_cfg.dtype,
         )
         it = make_iterator(
-            cfg=dl_cfg,
+            cfg=cfg,
             seed=seed + T,
             print_filter_warnings=print_filter_warnings,
             device=device,

@@ -59,7 +59,6 @@ def train_step(
     data: jnp.ndarray,        # Full batch: videos (B, T, H, W, C) or latents (B, T, n_latents, d_bottleneck)
     actions: Actions,         # Full batch (B, T, ...)
     *,
-    tokenizer_key: jax.Array,
     master_key: jax.Array,
     step: int,
     B_img: int,               # Number of samples to treat as images
@@ -72,8 +71,7 @@ def train_step(
     if use_latent_data:
         latents = data
     else:
-        rngs = nnx.Rngs(mae=tokenizer_key)
-        latents, _ = tokenizer.encode(data, deterministic=True, rngs=rngs)
+        latents, _ = tokenizer.encode(data, deterministic=True)
         latents = jax.lax.stop_gradient(latents)
 
     latents = latents.astype(dynamics.dtype)
@@ -167,20 +165,20 @@ def run(cfg: DynamicsConfig):
         avg_T = int(cfg.long_batch_ratio * cfg.long_T + (1 - cfg.long_batch_ratio) * cfg.short_T)
 
         # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
-        dynamics_flops = dynamics.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T, n_latents=n_latents)
-        bootstrap_multiplier = 1 + 2 * cfg.bootstrap_fraction
+        dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
+        bootstrap_multiplier = 1 + cfg.bootstrap_fraction * (2/6)
         total_dynamics_flops = dynamics_flops * bootstrap_multiplier
 
         # Encoder FLOPs: forward-only (no gradients) when using video data
         encoder_flops = 0
         if not use_latent_data:
-            tokenizer_training_flops = tokenizer.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T)
+            tokenizer_training_flops = tokenizer.estimate_flops(batch_size=B, seq_length=avg_T)
             encoder_flops = tokenizer_training_flops // 12  # ~1/12 of tokenizer training FLOPs (half for encoder, 1/6 for inference)
 
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents),
+            flops_per_step=dynamics_flops + encoder_flops,
             data_tokens_per_step=B * avg_T * (n_spatial + 1),  # spatial + action
             total_tokens_per_step=B * avg_T * (3 + n_spatial + cfg.dynamics.n_register),  # action + signal + step + spatial + register
             logger=logger,
@@ -230,14 +228,15 @@ def run(cfg: DynamicsConfig):
                     step=step,
                     B_img=int(B * cfg.image_fraction),
                     T=T,
-                    categorical_action_dim=cfg.dataset.categorical_action_dim,
                     k_max=cfg.dynamics.k_max,
                     context_length=cfg.dynamics.context_length,
+                    bootstrap_fraction=cfg.bootstrap_fraction,
+                    use_latent_data=use_latent_data,
                 )
 
                 # Validation step before training (as input buffers might be donated)
                 if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
-                    val_data = data[:4]
+                    val_data = input_tensor[:4]
                     val_actions = actions[:4]
                     run_evaluation(
                         cfg, step, bundle.tokenizer, bundle.dynamics,

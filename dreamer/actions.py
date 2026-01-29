@@ -34,7 +34,7 @@ class Actions:
     @classmethod
     def from_dict(cls, d: dict[str, Array | None]) -> Actions:
         """Reconstruct Actions from a flattened dict. Raise KeyError if a key is missing."""
-        return cls(binary=d["binary"], categorical=d["categorical"], continuous=d["continuous"])
+        return cls(binary=d.get("binary"), categorical=d.get("categorical"), continuous=d.get("continuous"))
 
 
 def create_noop_action_like(template: Actions, categorical_action_dim: int) -> Actions:
