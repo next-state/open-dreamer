@@ -220,22 +220,15 @@ def run(cfg: TokenizerConfig):
         )
 
         # Data iterator
-        train_dataloader = make_iterator(cfg.dataset)
-        train_iterator = iter(train_dataloader)
+        train_dataloader = make_iterator(cfg.dataset, device=data_sharding)
 
-        with build_checkpoint_manager(
-            cfg.ckpt, ckpt_dir,
-            item_names=TokenizerCheckpointBundle.get_item_names(
-                iterator_names=("train_dataloader_state",)
-            )
-        ) as checkpoint_manager:
+        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
-
             scaling.start_training()
 
             # Training loop
-            pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step,total=cfg.max_steps)
+            pbar = tqdm(enumerate(train_dataloader, start=start_step), initial=start_step,total=cfg.max_steps)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
@@ -245,10 +238,8 @@ def run(cfg: TokenizerConfig):
                 mae_key, dropout_key = jax.random.split(step_rng)
 
                 # Shard batch data
-                videos = jax.device_put(batch["videos"], data_sharding)
-
                 aux = train_step(
-                    bundle.tokenizer, bundle.tokenizer_optimizer, lpips_model, videos,
+                    bundle.tokenizer, bundle.tokenizer_optimizer, lpips_model, batch["videos"],
                     mae_key=mae_key, dropout_key=dropout_key, step=step,
                     lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
                     dataset_mean=tuple(cfg.dataset.dataset_mean),
@@ -284,8 +275,7 @@ def run(cfg: TokenizerConfig):
                     )
 
                 # Checkpointing
-                iterators = {"train_dataloader_state": train_iterator}
-                bundle.maybe_save(checkpoint_manager, step, iterators, rng)
+                bundle.maybe_save(checkpoint_manager, step, rng)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization

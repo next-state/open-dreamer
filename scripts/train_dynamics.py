@@ -209,27 +209,11 @@ def run(cfg: DynamicsConfig):
 
         # Data iterator (replaced with dummy random iterator)
         dataloader = make_iterator(cfg.dataset, device=data_sharding)
-        start_step = 0
-        # batch_iterator = iter(dataloader)
-        # batch_iterator = make_dummy_iterator(cfg, tokenizer_cfg)
-        with build_checkpoint_manager(
-            cfg.ckpt, ckpt_dir,
-            item_names=DynamicsCheckpointBundle.get_item_names(
-                iterator_names=("dataloader_state",)
-            )
-        ) as checkpoint_manager:
+        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
             # Resume from checkpoint
-            # start_step, bundle, restored_iterators, rng = bundle.restore(
-            #     checkpoint_manager, batch_iterator, rng
-            # )
+            start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
             scaling.start_training()
 
-            # Training loop with prefetching
-            # Prefetch first batch to GPU before loop starts
-            # batch = next(batch_iterator)
-            # next_actions = jax.device_put(batch["actions"], data_sharding)
-            # next_videos = None if use_latent_data else jax.device_put(batch["videos"], data_sharding)
-            # next_latents = jax.device_put(batch["latents"], data_sharding) if use_latent_data else None
 
             pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps)
             for step, batch in pbar:
@@ -288,8 +272,7 @@ def run(cfg: DynamicsConfig):
 
                 # Checkpointing
                 # TODO: checkpointing with DevicePutIterator needs iterator state access
-                # iterators = {"dataloader_state": batch_iterator}
-                # bundle.maybe_save(checkpoint_manager, step, iterators, rng)
+                bundle.maybe_save(checkpoint_manager, step, rng)
 
             scaling.finalize()
 
