@@ -218,13 +218,13 @@ def compute_flow_loss(
             mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
             mse_per_token: tuple of scalars. MSE loss 
     """
-    mse_per_token = (z_pred - z_target) ** 2  # (B, T, S, D)
-    mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
+    z_mean, z_logvar = jnp.split(z_pred, 2, axis=-1)
+    mse = (z_mean-z_target)**2
+    log_prob = z_logvar + jnp.exp(-z_logvar)*mse  # (B, T, S, D)
     
     
     # Apply ramp weighting and reduce
-    weights = ramp_weight(sigma)
-    return jnp.mean(mse_per_step * weights), jnp.mean(mse_per_step)
+    return jnp.mean(log_prob), jnp.mean(mse)
 
 
 def compute_bootstrap_loss(
@@ -253,20 +253,20 @@ def compute_bootstrap_loss(
             mse_per_token: tuple of scalars. MSE loss 
     """
     # Convert full-step prediction to velocity
-    v_hat = (z_pred - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
+    z_mean, z_logvar = jnp.split(z_pred, 2, axis=-1)
+    v_hat = (z_mean - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
+    v_logvar = z_logvar - jnp.log(jnp.maximum(1.0 - sigma[..., None, None], 1e-8))
     
     # Target velocity is average of two half-steps (stop gradient)
     v_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
     
     # MSE in v-space, scaled to x-space
     v_diff = (v_hat - v_target) ** 2
-    boot_per_token = (1.0 - sigma[..., None, None]) ** 2 * v_diff
-    boot_per_step = jnp.mean(boot_per_token, axis=(2, 3))  # (B, T)
+    boot_per_token = v_logvar + jnp.exp(-v_logvar)*v_diff
     
     
     # Apply ramp weighting and reduce
-    weights = ramp_weight(sigma)
-    return jnp.mean(boot_per_step * weights), jnp.mean(boot_per_step)
+    return jnp.mean(boot_per_token), jnp.mean(v_diff)
 
 
 # ---------------------------
@@ -375,6 +375,7 @@ def shortcut_forcing_step(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs2
         )
+        z1_half1 = z1_half1[...,:z1_half1.shape[-1]//2]
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
 
@@ -384,6 +385,7 @@ def shortcut_forcing_step(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
         )
+        z1_half2 = z1_half2[...,:z1_half2.shape[-1]//2]
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
 
         # Bootstrap loss (computed unconditionally)
@@ -719,7 +721,6 @@ def compute_policy_loss(
 # Evaluation and visualization
 # ---------------------------
 
-@jax.jit
 def run_evaluation(
     cfg: DynamicsConfig | HeadsConfig,
     step: int,

@@ -147,7 +147,7 @@ def next_latent(
             task_embeddings=task_embedding, deterministic=True, caches=caches
         )
 
-        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
+        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :latent_clean_pred_seq.shape[-1]//2]  # (B, 1, n_spatial, D_s)
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
 
         # Per-step mixing toward clean latent

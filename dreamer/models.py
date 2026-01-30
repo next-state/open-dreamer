@@ -1129,7 +1129,7 @@ class Dynamics(nnx.Module):
 
         # Output head (zero-init)
         self.flow_x_head = nnx.Linear(
-            cfg.d_model, cfg.d_bottleneck * cfg.packing_factor,
+            cfg.d_model, cfg.d_bottleneck * cfg.packing_factor * 2,
             use_bias=cfg.use_bias,
             kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
             bias_init=nnx.initializers.zeros,
