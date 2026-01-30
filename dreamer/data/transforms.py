@@ -351,29 +351,25 @@ class ProcessLatentAndSlice(grain.transforms.RandomMap):
 
 
 class CastDtype(grain.transforms.Map):
-    """Convert numpy arrays to JAX and cast floating-point arrays to a specified dtype."""
+    """Cast floating-point arrays to a specified dtype."""
+
+    DTYPE_MAP = {
+        "float32": np.float32,
+        "float16": np.float16,
+        "bfloat16": np.float32,  # numpy doesn't support bfloat16, cast later in JAX
+    }
 
     def __init__(self, dtype: str):
-        """Initialize dtype caster.
-
-        Args:
-            dtype: Target dtype string (e.g., "float32", "float16", "bfloat16")
-        """
-
         self.dtype_str = dtype
-        self.dtype = getattr(jnp, dtype, jnp.float32)
+        self.dtype = self.DTYPE_MAP.get(dtype, np.float32)
 
     def _cast_array(self, arr):
-        """Convert to JAX and cast if it's a floating-point type."""
-
         if arr is None:
             return None
-        # Convert numpy to JAX array
-        jax_arr = jnp.array(arr)
-        # Cast floating-point arrays to target dtype
-        if jnp.issubdtype(jax_arr.dtype, jnp.floating):
-            return jax_arr.astype(self.dtype)
-        return jax_arr
+        if np.issubdtype(arr.dtype, np.floating):
+            return arr.astype(self.dtype)
+        return arr
 
     def map(self, element):
+        import jax
         return jax.tree.map(self._cast_array, element)

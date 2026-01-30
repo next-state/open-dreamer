@@ -5,9 +5,9 @@ from typing import Any
 
 import grain
 import jax
+from jax import numpy as jnp
 import numpy as np
 from grain._src.python.dataset import dataset as grain_dataset
-from grain.experimental import device_put
 from grain.transforms import Batch
 
 from dreamer.actions import Actions
@@ -32,6 +32,7 @@ def make_iterator(
     seed: int = 42,
     print_filter_warnings: bool = False,
     device = None,
+    dtype = None,
 ):
     """Creates a data loading pipeline using Grain from a DatasetConfig.
 
@@ -139,6 +140,7 @@ def make_iterator(
     iter_dataset = device_put(
         iter_dataset,
         device,
+        dtype=dtype,
         cpu_buffer_size=prefetch_buffer_size,
         device_buffer_size=device_prefetch_buffer_size if prefetch_buffer_size is not None else prefetch_buffer_size,
     )
@@ -170,6 +172,7 @@ def make_dual_iterator(
     seed: int = 42,
     print_filter_warnings: bool = False,
     device = None,
+    dtype = None
     ) -> grain.IterDataset:
     """Create alternating iterator over short and long sequences.
     
@@ -194,6 +197,8 @@ def make_dual_iterator(
             cfg,
             seed=seed,
             print_filter_warnings=print_filter_warnings,
+            device=device,
+            dtype=dtype,
         )
         return iterator
         
@@ -215,6 +220,7 @@ def make_dual_iterator(
             seed=seed + T,
             print_filter_warnings=print_filter_warnings,
             device=device,
+            dtype=dtype,
         )
         iterators.append(it)
 
@@ -249,3 +255,49 @@ class DataLoaderIteratorWrapper(grain_dataset.IterDataset):
     
     def set_state(self, state):
         self._count = state.get("count", 0)
+        
+# ==============================================================================
+# Adapted from grain.experimental.device_put
+# ==============================================================================
+
+from grain._src.python.dataset import dataset
+from grain._src.python.dataset.transformations.prefetch import ThreadPrefetchIterDataset
+
+
+def device_put(
+    ds: dataset.IterDataset,
+    device,
+    *,
+    dtype: str | None = None,
+    cpu_buffer_size: int = 4,
+    device_buffer_size: int = 2,
+) -> dataset.IterDataset:
+  """Moves the data to the given devices with prefetching.
+
+  Stage 1: A CPU-side prefetch buffer.
+  Stage 2: Per-device buffers for elements already transferred to the device.
+
+  Args:
+    ds: Dataset to prefetch.
+    device: same arguments as in jax.device_put.
+    dtype: Optional dtype to cast floating-point arrays to (e.g., "float32", "bfloat16").
+    cpu_buffer_size: Number of elements to prefetch on CPU.
+    device_buffer_size: Number of elements to prefetch per device.
+
+  Returns:
+    Dataset with the elements prefetched to the devices.
+  """
+  ds = ThreadPrefetchIterDataset(ds, prefetch_buffer_size=cpu_buffer_size)
+  # May raise ImportError if jax is not linked.
+
+  jax_dtype = getattr(jnp, dtype, None) if dtype else None
+  
+  def _transfer(x):
+    x = jax.device_put(x, device)
+    if jax_dtype is not None:
+      x = jax.tree.map(lambda a: a.astype(jax_dtype) if a is not None and jnp.issubdtype(a.dtype, jnp.floating) else a, x)
+    return x
+    
+  ds = ds.map(_transfer)
+  ds = ThreadPrefetchIterDataset(ds, prefetch_buffer_size=device_buffer_size)
+  return ds
