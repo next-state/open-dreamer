@@ -364,6 +364,44 @@ class HeadsConfig(BaseExperimentConfig):
 
 
 @dataclass(frozen=False)
+class HistoryGuidanceConfig:
+    """Configuration for History Guidance (HG-tf) during sampling.
+
+    History Guidance improves video generation by combining scores conditioned
+    on different history configurations. See "History-Guided Video Diffusion"
+    (Song et al., 2025) for details.
+
+    Guidance types:
+        - "vanilla": Standard CFG with history (HG-v)
+        - "fractional": Guide using partially-noised history (HG-f)
+        - "temporal": Compose scores from different history lengths (HG-t)
+        - "tf": Combined temporal + fractional guidance (HG-tf, recommended)
+    """
+    # Master enable
+    enabled: bool = False
+
+    # Guidance type
+    guidance_type: str = "tf"  # "vanilla" | "fractional" | "temporal" | "tf"
+
+    # HG-v/HG-f: main guidance weight (omega in paper)
+    omega: float = 1.5
+
+    # HG-f: fractional noise level on history (tau_H in paper)
+    # 0.0 = clean history, 1.0 = full noise (like unconditional)
+    # Lower values retain more low-frequency information
+    tau_H_frac: float = 0.5
+
+    # HG-t: history window sizes (in frames)
+    history_long: int = 16   # Longer history window
+    history_short: int = 4   # Shorter history window (recent frames)
+
+    # HG-tf: per-component weights when combining temporal + fractional
+    omega_long: float = 0.5   # Weight for long history score
+    omega_short: float = 1.0  # Weight for short history score
+    omega_frac: float = 0.5   # Weight for fractional history score (HG-f component)
+
+
+@dataclass(frozen=False)
 class RLConfig(BaseExperimentConfig):
     heads_ckpt: str = ""  # checkpoint from train_heads.py
     action_dim: int = 4

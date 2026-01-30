@@ -6,6 +6,8 @@ from typing import Any, Tuple
 from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 from .actions import Actions
 from .utils import normalize_latents, unnormalize_latents
+from .configs import HistoryGuidanceConfig
+from .guidance import GuidanceState, create_guidance_state, compute_guided_prediction
 from flax.struct import dataclass
 
 
@@ -187,6 +189,104 @@ def next_latent(
 
     return latent_t_final, h_last, caches_new, rng
 
+
+def next_latent_guided(
+    dynamics: Dynamics,
+    schedule: DenoiseSchedule,
+    action: Actions,
+    latent_shape: Tuple,
+    rng: jax.Array,
+    guidance_config: HistoryGuidanceConfig,
+    guidance_state: GuidanceState,
+    task_embedding: jax.Array | None = None,
+) -> Tuple[jax.Array, jax.Array | None, GuidanceState, jax.Array]:
+    """
+    τ-ladder denoiser with History Guidance (HG-tf).
+
+    This function extends the standard next_latent() to use history guidance
+    during the denoising process. At each refinement step, it computes guided
+    predictions by combining scores from different history configurations.
+
+    Args:
+        dynamics: Dynamics NNX model
+        schedule: Precomputed DenoiseSchedule
+        action: Action for current step (B, ...)
+        latent_shape: Tuple representing the shape of the latent (B, 1, n_spatial, D_s)
+        rng: Random number generator key
+        guidance_config: History guidance configuration
+        guidance_state: Pre-computed guidance cache states
+        task_embedding: Optional agent tokens (B, 1, n_agent, d_model)
+
+    Returns:
+        Tuple containing:
+        - latent_t_final: The denoised latent (B, 1, n_spatial, D_s)
+        - h_last: The final hidden state from dynamics
+        - guidance_state: Updated guidance state with new caches
+        - rng: Updated random key
+    """
+    rng, rng_latent = jax.random.split(rng)
+    noisy_latent = jax.random.normal(rng_latent, latent_shape)
+    B = latent_shape[0]
+
+    def refinement_step(latent_t, s):
+        tau_prev, tau_curr = schedule.tau_values[s], schedule.tau_values[s + 1]
+        alpha = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
+
+        step_idx = schedule.step_idx
+        tau_idx_val = schedule.tau_indices[s]
+
+        # Compute guided prediction using history guidance
+        latent_clean_pred = compute_guided_prediction(
+            dynamics=dynamics,
+            config=guidance_config,
+            guidance_state=guidance_state,
+            noisy_latent=latent_t,
+            action=action,
+            tau_idx=tau_idx_val,
+            step_idx=step_idx,
+            task_embedding=task_embedding,
+        )
+
+        # Per-step mixing toward clean latent
+        latent_t_new = (1.0 - alpha) * latent_t + alpha * latent_clean_pred
+
+        return latent_t_new, None
+
+    # Run τ-ladder with guidance at each step
+    latent_t_final, _ = jax.lax.scan(
+        refinement_step,
+        noisy_latent,
+        jnp.arange(schedule.num_steps),
+    )
+
+    # Update main caches with the generated latent for next frame
+    # Add noise to the generated latent before caching (standard practice)
+    rng, rng_cache = jax.random.split(rng)
+    latent_noised_caching = (
+        latent_t_final * schedule.tau_ctx +
+        (1 - schedule.tau_ctx) * jax.random.normal(rng_cache, latent_t_final.shape, dtype=latent_t_final.dtype)
+    )
+
+    # Update caches by running forward pass
+    action_expanded = jax.tree.map(lambda x: x[:, None, ...], action)
+    step_indices = jnp.full((B, 1), schedule.step_idx_ctx, dtype=jnp.int32)
+    tau_indices = jnp.full((B, 1), schedule.tau_idx_ctx, dtype=jnp.int32)
+
+    _, (h_seq_final, caches_updated) = dynamics(
+        action_expanded, step_indices, tau_indices, latent_noised_caching,
+        task_embeddings=task_embedding, deterministic=True, caches=guidance_state.caches_full
+    )
+    h_last = h_seq_final[:, -1:, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
+
+    # Update guidance state with new caches (use .replace() for flax.struct.dataclass)
+    guidance_state_updated = guidance_state.replace(caches_full=caches_updated)
+
+    # Unnormalize output so caller receives latents in original space
+    latent_t_final = unnormalize_latents(latent_t_final, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+
+    return latent_t_final, h_last, guidance_state_updated, rng
+
+
 def next_frame(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -250,9 +350,10 @@ def latent_rollout(
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
     deterministic: bool = False,
+    guidance_config: HistoryGuidanceConfig | None = None,
 ):
     """
-    Autoregressive rollout in latent space.
+    Autoregressive rollout in latent space with optional History Guidance.
 
     Args:
         dynamics: Dynamics NNX model.
@@ -264,7 +365,9 @@ def latent_rollout(
         rng: Random number generator key
         initial_task_embedding: Optional (B, T_ctx, n_agent, D) agent tokens for context.
         deterministic: Whether to sample deterministic actions from the policy.
-        
+        guidance_config: Optional history guidance configuration. If provided and enabled,
+            uses HG-tf guidance during sampling for improved video quality.
+
     Returns:
         Dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
     """
@@ -275,10 +378,33 @@ def latent_rollout(
     latents_ctx_orig = latents_ctx
     latents_ctx = normalize_latents(latents_ctx, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
+    # Check if guidance is enabled
+    use_guidance = guidance_config is not None and guidance_config.enabled
+
     # Initialize caches and process context
     window_size = T_ctx + num_steps
     n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
-    caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
+
+    if use_guidance:
+        # Initialize guidance state with multiple cache configurations
+        rng, guidance_rng = jax.random.split(rng)
+        guidance_state = create_guidance_state(
+            dynamics=dynamics,
+            config=guidance_config,
+            latents_ctx=latents_ctx,
+            actions_ctx=actions_ctx,
+            k_max=schedule.k_max,
+            rng=guidance_rng,
+            n_agent=n_agents,
+        )
+        # Use guidance_state.caches_full as the main cache
+        caches = guidance_state.caches_full
+    else:
+        guidance_state = None
+        caches = dynamics.create_static_caches(
+            batch_size=B, n_latents=n_spatial, window_size=window_size,
+            n_agent=n_agents, dtype=latents_ctx.dtype
+        )
 
     # Run dynamics on context to prefill caches and get last hidden state
     # Use clean signal for ground truth context
@@ -286,42 +412,81 @@ def latent_rollout(
     step_idx_ctx = jnp.full((B, T_ctx), emax, dtype=jnp.int32)
     tau_idx_ctx = jnp.full((B, T_ctx), schedule.k_max - 1, dtype=jnp.int32)
 
-    # Dynamics call for prefill
-    _, (h_seq, caches) = dynamics(
-        actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx,
-        task_embeddings=initial_task_embedding, caches=caches, deterministic=True
-    )
+    # Dynamics call for prefill (only needed if not using guidance, which already prefilled)
+    if not use_guidance:
+        _, (h_seq, caches) = dynamics(
+            actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx,
+            task_embeddings=initial_task_embedding, caches=caches, deterministic=True
+        )
+    else:
+        # For guided rollout, we already prefilled during guidance state creation
+        # But we still need h_seq for the policy - run a forward pass to get it
+        _, (h_seq, _) = dynamics(
+            actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx,
+            task_embeddings=initial_task_embedding, caches=caches, deterministic=True
+        )
 
     # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
     task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
     h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
 
-    # 2. Scan loop for rollout
-    def scan_step(carry, step_idx):
-        h_t, caches_t, rng = carry
+    if use_guidance:
+        # Guided rollout scan loop
+        def scan_step_guided(carry, step_idx):
+            h_t, guidance_state_t, rng = carry
 
-        # Sample action
-        rng, rng_policy = jax.random.split(rng)
-        
-        if isinstance(policy, Actions):
-            action = policy[:, step_idx]  # (B, ...)
-        else:
-            all_actions = policy.sample(h_t, deterministic=deterministic, rng=rng_policy)  # (B, T, L, ...)
-            action = all_actions[:, 0, 0, ...]  # (B, ...) - use first predicted action
-        
-        # Predict next latent (denoising)
-        latent_next, h_next, caches_next, rng = next_latent(
-            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
+            # Sample action
+            rng, rng_policy = jax.random.split(rng)
+
+            if isinstance(policy, Actions):
+                action = policy[:, step_idx]  # (B, ...)
+            else:
+                all_actions = policy.sample(h_t, deterministic=deterministic, rng=rng_policy)
+                action = all_actions[:, 0, 0, ...]
+
+            # Predict next latent with history guidance
+            latent_next, h_next, guidance_state_next, rng = next_latent_guided(
+                dynamics, schedule, action, latent_shape, rng,
+                guidance_config=guidance_config,
+                guidance_state=guidance_state_t,
+                task_embedding=task_embedding,
+            )
+
+            return (h_next, guidance_state_next, rng), (latent_next[:, 0], action, h_next)
+
+        # Run guided scan
+        _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
+            scan_step_guided,
+            (h_last, guidance_state, rng),
+            jnp.arange(num_steps)
         )
-        
-        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
+    else:
+        # Standard (non-guided) rollout scan loop
+        def scan_step(carry, step_idx):
+            h_t, caches_t, rng = carry
 
-    # Run scan
-    _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
-        scan_step,
-        (h_last, caches, rng),
-        jnp.arange(num_steps)
-    )
+            # Sample action
+            rng, rng_policy = jax.random.split(rng)
+
+            if isinstance(policy, Actions):
+                action = policy[:, step_idx]  # (B, ...)
+            else:
+                all_actions = policy.sample(h_t, deterministic=deterministic, rng=rng_policy)
+                action = all_actions[:, 0, 0, ...]
+
+            # Predict next latent (denoising)
+            latent_next, h_next, caches_next, rng = next_latent(
+                dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
+            )
+
+            return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next)
+
+        # Run standard scan
+        _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
+            scan_step,
+            (h_last, caches, rng),
+            jnp.arange(num_steps)
+        )
 
     # Unpack results
     rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
@@ -348,9 +513,10 @@ def video_rollout(
     num_steps: int,
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
+    guidance_config: HistoryGuidanceConfig | None = None,
 ):
     """
-    End-to-end video generation rollout.
+    End-to-end video generation rollout with optional History Guidance.
 
     Args:
         tokenizer: Tokenizer NNX model.
@@ -362,6 +528,7 @@ def video_rollout(
         num_steps: Number of steps to unroll.
         rng: Random number generator key.
         initial_task_embedding: Optional task tokens for context.
+        guidance_config: Optional history guidance configuration for HG-tf.
     Returns:
         pred_frames: (B, T_ctx + num_steps, H, W, C)
     """
@@ -389,6 +556,7 @@ def video_rollout(
         rng,
         initial_task_embedding,
         deterministic=True,  # use deterministic policy for visualization
+        guidance_config=guidance_config,
     )
 
     # Decode

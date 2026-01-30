@@ -9,6 +9,7 @@ from flax import nnx
 
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
+from dreamer.configs import HistoryGuidanceConfig
 from .generation import DenoiseSchedule, video_rollout, latent_rollout
 
 
@@ -27,6 +28,7 @@ def sample_video(
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
     latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
+    guidance_config: HistoryGuidanceConfig | None = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array | None]:
     """
     Sample video predictions using Tokenizer and Dynamics.
@@ -45,6 +47,8 @@ def sample_video(
                 agent tokens for the dynamics model.
         latents: Optional pre-tokenized latents (B, T, n_latents, d_bottleneck). If provided,
                 skips tokenizer encoding. Latents should already be unpacked.
+        guidance_config: Optional history guidance configuration for HG-tf. If provided and
+                enabled, uses history guidance during video generation for improved quality.
 
     Returns:
         pred_frames: (B, ctx+horizon, H, W, C) predicted frames [0, 255] uint8
@@ -116,6 +120,7 @@ def sample_video(
         rng=rng,
         initial_task_embedding=initial_agent_tokens,
         deterministic=True,
+        guidance_config=guidance_config,
     )
 
     # Decode predicted latents to frames
