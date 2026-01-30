@@ -1008,7 +1008,7 @@ class ActionEncoder(nnx.Module):
                 continuous_action_dim, d_model,
                 use_bias=use_bias,
                 dtype=dtype, param_dtype=param_dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')),
+                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('embed')),
                 rngs=rngs
             )  # (B, T, d_model)
         else:

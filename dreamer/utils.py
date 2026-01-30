@@ -440,6 +440,7 @@ def build_optimizer(
             b1=optimizer_cfg.adam_b1,
             b2=optimizer_cfg.adam_b2,
             weight_decay=optimizer_cfg.weight_decay,
+            mu_dtype=jnp.float32,
         )
     elif optimizer_cfg.optimizer_type == "muon":
         import optax.contrib
@@ -464,6 +465,7 @@ def build_optimizer(
             adam_weight_decay=0.0,  # hardcoded to 0
             # Callable that excludes embeddings from Muon
             muon_weight_dimension_numbers=_muon_weight_dims,
+            mu_dtype=jnp.float32,
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_cfg.optimizer_type}")

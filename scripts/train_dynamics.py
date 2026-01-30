@@ -116,7 +116,7 @@ def train_step(
         dynamics, 
         latents, actions, time_mask, context_length
     )
-
+    
     # Update model with optimizer
     optimizer.update(dynamics, grads)
 

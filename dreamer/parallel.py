@@ -28,7 +28,7 @@ def build_parallel(strategy: Literal["data", "fsdp", "tp", "sp"]) -> tuple[Mesh,
     elif strategy == "fsdp":
         mesh = jax.make_mesh((n, 1), ('data', 'model'))
         sharding = NamedSharding(mesh, P('data', None))
-        rules = MeshRules(embed='data', mlp='data', attn='data', data='data')
+        rules = MeshRules(embed=None, mlp='data', attn='data', data='data')
 
     elif strategy == "tp":
         mesh = jax.make_mesh((1, n), ('data', 'model'))
