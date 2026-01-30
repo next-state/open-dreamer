@@ -75,6 +75,8 @@ def next_latent(
     caches: KVCachesDict | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: Actions | None = None,
+    omega: jax.Array = jnp.array(0.0),
+    alpha: jax.Array = jnp.array(0.7)
 ) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
@@ -146,8 +148,21 @@ def next_latent(
             actions_input, step_indices, tau_indices, latent_input,
             task_embeddings=task_embedding, deterministic=True, caches=caches
         )
+        latent_clean_pred_seq = latent_clean_pred_seq[:, :-1, :, :] # (B, 1, n_spatial, D_s)
+        
 
-        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
+        # Guidance https://arxiv.org/pdf/2502.07849
+        if omega!=0:
+            # Unguided Dynamics call
+            latent_unguided_pred_seq, _ = dynamics(
+                actions_input[:, :-1], step_indices[:,:-1], tau_indices[:,:-1], latent_input[:,:-1],
+                task_embeddings=task_embedding[:,:-1] if task_embedding is not None else None, deterministic=True, caches=None
+            )
+            latent_diff = (latent_clean_pred_seq - latent_unguided_pred_seq) 
+            latent_clean_pred = latent_clean_pred_seq + omega * latent_diff + (latent_diff**2).sum(axis=(1,2,3))**alpha
+        else:
+            latent_clean_pred = latent_clean_pred_seq
+        
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
 
         # Per-step mixing toward clean latent
