@@ -18,11 +18,11 @@ class DenoiseSchedule:
         num_steps: number of sampling steps (k ∈ {1, 2, 4, ..., k_max}) that you take during inference. In the paper, it's 4.
         k_max: a power of two, maximum noise resolution used during diffusion training. In the paper, it's 256.
         d: Step size d=1/k ∈ {1, 1/2, 1/4, ..., 1/k_max} during inference, where k is num_steps.
-        step_idx: log2(k) ∈ {0, 1, 2, ..., log2(K_max)}.
+        step_idx: log2(k) ∈ {0, 1, 2, ..., log2(K_max)} for denoising.
         tau_values: signal levels used during the denoising τ = [0, d, 2d, ..., 1 - d, 1].
         tau_indices: indices of the signal levels used during the denoising τ_idx = [0, k, 2k, ..., k_max].
-        tau_idx_ctx: we pass slightly noised context frames, the index of that noise level (0.1 in the paper) is tau_idx_ctx.
-        step_idx_ctx: the index of the noise level that starting from tau_idx_ctx brings you to 1.
+        step_idx_ctx: step index for context frames (may differ from step_idx for finer tau_ctx control).
+        tau_idx_ctx: tau index for slightly noised context frames, snapped to step_idx_ctx ladder.
         tau_ctx: noise level of context frames during autoregressive rollout.
     """
 
@@ -37,27 +37,38 @@ class DenoiseSchedule:
     tau_ctx: float
 
     @classmethod
-    def init(cls, num_steps: int, k_max: int = 256, tau_ctx=0.9) -> "DenoiseSchedule":
+    def init(cls, num_steps: int, k_max: int = 256, tau_ctx_target: float = 0.9) -> "DenoiseSchedule":
         """
         Create a DenoiseSchedule object.
         Args:
-            num_steps: Number of steps in the schedule.
-            k_max: Maximum value of k.
+            num_steps: Number of steps in the schedule (must be power of 2).
+            k_max: Maximum value of k (noise resolution).
+            tau_ctx_target: Target noise level for context frames during autoregressive rollout.
+                           Will be snapped down to the nearest valid tau on an appropriate ladder.
         Returns:
             DenoiseSchedule object.
         """
         assert k_max % num_steps == 0, f"k_max={k_max} must be divisible by num_steps={num_steps}"
-        
+
         d = 1 / num_steps
         step_idx = int(math.log2(num_steps))
         tau_values = jnp.linspace(0.0, 1.0, num_steps + 1)
-        tau_indices = jnp.arange(num_steps) * (k_max // num_steps)
-        
-        # Compute noise level for context during autoregressive rollout
-        step_idx_ctx = int(jnp.round(-math.log2(1 - tau_ctx)))
-        tau_idx_ctx = k_max - k_max // 2**step_idx_ctx
-        tau_ctx = 1.0 - 2.0**(-step_idx_ctx) # setting tau_ctx to the exact value such that tau_ctx + step_ctx = 1
-        
+        tau_indices = jnp.arange(num_steps + 1) * (k_max // num_steps)
+
+        # Snap tau_ctx to an appropriate ladder:
+        emax = int(math.log2(k_max))
+        if step_idx == emax:
+            # Use the same ladder for consistency with empirical training
+            step_idx_ctx = step_idx
+            K_ctx = num_steps
+        else:
+            # Use emax-1 ladder for finer control (bootstrap training uses mixed ladders excluding emax)
+            step_idx_ctx = emax - 1
+            K_ctx = k_max // 2  # emax - 1 ladder has K = k_max / 2
+        j_ctx = int(tau_ctx_target * K_ctx)  # floor to ensure some noise
+        tau_ctx = j_ctx / K_ctx
+        tau_idx_ctx = j_ctx * (k_max // K_ctx)
+
         return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, step_idx_ctx, tau_idx_ctx, tau_ctx)
     
 # ---------------------------
@@ -103,10 +114,11 @@ def next_latent(
 
     latents_ctx_noised = None
     if latents_ctx is not None and caches is None:
-        noise_prefill = jnp.zeros(latents_ctx[:, :prefill_length].shape)
-        noise_decode = jax.random.normal(rng_ctx, latents_ctx[:, prefill_length:].shape)
-        noise_ctx = jnp.concatenate([noise_prefill, noise_decode], axis=1)
-        latents_ctx_noised = latents_ctx * schedule.tau_ctx + (1 - schedule.tau_ctx) * noise_ctx
+        latents_prefill = latents_ctx[:, :prefill_length]
+        latents_decode = latents_ctx[:, prefill_length:]
+        noise_decode = jax.random.normal(rng_ctx, latents_decode.shape)
+        latents_decode_noised = latents_decode * schedule.tau_ctx + (1 - schedule.tau_ctx) * noise_decode
+        latents_ctx_noised = jnp.concatenate([latents_prefill, latents_decode_noised], axis=1)
 
     action = action[:, None, ...]  # expand squeezed-out time dimension
     
@@ -136,7 +148,7 @@ def next_latent(
             step_idx_curr   = jnp.full((B, 1), step_idx, dtype=jnp.int32)
             step_indices    = jnp.concatenate([step_idx_prefill, step_idx_decode, step_idx_curr], axis=1)
             
-            tau_idx_prefill= jnp.full((B, prefill_length), schedule.k_max - 1, dtype=jnp.int32)
+            tau_idx_prefill= jnp.full((B, prefill_length), schedule.k_max, dtype=jnp.int32)
             tau_idx_decode = jnp.full((B, decode_length), schedule.tau_idx_ctx, dtype=jnp.int32)
             tau_idx_curr   = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
             tau_indices    = jnp.concatenate([tau_idx_prefill, tau_idx_decode, tau_idx_curr], axis=1)  # (B, T_ctx+1)
@@ -163,9 +175,9 @@ def next_latent(
     )
     
     if caches is not None:
-        # update caches by doing one more refinement step with tau_ctx
-        step_indices= jnp.full((B, 1), schedule.step_idx_ctx, dtype=jnp.int32)
-        tau_indices = jnp.full((B, 1), schedule.tau_idx_ctx,  dtype=jnp.int32)
+        # Update caches by doing one more forward pass with tau_ctx
+        step_indices = jnp.full((B, 1), schedule.step_idx_ctx, dtype=jnp.int32)
+        tau_indices = jnp.full((B, 1), schedule.tau_idx_ctx, dtype=jnp.int32)
         
         rng, new_random_key = jax.random.split(rng)
         latent_noised_caching = latent_t_final * schedule.tau_ctx + (1 - schedule.tau_ctx) * jax.random.normal(new_random_key, shape=latent_t_final.shape, dtype=latent_t_final.dtype)
@@ -282,13 +294,13 @@ def latent_rollout(
 
     # Run dynamics on context to prefill caches and get last hidden state
     # Use clean signal for ground truth context
-    emax = int(math.log2(schedule.k_max))  # Use finest step size (emax) for prefill
-    step_idx_ctx = jnp.full((B, T_ctx), emax, dtype=jnp.int32)
-    tau_idx_ctx = jnp.full((B, T_ctx), schedule.k_max - 1, dtype=jnp.int32)
+    emax = int(math.log2(schedule.k_max))
+    step_idx_prefill = jnp.full((B, T_ctx), emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
+    tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)  # tau=1.0
 
     # Dynamics call for prefill
     _, (h_seq, caches) = dynamics(
-        actions_ctx, step_idx_ctx, tau_idx_ctx, latents_ctx,
+        actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
         task_embeddings=initial_task_embedding, caches=caches, deterministic=True
     )
 
