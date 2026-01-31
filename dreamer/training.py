@@ -97,40 +97,50 @@ class RMSLossNormalizer(nnx.Module):
 # Sampling utilities
 # ---------------------------
 
-@partial(jax.jit, static_argnames=("shape_bt", "k_max", "dtype"))
+@partial(jax.jit, static_argnames=("shape_bt", "k_max", "dtype", "include_endpoint"))
 def sample_tau_for_step(
     rng: jax.Array,
     shape_bt: Tuple[int, int],
     k_max: int,
     step_idx: jnp.ndarray,
     *,
-    dtype=jnp.float32
+    dtype=jnp.float32,
+    include_endpoint: bool = True
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Sample tau (signal level) values aligned to step_idx grid.
-    
+
     This is the core sampling logic for shortcut forcing - it samples signal levels
     on the discrete grid defined by the current step size.
-    
+
     Args:
         rng: JAX random key
         shape_bt: Tuple of (batch_size, sequence_length)
         k_max: Maximum noise resolution (e.g., 256)
         step_idx: (B, T) array of step indices encoding d = 1 / (1 << step_idx)
         dtype: Data type for computation
-        
+        include_endpoint: If True, include tau=1.0 (clean). Set to False for bootstrap
+                         training which needs room for half-steps.
+
     Returns:
-        tau: (B, T) Signal levels in [0, 1]
+        tau: (B, T) Signal levels in [0, 1] (or [0, 1-d] if include_endpoint=False)
         tau_idx: (B, T) Discrete indices in [0, k_max]
-        
+
     Example:
         If step_idx = 3, then K = 2^3 = 8, d = 1/8
-        tau will be sampled uniformly from {0, 1/8, 2/8, ..., 7/8}
+        include_endpoint=True:  tau sampled from {0, 1/8, 2/8, ..., 7/8, 1}
+        include_endpoint=False: tau sampled from {0, 1/8, 2/8, ..., 7/8}
     """
     B_, T_ = shape_bt
     K = 1 << step_idx  # 2^step_idx
     u = jax.random.uniform(rng, (B_, T_), dtype=dtype)
-    j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)
+    if include_endpoint:
+        # Sample j_idx from {0, 1, ..., K} to include tau=1.0
+        j_idx = jnp.floor(u * (K + 1).astype(dtype)).astype(jnp.int32)
+        j_idx = jnp.minimum(j_idx, K)  # handle edge case where u=1.0
+    else:
+        # Sample j_idx from {0, 1, ..., K-1} to exclude tau=1.0
+        j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)
     tau = j_idx.astype(dtype) / K.astype(dtype)
     tau_idx = j_idx * (k_max // K)
     return tau, tau_idx
@@ -316,26 +326,37 @@ def shortcut_forcing_step(
     latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
 
     # Split RNG
-    key_sigma, key_step, key_noise, key_dropout1, key_dropout2, key_dropout3 = jax.random.split(rng, 6)
+    key_sigma_emp, key_sigma_self, key_step, key_noise, key_dropout1, key_dropout2, key_dropout3 = jax.random.split(rng, 7)
 
     # --- Step indices ---
     # Empirical rows: always use finest step (d_min)
     step_idx_emp = jnp.full((B_emp, T), emax, dtype=jnp.int32)
-    
+
     # Bootstrap rows: coarser steps (if B_self > 0)
     if B_self > 0:
         d_self, step_idx_self = sample_step_excluding_dmin(key_step, (B_self, T), k_max, dtype=latents.dtype)
     else:
         d_self = jnp.zeros((0, T), dtype=latents.dtype)
         step_idx_self = jnp.zeros((0, T), dtype=jnp.int32)
-    
+
     step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)
-    
+
     # --- Sample signal levels ---
-    sigma_full, sigma_idx_full = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx_full, dtype=latents.dtype)
-    sigma_emp = sigma_full[:B_emp]
-    sigma_self = sigma_full[B_emp:]
-    sigma_idx_self = sigma_idx_full[B_emp:]
+    # Empirical rows: include tau=1.0 (clean frames) for diffusion forcing flow loss
+    sigma_emp, sigma_idx_emp = sample_tau_for_step(
+        key_sigma_emp, (B_emp, T), k_max, step_idx_emp, dtype=latents.dtype, include_endpoint=True
+    )
+    # Bootstrap rows: exclude tau=1.0 (need room for half-steps in bootstrap loss)
+    if B_self > 0:
+        sigma_self, sigma_idx_self = sample_tau_for_step(
+            key_sigma_self, (B_self, T), k_max, step_idx_self, dtype=latents.dtype, include_endpoint=False
+        )
+    else:
+        sigma_self = jnp.zeros((0, T), dtype=latents.dtype)
+        sigma_idx_self = jnp.zeros((0, T), dtype=jnp.int32)
+
+    sigma_full = jnp.concatenate([sigma_emp, sigma_self], axis=0)
+    sigma_idx_full = jnp.concatenate([sigma_idx_emp, sigma_idx_self], axis=0)
     
     # --- Corrupt latents: z_tilde = (1 - sigma) * z0 + sigma * z1 ---
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)

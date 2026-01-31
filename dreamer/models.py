@@ -1119,9 +1119,9 @@ class Dynamics(nnx.Module):
         )
 
         # Signal level τ ∈ {0, d, 2d, ..., 1 - d, 1}
-        # We index signals by: signal_idx = τ * k_max ∈ {0, 1, 2, ..., k_max}
+        # We index signals by: signal_idx = τ * k_max ∈ {0, 1, 2, ..., k_max}, k_max + 1 indices
         self.signal_embed = nnx.Embed(
-            cfg.k_max, half_dim,
+            cfg.k_max + 1, half_dim,
             dtype=self.dtype, param_dtype=self.param_dtype,
             embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
             rngs=rngs
