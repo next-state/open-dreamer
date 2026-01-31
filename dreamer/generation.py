@@ -76,7 +76,7 @@ def next_latent(
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: Actions | None = None,
     omega: jax.Array = jnp.array(0.0),
-    alpha: jax.Array = jnp.array(0.7)
+    exponent: jax.Array = jnp.array(0.7)
 ) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
@@ -148,20 +148,25 @@ def next_latent(
             actions_input, step_indices, tau_indices, latent_input,
             task_embeddings=task_embedding, deterministic=True, caches=caches
         )
-        latent_clean_pred_seq = latent_clean_pred_seq[:, :-1, :, :] # (B, 1, n_spatial, D_s)
+        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
         
 
         # Guidance https://arxiv.org/pdf/2502.07849
-        if omega!=0:
-            # Unguided Dynamics call
-            latent_unguided_pred_seq, _ = dynamics(
-                actions_input[:, :-1], step_indices[:,:-1], tau_indices[:,:-1], latent_input[:,:-1],
-                task_embeddings=task_embedding[:,:-1] if task_embedding is not None else None, deterministic=True, caches=None
+        def apply_guidance():
+            # Unconditional dynamics call (no context)
+            latent_uncond_pred, _ = dynamics(
+                actions_input[:,-1:], step_indices[:,-1:], tau_indices[:,-1:], latent_input[:,-1:],
+                task_embeddings=task_embedding[:,-1:] if task_embedding is not None else None, deterministic=True, caches=None
             )
-            latent_diff = (latent_clean_pred_seq - latent_unguided_pred_seq) 
-            latent_clean_pred = latent_clean_pred_seq + omega * latent_diff + (latent_diff**2).sum(axis=(1,2,3))**alpha
-        else:
-            latent_clean_pred = latent_clean_pred_seq
+            # Classifier-free guidance: pred = uncond + (1 + omega) * (cond - uncond) * |cond - uncond|^(2 * exponent)
+            latent_diff = latent_clean_pred - latent_uncond_pred
+            result = latent_clean_pred + (1.0 + omega) * latent_diff * (latent_diff**2).mean(axis = (1,2,3), keepdims=True)**exponent
+            return result
+            
+        def no_guidance():
+            return latent_clean_pred
+        
+        latent_clean_pred = jax.lax.cond(omega != 0, apply_guidance, no_guidance)
         
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
 
@@ -212,6 +217,8 @@ def next_frame(
     tokenizer_cache: Any,
     rng: jax.Array,
     task_embedding: jax.Array | None = None,
+    omega: jax.Array = jnp.array(0.0),
+    alpha: jax.Array = jnp.array(0.7),
 ) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, Any, jax.Array]:
     """
     Generate next frame using dynamics model and decode to pixels.
@@ -226,6 +233,8 @@ def next_frame(
         tokenizer_cache: KV cache for tokenizer decoder from previous steps
         rng: Random key
         task_embedding: Optional task embedding (currently unused)
+        omega: Guidance strength (0 = no guidance). See https://arxiv.org/pdf/2502.07849
+        alpha: Guidance alpha parameter for scaling.
         
     Returns:
         Tuple of (frame as jax.Array, h_last, updated dynamics cache, updated tokenizer cache, updated rng)
@@ -240,6 +249,8 @@ def next_frame(
         prefill_length=None,  # No prefill for interactive generation
         task_embedding=task_embedding,
         caches=dynamics_cache,
+        omega=omega,
+        exponent=alpha,
     )
     
     # Decoder call
@@ -265,6 +276,8 @@ def latent_rollout(
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
     deterministic: bool = False,
+    omega: jax.Array = jnp.array(0.0),
+    alpha: jax.Array = jnp.array(0.7),
 ):
     """
     Autoregressive rollout in latent space.
@@ -279,6 +292,8 @@ def latent_rollout(
         rng: Random number generator key
         initial_task_embedding: Optional (B, T_ctx, n_agent, D) agent tokens for context.
         deterministic: Whether to sample deterministic actions from the policy.
+        omega: Guidance strength (0 = no guidance). See https://arxiv.org/pdf/2502.07849
+        alpha: Guidance alpha parameter for scaling.
         
     Returns:
         Dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
@@ -326,7 +341,8 @@ def latent_rollout(
         
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng = next_latent(
-            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
+            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding,
+            omega=omega, exponent=alpha
         )
         
         return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
@@ -363,6 +379,8 @@ def video_rollout(
     num_steps: int,
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
+    omega: jax.Array = jnp.array(0.0),
+    alpha: jax.Array = jnp.array(0.7),
 ):
     """
     End-to-end video generation rollout.
@@ -377,6 +395,8 @@ def video_rollout(
         num_steps: Number of steps to unroll.
         rng: Random number generator key.
         initial_task_embedding: Optional task tokens for context.
+        omega: Guidance strength (0 = no guidance). See https://arxiv.org/pdf/2502.07849
+        alpha: Guidance alpha parameter for scaling.
     Returns:
         pred_frames: (B, T_ctx + num_steps, H, W, C)
     """
@@ -404,6 +424,8 @@ def video_rollout(
         rng,
         initial_task_embedding,
         deterministic=True,  # use deterministic policy for visualization
+        omega=omega,
+        alpha=alpha,
     )
 
     # Decode

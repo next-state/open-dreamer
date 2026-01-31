@@ -27,6 +27,8 @@ def sample_video(
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
     latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
+    omega: jax.Array = jnp.array(0.0),
+    alpha: jax.Array = jnp.array(0.7),
 ) -> Tuple[jax.Array, jax.Array, jax.Array | None]:
     """
     Sample video predictions using Tokenizer and Dynamics.
@@ -45,6 +47,8 @@ def sample_video(
                 agent tokens for the dynamics model.
         latents: Optional pre-tokenized latents (B, T, n_latents, d_bottleneck). If provided,
                 skips tokenizer encoding. Latents should already be unpacked.
+        omega: Guidance strength (0 = no guidance). See https://arxiv.org/pdf/2502.07849
+        alpha: Guidance alpha parameter for scaling.
 
     Returns:
         pred_frames: (B, ctx+horizon, H, W, C) predicted frames [0, 255] uint8
@@ -116,6 +120,8 @@ def sample_video(
         rng=rng,
         initial_task_embedding=initial_agent_tokens,
         deterministic=True,
+        omega=omega,
+        alpha=alpha,
     )
 
     # Decode predicted latents to frames

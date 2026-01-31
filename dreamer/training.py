@@ -732,6 +732,8 @@ def run_evaluation(
     logger,
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
+    omega: jax.Array = jnp.array(0.0),
+    alpha: jax.Array = jnp.array(0.7),
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
@@ -752,6 +754,8 @@ def run_evaluation(
         logger: Logger instance for logging metrics and videos
         policy: Optional policy model for action sampling
         task_embedder: Optional task embedder for agent tokens
+        omega: Guidance strength (0 = no guidance). See https://arxiv.org/pdf/2502.07849
+        alpha: Guidance alpha parameter for scaling.
     """
     k_max = dynamics.cfg.k_max
     schedule_shortcut = DenoiseSchedule.init(4, k_max)
@@ -773,7 +777,7 @@ def run_evaluation(
                 tokenizer, dynamics, frames=None,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=rng, policy=policy, task_embedder=task_embedder,
-                latents=val_data
+                latents=val_data, omega=omega, alpha=alpha
             )
             # For metrics, compare pred vs gt_decoded (both from latents)
             gt_frames_for_metrics = gt_decoded_frames
@@ -781,7 +785,8 @@ def run_evaluation(
             pred_frames, gt_decoded_frames, original_frames = sample_video(
                 tokenizer, dynamics, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
-                rng=rng, policy=policy, task_embedder=task_embedder
+                rng=rng, policy=policy, task_embedder=task_embedder,
+                omega=omega, alpha=alpha
             )
             # For metrics, compare pred vs original frames
             gt_frames_for_metrics = original_frames
