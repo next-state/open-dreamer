@@ -314,7 +314,10 @@ def latent_rollout(
     # Use clean signal for ground truth context
     emax = int(math.log2(schedule.k_max))  # Use finest step size (emax) for prefill
     step_idx_ctx = jnp.full((B, T_ctx), emax, dtype=jnp.int32)
-    tau_idx_ctx = jnp.full((B, T_ctx), schedule.k_max - 1, dtype=jnp.int32)
+    tau_idx_ctx = jnp.full((B, T_ctx), schedule.tau_idx_ctx, dtype=jnp.int32)
+    # Uncomment this in case you want to noise the clean context as well
+    # rng, rng_noise = jax.random.split(rng)
+    # latents_ctx = latents_ctx*schedule.tau_ctx + jax.random.normal(rng_noise, shape=latents_ctx.shape, dtype=latents_ctx.dtype)*(1-schedule.tau_ctx)
 
     # Dynamics call for prefill
     _, (h_seq, caches) = dynamics(
