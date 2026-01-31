@@ -82,7 +82,7 @@ def test_video_rollout(
 
         # Create denoising schedule
         print(f"\n2. Creating denoising schedule")
-        schedule = DenoiseSchedule.init(num_steps=4, k_max=dynamics.cfg.k_max)
+        schedule = DenoiseSchedule.init(num_steps=4, k_max=dynamics.cfg.k_max, tau_ctx_target=0.9)
         print(f"   ✓ Schedule created with {schedule.num_steps} steps")
 
         # Load real data
@@ -202,7 +202,9 @@ def test_video_rollout(
             # Save video if output path provided
             if output_video_path:
                 print(f"\n8. Saving video")
-                output_path = Path(output_video_path) / 'guidance.mp4'
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_path = Path(output_video_path) / f"{timestamp}.mp4"
                 output_path.parent.mkdir(parents=True, exist_ok=True)
 
                 # Convert to numpy and ensure uint8
@@ -268,7 +270,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output",
         type=str,
-        default=None,
+        default="outputs",
         help="Path to save output video (e.g., video.mp4)",
     )
 
