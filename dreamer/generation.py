@@ -75,8 +75,8 @@ def next_latent(
     caches: KVCachesDict | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: Actions | None = None,
-    omega: jax.Array = jnp.array(0.0),
-    exponent: jax.Array = jnp.array(0.7)
+    omega: jax.Array | float = 0.0,
+    exponent: jax.Array | float = 0.7,
 ) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
@@ -99,9 +99,11 @@ def next_latent(
         - h_last: The final hidden state from dynamics (B, n_agent, d_model)
         - caches_new: The updated KV cache
     """
+    omega = jnp.asarray(omega)
+    exponent = jnp.asarray(exponent)
     rng, rng_latent, rng_ctx = jax.random.split(rng, 3)
     noisy_latent = jax.random.normal(rng_latent, latent_shape)
-    B = latent_shape[0]
+    B,_,_,C = latent_shape
 
     latents_ctx_noised = None
     if latents_ctx is not None and caches is None:
@@ -148,9 +150,8 @@ def next_latent(
             actions_input, step_indices, tau_indices, latent_input,
             task_embeddings=task_embedding, deterministic=True, caches=caches
         )
-        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
+        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :C]  # (B, 1, n_spatial, D_s)
         
-
         # Guidance https://arxiv.org/pdf/2502.07849
         def apply_guidance():
             # Unconditional dynamics call (no context)
@@ -159,7 +160,8 @@ def next_latent(
                 task_embeddings=task_embedding[:,-1:] if task_embedding is not None else None, deterministic=True, caches=None
             )
             # Classifier-free guidance: pred = uncond + (1 + omega) * (cond - uncond) * |cond - uncond|^(2 * exponent)
-            latent_diff = latent_clean_pred - latent_uncond_pred
+            latent_diff = latent_clean_pred - latent_uncond_pred[...,:C]
+            # TODO: edit logvar distance between scores
             result = latent_clean_pred + (1.0 + omega) * latent_diff * (latent_diff**2).mean(axis = (1,2,3), keepdims=True)**exponent
             return result
             
@@ -202,8 +204,12 @@ def next_latent(
 
     assert isinstance(h_last, jax.Array) or h_last is None
 
+    # Print latent std as a function of timestep
+    # jax.debug.print("Timestep {s}, Latent Std: {std}", s=s, std=jnp.std(latent_t_final))
+    
     # Unnormalize output so caller receives latents in original space
     latent_t_final = unnormalize_latents(latent_t_final, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+
 
     return latent_t_final, h_last, caches_new, rng
 
@@ -217,8 +223,8 @@ def next_frame(
     tokenizer_cache: Any,
     rng: jax.Array,
     task_embedding: jax.Array | None = None,
-    omega: jax.Array = jnp.array(0.0),
-    alpha: jax.Array = jnp.array(0.7),
+    omega: jax.Array | float = 0.0,
+    alpha: jax.Array | float = 0.7,
 ) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, Any, jax.Array]:
     """
     Generate next frame using dynamics model and decode to pixels.
@@ -276,8 +282,8 @@ def latent_rollout(
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
     deterministic: bool = False,
-    omega: jax.Array = jnp.array(0.0),
-    alpha: jax.Array = jnp.array(0.7),
+    omega: jax.Array | float = 0.0,
+    alpha: jax.Array | float = 0.7,
 ):
     """
     Autoregressive rollout in latent space.
@@ -382,8 +388,8 @@ def video_rollout(
     num_steps: int,
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
-    omega: jax.Array = jnp.array(0.0),
-    alpha: jax.Array = jnp.array(0.7),
+    omega: jax.Array | float = 0.0,
+    alpha: jax.Array | float = 0.7,
 ):
     """
     End-to-end video generation rollout.

@@ -63,6 +63,9 @@ class KVCache:
         Handles both contiguous writes and wrapping writes (T > 1) via branching.
         Returns updated cache with index incremented by the length of new data.
         """
+        # Ensure k_new/v_new match the cache dtype
+        k_new = k_new.astype(self.k.dtype)
+        v_new = v_new.astype(self.v.dtype)
         T = k_new.shape[1]
         write_idx = self.index % self.window_size
 
@@ -446,6 +449,8 @@ class GroupedQueryAttention(nnx.Module):
 
                 T = q.shape[1]
                 k_attn, v_attn, cache_mask = new_cache.get_ordered_kv(query_len=T)
+                # Ensure q matches cache dtype for attention
+                q = q.astype(k_attn.dtype)
 
                 attn_is_causal = False  # Handled manually by cache_mask
                 if mask is not None:
@@ -1129,7 +1134,7 @@ class Dynamics(nnx.Module):
 
         # Output head (zero-init)
         self.flow_x_head = nnx.Linear(
-            cfg.d_model, cfg.d_bottleneck * cfg.packing_factor,
+            cfg.d_model, cfg.d_bottleneck * cfg.packing_factor * 2,
             use_bias=cfg.use_bias,
             kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
             bias_init=nnx.initializers.zeros,
