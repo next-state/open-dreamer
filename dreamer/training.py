@@ -174,7 +174,8 @@ def sample_step_excluding_dmin(
 
 # Loss weighting
 def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float = 1.0) -> jnp.ndarray:
-    return (max_weight - min_weight) * sigma + min_weight
+    weight = (max_weight - min_weight) * sigma + min_weight
+    return weight[...,None,None]
 
 
 # ---------------------------
@@ -224,6 +225,8 @@ def compute_flow_loss(
     
     
     # Apply ramp weighting and reduce
+    # weight = ramp_weight(sigma, min_weight=1., max_weight=0.1)
+    
     return jnp.mean(log_prob), jnp.mean(mse)
 
 

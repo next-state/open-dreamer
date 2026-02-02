@@ -51,6 +51,7 @@ class DatasetConfig:
 
     # For minecraft_vpt: number of shards to use (each shard = 1 episode)
     index_max: int = 0
+    num_max_samples = -1
 
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
