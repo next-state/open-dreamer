@@ -53,10 +53,12 @@ class DenoiseSchedule:
         tau_values = jnp.linspace(0.0, 1.0, num_steps + 1)
         tau_indices = jnp.arange(num_steps) * (k_max // num_steps)
         
-        # Compute noise level for context during autoregressive rollout
-        step_idx_ctx = int(jnp.round(-math.log2(1 - tau_ctx)))
-        tau_idx_ctx = k_max - k_max // 2**step_idx_ctx
-        tau_ctx = 1.0 - 2.0**(-step_idx_ctx) # setting tau_ctx to the exact value such that tau_ctx + step_ctx = 1
+        # Compute noise level for context during autoregressive rollout (JAX-friendly)
+        tau_ctx = jnp.asarray(tau_ctx, dtype=jnp.float32)
+        step_idx_ctx = jnp.round(-jnp.log2(1.0 - tau_ctx)).astype(jnp.int32)
+        tau_idx_ctx = k_max - k_max // (2 ** step_idx_ctx)
+        # set tau_ctx to the exact value such that tau_ctx + step_ctx = 1
+        tau_ctx = 1.0 - 2.0 ** (-step_idx_ctx)
         
         return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, step_idx_ctx, tau_idx_ctx, tau_ctx)
     

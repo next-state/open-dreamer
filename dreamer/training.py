@@ -313,6 +313,7 @@ def shortcut_forcing_step(
     B, T, S, D = latents.shape
     B_emp = B - B_self
     emax = jnp.log2(k_max).astype(jnp.int32)
+    schedule = DenoiseSchedule.init(4, k_max, 0.9)
 
     # Normalize latents before corruption (all operations happen in normalized space)
     latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
@@ -322,49 +323,68 @@ def shortcut_forcing_step(
 
     # --- Step indices ---
     # Empirical rows: always use finest step (d_min)
+    d_self, step_idx_self = sample_step_excluding_dmin(key_step, (B_self, T), k_max, dtype=latents.dtype)
     step_idx_emp = jnp.full((B_emp, T), emax, dtype=jnp.int32)
-
-    # Bootstrap rows: coarser steps (if B_self > 0)
-    if B_self > 0:
-        d_self, step_idx_self = sample_step_excluding_dmin(key_step, (B_self, T), k_max, dtype=latents.dtype)
-    else:
-        d_self = jnp.zeros((0, T), dtype=latents.dtype)
-        step_idx_self = jnp.zeros((0, T), dtype=jnp.int32)
-
     step_idx_noisy = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)
-
+    _, sigma_idx_noisy = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx_noisy, dtype=latents.dtype)
+    sigma_noisy = sigma_idx_noisy.astype(latents.dtype) / k_max
+    
     # --- Sample signal levels (noisy half) ---
-    sigma_noisy, sigma_idx_noisy = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx_noisy, dtype=latents.dtype)
     sigma_emp = sigma_noisy[:B_emp]
     sigma_self = sigma_noisy[B_emp:]
     sigma_idx_self = sigma_idx_noisy[B_emp:]
 
-    # --- Corrupt latents (noisy half only) ---
-    z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
-    z_tilde_noisy = (1.0 - sigma_noisy[..., None, None]) * z0 + sigma_noisy[..., None, None] * latents
+    # --- Build full indices (clean + noisy) ---
+    if use_dart:
+        step_idx_clean = jnp.full((B, T), schedule.step_idx_ctx, dtype=jnp.int32)
+        sigma_idx_clean = jnp.full((B, T), schedule.tau_idx_ctx, dtype=jnp.int32)
+        step_idx_full = jnp.concatenate([step_idx_clean, step_idx_noisy], axis=1)
+        sigma_idx_full = jnp.concatenate([sigma_idx_clean, sigma_idx_noisy], axis=1)
+        latents_full = jnp.concatenate([latents, latents], axis=1)
+        actions_full = jax.tree.map(
+            lambda x: jnp.concatenate([x, x], axis=1) if x is not None else None,
+            actions,
+        )
+        task_embeddings_full = jnp.concatenate([task_embeddings, task_embeddings], axis=1) if task_embeddings is not None else None
+    else:
+        step_idx_full = step_idx_noisy
+        sigma_idx_full = sigma_idx_noisy
+        latents_full = latents
+        actions_full = actions
+        task_embeddings_full = task_embeddings
 
-    def _build_inputs(latents_clean, z_noisy, step_idx_noisy_local, sigma_idx_noisy_local, actions_local, task_local):
+    # --- Corrupt latents (full sequence, context may be slightly noised in DART) ---
+    sigma_full = sigma_idx_full.astype(latents.dtype) / k_max
+    z0_full = jax.random.normal(key_noise, latents_full.shape, dtype=latents.dtype)
+    z_tilde_full = (1.0 - sigma_full[..., None, None]) * z0_full + sigma_full[..., None, None] * latents_full
+
+    if use_dart:
+        z_tilde_noisy = z_tilde_full[:, T:]
+        z_ctx_full = z_tilde_full[:, :T]
+    else:
+        z_tilde_noisy = z_tilde_full
+        z_ctx_full = None
+
+    def _build_inputs(z_ctx, z_noisy, step_idx_local, sigma_idx_noisy_local, actions_local, task_local):
         if use_dart:
-            B_local = latents_clean.shape[0]
-            step_idx_clean = jnp.full((B_local, T), emax, dtype=jnp.int32)
-            sigma_idx_clean = jnp.full((B_local, T), k_max - 1, dtype=jnp.int32)
-            step_idx_full = jnp.concatenate([step_idx_clean, step_idx_noisy_local], axis=1)
-            sigma_idx_full = jnp.concatenate([sigma_idx_clean, sigma_idx_noisy_local], axis=1)
-            z_full = jnp.concatenate([latents_clean, z_noisy], axis=1)
+            B_local, T_local = z_noisy.shape[:2]
+            step_idx_ctx = jnp.full((B_local, T_local), schedule.step_idx_ctx, dtype=jnp.int32)
+            sigma_idx_ctx = jnp.full((B_local, T_local), schedule.tau_idx_ctx, dtype=jnp.int32)
+            step_idx_full = jnp.concatenate([step_idx_ctx, step_idx_local], axis=1)
+            sigma_idx_full = jnp.concatenate([sigma_idx_ctx, sigma_idx_noisy_local], axis=1)
+            z_full = jnp.concatenate([z_ctx, z_noisy], axis=1)
+
             actions_full = jax.tree.map(lambda x: jnp.concatenate([x, x], axis=1) if x is not None else None, actions_local)
             task_full = jnp.concatenate([task_local, task_local], axis=1) if task_local is not None else None
         else:
             actions_full = actions_local
             task_full = task_local
-            step_idx_full = step_idx_noisy_local
+            step_idx_full = step_idx_local
             sigma_idx_full = sigma_idx_noisy_local
             z_full = z_noisy
         return actions_full, step_idx_full, sigma_idx_full, z_full, task_full
 
     # --- Forward pass (full batch) ---
-    actions_full, step_idx_full, sigma_idx_full, z_tilde_full, task_embeddings_full = _build_inputs(
-        latents, z_tilde_noisy, step_idx_noisy, sigma_idx_noisy, actions, task_embeddings
-    )
     rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
         actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
@@ -374,8 +394,7 @@ def shortcut_forcing_step(
 
     # Always take the last T (noisy) positions; for non-DART this is the full sequence.
     z_pred_full = z_pred_full[:, -T:, ...]
-    if h_states is not None:
-        h_states = h_states[:, -T:, ...]
+    h_states = h_states[:, -T:, ...] if h_states is not None else None
 
     # --- Flow loss (empirical rows) ---
     loss_flow, flow_mse_unweighted = compute_flow_loss(z_pred_full[:B_emp], latents[:B_emp], sigma_emp)
@@ -387,6 +406,7 @@ def shortcut_forcing_step(
     if B_self > 0:
         z_pred_self = z_pred_full[B_emp:, -T:]
         z_tilde_self = z_tilde_noisy[B_emp:]
+        z_ctx_self = z_ctx_full[B_emp:] if use_dart else None
         actions_self = actions[B_emp:]
         time_mask_self = time_mask[B_emp:] if time_mask is not None and time_mask.shape[0] == B else time_mask # assume aligned with batch
         task_embeddings_self = task_embeddings[B_emp:] if task_embeddings is not None else None
@@ -400,7 +420,7 @@ def shortcut_forcing_step(
 
         # First half-step
         actions_half1, step_idx_half1, sigma_idx_half1, z_tilde_full_self, task_half1 = _build_inputs(
-            latents_self, z_tilde_self, step_idx_half, sigma_idx_self, actions_self, task_embeddings_self
+            z_ctx_self, z_tilde_self, step_idx_half, sigma_idx_self, actions_self, task_embeddings_self
         )
         rngs2 = nnx.Rngs(dropout=key_dropout2)
         z1_half1_full, *_ = dynamics_model(
@@ -414,7 +434,7 @@ def shortcut_forcing_step(
 
         # Second half-step
         actions_half2, step_idx_half2, sigma_idx_half2, z_prime_full, task_half2 = _build_inputs(
-            latents_self, z_prime, step_idx_half, sigma_idx_plus, actions_self, task_embeddings_self
+            z_ctx_self, z_prime, step_idx_half, sigma_idx_plus, actions_self, task_embeddings_self
         )
         rngs3 = nnx.Rngs(dropout=key_dropout3)
         z1_half2_full, *_ = dynamics_model(
