@@ -59,6 +59,29 @@ temporal_patchify = jax.jit(
     static_argnames=("patch",),
 )
 
+
+# --- DART helpers ---
+
+def build_dart_time_mask(T: int) -> jnp.ndarray:
+    """
+    Build the DART time mask for a sequence length T (frame-level, no block trickery).
+
+    Returns:
+        (1, 1, 2T, 2T) boolean mask.
+    """
+    t_idx = jnp.arange(T)
+    clean = t_idx[:, None] >= t_idx[None, :]
+    noisy_to_clean = t_idx[:, None] > t_idx[None, :]
+    noisy_self = jnp.eye(T, dtype=jnp.bool_)
+
+    top = jnp.concatenate([clean, jnp.zeros((T, T), dtype=jnp.bool_)], axis=1)
+    bottom = jnp.concatenate([noisy_to_clean, noisy_self], axis=1)
+    mask = jnp.concatenate([top, bottom], axis=0)
+    mask = mask[None, None, :, :]
+    return jax.lax.stop_gradient(mask)
+
+
+
 temporal_unpatchify = jax.jit(
     jax.vmap(unpatchify, in_axes=(1, None, None, None), out_axes=1),
     static_argnames=("patch", "H", "W"),
