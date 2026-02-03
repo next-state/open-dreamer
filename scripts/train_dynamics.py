@@ -48,7 +48,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_fraction", "use_latent_data"),
+    static_argnames=("k_max", "T", "context_length", "bootstrap_fraction", "use_latent_data", "use_dart"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -60,12 +60,12 @@ def train_step(
     *,
     master_key: jax.Array,
     step: int,
-    B_img: int,               # Number of samples to treat as images
     T: int,
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
     bootstrap_fraction: float,
     use_latent_data: bool,    # True if data is already latents, False if data is videos
+    use_dart: bool,
 ):
     if use_latent_data:
         latents = data
@@ -79,20 +79,20 @@ def train_step(
     B_self = int(B * bootstrap_fraction)
     B_emp = B - B_self
 
-    # Identify image samples (split with same bootstrap ratio)
-    idx = jnp.arange(B)
-    B_img_boot = int(B_img * bootstrap_fraction)
-    B_img_emp = B_img - B_img_boot
-    is_img = (idx < B_img_emp) | ((idx >= B_emp) & (idx < (B_emp + B_img_boot)))
-
     # Build time mask for full batch
-    mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
-    mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))  # causal tokens
-    time_mask = jnp.where(
-        is_img[:, None, None, None],
-        mask_img[None, None, :, :],
-        mask_vid[None, None, :, :]
-    )
+    if use_dart:
+        Td = T * 2
+        t_idx = jnp.arange(T)
+        clean = t_idx[:, None] >= t_idx[None, :]
+        noisy_to_clean = t_idx[:, None] > t_idx[None, :]
+        noisy_self = jnp.eye(T, dtype=jnp.bool_)
+        top = jnp.concatenate([clean, jnp.zeros((T, T), dtype=jnp.bool_)], axis=1)
+        bottom = jnp.concatenate([noisy_to_clean, noisy_self], axis=1)
+        mask_vid = jnp.concatenate([top, bottom], axis=0)
+        time_mask = mask_vid[None, None, :, :]
+    else:
+        mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))  # causal tokens
+        time_mask = mask_vid[None, None, :, :]
 
     # Training step
     step_key = jax.random.fold_in(master_key, step)
@@ -108,6 +108,7 @@ def train_step(
             context_length=context_length, # Builds sliding window attention
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
+            use_dart=use_dart,
         )
 
         return losses['total'], aux
@@ -235,12 +236,12 @@ def run(cfg: DynamicsConfig):
                     bundle.dynamics_optimizer, input_tensor, actions,
                     master_key=master_key,
                     step=step,
-                    B_img=int(B * cfg.image_fraction),
                     T=T,
                     k_max=cfg.dynamics.k_max,
                     context_length=cfg.dynamics.context_length,
                     bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                     use_latent_data=use_latent_data,
+                    use_dart=getattr(cfg, "use_dart", False),
                 )
 
                 # Logging

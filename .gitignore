@@ -5,7 +5,7 @@ overfit_exps/
 slurm_outs/
 wandb/
 run_job.sh
-logs
+viz/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

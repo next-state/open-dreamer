@@ -334,6 +334,7 @@ class DynamicsConfig(BaseExperimentConfig):
     dynamics: DynamicsModelConfig = field(default_factory=DynamicsModelConfig)
 
     # Training
+    use_dart: bool = False  # Use DART masking/duplication in dynamics training
     bootstrap_start: int = 5_000  # Number of start steps trained exclusively on flow-matching objective
     bootstrap_fraction: float = 0.25  # Fraction of batch used for bootstrap samples
     image_fraction: float = 0.3
