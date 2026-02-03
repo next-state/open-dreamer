@@ -26,6 +26,7 @@ from dreamer.utils import (
     setup_training_directories,
     build_lr_schedule,
     build_optimizer,
+    build_dart_time_mask,
 )
 
 # Suppress absl info logs
@@ -81,15 +82,7 @@ def train_step(
 
     # Build time mask for full batch
     if use_dart:
-        Td = T * 2
-        t_idx = jnp.arange(T)
-        clean = t_idx[:, None] >= t_idx[None, :]
-        noisy_to_clean = t_idx[:, None] > t_idx[None, :]
-        noisy_self = jnp.eye(T, dtype=jnp.bool_)
-        top = jnp.concatenate([clean, jnp.zeros((T, T), dtype=jnp.bool_)], axis=1)
-        bottom = jnp.concatenate([noisy_to_clean, noisy_self], axis=1)
-        mask_vid = jnp.concatenate([top, bottom], axis=0)
-        time_mask = mask_vid[None, None, :, :]
+        time_mask = build_dart_time_mask(T)
     else:
         mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))  # causal tokens
         time_mask = mask_vid[None, None, :, :]
