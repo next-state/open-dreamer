@@ -223,8 +223,8 @@ def compute_flow_loss(
     
     
     # Apply ramp weighting and reduce
-    weights = ramp_weight(sigma)
-    return jnp.mean(mse_per_step * weights), jnp.mean(mse_per_step)
+    mse_per_step = mse_per_step * ramp_weight(sigma)[...,None,None]
+    return jnp.mean(mse_per_step), jnp.mean(mse_per_step)
 
 
 def compute_bootstrap_loss(
@@ -368,7 +368,8 @@ def shortcut_forcing_step(
     rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
         actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
-        context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings_full, deterministic=False, rngs=rngs1
+        context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings_full,
+        use_dart=use_dart, deterministic=False, rngs=rngs1
     )
 
     # Always take the last T (noisy) positions; for non-DART this is the full sequence.
@@ -404,7 +405,8 @@ def shortcut_forcing_step(
         rngs2 = nnx.Rngs(dropout=key_dropout2)
         z1_half1_full, *_ = dynamics_model(
             actions_half1, step_idx_half1, sigma_idx_half1, z_tilde_full_self,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_half1, deterministic=False, rngs=rngs2
+            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_half1,
+            use_dart=use_dart, deterministic=False, rngs=rngs2
         )
         z1_half1 = z1_half1_full[:, -T:, ...]
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
@@ -417,7 +419,8 @@ def shortcut_forcing_step(
         rngs3 = nnx.Rngs(dropout=key_dropout3)
         z1_half2_full, *_ = dynamics_model(
             actions_half2, step_idx_half2, sigma_idx_half2, z_prime_full,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_half2, deterministic=False, rngs=rngs3
+            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_half2,
+            use_dart=use_dart, deterministic=False, rngs=rngs3
         )
         z1_half2 = z1_half2_full[:, -T:, ...]
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)

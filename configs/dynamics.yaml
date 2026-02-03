@@ -47,7 +47,7 @@ dynamics:
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
 
-bootstrap_start: 5_000  # Number of start steps trained exclusively on flow-matching objective
+bootstrap_start: 2_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
 
 # Alternating batch lengths (paper: "Sequence length" paragraph)
@@ -59,11 +59,11 @@ max_steps: 30_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
-  lr: 3e-3  # constant LR or peak LR for schedules
+  lr: 1e-2  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05
-  decay_ratio: 0.5
+  decay_ratio: 0.95
   max_steps: ${max_steps}
 
 optimizer:

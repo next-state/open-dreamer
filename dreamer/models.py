@@ -366,6 +366,7 @@ class GroupedQueryAttention(nnx.Module):
             *args,
             mask: jnp.ndarray | None = None,
             local_window_size: int | tuple[int, int] | None = None,
+            dart_rope: bool = False,
             deterministic: bool = True,
             cache: KVCache | None = None,
             rngs: nnx.Rngs | None = None
@@ -394,6 +395,21 @@ class GroupedQueryAttention(nnx.Module):
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
             scale = 1.0
 
+        def _apply_dart_rope(q_in, k_in):
+            t2 = q_in.shape[1]
+            if t2 % 2 != 0:
+                raise ValueError(f"DART RoPE requires even sequence length, got {t2}")
+            t = t2 // 2
+            q2 = rearrange(q_in, "B (a T) N H -> (B a) T N H", a=2, T=t)
+            k2 = rearrange(k_in, "B (a T) K H -> (B a) T K H", a=2, T=t)
+            q2, k2 = self.rope(q2, k2, start_pos=0)
+            q_out = rearrange(q2, "(B a) T N H -> B (a T) N H", a=2, T=t)
+            k_out = rearrange(k2, "(B a) T K H -> B (a T) K H", a=2, T=t)
+            return q_out, k_out
+
+        if dart_rope and self.use_seq_parallel and cache is None:
+            raise NotImplementedError("DART RoPE with sequence parallelism is not supported.")
+
         # Sequence parallel path: all-gather K,V across sequence axis for training
         if self.use_seq_parallel and cache is None:
             # Get sequence axis info from the mesh
@@ -405,7 +421,10 @@ class GroupedQueryAttention(nnx.Module):
 
             # Global position offset for RoPE
             global_start_pos = seq_axis_idx * T_local
-            q, k = self.rope(q, k, start_pos=global_start_pos)
+            if dart_rope:
+                q, k = _apply_dart_rope(q, k)
+            else:
+                q, k = self.rope(q, k, start_pos=global_start_pos)
 
             # All-gather K, V across sequence axis
             # tiled=True means the results are concatenated along the axis rather than stacked
@@ -437,7 +456,10 @@ class GroupedQueryAttention(nnx.Module):
             # Standard non-SP path
             # RoPE
             start_pos = cache.index if cache is not None else 0
-            q, k = self.rope(q, k, start_pos=start_pos)
+            if dart_rope and cache is None:
+                q, k = _apply_dart_rope(q, k)
+            else:
+                q, k = self.rope(q, k, start_pos=start_pos)
 
             # KV cache
             if self.is_causal and cache is not None:
@@ -498,6 +520,7 @@ class SpaceSelfAttention(nnx.Module):
             *,
             mask: jnp.ndarray | None = None,
             local_window_size: int | tuple[int, int] | None = None,
+            dart_rope: bool = False,
             deterministic: bool = True,
             cache: KVCache | None = None,
             rngs: nnx.Rngs | None = None
@@ -537,6 +560,7 @@ class TimeSelfAttention(nnx.Module):
         *,
         mask: jnp.ndarray | None = None,
         local_window_size: int | tuple[int, int] | None = None,
+        dart_rope: bool = False,
         deterministic: bool = True,
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None
@@ -548,7 +572,7 @@ class TimeSelfAttention(nnx.Module):
         if mask is not None and mask.ndim >= 3 and mask.shape[0] == B:
             mask = repeat(mask, 'B ... -> (B S) ...', S=S)
 
-        out, new_cache = self.attn(x, mask=mask, local_window_size=local_window_size, cache=cache, deterministic=deterministic, rngs=rngs)
+        out, new_cache = self.attn(x, mask=mask, local_window_size=local_window_size, dart_rope=dart_rope, cache=cache, deterministic=deterministic, rngs=rngs)
 
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         return out, new_cache
@@ -601,6 +625,7 @@ class BlockCausalLayer(nnx.Module):
         space_mask: jnp.ndarray | None = None,
         time_mask: jnp.ndarray | None = None,
         time_local_window_size: int | tuple[int, int] | None = None,
+        dart_rope: bool = False,
         deterministic: bool = True,
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None
@@ -613,7 +638,7 @@ class BlockCausalLayer(nnx.Module):
         else:
             attn_mask = space_mask
             local_window_size = None
-        y, new_cache = self.attn(y, mask=attn_mask, local_window_size=local_window_size, deterministic=deterministic, cache=cache, rngs=rngs)
+        y, new_cache = self.attn(y, mask=attn_mask, local_window_size=local_window_size, dart_rope=dart_rope if self.use_time else False, deterministic=deterministic, cache=cache, rngs=rngs)
         x = x + y
 
         # MLP
@@ -669,6 +694,7 @@ class BlockCausalTransformer(nnx.Module):
         space_mask: jnp.ndarray | None = None,
         time_mask: jnp.ndarray | None = None,
         time_local_window_size: int | tuple[int, int] | None = None,
+        dart_rope: bool = False,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
         rngs: nnx.Rngs | None = None
@@ -699,7 +725,16 @@ class BlockCausalTransformer(nnx.Module):
             is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
 
-            x, new_cache_i = layer(x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs)
+            x, new_cache_i = layer(
+                x,
+                space_mask=space_mask,
+                time_mask=time_mask,
+                time_local_window_size=time_local_window_size,
+                dart_rope=dart_rope,
+                deterministic=deterministic,
+                cache=cache_i,
+                rngs=rngs,
+            )
 
             if new_caches is not None and new_cache_i is not None:
                 new_caches[time_index] = new_cache_i
@@ -1187,6 +1222,7 @@ class Dynamics(nnx.Module):
         context_length: int | None = None,
         time_mask: jnp.ndarray | None = None,
         task_embeddings: jnp.ndarray | None = None,
+        use_dart: bool = False,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
         rngs: nnx.Rngs | None = None
@@ -1201,6 +1237,7 @@ class Dynamics(nnx.Module):
                            creates local_window_size=(context_length - 1, 0) for causal sliding window.
             time_mask: optional (B, 1, T, T) boolean mask for temporal attention
             task_embeddings: (B, T, n_agent, d_model) optional agent tokens
+            use_dart: If True, apply DART RoPE semantics for clean/noisy halves (training only)
             caches: optional dict of KVCache for each layer
 
         Shapes produced (internal):
@@ -1254,6 +1291,7 @@ class Dynamics(nnx.Module):
         x, new_caches = self.transformer(
             tokens, space_mask=space_mask,
             time_mask=time_mask,
+            dart_rope=use_dart,
             time_local_window_size=time_local_window_size,
             deterministic=deterministic,
             caches=caches,
