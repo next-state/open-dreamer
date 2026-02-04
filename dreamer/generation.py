@@ -7,6 +7,7 @@ from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 from .actions import Actions
 from .utils import normalize_latents, unnormalize_latents
 from flax.struct import dataclass
+from flax import nnx
 
 
 @dataclass
@@ -30,8 +31,8 @@ class DenoiseSchedule:
     k_max: int
     d: float
     step_idx: int
-    tau_values: jax.Array
-    tau_indices: jax.Array
+    tau_values: tuple[float, ...]
+    tau_indices: tuple[int, ...]
     step_idx_ctx: int
     tau_idx_ctx: int
     tau_ctx: float
@@ -50,12 +51,11 @@ class DenoiseSchedule:
         
         d = 1 / num_steps
         step_idx = int(math.log2(num_steps))
-        tau_values = jnp.linspace(0.0, 1.0, num_steps + 1)
-        tau_indices = jnp.arange(num_steps) * (k_max // num_steps)
+        tau_values = tuple(i * d for i in range(num_steps + 1))
+        tau_indices = tuple(i * (k_max // num_steps) for i in range(num_steps))
         
-        # Compute noise level for context during autoregressive rollout (JAX-friendly)
-        tau_ctx = jnp.asarray(tau_ctx, dtype=jnp.float32)
-        step_idx_ctx = jnp.round(-jnp.log2(1.0 - tau_ctx)).astype(jnp.int32)
+        # Compute noise level for context during autoregressive rollout
+        step_idx_ctx = int(round(-math.log2(1.0 - tau_ctx)))
         tau_idx_ctx = k_max - k_max // (2 ** step_idx_ctx)
         # set tau_ctx to the exact value such that tau_ctx + step_ctx = 1
         tau_ctx = 1.0 - 2.0 ** (-step_idx_ctx)
@@ -77,6 +77,7 @@ def next_latent(
     caches: KVCachesDict | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: Actions | None = None,
+    use_actions: bool = True,
 ) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
@@ -103,6 +104,12 @@ def next_latent(
     noisy_latent = jax.random.normal(rng_latent, latent_shape)
     B = latent_shape[0]
 
+    # Null out actions if not using them
+    if not use_actions:
+        action = jax.tree.map(lambda _: None, action)
+        if actions_ctx is not None:
+            actions_ctx = jax.tree.map(lambda _: None, actions_ctx)
+
     latents_ctx_noised = None
     if latents_ctx is not None and caches is None:
         noise_prefill = jnp.zeros(latents_ctx[:, :prefill_length].shape)
@@ -112,12 +119,16 @@ def next_latent(
 
     action = action[:, None, ...]  # expand squeezed-out time dimension
     
+    # Convert to arrays for dynamic indexing in scan
+    tau_values_arr = jnp.asarray(schedule.tau_values)
+    tau_indices_arr = jnp.asarray(schedule.tau_indices)
+    
     def refinement_step(latent_t, s):
-        tau_prev, tau_curr = schedule.tau_values[s], schedule.tau_values[s+1]
+        tau_prev, tau_curr = tau_values_arr[s], tau_values_arr[s+1]
         alpha = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
 
         step_idx = schedule.step_idx
-        tau_idx_val = schedule.tau_indices[s]
+        tau_idx_val = tau_indices_arr[s]
 
         if caches is not None:
             latent_input, actions_input = latent_t, action
@@ -242,9 +253,10 @@ def next_frame(
     
     return frame, h_last, dynamics_cache_updated, tokenizer_cache_updated, rng
 
+@nnx.jit(static_argnames=('schedule', 'num_steps', 'deterministic', 'use_actions'))
 def latent_rollout(
     dynamics: Dynamics,
-    policy: PolicyHeadMTP | Actions,
+    policy: PolicyHeadMTP | Actions | None,
     schedule: DenoiseSchedule,
     latents_ctx: jax.Array,
     actions_ctx: Actions,
@@ -252,6 +264,7 @@ def latent_rollout(
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
     deterministic: bool = False,
+    use_actions: bool = True,
 ):
     """
     Autoregressive rollout in latent space.
@@ -273,13 +286,17 @@ def latent_rollout(
     B, T_ctx, n_spatial, D_s = latents_ctx.shape
     latent_shape = (B, 1, n_spatial, D_s)
 
+    # Null out actions if not using them
+    if not use_actions:
+        actions_ctx = jax.tree.map(lambda _: None, actions_ctx)
+
     # Normalize context latents for dynamics (keep original for output)
     latents_ctx_orig = latents_ctx
     latents_ctx = normalize_latents(latents_ctx, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
     # Initialize caches and process context
     window_size = T_ctx + num_steps
-    n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
+    n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0 if policy is None else 0
     caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
 
     # Run dynamics on context to prefill caches and get last hidden state
@@ -305,7 +322,9 @@ def latent_rollout(
         # Sample action
         rng, rng_policy = jax.random.split(rng)
         
-        if isinstance(policy, Actions):
+        if not use_actions or policy is None:
+            action = Actions()  # Null action
+        elif isinstance(policy, Actions):
             action = policy[:, step_idx]  # (B, ...)
         else:
             all_actions = policy.sample(h_t, deterministic=deterministic, rng=rng_policy)  # (B, T, L, ...)
@@ -313,7 +332,8 @@ def latent_rollout(
         
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng = next_latent(
-            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
+            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding,
+            use_actions=use_actions,
         )
         
         return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
@@ -343,13 +363,14 @@ def latent_rollout(
 def video_rollout(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
-    policy: PolicyHeadMTP | Actions,
+    policy: PolicyHeadMTP | Actions | None,
     schedule: DenoiseSchedule,
     frames_ctx: jax.Array,
     actions_ctx: Actions,
     num_steps: int,
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
+    use_actions: bool = True,
 ):
     """
     End-to-end video generation rollout.
@@ -391,6 +412,7 @@ def video_rollout(
         rng,
         initial_task_embedding,
         deterministic=True,  # use deterministic policy for visualization
+        use_actions=use_actions,
     )
 
     # Decode

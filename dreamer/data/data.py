@@ -70,7 +70,7 @@ def make_iterator(
     source = grain.sources.ArrayRecordDataSource(array_record_paths)
 
     sampler = grain.samplers.IndexSampler(
-        num_records=len(source),
+        num_records=cfg.num_samples if cfg.num_samples > 0 else len(source),
         shard_options=grain.sharding.ShardByJaxProcess(drop_remainder=True),
         shuffle=True,
         num_epochs=None,

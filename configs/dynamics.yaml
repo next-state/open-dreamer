@@ -3,12 +3,12 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-dart
+run_name: dynamics
 tokenizer_ckpt: logs/tokenizer-512/checkpoints/
 
 ckpt:
-  max_to_keep: 0
-  save_interval_steps: 10_000
+  max_to_keep: 1
+  save_interval_steps: 1_000
 
 dataset:
   dataloader_cfg:
@@ -59,7 +59,7 @@ max_steps: 30_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
-  lr: 1e-2  # constant LR or peak LR for schedules
+  lr: 3e-3  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05
@@ -83,4 +83,4 @@ optimizer:
 write_video_every: 2000
 dtype: ${dataset.dataloader_cfg.dtype}
 param_dtype: bfloat16
-use_dart: true  # Use DART masking/duplication in dynamics training
+use_dart: false  # Use DART masking/duplication in dynamics training

@@ -49,7 +49,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "T", "context_length", "bootstrap_fraction", "use_latent_data", "use_dart"),
+    static_argnames=("k_max", "T", "context_length", "bootstrap_fraction", "use_latent_data", "use_dart", "use_actions"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -67,6 +67,7 @@ def train_step(
     bootstrap_fraction: float,
     use_latent_data: bool,    # True if data is already latents, False if data is videos
     use_dart: bool,
+    use_actions: bool = True,
 ):
     if use_latent_data:
         latents = data
@@ -102,6 +103,7 @@ def train_step(
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
             use_dart=use_dart,
+            use_actions=use_actions,
         )
 
         return losses['total'], aux
@@ -203,8 +205,9 @@ def run(cfg: DynamicsConfig):
                 if step >= cfg.max_steps:
                     break
 
+                bundle.maybe_save(checkpoint_manager, step, rng)
                 rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
-
+                
                 # Use pre-allocated batch
                 actions = batch["actions"]
                 videos = batch.get("videos")
@@ -220,7 +223,8 @@ def run(cfg: DynamicsConfig):
                         cfg, step, bundle.tokenizer, bundle.dynamics,
                         val_data=val_data, val_actions=val_actions,
                         use_latent_data=use_latent_data,
-                        vis_dir=vis_dir, rng=rng, logger=logger
+                        vis_dir=vis_dir, rng=rng, logger=logger,
+                        use_actions=getattr(cfg, "use_actions", False),
                     )
 
                 # Training step
@@ -235,6 +239,7 @@ def run(cfg: DynamicsConfig):
                     bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                     use_latent_data=use_latent_data,
                     use_dart=getattr(cfg, "use_dart", False),
+                    use_actions=getattr(cfg, "use_actions", False),
                 )
 
                 # Logging
@@ -253,8 +258,6 @@ def run(cfg: DynamicsConfig):
                         pbar=pbar,
                     )
 
-                # Checkpointing
-                bundle.maybe_save(checkpoint_manager, step, rng)
 
             scaling.finalize()
 

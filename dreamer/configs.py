@@ -51,6 +51,7 @@ class DatasetConfig:
 
     # For minecraft_vpt: number of shards to use (each shard = 1 episode)
     index_max: int = 0
+    num_samples: int = -1
 
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
@@ -334,6 +335,7 @@ class DynamicsConfig(BaseExperimentConfig):
     dynamics: DynamicsModelConfig = field(default_factory=DynamicsModelConfig)
 
     # Training
+    use_actions: bool = True  # Whether to condition dynamics on actions
     use_dart: bool = False  # Use DART masking/duplication in dynamics training
     bootstrap_start: int = 5_000  # Number of start steps trained exclusively on flow-matching objective
     bootstrap_fraction: float = 0.25  # Fraction of batch used for bootstrap samples

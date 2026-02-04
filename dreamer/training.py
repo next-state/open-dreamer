@@ -22,7 +22,7 @@ import time
 
 from dreamer.configs import DynamicsConfig, HeadsConfig
 from dreamer.generation import DenoiseSchedule
-from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
+from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder, Tokenizer
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
 from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents
@@ -285,6 +285,7 @@ def shortcut_forcing_step(
     time_mask: jnp.ndarray | None = None,
     task_embeddings: jnp.ndarray | None = None,
     use_dart: bool = False,
+    use_actions: bool = True,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
     Compute shortcut forcing losses (flow + bootstrap) for a batch.
@@ -313,7 +314,11 @@ def shortcut_forcing_step(
     B, T, S, D = latents.shape
     B_emp = B - B_self
     emax = jnp.log2(k_max).astype(jnp.int32)
-    schedule = DenoiseSchedule.init(4, k_max, 0.9)
+    schedule = DenoiseSchedule.init(4, k_max, 0.99)
+
+    # Null out actions if not conditioning on them
+    if not use_actions:
+        actions = jax.tree.map(lambda _: None, actions)
 
     # Normalize latents before corruption (all operations happen in normalized space)
     latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
@@ -778,11 +783,12 @@ def compute_policy_loss(
 # Evaluation and visualization
 # ---------------------------
 
+
 def run_evaluation(
     cfg: DynamicsConfig | HeadsConfig,
     step: int,
-    tokenizer,
-    dynamics,
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
     val_data: jnp.ndarray,
     val_actions: Actions,
     use_latent_data: bool,
@@ -791,6 +797,7 @@ def run_evaluation(
     logger,
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
+    use_actions: bool = True,
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
@@ -813,8 +820,8 @@ def run_evaluation(
         task_embedder: Optional task embedder for agent tokens
     """
     k_max = dynamics.cfg.k_max
-    schedule_shortcut = DenoiseSchedule.init(4, k_max)
-    schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
+    schedule_shortcut = DenoiseSchedule.init(4, k_max, 0.99)
+    schedule_diffusion = DenoiseSchedule.init(k_max, k_max, 0.99)
 
     evaluation_schedules = {"shortcut": schedule_shortcut, "diffusion": schedule_diffusion}
 
@@ -832,7 +839,7 @@ def run_evaluation(
                 tokenizer, dynamics, frames=None,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=rng, policy=policy, task_embedder=task_embedder,
-                latents=val_data
+                latents=val_data, use_actions=use_actions,
             )
             # For metrics, compare pred vs gt_decoded (both from latents)
             gt_frames_for_metrics = gt_decoded_frames
@@ -840,7 +847,8 @@ def run_evaluation(
             pred_frames, gt_decoded_frames, original_frames = sample_video(
                 tokenizer, dynamics, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
-                rng=rng, policy=policy, task_embedder=task_embedder
+                rng=rng, policy=policy, task_embedder=task_embedder,
+                use_actions=use_actions,
             )
             # For metrics, compare pred vs original frames
             gt_frames_for_metrics = original_frames
