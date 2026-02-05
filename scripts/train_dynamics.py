@@ -49,7 +49,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "T", "context_length", "bootstrap_fraction", "use_latent_data", "use_dart", "use_actions"),
+    static_argnames=("T", "cfg", "use_latent_data"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -62,12 +62,8 @@ def train_step(
     master_key: jax.Array,
     step: int,
     T: int,
-    k_max: int,
-    context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
-    bootstrap_fraction: float,
+    cfg: DynamicsConfig,
     use_latent_data: bool,    # True if data is already latents, False if data is videos
-    use_dart: bool,
-    use_actions: bool = True,
 ):
     if use_latent_data:
         latents = data
@@ -78,11 +74,12 @@ def train_step(
     latents = latents.astype(dynamics.dtype)
 
     B = latents.shape[0]
+    bootstrap_fraction = cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0
     B_self = int(B * bootstrap_fraction)
     B_emp = B - B_self
 
     # Build time mask for full batch
-    if use_dart:
+    if cfg.use_dart:
         time_mask = build_dart_time_mask(T)
     else:
         mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))  # causal tokens
@@ -97,20 +94,20 @@ def train_step(
             actions=actions,
             latents=latents,
             rng=step_key,
-            k_max=k_max,
+            k_max=cfg.dynamics.k_max,
             B_self=B_self,
             context_length=context_length, # Builds sliding window attention
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
-            use_dart=use_dart,
-            use_actions=use_actions,
+            use_dart=cfg.use_dart,
+            use_actions=cfg.use_actions,
         )
 
         return losses['total'], aux
 
     (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
         dynamics, 
-        latents, actions, time_mask, context_length
+        latents, actions, time_mask, cfg.dynamics.context_length
     )
 
     # Update model with optimizer
@@ -234,12 +231,8 @@ def run(cfg: DynamicsConfig):
                     master_key=master_key,
                     step=step,
                     T=T,
-                    k_max=cfg.dynamics.k_max,
-                    context_length=cfg.dynamics.context_length,
-                    bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
+                    cfg=cfg,
                     use_latent_data=use_latent_data,
-                    use_dart=getattr(cfg, "use_dart", False),
-                    use_actions=getattr(cfg, "use_actions", False),
                 )
 
                 # Logging
