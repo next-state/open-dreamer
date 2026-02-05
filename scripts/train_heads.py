@@ -410,10 +410,18 @@ def run(cfg: HeadsConfig):
                     val_videos = batch["videos"][:4]
                     val_actions = actions[:4]
                     run_evaluation(
-                        cfg, step,
-                        bundle.tokenizer, bundle.dynamics,
-                        val_videos, val_actions, vis_dir, rng, logger, bundle.policy_head,
-                        bundle.task_embedder
+                        cfg=cfg,
+                        step=step,
+                        tokenizer=bundle.tokenizer,
+                        dynamics=bundle.dynamics,
+                        val_data=val_videos,
+                        val_actions=val_actions,
+                        use_latent_data=False,
+                        vis_dir=vis_dir,
+                        rng=rng,
+                        logger=logger,
+                        policy=bundle.policy_head,
+                        task_embedder=bundle.task_embedder,
                     )
 
     print("[done] Agent finetuning complete!")

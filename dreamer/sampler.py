@@ -47,14 +47,12 @@ def sample_video(
                 agent tokens for the dynamics model.
         latents: Optional pre-tokenized latents (B, T, n_latents, d_bottleneck). If provided,
                 skips tokenizer encoding. Latents should already be unpacked.
-        omega: Guidance strength (0 = no guidance). See https://arxiv.org/pdf/2502.07849
-        alpha: Guidance alpha parameter for scaling.
-
     Returns:
         pred_frames: (B, ctx+horizon, H, W, C) predicted frames [0, 255] uint8
         gt_decoded_frames: (B, ctx+horizon, H, W, C) GT latents decoded [0, 255] uint8
         original_frames: (B, ctx+horizon, H, W, C) original frames [0, 255] uint8, or None if using latents
     """
+    del omega, alpha
 
     if latents is not None:
         # Pre-tokenized latent path
@@ -120,8 +118,6 @@ def sample_video(
         rng=rng,
         initial_task_embedding=initial_agent_tokens,
         deterministic=True,
-        omega=omega,
-        alpha=alpha,
     )
 
     # Decode predicted latents to frames

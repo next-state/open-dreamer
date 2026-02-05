@@ -1,12 +1,4 @@
-"""
-Reusable training components for dynamics and imagination training.
-
-This module contains:
-- Sampling utilities for tau (signal level) and step size
-- Loss computation functions for shortcut forcing
-- Training step helpers that can be shared across training phases
-- Evaluation and visualization utilities
-"""
+"""Reusable training components for dynamics and imagination training."""
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -102,80 +94,15 @@ def sample_tau_for_step(
     rng: jax.Array,
     shape_bt: Tuple[int, int],
     k_max: int,
-    step_idx: jnp.ndarray,
     *,
-    dtype=jnp.float32
+    dtype=jnp.float32,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Sample tau (signal level) values aligned to step_idx grid.
-    
-    This is the core sampling logic for shortcut forcing - it samples signal levels
-    on the discrete grid defined by the current step size.
-    
-    Args:
-        rng: JAX random key
-        shape_bt: Tuple of (batch_size, sequence_length)
-        k_max: Maximum noise resolution (e.g., 256)
-        step_idx: (B, T) array of step indices encoding d = 1 / (1 << step_idx)
-        dtype: Data type for computation
-        
-    Returns:
-        tau: (B, T) Signal levels in [0, 1]
-        tau_idx: (B, T) Discrete indices in [0, k_max]
-        
-    Example:
-        If step_idx = 3, then K = 2^3 = 8, d = 1/8
-        tau will be sampled uniformly from {0, 1/8, 2/8, ..., 7/8}
-    """
+    """Sample tau on the finest training grid [0, 1) with k_max bins."""
     B_, T_ = shape_bt
-    K = 1 << step_idx  # 2^step_idx
     u = jax.random.uniform(rng, (B_, T_), dtype=dtype)
-    j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)
-    tau = j_idx.astype(dtype) / K.astype(dtype)
-    tau_idx = j_idx * (k_max // K)
+    tau_idx = jnp.floor(u * k_max).astype(jnp.int32)
+    tau = tau_idx.astype(dtype) / k_max
     return tau, tau_idx
-
-
-@partial(jax.jit, static_argnames=("shape_bt", "k_max", "dtype"))
-def sample_step_excluding_dmin(
-    rng: jax.Array,
-    shape_bt: Tuple[int, int],
-    k_max: int,
-    *,
-    dtype=jnp.float32
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Sample step indices excluding the finest level (for bootstrap loss).
-    
-    The bootstrap loss requires coarser step sizes (d > d_min) to distill
-    two half-steps into a full step.
-    
-    Args:
-        rng: JAX random key
-        shape_bt: Tuple of (batch_size, sequence_length)
-        k_max: Maximum noise resolution
-        dtype: Data type for computation
-        
-    Returns:
-        d: (B, T) Step sizes (e.g., 1/128, 1/64, ..., 1/2, 1)
-        step_idx: (B, T) Step indices in [0, log2(k_max) - 1]
-        
-    Example:
-        If k_max = 256, emax = 8, samples step_idx from {0, 1, ..., 7}
-        Step idx 7 gives d = 1/2, idx 0 gives d = 1/256 (but excludes d_min = 1/256)
-    """
-    B_, T_ = shape_bt
-    emax = jnp.log2(k_max).astype(jnp.int32)
-    # Sample from [0, emax) to exclude finest level at emax
-    step_idx = jax.random.randint(rng, (B_, T_), 0, emax, dtype=jnp.int32)
-    d = 1.0 / (1 << step_idx).astype(dtype)
-    return d, step_idx
-
-
-# Loss weighting
-def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float = 1.0) -> jnp.ndarray:
-    weight = (max_weight - min_weight) * sigma + min_weight
-    return weight[...,None,None]
 
 
 # ---------------------------
@@ -203,77 +130,16 @@ def compute_psnr(pred, target):
 def compute_flow_loss(
     z_pred: jnp.ndarray,
     z_target: jnp.ndarray,
-    sigma: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Flow matching loss in x-space (direct prediction of clean latents).
-    
-    Args:
-        z_pred: (B, T, S, D) Predicted clean latents
-        z_target: (B, T, S, D) Ground truth clean latents
-        sigma: (B, T) Signal levels (used for weighting)
-        per_example: If True, return (B, T) losses; else return scalar
-        
-    Returns:
-        loss: Tuple[jnp.float32, jnp.float32]
-            mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
-            mse_per_token: tuple of scalars. MSE loss 
-    """
+    """Flow matching loss in x-space (direct prediction of clean latents)."""
     z_mean, z_logvar = jnp.split(z_pred, 2, axis=-1)
-    mse = (z_mean-z_target)**2
-    log_prob = z_logvar + jnp.exp(-z_logvar)*mse  # (B, T, S, D)
-    
-    
-    # Apply ramp weighting and reduce
-    # weight = ramp_weight(sigma, min_weight=1., max_weight=0.1)
-    
+    mse = (z_mean - z_target) ** 2
+    log_prob = z_logvar + jnp.exp(-z_logvar) * mse
     return jnp.mean(log_prob), jnp.mean(mse)
 
 
-def compute_bootstrap_loss(
-    z_pred: jnp.ndarray,
-    z_tilde: jnp.ndarray,
-    b_prime: jnp.ndarray,
-    b_doubleprime: jnp.ndarray,
-    sigma: jnp.ndarray,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Bootstrap self-consistency loss for shortcut forcing.
-    
-    Trains the model to predict the same endpoint whether taking one large step
-    or two smaller steps. Loss is computed in v-space but scaled to x-space.
-    
-    Args:
-        z_pred: (B, T, S, D) Predicted latent from full step
-        z_tilde: (B, T, S, D) Initial noisy latent
-        b_prime: (B, T, S, D) Velocity from first half-step
-        b_doubleprime: (B, T, S, D) Velocity from second half-step
-        sigma: (B, T) Signal levels
-        
-    Returns:
-        loss: Tuple[jnp.float32, jnp.float32]
-            mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
-            mse_per_token: tuple of scalars. MSE loss 
-    """
-    # Convert full-step prediction to velocity
-    z_mean, z_logvar = jnp.split(z_pred, 2, axis=-1)
-    v_hat = (z_mean - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
-    v_logvar = z_logvar - jnp.log(jnp.maximum(1.0 - sigma[..., None, None], 1e-8))
-    
-    # Target velocity is average of two half-steps (stop gradient)
-    v_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-    
-    # MSE in v-space, scaled to x-space
-    v_diff = (v_hat - v_target) ** 2
-    boot_per_token = v_logvar + jnp.exp(-v_logvar)*v_diff
-    
-    
-    # Apply ramp weighting and reduce
-    return jnp.mean(boot_per_token), jnp.mean(v_diff)
-
-
 # ---------------------------
-# Shortcut forcing step logic
+# Dynamics flow step logic
 # ---------------------------
 
 def shortcut_forcing_step(
@@ -289,119 +155,44 @@ def shortcut_forcing_step(
     task_embeddings: jnp.ndarray | None = None,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
-    Compute shortcut forcing losses (flow + bootstrap) for a batch.
+    Compute flow-matching losses for a batch.
 
-    This is the core training logic that can be reused in both dynamics pretraining
-    and imagination training phases.
-
-    Args:
-        dynamics_model: NNX Dynamics model instance
-        actions: (B, T) Action sequence
-        latents: (B, T, S, D) Latent sequence (ground truth)
-        rng: Random key
-        k_max: Maximum noise resolution
-        B_self: Number of bootstrap examples (last B_self rows of batch)
-        context_length: optional context length for sliding window attention. If provided,
-                       creates local_window_size=(context_length - 1, 0) for causal sliding window.
-        task_embeddings: Optional (B, T, n_agent, d_model) agent tokens
-
-    Returns:
-        losses: Dict with 'total', 'flow', 'bootstrap' keys
-        aux: Dict with auxiliary metrics for logging. If task_embeddings is not None,
-             aux contains 'h_states' key with (B, T, n_agent, d_model) hidden states
-             from the main forward pass (computed with noisy inputs)
+    The function name is kept for compatibility with training scripts.
     """
-    B, T, S, D = latents.shape
-    B_emp = B - B_self
+    del B_self
+
+    B, T, _, _ = latents.shape
     emax = jnp.log2(k_max).astype(jnp.int32)
 
-    # Normalize latents before corruption (all operations happen in normalized space)
+    # Normalize latents before corruption.
     latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
 
-    # Split RNG
-    key_sigma, key_step, key_noise, key_dropout1, key_dropout2, key_dropout3 = jax.random.split(rng, 6)
-
-    # --- Step indices ---
-    # Empirical rows: always use finest step (d_min)
-    step_idx_emp = jnp.full((B_emp, T), emax, dtype=jnp.int32)
-    
-    # Bootstrap rows: coarser steps (if B_self > 0)
-    if B_self > 0:
-        d_self, step_idx_self = sample_step_excluding_dmin(key_step, (B_self, T), k_max, dtype=latents.dtype)
-    else:
-        d_self = jnp.zeros((0, T), dtype=latents.dtype)
-        step_idx_self = jnp.zeros((0, T), dtype=jnp.int32)
-    
-    step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)
-    
-    # --- Sample signal levels ---
-    sigma_full, sigma_idx_full = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx_full, dtype=latents.dtype)
-    sigma_emp = sigma_full[:B_emp]
-    sigma_self = sigma_full[B_emp:]
-    sigma_idx_self = sigma_idx_full[B_emp:]
-    
-    # --- Corrupt latents: z_tilde = (1 - sigma) * z0 + sigma * z1 ---
+    # Sample tau and noise at full resolution.
+    key_sigma, key_noise, key_dropout = jax.random.split(rng, 3)
+    step_idx = jnp.full((B, T), emax, dtype=jnp.int32)
+    sigma, sigma_idx = sample_tau_for_step(key_sigma, (B, T), k_max, dtype=latents.dtype)
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
-    z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
-    
-    # --- Forward pass (full batch) ---
-    rngs1 = nnx.Rngs(dropout=key_dropout1)
-    z_pred_full, (h_states, _) = dynamics_model(
-        actions, step_idx_full, sigma_idx_full, z_tilde,
-        context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
+    z_tilde = (1.0 - sigma[..., None, None]) * z0 + sigma[..., None, None] * latents
+
+    # One dynamics pass, one loss.
+    rngs = nnx.Rngs(dropout=key_dropout)
+    z_pred, (h_states, _) = dynamics_model(
+        actions,
+        step_idx,
+        sigma_idx,
+        z_tilde,
+        context_length=context_length,
+        time_mask=time_mask,
+        task_embeddings=task_embeddings,
+        deterministic=False,
+        rngs=rngs,
     )
-    
-    # --- Flow loss (empirical rows) ---
-    z_pred_emp = z_pred_full[:B_emp]
-    loss_flow, flow_mse_unweighted = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
-    
-    # --- Bootstrap loss (self-consistency rows) ---
+
+    loss_flow, flow_mse = compute_flow_loss(z_pred, latents)
     loss_boot = jnp.array(0.0, dtype=latents.dtype)
-    boot_mse_unweighted = jnp.array(0.0, dtype=latents.dtype)
-    
-    if B_self > 0:
-        z_pred_self = z_pred_full[B_emp:]
-        z_tilde_self = z_tilde[B_emp:]
-        actions_self = actions[B_emp:]
-        time_mask_self = time_mask[B_emp:] if time_mask is not None else None  # assume aligned with batch
-        task_embeddings_self = task_embeddings[B_emp:] if task_embeddings is not None else None
 
-        # Half-step metadata
-        d_half = d_self / 2.0
-        step_idx_half = step_idx_self + 1
-        sigma_plus = sigma_self + d_half
-        sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
-
-        # First half-step
-        rngs2 = nnx.Rngs(dropout=key_dropout2)
-        z1_half1, *_ = dynamics_model(
-            actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs2
-        )
-        z1_half1 = z1_half1[...,:D]
-        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
-        z_prime = z_tilde_self + b_prime * d_half[..., None, None]
-
-        # Second half-step
-        rngs3 = nnx.Rngs(dropout=key_dropout3)
-        z1_half2, *_ = dynamics_model(
-            actions_self, step_idx_half, sigma_idx_plus, z_prime,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
-        )
-        z1_half2 = z1_half2[...,:D]
-        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
-
-        # Bootstrap loss (computed unconditionally)
-        loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
-    
-    # --- Combine losses ---
-    # Weight by batch composition to keep scale constant
-    loss_total = ((loss_flow * (B - B_self)) + (loss_boot * B_self)) / B
-    
-    losses = {'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
-    aux = {'flow_mse': flow_mse_unweighted, 'bootstrap_mse': boot_mse_unweighted, 'h_states': h_states}
-    
-    
+    losses = {"total": loss_flow, "flow": loss_flow, "bootstrap": loss_boot}
+    aux = {"flow_mse": flow_mse, "bootstrap_mse": loss_boot, "h_states": h_states}
     return losses, aux
 
 
@@ -740,105 +531,85 @@ def run_evaluation(
     omega: jax.Array | float = 0.0,
     alpha: jax.Array | float = 0.7,
 ):
-    """
-    Run periodic evaluation: sample videos, compute metrics, and save visualization.
+    """Run periodic evaluation: sample videos, compute metrics, and save visualization."""
+    del omega, alpha
 
-    This function can be used in both dynamics pretraining and agent finetuning.
-
-    Args:
-        cfg: Training config
-        step: Current training step
-        tokenizer: Tokenizer NNX model instance
-        dynamics: Dynamics NNX model instance
-        val_data: (B, T, H, W, C) Validation videos if use_latent_data=False,
-                  or (B, T, n_latents, d_bottleneck) pre-tokenized validation latents if use_latent_data=True
-        val_actions: (B, T) Validation actions
-        use_latent_data: Whether val_data contains latents (True) or videos (False)
-        vis_dir: Directory to save visualizations
-        rng: Random key
-        logger: Logger instance for logging metrics and videos
-        policy: Optional policy model for action sampling
-        task_embedder: Optional task embedder for agent tokens
-        omega: Guidance strength (0 = no guidance). See https://arxiv.org/pdf/2502.07849
-        alpha: Guidance alpha parameter for scaling.
-    """
     k_max = dynamics.cfg.k_max
-    schedule_shortcut = DenoiseSchedule.init(4, k_max)
     schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
+    tag = "diffusion"
 
-    evaluation_schedules = {"shortcut": schedule_shortcut, "diffusion": schedule_diffusion}
+    t0 = time.time()
+    T = val_data.shape[1]
+    assert T > 5, f"Sequence length {T} must be > 5"
+    ctx_length = 4
+    horizon = T - ctx_length
 
-    for tag, schedule_config in evaluation_schedules.items():
-        t0 = time.time()
-        # Determine sequence length and horizon
-        T = val_data.shape[1]
-        assert T > 5, f"Sequence length {T} must be > 5"
-        ctx_length = 4
-        horizon = T - ctx_length
+    if use_latent_data:
+        pred_frames, gt_decoded_frames, _ = sample_video(
+            tokenizer,
+            dynamics,
+            frames=None,
+            actions=val_actions,
+            horizon=horizon,
+            schedule_config=schedule_diffusion,
+            rng=rng,
+            policy=policy,
+            task_embedder=task_embedder,
+            latents=val_data,
+        )
+        gt_frames_for_metrics = gt_decoded_frames
+    else:
+        pred_frames, gt_decoded_frames, original_frames = sample_video(
+            tokenizer,
+            dynamics,
+            frames=val_data,
+            actions=val_actions,
+            horizon=horizon,
+            schedule_config=schedule_diffusion,
+            rng=rng,
+            policy=policy,
+            task_embedder=task_embedder,
+        )
+        gt_frames_for_metrics = original_frames
 
-        # Sample video predictions
-        if use_latent_data:
-            pred_frames, gt_decoded_frames, _ = sample_video(
-                tokenizer, dynamics, frames=None,
-                actions=val_actions, horizon=horizon, schedule_config=schedule_config,
-                rng=rng, policy=policy, task_embedder=task_embedder,
-                latents=val_data, omega=omega, alpha=alpha
-            )
-            # For metrics, compare pred vs gt_decoded (both from latents)
-            gt_frames_for_metrics = gt_decoded_frames
-        else:
-            pred_frames, gt_decoded_frames, original_frames = sample_video(
-                tokenizer, dynamics, frames=val_data,
-                actions=val_actions, horizon=horizon, schedule_config=schedule_config,
-                rng=rng, policy=policy, task_embedder=task_embedder,
-                omega=omega, alpha=alpha
-            )
-            # For metrics, compare pred vs original frames
-            gt_frames_for_metrics = original_frames
+    dt = time.time() - t0
+    dataset_std = cfg.dataset.dataset_std[0]
+    normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
+    normalized_gt = normalize_with_dataset_stats(gt_frames_for_metrics[:, -horizon:], mean=0, std=dataset_std)
+    mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
+    psnr = float(compute_psnr(pred_frames[:, -horizon:] / 255, gt_frames_for_metrics[:, -horizon:] / 255))
 
-        # Compute metrics
-        dt = time.time() - t0
-        dataset_std = cfg.dataset.dataset_std[0]
-        normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
-        normalized_gt = normalize_with_dataset_stats(gt_frames_for_metrics[:, -horizon:], mean=0, std=dataset_std)
-        mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
-        psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames_for_metrics[:, -horizon:]/255))
+    print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
 
-        print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
+    num_videos = min(4, pred_frames.shape[0])
+    pred_frames = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
 
-        # Build visualization
-        num_videos = min(4, pred_frames.shape[0])
+    if use_latent_data:
+        frames_list = [gt_decoded_frames, pred_frames]
+    else:
+        frames_list = [gt_decoded_frames, original_frames, pred_frames]
+    stacked_frames = jnp.stack(frames_list)[:, :num_videos]
+    videos = rearrange(stacked_frames, "S B T H W C -> T (B H) (S W) C", B=num_videos)
 
-        # Add red border to context frames in prediction
-        pred_frames = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
+    tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+    mp4_path = tag_dir / f"{tag}_grid.mp4"
 
-        if use_latent_data:
-            # 2-column grid: [gt_decoded, pred]
-            frames_list = [gt_decoded_frames, pred_frames]
-        else:
-            # 3-column grid: [floor (tokenizer reconstruction), gt, pred]
-            frames_list = [gt_decoded_frames, original_frames, pred_frames]
-        stacked_frames = jnp.stack(frames_list)[:, :num_videos]
-        videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
+    try:
+        videos = jax.device_get(videos)
+        iio.imwrite(str(mp4_path), videos, fps=5, plugin="pyav", codec="libx264")
+    except Exception as e:
+        print(f"[eval:{tag}] MP4 write failed: {e}")
 
-        # Save artifacts
-        tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
-        mp4_path = tag_dir / f"{tag}_grid.mp4"
-
-        # Save video
-        try:
-            videos = jax.device_get(videos)
-            iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
-        except Exception as e:
-            print(f"[eval:{tag}] MP4 write failed: {e}")
-
-        # Log metrics and video
-        logger.log_metrics(step, {
+    logger.log_metrics(
+        step,
+        {
             f"{tag}/mse": mse,
             f"{tag}/psnr": psnr,
             f"{tag}/horizon": horizon,
             f"{tag}/eval_time": dt,
-        }, prefix="eval/")
+        },
+        prefix="eval/",
+    )
 
-        if videos is not None:
-            logger.log_video(step, f"eval/{tag}/video", mp4_path)
+    if videos is not None:
+        logger.log_video(step, f"eval/{tag}/video", mp4_path)
