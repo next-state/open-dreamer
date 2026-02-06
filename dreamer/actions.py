@@ -51,7 +51,20 @@ def create_noop_action_like(template: Actions, categorical_action_dim: int) -> A
     )
 
 
+def shift_actions(actions: Actions, categorical_action_dim: int) -> Actions:
+    """Shift actions right by 1, preprend noop action."""
 
+    noop_action = create_noop_action_like(actions, categorical_action_dim)
+    
+    def _shift(current_arr, start_arr):
+        if current_arr is None: return None
+        return jnp.concatenate([start_arr, current_arr[:, :-1]], axis=1)
+
+    return Actions(
+        binary      = _shift(actions.binary, noop_action.binary),
+        categorical = _shift(actions.categorical, noop_action.categorical),
+        continuous  = _shift(actions.continuous, noop_action.continuous)
+    )
 
 
 # ------------------------------------------------------------

@@ -11,7 +11,7 @@ from dreamer.configs import DynamicsConfig
 from dreamer.data import make_dual_iterators
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.actions import Actions
+from dreamer.actions import Actions, shift_actions
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import run_evaluation, shortcut_forcing_step
@@ -242,6 +242,9 @@ def run(cfg: DynamicsConfig):
                 # Shard batch data
                 actions = jax.device_put(batch["actions"], data_sharding)
                 data = jax.device_put(batch["latents"] if use_latent_data else batch["videos"], data_sharding)
+                
+                # Action shifting: prepend "first action token" (noop) so action[t] aligns with state[t]
+                actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
 
                 # Validation step before training (as input buffers might be donated)
                 if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
