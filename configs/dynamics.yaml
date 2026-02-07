@@ -14,9 +14,6 @@ dataset:
   dataloader_cfg:
     B: 32
     T: 64
-    short_T: ${short_T}
-    long_T: ${long_T}
-    long_ratio: ${long_batch_ratio}
   C: 16
 
 dynamics:
@@ -46,15 +43,6 @@ dynamics:
     num_binary_actions: ${dataset.num_binary_actions}
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
-
-bootstrap_start: 5_000  # Number of start steps trained exclusively on flow-matching objective
-bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
-image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
-
-# Alternating batch lengths (paper: "Sequence length" paragraph)
-short_T: 32  # Overrides dataset.T
-long_T: 32  # Overrides dataset.T
-long_batch_ratio: 0.1  # Fraction of batches that use long_T
 
 max_steps: 30_000
 

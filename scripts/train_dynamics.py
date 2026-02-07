@@ -3,7 +3,6 @@ import logging
 import hydra
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -48,7 +47,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_fraction", "use_latent_data"),
+    static_argnames=("k_max", "context_length", "use_latent_data"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -60,11 +59,8 @@ def train_step(
     *,
     master_key: jax.Array,
     step: int,
-    B_img: int,               # Number of samples to treat as images
-    T: int,
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
-    bootstrap_fraction: float,
     use_latent_data: bool,    # True if data is already latents, False if data is videos
 ):
     if use_latent_data:
@@ -75,46 +71,25 @@ def train_step(
 
     latents = latents.astype(dynamics.dtype)
 
-    B = latents.shape[0]
-    B_self = int(B * bootstrap_fraction)
-    B_emp = B - B_self
-
-    # Identify image samples (split with same bootstrap ratio)
-    idx = jnp.arange(B)
-    B_img_boot = int(B_img * bootstrap_fraction)
-    B_img_emp = B_img - B_img_boot
-    is_img = (idx < B_img_emp) | ((idx >= B_emp) & (idx < (B_emp + B_img_boot)))
-
-    # Build time mask for full batch
-    mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
-    mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))  # causal tokens
-    time_mask = jnp.where(
-        is_img[:, None, None, None],
-        mask_img[None, None, :, :],
-        mask_vid[None, None, :, :]
-    )
-
     # Training step
     step_key = jax.random.fold_in(master_key, step)
 
-    def loss_fn(model: Dynamics, latents, actions, mask, context_length):
+    def loss_fn(model: Dynamics, latents, actions, context_length):
         losses, aux = shortcut_forcing_step(
             dynamics_model=model,
             actions=actions,
             latents=latents,
             rng=step_key,
             k_max=k_max,
-            B_self=B_self,
-            context_length=context_length, # Builds sliding window attention
-            time_mask=mask,
-            task_embeddings=None,  # Not used in dynamics pretraining
+            context_length=context_length,
+            task_embeddings=None,
         )
 
         return losses['total'], aux
 
     (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
-        dynamics, 
-        latents, actions, time_mask, context_length
+        dynamics,
+        latents, actions, context_length
     )
     
     # Update model with optimizer
@@ -161,25 +136,22 @@ def run(cfg: DynamicsConfig):
         n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
         B, T = cfg.dataset.dataloader_cfg.B, cfg.dataset.dataloader_cfg.T
-        avg_T = int(cfg.long_batch_ratio * cfg.long_T + (1 - cfg.long_batch_ratio) * cfg.short_T)
 
-        # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
-        dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
-        bootstrap_multiplier = 1 + cfg.bootstrap_fraction * (2/3)  # two additional gradientless calls to dynamics model, 1/6 for inference
-        total_dynamics_flops = dynamics_flops * bootstrap_multiplier
+        # Dynamics FLOPs
+        dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=T, n_latents=n_latents)
 
         # Encoder FLOPs: forward-only (no gradients) when using video data
         encoder_flops = 0
         if not use_latent_data:
-            tokenizer_training_flops = tokenizer.estimate_flops(batch_size=B, seq_length=avg_T)
-            encoder_flops = tokenizer_training_flops // 6  # ~1/6 of tokenizer training FLOPs (half for encoder, 1/3 for inference)
+            tokenizer_training_flops = tokenizer.estimate_flops(batch_size=B, seq_length=T)
+            encoder_flops = tokenizer_training_flops // 6
 
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
             flops_per_step=dynamics_flops + encoder_flops,
-            data_tokens_per_step=B * avg_T * (n_spatial + 1),  # spatial + action
-            total_tokens_per_step=B * avg_T * (2 + n_spatial + cfg.dynamics.n_register),  # action + shortcut + spatial + register
+            data_tokens_per_step=B * T * (n_spatial + 1),  # spatial + action
+            total_tokens_per_step=B * T * (2 + n_spatial + cfg.dynamics.n_register),  # action + shortcut + spatial + register
             logger=logger,
             run_dir=run_dir,
         )
@@ -231,15 +203,12 @@ def run(cfg: DynamicsConfig):
 
                 # Training step
                 metrics = train_step(
-                    bundle.tokenizer, bundle.dynamics, 
+                    bundle.tokenizer, bundle.dynamics,
                     bundle.dynamics_optimizer, input_tensor, actions,
                     master_key=master_key,
                     step=step,
-                    B_img=int(B * cfg.image_fraction),
-                    T=T,
                     k_max=cfg.dynamics.k_max,
                     context_length=cfg.dynamics.context_length,
-                    bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                     use_latent_data=use_latent_data,
                 )
 
@@ -251,9 +220,7 @@ def run(cfg: DynamicsConfig):
                         step,
                         metrics={
                             "flow_mse": metrics_cpu["flow_mse"],
-                            "boot_mse": metrics_cpu["bootstrap_mse"],
                             "lr": lr_schedule(step),
-                            # "batch_type": 1. if use_long else 0,
                             **scaling.get_step_metrics(step),
                         },
                         pbar=pbar,

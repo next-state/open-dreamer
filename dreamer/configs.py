@@ -16,10 +16,6 @@ class DataloaderConfig:
     prefetch_buffer_size: int = 10
     device_prefetch_buffer_size: int = 1
     
-    # Dual iterator parameters (for alternating short/long sequences)
-    short_T: int = 64
-    long_T: int = 64
-    long_ratio: float = 0.0
     start_step: int = 0
     
     dtype: str = "bfloat16"
@@ -333,16 +329,6 @@ class DynamicsConfig(BaseExperimentConfig):
 
     # Model
     dynamics: DynamicsModelConfig = field(default_factory=DynamicsModelConfig)
-
-    # Training
-    bootstrap_start: int = 5_000  # Number of start steps trained exclusively on flow-matching objective
-    bootstrap_fraction: float = 0.25  # Fraction of batch used for bootstrap samples
-    image_fraction: float = 0.3
-
-    # Alternating batch lengths (paper: "Sequence length" paragraph)
-    short_T: int = 64
-    long_T: int = 256
-    long_batch_ratio: float = 0.0  # Fraction of batches that use long_T
 
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
