@@ -80,7 +80,7 @@ class EncoderModelConfig:
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
-    use_residual_lambdas: bool = False
+
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
@@ -105,7 +105,7 @@ class DecoderModelConfig:
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
-    use_residual_lambdas: bool = False
+
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
@@ -139,7 +139,7 @@ class DynamicsModelConfig:
     time_every: int = 4
     mlp_ratio: float = 4.0
     dropout_rate: float = 0.0
-    use_residual_lambdas: bool = False
+
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
