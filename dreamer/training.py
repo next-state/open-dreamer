@@ -132,10 +132,8 @@ def compute_flow_loss(
     z_target: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Flow matching loss in x-space (direct prediction of clean latents)."""
-    z_mean, z_logvar = jnp.split(z_pred, 2, axis=-1)
-    mse = (z_mean - z_target) ** 2
-    log_prob = z_logvar + jnp.exp(-z_logvar) * mse
-    return jnp.mean(log_prob), jnp.mean(mse)
+    mse = jnp.mean((z_pred - z_target) ** 2)
+    return mse, mse
 
 
 # ---------------------------
