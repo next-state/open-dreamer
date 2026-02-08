@@ -8,7 +8,6 @@ from flax.struct import dataclass
 
 from .actions import Actions
 from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
-from .utils import normalize_latents, unnormalize_latents
 
 
 @dataclass
@@ -116,7 +115,6 @@ def next_latent(
         h_last = h_history[-1] if isinstance(h_history, jax.Array) else None
         caches_new = None
 
-    latent_t_final = unnormalize_latents(latent_t_final, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
     return latent_t_final, h_last, caches_new, rng
 
 
@@ -176,7 +174,6 @@ def latent_rollout(
     latent_shape = (B, 1, n_spatial, D_s)
 
     latents_ctx_orig = latents_ctx
-    latents_ctx = normalize_latents(latents_ctx, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
     window_size = T_ctx + num_steps
     n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
@@ -275,11 +272,14 @@ def video_rollout(
         rngs=rngs,
     )
 
+    # Normalize before rollout
+    latents_ctx_norm = tokenizer.latent_normalizer.normalize(latents_ctx)
+
     rollout_result = latent_rollout(
         dynamics,
         policy,
         schedule,
-        latents_ctx,
+        latents_ctx_norm,
         actions_ctx,
         num_steps,
         rng,
@@ -287,8 +287,11 @@ def video_rollout(
         deterministic=True,
     )
 
+    # Unnormalize before decode
+    pred_latents = tokenizer.latent_normalizer.unnormalize(rollout_result["latents"])
+
     pred_frames, _ = tokenizer.decode(
-        rollout_result["latents"],
+        pred_latents,
         deterministic=True,
     )
     return jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)

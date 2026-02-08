@@ -3,7 +3,7 @@ defaults:
   - dataset: coinrun
   - _self_
 
-run_name: tokenizer-coinrun-small
+run_name: tokenizer-normalized
 
 ckpt:
   max_to_keep: 1
@@ -30,9 +30,6 @@ tokenizer:
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
-    dataset_mean: ${dataset.dataset_mean}
-    dataset_std: ${dataset.dataset_std}
-
   decoder:
     n_latents: ${tokenizer.encoder.n_latents}
     d_bottleneck: ${tokenizer.encoder.d_bottleneck}
@@ -52,9 +49,6 @@ tokenizer:
     use_rmsnorm_scale: ${tokenizer.encoder.use_rmsnorm_scale}
     dtype: ${dtype}
     param_dtype: ${param_dtype}
-
-    dataset_mean: ${dataset.dataset_mean}
-    dataset_std: ${dataset.dataset_std}
 
 max_steps: 300_000
 tokenizer_loss_type: mse  # mse | mae

@@ -87,9 +87,6 @@ class EncoderModelConfig:
     dtype: str = "float32"
     param_dtype: str = "float32"
 
-    dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
-    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
-
 
 @dataclass(frozen=False)
 class DecoderModelConfig:
@@ -113,9 +110,6 @@ class DecoderModelConfig:
     param_dtype: str = "float32"
     H: int = 64  # sum(DatasetConfig.padding_H, DatasetConfig.H)
     W: int = 64  # sum(DatasetConfig.padding_W, DatasetConfig.W)
-
-    dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
-    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
 @dataclass(frozen=False)
@@ -156,9 +150,6 @@ class DynamicsModelConfig:
     num_binary_actions: int = 0
     categorical_action_dim: int = 0
     continuous_action_dim: int = 0
-    
-    latent_mean: tuple[float, ...] | None = None
-    latent_std: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=False)

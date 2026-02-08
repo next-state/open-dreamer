@@ -28,7 +28,6 @@ from dreamer.checkpointing import (
     build_checkpoint_manager,
 )
 from dreamer.utils import (
-    normalize_with_dataset_stats,
     count_parameters_by_component,
     setup_training_directories,
     build_lr_schedule,
@@ -84,16 +83,16 @@ def lpips_on_mae_recon(lpips_model: LPIPS, pred, target, subsample_frac=1.0):
 # Train step
 # ------------------------
 
-@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"))
-def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | None, videos, *, mae_key, dropout_key, step, 
-               lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
+@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "log_gradients", "tokenizer_loss_type"))
+def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | None, videos, *, mae_key, dropout_key, step,
+               lpips_weight, lpips_frac, log_gradients: bool, tokenizer_loss_type: str):
 
     def loss_fn(model: Tokenizer):
         rngs = nnx.Rngs(mae=mae_key, dropout=dropout_key)
         pred, (mae_mask, keep_prob) = model(videos, deterministic=False, rngs=rngs)
 
-        pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
-        target_norm = normalize_with_dataset_stats(videos, mean=dataset_mean, std=dataset_std)
+        pred_norm = model.pixel_normalizer.normalize(pred / 255.0)
+        target_norm = model.pixel_normalizer.normalize(videos.astype(jnp.float32) / 255.0)
         if tokenizer_loss_type == "mae":
             mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
         elif tokenizer_loss_type == "mse":
@@ -244,8 +243,6 @@ def run(cfg: TokenizerConfig):
                     bundle.tokenizer, bundle.tokenizer_optimizer, lpips_model, batch["videos"],
                     mae_key=mae_key, dropout_key=dropout_key, step=step,
                     lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
-                    dataset_mean=tuple(cfg.dataset.dataset_mean),
-                    dataset_std=tuple(cfg.dataset.dataset_std),
                     log_gradients=cfg.logger.log_gradients,
                     tokenizer_loss_type=cfg.tokenizer_loss_type
                 )
