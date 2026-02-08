@@ -84,6 +84,7 @@ class Args:
     chunk_size: int = 160
     chunks_per_file: int = 100
     seed: int = 0
+    batch_size: int = 64
 
 
 args = tyro.cli(Args)
@@ -113,60 +114,47 @@ def generate_episodes(num_episodes, split):
         serialization_format="pickle"
     )
 
-    while episode_idx < num_episodes:
-        seed = np.random.randint(0, 10000)
-        env = ProcgenGym3Env(num=1, env_name="coinrun", start_level=seed)
+    batch_size = min(args.batch_size, num_episodes)
+    env = ProcgenGym3Env(num=batch_size, env_name="coinrun", num_levels=0)
 
-        observations_seq = []
-        actions_seq = []
-        rewards_seq = []
-        episode_obs_chunks = []
-        episode_act_chunks = []
-        episode_rew_chunks = []
+    # Per-env buffers
+    obs_seqs = [[] for _ in range(batch_size)]
+    act_seqs = [[] for _ in range(batch_size)]
+    rew_seqs = [[] for _ in range(batch_size)]
+    ep_obs_chunks = [[] for _ in range(batch_size)]
+    ep_act_chunks = [[] for _ in range(batch_size)]
+    ep_rew_chunks = [[] for _ in range(batch_size)]
+    step_counts = [0] * batch_size
+    first_obs_flags = [True] * batch_size
+    # Track which envs are still active (not yet reached num_episodes)
+    active = [True] * batch_size
 
-        # --- Run episode ---
-        step_t = 0
-        first_obs = True
-        for step_t in range(args.max_episode_length):
-            rew, obs, first = env.observe()
-            action = types_np.sample(env.ac_space, bshape=(env.num,))
-            env.act(action)
-            observations_seq.append(obs["rgb"])
-            actions_seq.append(action)
-            rewards_seq.append(rew)
-            if len(observations_seq) == args.chunk_size:
-                episode_obs_chunks.append(observations_seq)
-                episode_act_chunks.append(actions_seq)
-                episode_rew_chunks.append(rewards_seq)
-                observations_seq = []
-                actions_seq = []
-                rewards_seq = []
-            if first and not first_obs:
-                break
-            first_obs = False
-
-        # --- Save episode ---
-        if step_t + 1 >= args.min_episode_length:
-            if observations_seq:
-                if len(observations_seq) < args.chunk_size:
+    def _finalize_episode(i):
+        """Process a completed episode for env i. Returns True if episode was saved."""
+        nonlocal episode_idx, obs_chunks, act_chunks, rew_chunks
+        length = step_counts[i]
+        if length >= args.min_episode_length:
+            # Flush any remaining partial chunk
+            if obs_seqs[i]:
+                if len(obs_seqs[i]) < args.chunk_size:
                     print(
-                        f"Warning: Inconsistent chunk_sizes. Episode has {len(observations_seq)} frames, "
+                        f"Warning: Inconsistent chunk_sizes. Episode has {len(obs_seqs[i])} frames, "
                         f"which is smaller than the requested chunk_size: {args.chunk_size}. "
                         "This might lead to performance degradation during training."
                     )
-                episode_obs_chunks.append(observations_seq)
-                episode_act_chunks.append(actions_seq)
-                episode_rew_chunks.append(rewards_seq)
+                ep_obs_chunks[i].append(obs_seqs[i])
+                ep_act_chunks[i].append(act_seqs[i])
+                ep_rew_chunks[i].append(rew_seqs[i])
 
             obs_chunks_data = [
                 np.concatenate(seq, axis=0).astype(np.uint8)
-                for seq in episode_obs_chunks
+                for seq in ep_obs_chunks[i]
             ]
             act_chunks_data = [
-                np.concatenate(act, axis=0) for act in episode_act_chunks
+                np.concatenate(act, axis=0) for act in ep_act_chunks[i]
             ]
             rew_chunks_data = [
-                np.concatenate(rew, axis=0) for rew in episode_rew_chunks
+                np.concatenate(rew, axis=0) for rew in ep_rew_chunks[i]
             ]
             obs_chunks.extend(obs_chunks_data)
             act_chunks.extend(act_chunks_data)
@@ -177,10 +165,66 @@ def generate_episodes(num_episodes, split):
             )
             episode_metadata.extend(ep_metadata)
 
-            print(f"Episode {episode_idx} completed, length: {step_t + 1}.")
+            print(f"Episode {episode_idx} completed, length: {length}.")
             episode_idx += 1
+            saved = True
         else:
-            print(f"Episode too short ({step_t + 1}), resampling...")
+            print(f"Episode too short ({length}), discarding...")
+            saved = False
+
+        # Reset buffers for this env
+        obs_seqs[i] = []
+        act_seqs[i] = []
+        rew_seqs[i] = []
+        ep_obs_chunks[i] = []
+        ep_act_chunks[i] = []
+        ep_rew_chunks[i] = []
+        step_counts[i] = 0
+        first_obs_flags[i] = True
+        return saved
+
+    while episode_idx < num_episodes:
+        rew, obs, first = env.observe()
+        action = types_np.sample(env.ac_space, bshape=(env.num,))
+        env.act(action)
+
+        for i in range(batch_size):
+            if not active[i]:
+                continue
+
+            # Detect episode boundary (auto-reset) — first[i] is True on reset
+            if first[i] and not first_obs_flags[i]:
+                _finalize_episode(i)
+                if episode_idx >= num_episodes:
+                    active[i] = False
+                    continue
+
+            first_obs_flags[i] = False
+
+            # Append current step data (each is shape (1, ...))
+            obs_seqs[i].append(obs["rgb"][i:i+1])
+            act_seqs[i].append(action[i:i+1])
+            rew_seqs[i].append(rew[i:i+1])
+            step_counts[i] += 1
+
+            # Chunk when we hit chunk_size
+            if len(obs_seqs[i]) == args.chunk_size:
+                ep_obs_chunks[i].append(obs_seqs[i])
+                ep_act_chunks[i].append(act_seqs[i])
+                ep_rew_chunks[i].append(rew_seqs[i])
+                obs_seqs[i] = []
+                act_seqs[i] = []
+                rew_seqs[i] = []
+
+            # Force episode end at max_episode_length
+            if step_counts[i] >= args.max_episode_length:
+                _finalize_episode(i)
+                if episode_idx >= num_episodes:
+                    active[i] = False
+
+        # Early exit if all envs are done
+        if not any(active):
+            break
 
     if len(obs_chunks) > 0:
         print(

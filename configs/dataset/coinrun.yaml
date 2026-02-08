@@ -4,14 +4,16 @@ defaults:
 name: coinrun
 
 array_record_path: datasets/coinrun_episodes/train
+num_max_samples: -1
 
 dataloader_cfg:
-  B: 512
-  T: 64
-  num_workers: 16
+  B: 32
+  T: 32
+  num_workers: 4
   prefetch_buffer_size: 10
   device_prefetch_buffer_size: 1
   start_step: 0
+  dtype: bfloat16
 
 H: 64
 W: 64
@@ -29,3 +31,4 @@ dataset_mean: [0.5, 0.5, 0.5]
 dataset_std: [0.288675, 0.288675, 0.288675]
 
 p_include_reward: 0.5
+data_type: video

@@ -1,14 +1,9 @@
 defaults:
   - common
-  - dataset: minecraft_vpt
+  - dataset: coinrun
   - _self_
 
-run_name: tokenizer-512
-
-dataset:
-  dataloader_cfg:
-    B: 2
-    T: 256
+run_name: tokenizer-coinrun-small
 
 ckpt:
   max_to_keep: 1
@@ -16,9 +11,9 @@ ckpt:
 
 tokenizer:
   encoder:
-    n_latents: 512
+    n_latents: 16
     d_bottleneck: 16
-    depth: 7
+    depth: 5
     d_model: ${mul:64,${sum:${tokenizer.encoder.depth},${tokenizer.decoder.depth}}}
     n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}

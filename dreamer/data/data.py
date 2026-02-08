@@ -292,8 +292,18 @@ def device_put(
 
   jax_dtype = getattr(jnp, dtype, None) if dtype else None
   
+  def _make_sharding(leaf):
+    """Adapt sharding to leaf rank by truncating the partition spec."""
+    if not isinstance(device, jax.sharding.NamedSharding):
+      return device
+    if not hasattr(leaf, 'ndim') or leaf.ndim >= len(device.spec):
+      return device
+    truncated = jax.sharding.PartitionSpec(*device.spec[:leaf.ndim])
+    return jax.sharding.NamedSharding(device.mesh, truncated)
+
   def _transfer(x):
-    x = jax.device_put(x, device)
+    shardings = jax.tree.map(_make_sharding, x)
+    x = jax.device_put(x, shardings)
     if jax_dtype is not None:
       x = jax.tree.map(lambda a: a.astype(jax_dtype) if a is not None and jnp.issubdtype(a.dtype, jnp.floating) else a, x)
     return x

@@ -177,9 +177,11 @@ def run(cfg: TokenizerConfig):
     )
 
     # Parallelism
-    mesh = jax.make_mesh((2, jax.local_device_count()//2), ('data', 'seq'))
-    data_sharding = NamedSharding(mesh, P('data', 'seq', None, None))
-    mesh_rules = MeshRules(data='data', seq='seq')
+    # mesh = jax.make_mesh((2, jax.local_device_count()//2), ('data', 'seq'))
+    # data_sharding = NamedSharding(mesh, P('data', 'seq', None, None))
+    # mesh_rules = MeshRules(data='data', seq='seq')
+    
+    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
     with logger, jax.set_mesh(mesh):
         key = jax.random.key(cfg.seed)
@@ -222,7 +224,7 @@ def run(cfg: TokenizerConfig):
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset, device=data_sharding)
 
-        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
+        with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=TokenizerCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
             scaling.start_training()
