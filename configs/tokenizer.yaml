@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt
   - _self_
 
-run_name: tokenizer-asymmetric
+run_name: tokenizer-asymmetric-lots-of-latents
 
 ckpt:
   max_to_keep: 1
@@ -11,7 +11,7 @@ ckpt:
 
 tokenizer:
   encoder:
-    n_latents: 16
+    n_latents: 512
     d_bottleneck: 16
     depth: 6
     d_model: ${mul:128,${tokenizer.encoder.depth}}
@@ -55,7 +55,7 @@ tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
-  lr: 0.0003  # constant LR or peak LR for schedules
+  lr: 0.003  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05
@@ -64,7 +64,7 @@ lr_schedule:
 
 optimizer:
   optimizer_type: muon
-  weight_decay: 0.01
+  weight_decay: 0.001
   # AdamW params (for embeddings/biases)
   adam_lr_ratio: 1.0
   adam_b1: 0.9

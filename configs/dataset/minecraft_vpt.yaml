@@ -4,12 +4,12 @@ defaults:
 name: minecraft_vpt
 data_type: video
 
-array_record_path: /mnt/data/arrayrecords-mp4
+array_record_path: /mnt/arrayrecords-mp4
 index_max: 290
 num_max_samples: -1
 
 dataloader_cfg:
-  B: 32
+  B: 16
   T: 16
   num_workers: 32
   prefetch_buffer_size: 10
