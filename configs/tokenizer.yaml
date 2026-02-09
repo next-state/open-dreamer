@@ -3,7 +3,7 @@ defaults:
   - dataset: coinrun
   - _self_
 
-run_name: tokenizer-normalized
+run_name: tokenizer-asymmetric
 
 ckpt:
   max_to_keep: 1
@@ -14,7 +14,7 @@ tokenizer:
     n_latents: 16
     d_bottleneck: 16
     depth: 5
-    d_model: ${mul:64,${sum:${tokenizer.encoder.depth},${tokenizer.decoder.depth}}}
+    d_model: ${mul:128,${tokenizer.encoder.depth}}
     n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
     dropout_rate: 0.0
@@ -33,14 +33,14 @@ tokenizer:
   decoder:
     n_latents: ${tokenizer.encoder.n_latents}
     d_bottleneck: ${tokenizer.encoder.d_bottleneck}
-    depth: ${tokenizer.encoder.depth}
-    d_model: ${tokenizer.encoder.d_model}
-    n_heads: ${tokenizer.encoder.n_heads}
-    n_kv_heads: ${tokenizer.encoder.n_kv_heads}
+    depth: 3
+    d_model: ${mul:128,${tokenizer.decoder.depth}}
+    n_heads: ${floordiv:${tokenizer.decoder.d_model},64}
+    n_kv_heads: ${max:1,${floordiv:${tokenizer.decoder.n_heads},8}}
     dropout_rate: ${tokenizer.encoder.dropout_rate}
     qk_norm_type: ${tokenizer.encoder.qk_norm_type}
     rope_theta: ${tokenizer.encoder.rope_theta}
-    time_every: ${tokenizer.encoder.time_every}
+    time_every: 2
     H: ${sum:${dataset.padding_H[0]},${dataset.padding_H[1]},${dataset.H}}
     W: ${sum:${dataset.padding_W[0]},${dataset.padding_W[1]},${dataset.W}}
     patch_size: ${dataset.patch_size}
