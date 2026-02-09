@@ -1,6 +1,6 @@
 defaults:
   - common
-  - dataset: coinrun
+  - dataset: minecraft_vpt
   - _self_
 
 run_name: tokenizer-asymmetric
@@ -13,7 +13,7 @@ tokenizer:
   encoder:
     n_latents: 16
     d_bottleneck: 16
-    depth: 5
+    depth: 6
     d_model: ${mul:128,${tokenizer.encoder.depth}}
     n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
@@ -50,7 +50,7 @@ tokenizer:
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
-max_steps: 300_000
+max_steps: 30_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:
@@ -64,7 +64,7 @@ lr_schedule:
 
 optimizer:
   optimizer_type: muon
-  weight_decay: 0.1
+  weight_decay: 0.01
   # AdamW params (for embeddings/biases)
   adam_lr_ratio: 1.0
   adam_b1: 0.9

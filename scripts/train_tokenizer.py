@@ -35,7 +35,8 @@ from dreamer.utils import (
 )
 
 # disable preallocation completely
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
+# os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
