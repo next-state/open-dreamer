@@ -251,6 +251,78 @@ def unnormalize_latents(latents, mean, std):
     return latents * std + mean
 
 
+def frames_to_pixel_latents(
+    frames: jnp.ndarray,
+    pixel_h: int,
+    pixel_w: int,
+    d_bottleneck: int = 16,
+) -> jnp.ndarray:
+    """Downsample video frames and reshape as pseudo-latents for pixel-mode dynamics.
+
+    Args:
+        frames: (B, T, H, W, C) in [0, 255]
+        pixel_h: Target downsampled height
+        pixel_w: Target downsampled width
+        d_bottleneck: Bottleneck dimension (must match dynamics config)
+
+    Returns:
+        (B, T, n_latents, d_bottleneck) in [-1, 1]
+        where n_latents = (pixel_h * pixel_w * C) / d_bottleneck
+    """
+    B, T, H, W, C = frames.shape
+    n_values = pixel_h * pixel_w * C
+    assert n_values % d_bottleneck == 0, (
+        f"pixel_h * pixel_w * C = {n_values} must be divisible by d_bottleneck={d_bottleneck}"
+    )
+    n_latents = n_values // d_bottleneck
+
+    # Normalize to [-1, 1]
+    frames = frames.astype(jnp.float32) / 127.5 - 1.0
+
+    # Downsample: flatten B*T for jax.image.resize
+    flat = frames.reshape(B * T, H, W, C)
+    small = jax.image.resize(flat, (B * T, pixel_h, pixel_w, C), method='bilinear')
+
+    # Reshape to pseudo-latent format
+    return small.reshape(B, T, n_latents, d_bottleneck)
+
+
+def pixel_latents_to_frames(
+    latents: jnp.ndarray,
+    pixel_h: int,
+    pixel_w: int,
+    display_h: int,
+    display_w: int,
+    C: int = 3,
+) -> jnp.ndarray:
+    """Convert pseudo-latents back to displayable frames.
+
+    Args:
+        latents: (B, T, n_latents, d_bottleneck) in [-1, 1]
+        pixel_h: Downsampled height used during encoding
+        pixel_w: Downsampled width used during encoding
+        display_h: Output display height (upsampled)
+        display_w: Output display width (upsampled)
+        C: Number of channels
+
+    Returns:
+        (B, T, display_h, display_w, C) uint8 in [0, 255]
+    """
+    B, T = latents.shape[:2]
+
+    # Reshape to small frames
+    small = latents.reshape(B, T, pixel_h, pixel_w, C)
+
+    # Denormalize from [-1, 1] to [0, 255]
+    small = (small + 1.0) * 127.5
+
+    # Upsample for display
+    flat = small.reshape(B * T, pixel_h, pixel_w, C)
+    upsampled = jax.image.resize(flat, (B * T, display_h, display_w, C), method='bilinear')
+
+    return jnp.clip(upsampled.reshape(B, T, display_h, display_w, C), 0, 255).astype(jnp.uint8)
+
+
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.

@@ -1,0 +1,31 @@
+defaults:
+  - _self_
+
+name: minecraft_vpt
+data_type: pixel
+array_record_path: /home/ubuntu/minecraft-vpt/arrayrecords-mp4
+index_max: 1500
+
+num_binary_actions: 23
+categorical_action_dim: 121
+continuous_action_dim: 0
+
+B: 8
+T: 4
+H: 360
+W: 640
+C: 3
+
+padding_H: [0, 0]
+padding_W: [0, 0]
+patch_size: 20
+
+pixel_h: 32
+pixel_w: 32
+
+dataset_mean: [0.2241, 0.2348, 0.2086]
+dataset_std: [0.1809, 0.1874, 0.2282]
+
+# Skip latent normalization (pixels are already normalized to [-1, 1])
+latent_mean: null
+latent_std: null

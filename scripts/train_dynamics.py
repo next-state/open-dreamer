@@ -14,7 +14,7 @@ from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, shift_actions
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
-from dreamer.training import run_evaluation, shortcut_forcing_step
+from dreamer.training import run_evaluation, run_pixel_evaluation, shortcut_forcing_step
 from dreamer.checkpointing import (
     DynamicsCheckpointBundle,
     TokenizerCheckpointBundle,
@@ -25,6 +25,7 @@ from dreamer.utils import (
     setup_training_directories,
     build_lr_schedule,
     build_optimizer,
+    frames_to_pixel_latents,
 )
 
 # Suppress absl info logs
@@ -146,13 +147,29 @@ def run(cfg: DynamicsConfig):
         key = jax.random.PRNGKey(cfg.seed)
         rng, init_key = jax.random.split(key)
 
-        # Check if using latent data (pre-tokenized)
+        # Check data mode
         use_latent_data = cfg.dataset.data_type == "latent"
+        use_pixel_data = cfg.dataset.data_type == "pixel"
 
-        # Load pretrained tokenizer (required for video data, optional for latent data checkpoints)
+        # Load pretrained tokenizer (always needed for checkpoint bundle and train_step signature)
         tokenizer_bundle = TokenizerCheckpointBundle.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
         tokenizer = tokenizer_bundle.tokenizer
         tokenizer_cfg = tokenizer.cfg
+
+        # Compute n_latents based on data mode
+        if use_pixel_data:
+            pixel_h, pixel_w = cfg.dataset.pixel_h, cfg.dataset.pixel_w
+            n_values = pixel_h * pixel_w * cfg.dataset.C
+            assert n_values % cfg.dynamics.d_bottleneck == 0, (
+                f"pixel_h * pixel_w * C = {n_values} must be divisible by d_bottleneck={cfg.dynamics.d_bottleneck}"
+            )
+            n_latents = n_values // cfg.dynamics.d_bottleneck
+            assert n_latents % cfg.dynamics.packing_factor == 0, (
+                f"n_latents={n_latents} must be divisible by packing_factor={cfg.dynamics.packing_factor}"
+            )
+            print(f"Pixel mode: {pixel_h}x{pixel_w} -> {n_latents} pseudo-latents, {n_latents // cfg.dynamics.packing_factor} spatial tokens")
+        else:
+            n_latents = tokenizer_cfg.encoder.n_latents
 
         # Initialize dynamics
         dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
@@ -160,7 +177,6 @@ def run(cfg: DynamicsConfig):
         print(f"Parameter counts: {param_counts['total']:,}")
 
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
-        n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
         avg_T = int(cfg.long_batch_ratio * cfg.long_T + (1 - cfg.long_batch_ratio) * cfg.short_T)
 
@@ -171,7 +187,7 @@ def run(cfg: DynamicsConfig):
 
         # Encoder FLOPs: forward-only (no gradients) when using video data
         encoder_flops = 0
-        if not use_latent_data:
+        if not use_latent_data and not use_pixel_data:
             tokenizer_training_flops = tokenizer.estimate_flops(batch_size=cfg.dataset.B, seq_length=avg_T)
             encoder_flops = tokenizer_training_flops // 12  # ~1/12 of tokenizer training FLOPs (half for encoder, 1/6 for inference)
 
@@ -241,7 +257,13 @@ def run(cfg: DynamicsConfig):
 
                 # Shard batch data
                 actions = jax.device_put(batch["actions"], data_sharding)
-                data = jax.device_put(batch["latents"] if use_latent_data else batch["videos"], data_sharding)
+                if use_latent_data:
+                    data = jax.device_put(batch["latents"], data_sharding)
+                elif use_pixel_data:
+                    videos = jax.device_put(batch["videos"], data_sharding)
+                    data = frames_to_pixel_latents(videos, pixel_h, pixel_w, cfg.dynamics.d_bottleneck)
+                else:
+                    data = jax.device_put(batch["videos"], data_sharding)
                 
                 # Action shifting: prepend "first action token" (noop) so action[t] aligns with state[t]
                 actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
@@ -250,12 +272,20 @@ def run(cfg: DynamicsConfig):
                 if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
                     val_data = data[:4]
                     val_actions = actions[:4]
-                    run_evaluation(
-                        cfg, step, bundle.tokenizer, bundle.dynamics,
-                        val_data=val_data, val_actions=val_actions,
-                        use_latent_data=use_latent_data,
-                        vis_dir=vis_dir, rng=rng, logger=logger
-                    )
+                    if use_pixel_data:
+                        run_pixel_evaluation(
+                            cfg, step, bundle.dynamics,
+                            val_data=val_data, val_actions=val_actions,
+                            pixel_h=pixel_h, pixel_w=pixel_w,
+                            vis_dir=vis_dir, rng=rng, logger=logger
+                        )
+                    else:
+                        run_evaluation(
+                            cfg, step, bundle.tokenizer, bundle.dynamics,
+                            val_data=val_data, val_actions=val_actions,
+                            use_latent_data=use_latent_data,
+                            vis_dir=vis_dir, rng=rng, logger=logger
+                        )
 
                 # Training step
                 B_img = int(cfg.dataset.B * cfg.image_fraction)
@@ -270,7 +300,7 @@ def run(cfg: DynamicsConfig):
                     k_max=cfg.dynamics.k_max,
                     context_length=context_length,
                     bootstrap_fraction=cfg.bootstrap_fraction if step >= cfg.bootstrap_start else 0.0,
-                    use_latent_data=use_latent_data,
+                    use_latent_data=use_latent_data or use_pixel_data,
                 )
 
                 # Logging

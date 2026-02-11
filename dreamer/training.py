@@ -21,11 +21,11 @@ import optax
 import time
 
 from dreamer.configs import DynamicsConfig, HeadsConfig
-from dreamer.generation import DenoiseSchedule
+from dreamer.generation import DenoiseSchedule, latent_rollout
 from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
-from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents
+from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents, pixel_latents_to_frames
 
 
 # ---------------------------
@@ -847,6 +847,104 @@ def run_evaluation(
         logger.log_metrics(step, {
             f"{tag}/mse": mse,
             f"{tag}/psnr": psnr,
+            f"{tag}/horizon": horizon,
+            f"{tag}/eval_time": dt,
+        }, prefix="eval/")
+
+        if videos is not None:
+            logger.log_video(step, f"eval/{tag}/video", mp4_path)
+
+
+def run_pixel_evaluation(
+    cfg: DynamicsConfig,
+    step: int,
+    dynamics: Dynamics,
+    val_data: jnp.ndarray,
+    val_actions: Actions,
+    pixel_h: int,
+    pixel_w: int,
+    vis_dir: Path,
+    rng: jax.Array,
+    logger,
+):
+    """
+    Pixel-mode evaluation: runs latent rollout on pseudo-latents and converts
+    back to frames without a tokenizer.
+
+    Args:
+        cfg: Training config
+        step: Current training step
+        dynamics: Dynamics NNX model instance
+        val_data: (B, T, n_latents, d_bottleneck) pixel pseudo-latents in [-1, 1]
+        val_actions: (B, T) Validation actions
+        pixel_h: Downsampled frame height
+        pixel_w: Downsampled frame width
+        vis_dir: Directory to save visualizations
+        rng: Random key
+        logger: Logger instance
+    """
+    k_max = dynamics.cfg.k_max
+    schedule_shortcut = DenoiseSchedule.init(4, k_max)
+
+    for tag, schedule_config in [("shortcut", schedule_shortcut)]:
+        t0 = time.time()
+        T = val_data.shape[1]
+        assert T > 5, f"Sequence length {T} must be > 5"
+        ctx_length = 4
+        horizon = T - ctx_length
+
+        # Display resolution (upsample for visibility)
+        display_h = pixel_h * 8
+        display_w = pixel_w * 8
+
+        # Convert GT pseudo-latents to display frames
+        gt_frames = pixel_latents_to_frames(val_data, pixel_h, pixel_w, display_h, display_w)
+
+        # Split context and future for rollout
+        latents_ctx = val_data[:, :ctx_length]
+        actions_ctx = val_actions[:, :ctx_length]
+        actions_future = val_actions[:, ctx_length:]
+
+        # Latent rollout (reuses existing infrastructure unchanged)
+        rollout_result = latent_rollout(
+            dynamics,
+            policy=actions_future,
+            schedule=schedule_config,
+            latents_ctx=latents_ctx,
+            actions_ctx=actions_ctx,
+            num_steps=horizon,
+            rng=rng,
+            deterministic=True,
+        )
+
+        # Convert predicted pseudo-latents to display frames
+        pred_latents = rollout_result['latents']
+        pred_frames = pixel_latents_to_frames(pred_latents, pixel_h, pixel_w, display_h, display_w)
+
+        # Metrics on pseudo-latent space
+        dt = time.time() - t0
+        mse = float(jnp.mean((pred_latents[:, -horizon:] - val_data[:, -horizon:]) ** 2))
+        print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | {dt:.2f}s")
+
+        # Build 2-column visualization: [gt, pred]
+        num_videos = min(4, pred_frames.shape[0])
+        pred_frames = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
+
+        stacked = jnp.stack([gt_frames, pred_frames])[:, :num_videos]
+        videos = rearrange(stacked, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
+
+        # Save artifacts
+        tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+        mp4_path = tag_dir / f"{tag}_grid.mp4"
+
+        videos = jax.device_get(videos)
+        try:
+            iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
+        except Exception as e:
+            print(f"[eval:{tag}] MP4 write failed: {e}")
+
+        logger.log_metrics(step, {
+            f"{tag}/mse": mse,
             f"{tag}/horizon": horizon,
             f"{tag}/eval_time": dt,
         }, prefix="eval/")
