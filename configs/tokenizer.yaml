@@ -3,17 +3,17 @@ defaults:
   - dataset: minecraft_vpt
   - _self_
 
-run_name: tokenizer-asymmetric-lots-of-latents
+run_name: tokenizer-asymmetric
 
 ckpt:
   max_to_keep: 1
-  save_interval_steps: 10_000
+  save_interval_steps: 1_000
 
 tokenizer:
   encoder:
     n_latents: 512
     d_bottleneck: 16
-    depth: 6
+    depth: 8
     d_model: ${mul:128,${tokenizer.encoder.depth}}
     n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
@@ -33,14 +33,14 @@ tokenizer:
   decoder:
     n_latents: ${tokenizer.encoder.n_latents}
     d_bottleneck: ${tokenizer.encoder.d_bottleneck}
-    depth: 3
+    depth: 4
     d_model: ${mul:128,${tokenizer.decoder.depth}}
     n_heads: ${floordiv:${tokenizer.decoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.decoder.n_heads},8}}
     dropout_rate: ${tokenizer.encoder.dropout_rate}
     qk_norm_type: ${tokenizer.encoder.qk_norm_type}
     rope_theta: ${tokenizer.encoder.rope_theta}
-    time_every: 2
+    time_every: 3
     H: ${sum:${dataset.padding_H[0]},${dataset.padding_H[1]},${dataset.H}}
     W: ${sum:${dataset.padding_W[0]},${dataset.padding_W[1]},${dataset.W}}
     patch_size: ${dataset.patch_size}
@@ -64,7 +64,7 @@ lr_schedule:
 
 optimizer:
   optimizer_type: muon
-  weight_decay: 0.001
+  weight_decay: 0.0001
   # AdamW params (for embeddings/biases)
   adam_lr_ratio: 1.0
   adam_b1: 0.9
@@ -79,4 +79,4 @@ optimizer:
 lpips_weight: 0.2
 lpips_frac: 0.5
 visualize_every: 1000
-parallel_strategy: sp
+parallel_strategy: data

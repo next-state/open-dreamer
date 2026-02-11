@@ -1,24 +1,24 @@
 defaults:
   - common
-  - dataset: coinrun
+  - dataset: minecraft_vpt_latent
   - _self_
 
 run_name: dynamics
-tokenizer_ckpt: logs/tokenizer-coinrun_small/checkpoints/
+tokenizer_ckpt: logs/tokenizer-asymmetric/checkpoints/
 
 ckpt:
   max_to_keep: 1
-  save_interval_steps: 10_000
+  save_interval_steps: 1_000
 
 dataset:
   dataloader_cfg:
-    B: 16
-    T: 16
+    B: 32
+    T: 32
   C: 16
 
 dynamics:
     d_bottleneck: 16
-    depth: 24
+    depth: 16
     d_model: ${mul:64,${dynamics.depth}}
     n_heads: ${floordiv:${dynamics.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${dynamics.n_heads},8}}
@@ -40,7 +40,7 @@ dynamics:
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
 
-max_steps: 30_000
+max_steps: 150_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
@@ -53,7 +53,7 @@ lr_schedule:
 
 optimizer:
   optimizer_type: muon
-  weight_decay: 0.1
+  weight_decay: 0.00
   # AdamW params (for embeddings/biases)
   adam_lr_ratio: 1.0
   adam_b1: 0.9
