@@ -26,6 +26,5 @@ pixel_w: 32
 dataset_mean: [0.2241, 0.2348, 0.2086]
 dataset_std: [0.1809, 0.1874, 0.2282]
 
-# Skip latent normalization (pixels are already normalized to [-1, 1])
 latent_mean: null
 latent_std: null
