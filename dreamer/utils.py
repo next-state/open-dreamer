@@ -256,6 +256,9 @@ def frames_to_pixel_latents(
     pixel_h: int,
     pixel_w: int,
     d_bottleneck: int = 16,
+    *,
+    dataset_mean: tuple[float, ...] | None = None,
+    dataset_std: tuple[float, ...] | None = None,
 ) -> jnp.ndarray:
     """Downsample video frames and reshape as pseudo-latents for pixel-mode dynamics.
 
@@ -264,10 +267,13 @@ def frames_to_pixel_latents(
         pixel_h: Target downsampled height
         pixel_w: Target downsampled width
         d_bottleneck: Bottleneck dimension (must match dynamics config)
+        dataset_mean: Optional per-channel mean in [0, 1]. If set with dataset_std,
+            pseudo-latents are normalized to zero mean, unit std per channel.
+        dataset_std: Optional per-channel std. If set with dataset_mean, use for normalization.
 
     Returns:
-        (B, T, n_latents, d_bottleneck) in [-1, 1]
-        where n_latents = (pixel_h * pixel_w * C) / d_bottleneck
+        (B, T, n_latents, d_bottleneck). If dataset_mean/std given: zero mean, unit std
+        per channel. Otherwise: values in [-1, 1] (legacy).
     """
     B, T, H, W, C = frames.shape
     n_values = pixel_h * pixel_w * C
@@ -276,8 +282,18 @@ def frames_to_pixel_latents(
     )
     n_latents = n_values // d_bottleneck
 
-    # Normalize to [-1, 1]
-    frames = frames.astype(jnp.float32) / 127.5 - 1.0
+    frames = frames.astype(jnp.float32)
+    if dataset_mean is not None and dataset_std is not None:
+        # [0, 255] -> [0, 1], then zero mean, unit std per channel
+        frames_01 = frames / 255.0
+        mean_arr = jnp.asarray(dataset_mean, dtype=frames_01.dtype)
+        std_arr = jnp.asarray(dataset_std, dtype=frames_01.dtype)
+        mean_c = jnp.reshape(mean_arr, (1, 1, 1, 1, C))
+        std_c = jnp.reshape(std_arr, (1, 1, 1, 1, C))
+        frames = (frames_01 - mean_c) / jnp.maximum(std_c, 1e-8)
+    else:
+        # Legacy: normalize to [-1, 1]
+        frames = frames / 127.5 - 1.0
 
     # Downsample: flatten B*T for jax.image.resize
     flat = frames.reshape(B * T, H, W, C)
@@ -294,27 +310,42 @@ def pixel_latents_to_frames(
     display_h: int,
     display_w: int,
     C: int = 3,
+    *,
+    dataset_mean: tuple[float, ...] | None = None,
+    dataset_std: tuple[float, ...] | None = None,
 ) -> jnp.ndarray:
     """Convert pseudo-latents back to displayable frames.
 
     Args:
-        latents: (B, T, n_latents, d_bottleneck) in [-1, 1]
+        latents: (B, T, n_latents, d_bottleneck). If dataset_mean/std are given,
+            assumed zero mean, unit std per channel; else assumed [-1, 1].
         pixel_h: Downsampled height used during encoding
         pixel_w: Downsampled width used during encoding
         display_h: Output display height (upsampled)
         display_w: Output display width (upsampled)
         C: Number of channels
+        dataset_mean: Per-channel mean in [0, 1] (must match frames_to_pixel_latents).
+        dataset_std: Per-channel std (must match frames_to_pixel_latents).
 
     Returns:
         (B, T, display_h, display_w, C) uint8 in [0, 255]
     """
     B, T = latents.shape[:2]
 
-    # Reshape to small frames
+    # Reshape to small frames (B, T, pixel_h, pixel_w, C)
     small = latents.reshape(B, T, pixel_h, pixel_w, C)
 
-    # Denormalize from [-1, 1] to [0, 255]
-    small = (small + 1.0) * 127.5
+    if dataset_mean is not None and dataset_std is not None:
+        # Unnormalize: normalized -> [0, 1] then to [0, 255]
+        mean_arr = jnp.asarray(dataset_mean, dtype=small.dtype)
+        std_arr = jnp.asarray(dataset_std, dtype=small.dtype)
+        mean_c = jnp.reshape(mean_arr, (1, 1, 1, 1, C))
+        std_c = jnp.reshape(std_arr, (1, 1, 1, 1, C))
+        small = small * std_c + mean_c
+        small = jnp.clip(small, 0.0, 1.0) * 255.0
+    else:
+        # Legacy: denormalize from [-1, 1] to [0, 255]
+        small = (small + 1.0) * 127.5
 
     # Upsample for display
     flat = small.reshape(B * T, pixel_h, pixel_w, C)

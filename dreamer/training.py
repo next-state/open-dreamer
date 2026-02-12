@@ -875,7 +875,7 @@ def run_pixel_evaluation(
         cfg: Training config
         step: Current training step
         dynamics: Dynamics NNX model instance
-        val_data: (B, T, n_latents, d_bottleneck) pixel pseudo-latents in [-1, 1]
+        val_data: (B, T, n_latents, d_bottleneck) pixel pseudo-latents (zero mean, unit std if dataset stats used; else [-1, 1])
         val_actions: (B, T) Validation actions
         pixel_h: Downsampled frame height
         pixel_w: Downsampled frame width
@@ -885,8 +885,10 @@ def run_pixel_evaluation(
     """
     k_max = dynamics.cfg.k_max
     schedule_shortcut = DenoiseSchedule.init(4, k_max)
+    schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
+    evaluation_schedules = {"shortcut": schedule_shortcut, "diffusion": schedule_diffusion}
 
-    for tag, schedule_config in [("shortcut", schedule_shortcut)]:
+    for tag, schedule_config in evaluation_schedules.items():
         t0 = time.time()
         T = val_data.shape[1]
         assert T > 5, f"Sequence length {T} must be > 5"
@@ -897,11 +899,16 @@ def run_pixel_evaluation(
         display_h = pixel_h * 8
         display_w = pixel_w * 8
 
-        # Convert GT pseudo-latents to display frames
-        gt_frames = pixel_latents_to_frames(val_data, pixel_h, pixel_w, display_h, display_w)
+        # Convert GT pseudo-latents to display frames (use dataset stats if pixel mode uses them)
+        dataset_mean = tuple(cfg.dataset.dataset_mean) if getattr(cfg.dataset, "dataset_mean", None) else None
+        dataset_std = tuple(cfg.dataset.dataset_std) if getattr(cfg.dataset, "dataset_std", None) else None
+        gt_frames = pixel_latents_to_frames(
+            val_data, pixel_h, pixel_w, display_h, display_w,
+            dataset_mean=dataset_mean, dataset_std=dataset_std,
+        )
 
-        # Split context and future for rollout
-        latents_ctx = val_data[:, :ctx_length]
+        # Split context and future for rollout (cast to bfloat16 for KV cache compatibility)
+        latents_ctx = val_data[:, :ctx_length].astype(jnp.bfloat16)
         actions_ctx = val_actions[:, :ctx_length]
         actions_future = val_actions[:, ctx_length:]
 
@@ -918,8 +925,11 @@ def run_pixel_evaluation(
         )
 
         # Convert predicted pseudo-latents to display frames
-        pred_latents = rollout_result['latents']
-        pred_frames = pixel_latents_to_frames(pred_latents, pixel_h, pixel_w, display_h, display_w)
+        pred_latents = rollout_result['latents'].astype(jnp.float32)
+        pred_frames = pixel_latents_to_frames(
+            pred_latents, pixel_h, pixel_w, display_h, display_w,
+            dataset_mean=dataset_mean, dataset_std=dataset_std,
+        )
 
         # Metrics on pseudo-latent space
         dt = time.time() - t0
