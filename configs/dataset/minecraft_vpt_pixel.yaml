@@ -3,8 +3,8 @@ defaults:
 
 name: minecraft_vpt
 data_type: pixel
-array_record_path: /home/ubuntu/minecraft-vpt/arrayrecords-mp4
-index_max: 1500
+array_record_path: /home/ubuntu/minecraft-vpt
+index_max: 29
 
 num_binary_actions: 23
 categorical_action_dim: 121
@@ -21,7 +21,7 @@ padding_W: [0, 0]
 patch_size: 20
 
 pixel_h: 32
-pixel_w: 32
+pixel_w: 64
 
 dataset_mean: [0.2241, 0.2348, 0.2086]
 dataset_std: [0.1809, 0.1874, 0.2282]
