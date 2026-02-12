@@ -396,6 +396,7 @@ def shortcut_forcing_step(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs2
         )
+        z1_half1 = jax.lax.stop_gradient(z1_half1)
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
 
@@ -405,6 +406,7 @@ def shortcut_forcing_step(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
         )
+        z1_half2 = jax.lax.stop_gradient(z1_half2)
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
 
         # Bootstrap loss (computed unconditionally)
@@ -603,14 +605,14 @@ def compute_pmpo_loss(
     n_positive = jnp.sum(mask_positive)
     n_negative = jnp.sum(mask_negative)
     
-    # Negative set: encourage high log-prob (maximize)
+    # Negative set: discourage high log-prob (bad actions → push probability down)
     loss_negative = jnp.where(
         n_negative > 0,
         (1 - alpha) * jnp.sum(jnp.where(mask_negative, logp_flat, 0.0)) / n_negative,
         0.0,
     )
-    
-    # Positive set: discourage high log-prob (minimize)
+
+    # Positive set: encourage high log-prob (good actions → push probability up)
     loss_positive = jnp.where(
         n_positive > 0,
         -alpha * jnp.sum(jnp.where(mask_positive, logp_flat, 0.0)) / n_positive,
