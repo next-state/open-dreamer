@@ -17,8 +17,8 @@ tokenizer:
   encoder:
     n_latents: 512
     d_bottleneck: 16
-    depth: 7
-    d_model: ${mul:64,${sum:${tokenizer.encoder.depth},${tokenizer.decoder.depth}}}
+    depth: 8
+    d_model: ${mul:128,${tokenizer.encoder.depth}}
     n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
     dropout_rate: 0.0
@@ -29,7 +29,7 @@ tokenizer:
     mae_p_min: 0.0
     mae_p_max: 0.9
     patch_size: ${dataset.patch_size}
-    use_residual_lambdas: true
+    use_residual_lambdas: false
     use_bias: false
     use_rmsnorm_scale: true
     dtype: ${dtype}
@@ -41,10 +41,10 @@ tokenizer:
   decoder:
     n_latents: ${tokenizer.encoder.n_latents}
     d_bottleneck: ${tokenizer.encoder.d_bottleneck}
-    depth: ${tokenizer.encoder.depth}
-    d_model: ${tokenizer.encoder.d_model}
-    n_heads: ${tokenizer.encoder.n_heads}
-    n_kv_heads: ${tokenizer.encoder.n_kv_heads}
+    depth: ${floordiv:${tokenizer.encoder.depth},2}
+    d_model: ${mul:128,${tokenizer.decoder.depth}}
+    n_heads: ${floordiv:${tokenizer.decoder.d_model},64}
+    n_kv_heads: ${max:1,${floordiv:${tokenizer.decoder.n_heads},8}}
     dropout_rate: ${tokenizer.encoder.dropout_rate}
     qk_norm_type: ${tokenizer.encoder.qk_norm_type}
     rope_theta: ${tokenizer.encoder.rope_theta}
@@ -62,12 +62,12 @@ tokenizer:
     dataset_mean: ${dataset.dataset_mean}
     dataset_std: ${dataset.dataset_std}
 
-max_steps: 300_000
+max_steps: 30_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
-  lr: 0.0003  # constant LR or peak LR for schedules
+  lr: 0.003  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05
@@ -91,4 +91,4 @@ optimizer:
 lpips_weight: 0.2
 lpips_frac: 0.5
 visualize_every: 1000
-parallel_strategy: sp
+parallel_strategy: data
