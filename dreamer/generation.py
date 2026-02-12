@@ -123,9 +123,6 @@ def next_latent(
     action = action[:, None, ...]  # expand squeezed-out time dimension
     
     def refinement_step(latent_t, s):
-        tau_prev, tau_curr = schedule.tau_values[s], schedule.tau_values[s+1]
-        alpha = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
-
         step_idx = schedule.step_idx
         tau_idx_val = schedule.tau_indices[s]
 
@@ -136,7 +133,7 @@ def next_latent(
             tau_indices = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
 
             assert task_embedding is None or task_embedding.shape[1] == noisy_latent.shape[1], f"task_embedding.shape = {task_embedding.shape}, noisy_latent.shape = {noisy_latent.shape}"
-        
+
         else: # Used only for debugging.
             assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None
             latent_input  = jnp.concatenate([latents_ctx_noised, latent_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
@@ -147,23 +144,23 @@ def next_latent(
             step_idx_decode = jnp.full((B, decode_length),  schedule.step_idx_ctx, dtype=jnp.int32)
             step_idx_curr   = jnp.full((B, 1), step_idx, dtype=jnp.int32)
             step_indices    = jnp.concatenate([step_idx_prefill, step_idx_decode, step_idx_curr], axis=1)
-            
+
             tau_idx_prefill= jnp.full((B, prefill_length), schedule.k_max, dtype=jnp.int32)
             tau_idx_decode = jnp.full((B, decode_length), schedule.tau_idx_ctx, dtype=jnp.int32)
             tau_idx_curr   = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
             tau_indices    = jnp.concatenate([tau_idx_prefill, tau_idx_decode, tau_idx_curr], axis=1)  # (B, T_ctx+1)
 
-        # Dynamics call
-        latent_clean_pred_seq, (h_seq, _) = dynamics(
+        # Dynamics call — model outputs velocity
+        v_pred_seq, (h_seq, _) = dynamics(
             actions_input, step_indices, tau_indices, latent_input,
             task_embeddings=task_embedding, deterministic=True, caches=caches
         )
 
-        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
+        v_pred = v_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
 
-        # Per-step mixing toward clean latent
-        latent_t_new = (1.0 - alpha) * latent_t + alpha * latent_clean_pred
+        # Euler step with predicted velocity
+        latent_t_new = latent_t + v_pred * schedule.d
 
         return latent_t_new, h_last
 

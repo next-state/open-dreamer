@@ -182,11 +182,6 @@ def sample_step_excluding_dmin(
     return d, step_idx
 
 
-# Loss weighting
-def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float = 1.0) -> jnp.ndarray:
-    return (max_weight - min_weight) * sigma + min_weight
-
-
 # ---------------------------
 # Loss computation
 # ---------------------------
@@ -210,73 +205,52 @@ def compute_psnr(pred, target):
     return jnp.mean(psnr_per_sample)
     
 def compute_flow_loss(
-    z_pred: jnp.ndarray,
-    z_target: jnp.ndarray,
-    sigma: jnp.ndarray,
+    v_pred: jnp.ndarray,
+    v_target: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Flow matching loss in x-space (direct prediction of clean latents).
-    
+    Flow matching loss in v-space (velocity prediction, v = z_1 - z_0).
+
     Args:
-        z_pred: (B, T, S, D) Predicted clean latents
-        z_target: (B, T, S, D) Ground truth clean latents
-        sigma: (B, T) Signal levels (used for weighting)
-        per_example: If True, return (B, T) losses; else return scalar
-        
+        v_pred: (B, T, S, D) Predicted velocity from model
+        v_target: (B, T, S, D) Ground truth velocity (z_1 - z_0)
+
     Returns:
-        loss: Tuple[jnp.float32, jnp.float32]
-            mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
-            mse_per_token: tuple of scalars. MSE loss 
+        Tuple of (weighted_mse, unweighted_mse) scalars
     """
-    mse_per_token = (z_pred - z_target) ** 2  # (B, T, S, D)
+    mse_per_token = (v_pred - v_target) ** 2  # (B, T, S, D)
     mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
-    
-    
-    # Apply ramp weighting and reduce
-    weights = ramp_weight(sigma)
-    return jnp.mean(mse_per_step * weights), jnp.mean(mse_per_step)
+
+    return jnp.mean(mse_per_step), jnp.mean(mse_per_step)
 
 
 def compute_bootstrap_loss(
-    z_pred: jnp.ndarray,
-    z_tilde: jnp.ndarray,
+    v_pred: jnp.ndarray,
     b_prime: jnp.ndarray,
     b_doubleprime: jnp.ndarray,
-    sigma: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Bootstrap self-consistency loss for shortcut forcing.
-    
-    Trains the model to predict the same endpoint whether taking one large step
-    or two smaller steps. Loss is computed in v-space but scaled to x-space.
-    
+    Bootstrap self-consistency loss for shortcut forcing (v-space).
+
+    Trains the model to predict the same velocity whether taking one large step
+    or two smaller steps. Model output is velocity directly.
+
     Args:
-        z_pred: (B, T, S, D) Predicted latent from full step
-        z_tilde: (B, T, S, D) Initial noisy latent
-        b_prime: (B, T, S, D) Velocity from first half-step
-        b_doubleprime: (B, T, S, D) Velocity from second half-step
-        sigma: (B, T) Signal levels
-        
+        v_pred: (B, T, S, D) Predicted velocity from full step
+        b_prime: (B, T, S, D) Velocity from first half-step (model output)
+        b_doubleprime: (B, T, S, D) Velocity from second half-step (model output)
+
     Returns:
-        loss: Tuple[jnp.float32, jnp.float32]
-            mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
-            mse_per_token: tuple of scalars. MSE loss 
+        Tuple of (weighted_mse, unweighted_mse) scalars
     """
-    # Convert full-step prediction to velocity
-    v_hat = (z_pred - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
-    
     # Target velocity is average of two half-steps (stop gradient)
     v_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-    
-    # MSE in v-space, scaled to x-space
-    v_diff = (v_hat - v_target) ** 2
-    boot_per_token = (1.0 - sigma[..., None, None]) ** 2 * v_diff
-    boot_per_step = jnp.mean(boot_per_token, axis=(2, 3))  # (B, T)
-    
-    
-    # Apply ramp weighting and reduce
-    weights = ramp_weight(sigma)
-    return jnp.mean(boot_per_step * weights), jnp.mean(boot_per_step)
+
+    # Direct v-space MSE
+    mse_per_token = (v_pred - v_target) ** 2
+    mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
+
+    return jnp.mean(mse_per_step), jnp.mean(mse_per_step)
 
 
 # ---------------------------
@@ -362,23 +336,24 @@ def shortcut_forcing_step(
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
     z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
     
-    # --- Forward pass (full batch) ---
+    # --- Forward pass (full batch) --- model outputs velocity v = z_1 - z_0
     rngs1 = nnx.Rngs(dropout=key_dropout1)
-    z_pred_full, (h_states, _) = dynamics_model(
+    v_pred_full, (h_states, _) = dynamics_model(
         actions, step_idx_full, sigma_idx_full, z_tilde,
         context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
     )
-    
+
     # --- Flow loss (empirical rows) ---
-    z_pred_emp = z_pred_full[:B_emp]
-    loss_flow, flow_mse_unweighted = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
+    v_pred_emp = v_pred_full[:B_emp]
+    v_target_emp = latents[:B_emp] - z0[:B_emp]  # ground truth velocity
+    loss_flow, flow_mse_unweighted = compute_flow_loss(v_pred_emp, v_target_emp)
     
     # --- Bootstrap loss (self-consistency rows) ---
     loss_boot = jnp.array(0.0, dtype=latents.dtype)
     boot_mse_unweighted = jnp.array(0.0, dtype=latents.dtype)
     
     if B_self > 0:
-        z_pred_self = z_pred_full[B_emp:]
+        v_pred_self = v_pred_full[B_emp:]
         z_tilde_self = z_tilde[B_emp:]
         actions_self = actions[B_emp:]
         time_mask_self = time_mask[B_emp:] if time_mask is not None else None  # assume aligned with batch
@@ -387,28 +362,25 @@ def shortcut_forcing_step(
         # Half-step metadata
         d_half = d_self / 2.0
         step_idx_half = step_idx_self + 1
-        sigma_plus = sigma_self + d_half
         sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
 
-        # First half-step
+        # First half-step — model output is velocity directly
         rngs2 = nnx.Rngs(dropout=key_dropout2)
-        z1_half1, *_ = dynamics_model(
+        b_prime, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs2
         )
-        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
 
-        # Second half-step
+        # Second half-step — model output is velocity directly
         rngs3 = nnx.Rngs(dropout=key_dropout3)
-        z1_half2, *_ = dynamics_model(
+        b_doubleprime, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
         )
-        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
 
-        # Bootstrap loss (computed unconditionally)
-        loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
+        # Bootstrap loss — direct v-space comparison
+        loss_boot, boot_mse_unweighted = compute_bootstrap_loss(v_pred_self, b_prime, b_doubleprime)
     
     # --- Combine losses ---
     # Weight by batch composition to keep scale constant
