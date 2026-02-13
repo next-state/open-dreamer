@@ -3,11 +3,11 @@ defaults:
   - dataset: minecraft_vpt
   - _self_
 
-run_name: tokenizer-512
+run_name: tokenizer-asymmetric
 
 dataset:
-  B: 2
-  T: 256
+  B: 8
+  T: 16
 
 ckpt:
   max_to_keep: 1
