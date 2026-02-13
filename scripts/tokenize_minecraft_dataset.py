@@ -103,7 +103,20 @@ class MinecraftVPTProcessFullEpisode(grain.transforms.Map):
     """Decode full MP4 video for tokenization (no slicing).
 
     Reuses the decord pattern from MinecraftVPTProcessEpisodeAndSlice in data.py.
+    Applies spatial padding to make dimensions divisible by patch_size (16).
     """
+
+    def __init__(self, patch_size: int = 16):
+        self.patch_size = patch_size
+
+    def _calculate_padding(self, dimension: int) -> tuple[int, int]:
+        """Calculate (top/left, bottom/right) padding to make dimension divisible by patch_size."""
+        if dimension % self.patch_size == 0:
+            return (0, 0)
+        padding_needed = self.patch_size - (dimension % self.patch_size)
+        padding_start = padding_needed // 2
+        padding_end = padding_needed - padding_start
+        return (padding_start, padding_end)
 
     def map(self, element: bytes) -> dict:
         data = pickle.loads(element)
@@ -113,12 +126,23 @@ class MinecraftVPTProcessFullEpisode(grain.transforms.Map):
         vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(0), num_threads=1)
         frames = vr.get_batch(list(range(len(vr)))).asnumpy()
 
+        # Apply spatial padding to make H, W divisible by patch_size
+        frames = frames.astype(np.float32)  # (T, H, W, C) in [0, 255]
+        padding_h = self._calculate_padding(frames.shape[1])
+        padding_w = self._calculate_padding(frames.shape[2])
+        frames = np.pad(
+            frames,
+            ((0, 0), padding_h, padding_w, (0, 0)),
+            mode="constant",
+            constant_values=0,
+        )
+
         # Parse actions into Actions pytree
         actions = data.get("actions")
         actions = parse_action_dicts(actions).to_dict()
 
         return {
-            "videos": frames.astype(np.float32),  # (T, H, W, C) in [0, 255]
+            "videos": frames,  # (T, H_padded, W_padded, C) in [0, 255]
             "actions": actions,  # Actions pytree
             "source": data.get("source"),
         }
@@ -129,6 +153,7 @@ def make_tokenization_iterator(
     num_shards: int | None,
     batch_size: int,
     num_workers: int,
+    patch_size: int = 16,
 ):
     """Create dataloader for tokenization (sequential, no shuffle, full episodes)."""
     # Generate shard paths (same pattern as data.py:179)
@@ -153,7 +178,7 @@ def make_tokenization_iterator(
     )
 
     operations = [
-        MinecraftVPTProcessFullEpisode(),
+        MinecraftVPTProcessFullEpisode(patch_size=patch_size),
         grain.transforms.Batch(batch_size=batch_size, drop_remainder=False),
     ]
 
@@ -334,6 +359,7 @@ def main():
         print(f"[tokenize] Tokenizer loaded successfully")
         print(f"[tokenize] n_latents: {tokenizer.encoder.n_latents}")
         print(f"[tokenize] d_bottleneck: {tokenizer.cfg.encoder.d_bottleneck}")
+        print(f"[tokenize] patch_size: {tokenizer.cfg.encoder.patch_size}")
 
         # Create dataloader with device sharding
         base_dataloader = make_tokenization_iterator(
@@ -341,6 +367,7 @@ def main():
             num_shards=args.num_shards,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            patch_size=tokenizer.cfg.encoder.patch_size,
         )
         dataloader = DeviceShardedIterator(
             base_dataloader,
