@@ -204,8 +204,8 @@ def main():
         with open(cfg_path) as f:
             cfg_dict = yaml.safe_load(f)
 
-        dataset_cfg_dict = cfg_dict.get("dataset", {})
-        dataset_cfg = DatasetConfig(**dataset_cfg_dict)
+        # Dataset fields are at top level in the YAML, not nested under "dataset"
+        dataset_cfg = DatasetConfig(**cfg_dict)
 
     print(f"\n{'='*60}")
     print("Generation.py Test")
