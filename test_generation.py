@@ -8,14 +8,17 @@ Usage:
 
 import argparse
 from pathlib import Path
+import numpy as np
 
 import jax
 import jax.numpy as jnp
+from tqdm import tqdm
 
 from dreamer.checkpointing import DynamicsCheckpointBundle
 from dreamer.generation import DenoiseSchedule, video_rollout
 from dreamer.parallel import build_parallel
 from dreamer.actions import Actions
+from dreamer.data import make_dual_iterators, DatasetConfig
 
 
 def test_video_rollout(
@@ -24,7 +27,7 @@ def test_video_rollout(
     horizon: int = 4,
     output_dir: str = "test_outputs",
 ):
-    """Test video_rollout with synthetic frames."""
+    """Test video_rollout with real frames from dataset."""
     print("\n" + "=" * 60)
     print("Testing video_rollout")
     print("=" * 60)
@@ -48,35 +51,51 @@ def test_video_rollout(
         H = tokenizer.cfg.decoder.H
         W = tokenizer.cfg.decoder.W
         C = 3  # RGB
-        B = 2
         T_ctx = 4
 
         print(f"Frame dimensions from checkpoint: {H}x{W}x{C}")
-        print(f"Batch size: {B}, Context length: {T_ctx}, Horizon: {horizon}")
+        print(f"Context length: {T_ctx}, Horizon: {horizon}")
 
         # Get dynamics config
         k_max = dynamics.cfg.k_max
         schedule = DenoiseSchedule.init(n_steps=4, k_max=k_max)
 
-        # Create synthetic frames (random but reasonable range)
-        frames_ctx = jnp.ones((B, T_ctx, H, W, C), dtype=jnp.uint8) * 128  # mid-gray
-
-        # Create synthetic actions (all zeros/noop)
-        actions_ctx = Actions(
-            binary=jnp.zeros((B, T_ctx, dynamics.cfg.num_binary_actions), dtype=jnp.int32),
-            categorical=jnp.zeros((B, T_ctx), dtype=jnp.int32),
-            continuous=jnp.zeros(
-                (B, T_ctx, dynamics.cfg.continuous_action_dim), dtype=jnp.float32
-            ),
-        )
-        actions_future = Actions(
-            binary=jnp.zeros((B, horizon, dynamics.cfg.num_binary_actions), dtype=jnp.int32),
-            categorical=jnp.zeros((B, horizon), dtype=jnp.int32),
-            continuous=jnp.zeros(
-                (B, horizon, dynamics.cfg.continuous_action_dim), dtype=jnp.float32
-            ),
+        # Load real data from dataset
+        print(f"Loading dataset...")
+        dataset_cfg = DatasetConfig(
+            H=H, W=W, C=C,
+            num_binary_actions=dynamics.cfg.num_binary_actions,
+            categorical_action_dim=dynamics.cfg.categorical_action_dim,
+            continuous_action_dim=dynamics.cfg.continuous_action_dim,
         )
 
+        short_loader, _ = make_dual_iterators(
+            dataset_cfg,
+            short_T=T_ctx + horizon + 4,  # Extra buffer
+            long_T=T_ctx + horizon + 4,
+            num_workers=0,
+        )
+
+        iterator = iter(short_loader)
+        batch = next(iterator)
+
+        videos = batch["videos"]  # (B, T, H, W, C)
+        actions = batch["actions"]  # Actions pytree
+
+        # Take first few frames as context, next horizon frames for generation
+        T_total = min(T_ctx + horizon, videos.shape[1] - 1)
+        frames_all = videos[:, :T_total]
+        actions_all = jax.tree.map(lambda x: x[:, :T_total] if x is not None else None, actions)
+
+        frames_ctx = frames_all[:, :T_ctx]
+        frames_future = frames_all[:, T_ctx : T_ctx + horizon]
+
+        actions_ctx = jax.tree.map(lambda x: x[:, :T_ctx] if x is not None else None, actions_all)
+        actions_future = jax.tree.map(lambda x: x[:, T_ctx : T_ctx + horizon] if x is not None else None, actions_all)
+
+        B = frames_ctx.shape[0]
+
+        print(f"Loaded batch: videos {videos.shape}, B={B}")
         print(f"Context frames shape: {frames_ctx.shape}")
         if actions_ctx.binary is not None:
             print(f"Context actions: binary {actions_ctx.binary.shape}, categorical {actions_ctx.categorical.shape}")
@@ -85,12 +104,12 @@ def test_video_rollout(
 
         # Test video rollout
         print("\nRunning video_rollout...")
-        for rollout_idx in range(num_rollouts):
+        for rollout_idx in tqdm(range(num_rollouts), desc="Rollouts"):
             rng = jax.random.PRNGKey(rollout_idx)
             result = video_rollout(
                 tokenizer=tokenizer,
                 dynamics=dynamics,
-                policy=actions_future,
+                policy=actions_future,  # Use ground truth actions from dataset
                 schedule=schedule,
                 frames_ctx=frames_ctx,
                 actions_ctx=actions_ctx,
@@ -116,28 +135,28 @@ def test_video_rollout(
             assert pred_frames.shape[4] == C, f"Channel mismatch"
             print(f"    ✓ Shape checks passed")
 
-            # Save visualization (first sample in batch, context + generated)
+            # Save as GIF with 2 fps
             try:
-                import matplotlib.pyplot as plt
+                from PIL import Image
 
                 sample_idx = 0
-                fig, axes = plt.subplots(
-                    1, T_ctx + horizon, figsize=(3 * (T_ctx + horizon), 3)
-                )
+                frames_list = []
                 for t in range(T_ctx + horizon):
-                    frame = pred_frames[sample_idx, t].astype(jnp.uint8)
-                    axes[t].imshow(jnp.clip(frame, 0, 255))
-                    axes[t].set_title(
-                        f"t={t}" + (" (ctx)" if t < T_ctx else " (gen)")
-                    )
-                    axes[t].axis("off")
+                    frame = np.array(pred_frames[sample_idx, t])  # Convert JAX to numpy
+                    frame_np = np.clip(frame, 0, 255).astype(np.uint8)
+                    frames_list.append(Image.fromarray(frame_np))
 
-                save_path = output_path / f"rollout_{rollout_idx}.png"
-                plt.savefig(save_path, bbox_inches="tight", dpi=100)
-                plt.close()
-                print(f"    ✓ Saved visualization to {save_path}")
+                save_path = output_path / f"rollout_{rollout_idx}.gif"
+                frames_list[0].save(
+                    save_path,
+                    save_all=True,
+                    append_images=frames_list[1:],
+                    duration=500,  # 500ms per frame = 2 fps
+                    loop=0,
+                )
+                print(f"    ✓ Saved GIF to {save_path}")
             except ImportError:
-                print(f"    (matplotlib not available, skipping visualization)")
+                print(f"    (PIL not available, skipping visualization)")
 
         print("\n✓ video_rollout tests passed!")
 
