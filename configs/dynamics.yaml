@@ -4,7 +4,7 @@ defaults:
   - _self_
 
 run_name: dynamics
-tokenizer_ckpt: logs/tokenizer-512/checkpoints/
+tokenizer_ckpt: logs/tokenizer-asym-mse/checkpoints/
 
 ckpt:
   max_to_keep: 1
@@ -26,9 +26,9 @@ dynamics:
     time_every: 4
     mlp_ratio: 4
     dropout_rate: 0.05
-    k_max: 128
-    context_length: 192  # Attention window for sliding window attention
-    use_residual_lambdas: true
+    k_max: 64
+    context_length: 48  # Attention window for sliding window attention
+    use_residual_lambdas: false
     use_bias: false
     use_rmsnorm_scale: true
     dtype: ${dtype}
@@ -47,10 +47,10 @@ image_fraction: 0.3  # Fraction of batch to train as images (no temporal attenti
 
 # Alternating batch lengths (paper: "Sequence length" paragraph)
 short_T: 32  # Overrides dataset.T
-long_T: 32  # Overrides dataset.T
+long_T: 48  # Overrides dataset.T
 long_batch_ratio: 0.1  # Fraction of batches that use long_T
 
-max_steps: 300_000
+max_steps: 50_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos

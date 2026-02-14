@@ -302,7 +302,7 @@ def parse_args():
     parser.add_argument(
         "--input_dir",
         type=str,
-        default="/home/ubuntu/minecraft-vpt/arrayrecords-mp4",
+        default="/home/ubuntu/minecraft-vpt",
         help="Input shards directory",
     )
     parser.add_argument(

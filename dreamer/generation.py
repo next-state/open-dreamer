@@ -9,7 +9,7 @@ from .utils import normalize_latents, unnormalize_latents
 from flax.struct import dataclass
 
 
-LATENT_NORM_CLIP = 10.0
+LATENT_NORM_CLIP = 4.0
 
 @dataclass
 class DenoiseSchedule:

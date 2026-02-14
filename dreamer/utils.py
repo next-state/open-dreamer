@@ -434,6 +434,7 @@ def build_optimizer(
             scaled_schedule = lambda step, s=lr_schedule, m=mup_scale: s(step) * m
         else:
             scaled_schedule = lr_schedule
+        import optax
 
         tx = optax.adamw(
             scaled_schedule,

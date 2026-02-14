@@ -91,7 +91,15 @@ def sample_video(
         frames, _ = tokenizer.decode(z, deterministic=True)
         return frames
 
-    gt_decoded_frames = decode_jit(latents)
+    def decode_chunked(z, chunk_size=8):
+        """Decode (B, T, ...) latents in temporal chunks to save memory."""
+        T_dec = z.shape[1]
+        if T_dec <= chunk_size:
+            return decode_jit(z)
+        chunks = [decode_jit(z[:, t:t+chunk_size]) for t in range(0, T_dec, chunk_size)]
+        return jnp.concatenate(chunks, axis=1)
+
+    gt_decoded_frames = decode_chunked(latents)
     gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
@@ -120,7 +128,7 @@ def sample_video(
 
     # Decode predicted latents to frames
     # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
-    pred_frames = decode_jit(rollout_result['latents'])
+    pred_frames = decode_chunked(rollout_result['latents'])
     pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
 

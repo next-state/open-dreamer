@@ -1,0 +1,17 @@
+defaults:
+  - dynamics
+  - _self_
+
+# Path to dynamics checkpoint (contains both dynamics + tokenizer)
+dynamics_ckpt: ""
+
+# FVD evaluation settings
+num_videos: 256
+horizon: null  # null = T - ctx_length
+ctx_length: 4
+i3d_bs: 32
+
+# Video saving
+save_videos: false
+video_dir: ./logs/eval_fvd_videos
+max_save: 64
