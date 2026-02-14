@@ -23,11 +23,20 @@ from dreamer.data import make_dual_iterators
 
 def test_video_rollout(
     checkpoint_dir: str,
+    dataset_cfg: "DatasetConfig | None" = None,
     num_rollouts: int = 2,
     horizon: int = 4,
     output_dir: str = "test_outputs",
 ):
-    """Test video_rollout with real frames from dataset."""
+    """Test video_rollout with real frames from dataset.
+
+    Args:
+        checkpoint_dir: Path to checkpoint directory
+        dataset_cfg: DatasetConfig. If None, uses default config.
+        num_rollouts: Number of rollouts to test
+        horizon: Number of future frames to generate
+        output_dir: Directory to save visualizations
+    """
     print("\n" + "=" * 60)
     print("Testing video_rollout")
     print("=" * 60)
@@ -62,7 +71,10 @@ def test_video_rollout(
 
         # Load real data from dataset
         print(f"Loading dataset...")
-        dataset_cfg = dynamics.cfg.dataset
+        if dataset_cfg is None:
+            # Use default dataset config
+            from dreamer.configs import DatasetConfig
+            dataset_cfg = DatasetConfig()
 
         short_loader, _ = make_dual_iterators(
             dataset_cfg,
@@ -160,6 +172,9 @@ def main():
     parser = argparse.ArgumentParser(description="Test generation.py with a checkpoint")
     parser.add_argument("--checkpoint_dir", required=True, help="Path to checkpoint directory")
     parser.add_argument(
+        "--dataset_cfg", default="configs/dataset/minecraft_vpt_latent.yaml", help="Path to dataset config (YAML). If not provided, uses default config."
+    )
+    parser.add_argument(
         "--num_rollouts", type=int, default=2, help="Number of rollouts to test"
     )
     parser.add_argument(
@@ -175,10 +190,29 @@ def main():
         print(f"Error: checkpoint directory {checkpoint_dir} not found")
         return 1
 
+    # Load dataset config if provided
+    dataset_cfg = None
+    if args.dataset_cfg is not None:
+        import yaml
+        from dreamer.configs import DatasetConfig
+
+        cfg_path = Path(args.dataset_cfg)
+        if not cfg_path.exists():
+            print(f"Error: dataset config file {cfg_path} not found")
+            return 1
+
+        with open(cfg_path) as f:
+            cfg_dict = yaml.safe_load(f)
+
+        dataset_cfg_dict = cfg_dict.get("dataset", {})
+        dataset_cfg = DatasetConfig(**dataset_cfg_dict)
+
     print(f"\n{'='*60}")
     print("Generation.py Test")
     print(f"{'='*60}")
     print(f"Checkpoint: {checkpoint_dir}")
+    if args.dataset_cfg:
+        print(f"Dataset config: {args.dataset_cfg}")
     print(f"Num rollouts: {args.num_rollouts}")
     print(f"Horizon: {args.horizon}")
     print(f"Output directory: {args.output_dir}")
@@ -186,6 +220,7 @@ def main():
     try:
         test_video_rollout(
             str(checkpoint_dir),
+            dataset_cfg=dataset_cfg,
             num_rollouts=args.num_rollouts,
             horizon=args.horizon,
             output_dir=args.output_dir,
