@@ -70,11 +70,9 @@ def test_video_rollout(
         schedule = DenoiseSchedule.init(n_steps=4, k_max=k_max)
 
         # Load real data from dataset
-        print(f"Loading dataset...")
+        print(f"Loading dataset from {dataset_cfg.array_record_path}...")
         if dataset_cfg is None:
-            # Use default dataset config
-            from dreamer.configs import DatasetConfig
-            dataset_cfg = DatasetConfig()
+            raise ValueError("dataset_cfg is required")
 
         short_loader, _ = make_dual_iterators(
             dataset_cfg,
@@ -172,7 +170,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test generation.py with a checkpoint")
     parser.add_argument("--checkpoint_dir", required=True, help="Path to checkpoint directory")
     parser.add_argument(
-        "--dataset_cfg", default="configs/dataset/minecraft_vpt.yaml", help="Path to dataset config (YAML). If not provided, uses default config."
+        "--array_record_path", default="/home/ubuntu/minecraft-vpt/arrayrecords-mp4", help="Path to dataset arrayrecords"
     )
     parser.add_argument(
         "--num_rollouts", type=int, default=2, help="Number of rollouts to test"
@@ -190,20 +188,17 @@ def main():
         print(f"Error: checkpoint directory {checkpoint_dir} not found")
         return 1
 
-    # Load dataset config if provided
-    dataset_cfg = None
-    if args.dataset_cfg is not None:
-        from omegaconf import OmegaConf
-        from dreamer.configs import DatasetConfig
-
-        cfg_path = Path(args.dataset_cfg)
-        if not cfg_path.exists():
-            print(f"Error: dataset config file {cfg_path} not found")
-            return 1
-
-        # Load with OmegaConf and convert to DatasetConfig
-        cfg = OmegaConf.load(cfg_path)
-        dataset_cfg = OmegaConf.to_object(cfg, DatasetConfig)
+    # Create dataset config with provided path
+    from dreamer.configs import DatasetConfig
+    dataset_cfg = DatasetConfig(
+        array_record_path=args.array_record_path,
+        num_binary_actions=23,
+        categorical_action_dim=121,
+        continuous_action_dim=0,
+        H=360,
+        W=640,
+        C=3,
+    )
 
     print(f"\n{'='*60}")
     print("Generation.py Test")
