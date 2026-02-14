@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script for generation.py: loads a checkpoint and runs video rollouts.
+Test script for generation.py: loads a checkpoint and runs rollouts on real data.
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 python test_generation.py --checkpoint_dir /path/to/checkpoint [--num_rollouts 2] [--horizon 4]
@@ -12,33 +12,27 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from tqdm import tqdm
 
 from dreamer.checkpointing import DynamicsCheckpointBundle
-from dreamer.generation import DenoiseSchedule, video_rollout
+from dreamer.generation import DenoiseSchedule, latent_rollout, video_rollout
 from dreamer.parallel import build_parallel
-from dreamer.actions import Actions
 from dreamer.data import make_dual_iterators
 
 
-def test_video_rollout(
+def test_rollout(
     checkpoint_dir: str,
-    dataset_cfg: "DatasetConfig | None" = None,
+    dataset_cfg: "DatasetConfig",
     num_rollouts: int = 2,
     horizon: int = 4,
     output_dir: str = "test_outputs",
 ):
-    """Test video_rollout with real frames from dataset.
+    """Test rollout with real data from dataset."""
+    use_latent_data = dataset_cfg.data_type == "latent"
 
-    Args:
-        checkpoint_dir: Path to checkpoint directory
-        dataset_cfg: DatasetConfig. If None, uses default config.
-        num_rollouts: Number of rollouts to test
-        horizon: Number of future frames to generate
-        output_dir: Directory to save visualizations
-    """
     print("\n" + "=" * 60)
-    print("Testing video_rollout")
+    print(f"Testing {'latent' if use_latent_data else 'video'}_rollout")
     print("=" * 60)
 
     # Create output directory
@@ -59,10 +53,10 @@ def test_video_rollout(
         # Get dimensions from checkpoint
         H = tokenizer.cfg.decoder.H
         W = tokenizer.cfg.decoder.W
-        C = 3  # RGB
+        C = 3
         T_ctx = 4
 
-        print(f"Frame dimensions from checkpoint: {H}x{W}x{C}")
+        print(f"Frame dimensions: {H}x{W}x{C}")
         print(f"Context length: {T_ctx}, Horizon: {horizon}")
 
         # Get dynamics config
@@ -70,10 +64,7 @@ def test_video_rollout(
         schedule = DenoiseSchedule.init(n_steps=4, k_max=k_max)
 
         # Load real data from dataset
-        print(f"Loading dataset from {dataset_cfg.array_record_path}...")
-        if dataset_cfg is None:
-            raise ValueError("dataset_cfg is required")
-
+        print(f"Loading dataset (data_type={dataset_cfg.data_type})...")
         short_loader, _ = make_dual_iterators(
             dataset_cfg,
             short_T=T_ctx + horizon + 4,  # Extra buffer
@@ -83,61 +74,81 @@ def test_video_rollout(
 
         iterator = iter(short_loader)
         batch = next(iterator)
+        actions = batch["actions"]
 
-        videos = batch["videos"]  # (B, T, H, W, C)
-        actions = batch["actions"]  # Actions pytree
+        if use_latent_data:
+            data = batch["latents"]  # (B, T, n_latents, d_bottleneck)
+        else:
+            data = batch["videos"]  # (B, T, H, W, C)
 
-        # Take first few frames as context, next horizon frames for generation
-        T_total = min(T_ctx + horizon, videos.shape[1] - 1)
-        frames_all = videos[:, :T_total]
-        actions_all = jax.tree.map(lambda x: x[:, :T_total] if x is not None else None, actions)
+        B, T = data.shape[0], data.shape[1]
+        T_total = min(T_ctx + horizon, T)
 
-        frames_ctx = frames_all[:, :T_ctx]
-        frames_future = frames_all[:, T_ctx : T_ctx + horizon]
+        data_all = data[:, :T_total]
+        actions_all = actions[:, :T_total]
+        data_ctx = data_all[:, :T_ctx]
+        actions_ctx = actions_all[:, :T_ctx]
+        actions_future = actions_all[:, T_ctx : T_ctx + horizon]
 
-        actions_ctx = jax.tree.map(lambda x: x[:, :T_ctx] if x is not None else None, actions_all)
-        actions_future = jax.tree.map(lambda x: x[:, T_ctx : T_ctx + horizon] if x is not None else None, actions_all)
-
-        B = frames_ctx.shape[0]
-
-        print(f"Loaded batch: videos {videos.shape}, B={B}")
-        print(f"Context frames shape: {frames_ctx.shape}")
+        print(f"Loaded batch: data {data.shape}, B={B}")
+        print(f"Context data shape: {data_ctx.shape}")
         if actions_ctx.binary is not None:
             print(f"Context actions: binary {actions_ctx.binary.shape}, categorical {actions_ctx.categorical.shape}")
-        if actions_future.binary is not None:
-            print(f"Future actions: binary {actions_future.binary.shape}, categorical {actions_future.categorical.shape}")
 
-        # Test video rollout
-        print("\nRunning video_rollout...")
+        # Test rollout
+        print(f"\nRunning rollout...")
         for rollout_idx in tqdm(range(num_rollouts), desc="Rollouts"):
             rng = jax.random.PRNGKey(rollout_idx)
-            result = video_rollout(
-                tokenizer=tokenizer,
-                dynamics=dynamics,
-                policy=actions_future,  # Use ground truth actions from dataset
-                schedule=schedule,
-                frames_ctx=frames_ctx,
-                actions_ctx=actions_ctx,
-                num_steps=horizon,
-                rng=rng,
-                initial_task_embedding=None,
-            )
 
-            pred_frames = result["frames"]
-            pred_latents = result["latents"]
+            if use_latent_data:
+                # Latent path: use latent_rollout directly, then decode
+                latents_ctx = data_ctx.astype(jnp.bfloat16)
+                result = latent_rollout(
+                    dynamics=dynamics,
+                    policy=actions_future,
+                    schedule=schedule,
+                    latents_ctx=latents_ctx,
+                    actions_ctx=actions_ctx,
+                    num_steps=horizon,
+                    rng=rng,
+                    initial_task_embedding=None,
+                    deterministic=True,
+                )
+
+                # Decode latents to frames for visualization
+                @nnx.jit
+                def decode_jit(z):
+                    frames, _ = tokenizer.decode(z, deterministic=True)
+                    return frames
+
+                pred_frames = decode_jit(result["latents"])
+                pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
+                pred_latents = result["latents"]
+            else:
+                # Video path: use video_rollout
+                result = video_rollout(
+                    tokenizer=tokenizer,
+                    dynamics=dynamics,
+                    policy=actions_future,
+                    schedule=schedule,
+                    frames_ctx=data_ctx,
+                    actions_ctx=actions_ctx,
+                    num_steps=horizon,
+                    rng=rng,
+                    initial_task_embedding=None,
+                )
+                pred_frames = result["frames"]
+                pred_latents = result["latents"]
+
             print(f"  Rollout {rollout_idx + 1}:")
             print(f"    Output frames shape: {pred_frames.shape}")
             print(f"    Output latents shape: {pred_latents.shape}")
 
             # Verify shapes
-            assert pred_frames.shape[0] == B, f"Batch size mismatch"
-            assert (
-                pred_frames.shape[1] == T_ctx + horizon
-            ), f"Time steps mismatch: {pred_frames.shape[1]} vs {T_ctx + horizon}"
-            assert (
-                pred_frames.shape[2] == H and pred_frames.shape[3] == W
-            ), f"Frame size mismatch"
-            assert pred_frames.shape[4] == C, f"Channel mismatch"
+            assert pred_frames.shape[0] == B
+            assert pred_frames.shape[1] == T_ctx + horizon
+            assert pred_frames.shape[2] == H and pred_frames.shape[3] == W
+            assert pred_frames.shape[4] == C
             print(f"    ✓ Shape checks passed")
 
             # Save as GIF with 2 fps
@@ -147,7 +158,7 @@ def test_video_rollout(
                 sample_idx = 0
                 frames_list = []
                 for t in range(T_ctx + horizon):
-                    frame = np.array(pred_frames[sample_idx, t])  # Convert JAX to numpy
+                    frame = np.array(pred_frames[sample_idx, t])
                     frame_np = np.clip(frame, 0, 255).astype(np.uint8)
                     frames_list.append(Image.fromarray(frame_np))
 
@@ -163,14 +174,14 @@ def test_video_rollout(
             except ImportError:
                 print(f"    (PIL not available, skipping visualization)")
 
-        print("\n✓ video_rollout tests passed!")
+        print("\n✓ rollout tests passed!")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Test generation.py with a checkpoint")
     parser.add_argument("--checkpoint_dir", required=True, help="Path to checkpoint directory")
     parser.add_argument(
-        "--array_record_path", default="/home/ubuntu/minecraft-vpt/arrayrecords-mp4", help="Path to dataset arrayrecords"
+        "--dataset_cfg", default="configs/dataset/minecraft_vpt_latent.yaml", help="Path to dataset config (YAML)."
     )
     parser.add_argument(
         "--num_rollouts", type=int, default=2, help="Number of rollouts to test"
@@ -188,30 +199,33 @@ def main():
         print(f"Error: checkpoint directory {checkpoint_dir} not found")
         return 1
 
-    # Create dataset config with provided path
+    # Load dataset config
+    import yaml
     from dreamer.configs import DatasetConfig
-    dataset_cfg = DatasetConfig(
-        array_record_path=args.array_record_path,
-        num_binary_actions=23,
-        categorical_action_dim=121,
-        continuous_action_dim=0,
-        H=360,
-        W=640,
-        C=3,
-    )
+
+    cfg_path = Path(args.dataset_cfg)
+    if not cfg_path.exists():
+        print(f"Error: dataset config file {cfg_path} not found")
+        return 1
+
+    with open(cfg_path) as f:
+        cfg_dict = yaml.safe_load(f)
+
+    # Config YAML may have flat keys or nested under 'dataset:'
+    cfg_dict.pop("defaults", None)  # Remove hydra defaults key
+    dataset_cfg = DatasetConfig(**cfg_dict)
 
     print(f"\n{'='*60}")
     print("Generation.py Test")
     print(f"{'='*60}")
     print(f"Checkpoint: {checkpoint_dir}")
-    if args.dataset_cfg:
-        print(f"Dataset config: {args.dataset_cfg}")
+    print(f"Dataset config: {args.dataset_cfg} (data_type={dataset_cfg.data_type})")
     print(f"Num rollouts: {args.num_rollouts}")
     print(f"Horizon: {args.horizon}")
     print(f"Output directory: {args.output_dir}")
 
     try:
-        test_video_rollout(
+        test_rollout(
             str(checkpoint_dir),
             dataset_cfg=dataset_cfg,
             num_rollouts=args.num_rollouts,
