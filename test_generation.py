@@ -172,7 +172,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test generation.py with a checkpoint")
     parser.add_argument("--checkpoint_dir", required=True, help="Path to checkpoint directory")
     parser.add_argument(
-        "--dataset_cfg", default="configs/dataset/minecraft_vpt_latent.yaml", help="Path to dataset config (YAML). If not provided, uses default config."
+        "--dataset_cfg", default="configs/dataset/minecraft_vpt.yaml", help="Path to dataset config (YAML). If not provided, uses default config."
     )
     parser.add_argument(
         "--num_rollouts", type=int, default=2, help="Number of rollouts to test"
