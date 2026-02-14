@@ -193,7 +193,7 @@ def main():
     # Load dataset config if provided
     dataset_cfg = None
     if args.dataset_cfg is not None:
-        import yaml
+        from omegaconf import OmegaConf
         from dreamer.configs import DatasetConfig
 
         cfg_path = Path(args.dataset_cfg)
@@ -201,11 +201,9 @@ def main():
             print(f"Error: dataset config file {cfg_path} not found")
             return 1
 
-        with open(cfg_path) as f:
-            cfg_dict = yaml.safe_load(f)
-
-        # Dataset fields are at top level in the YAML, not nested under "dataset"
-        dataset_cfg = DatasetConfig(**cfg_dict)
+        # Load with OmegaConf and convert to DatasetConfig
+        cfg = OmegaConf.load(cfg_path)
+        dataset_cfg = OmegaConf.to_object(cfg, DatasetConfig)
 
     print(f"\n{'='*60}")
     print("Generation.py Test")
