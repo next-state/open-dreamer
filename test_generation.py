@@ -1,35 +1,32 @@
 #!/usr/bin/env python3
 """
-Test script for generation.py: loads a checkpoint and runs video rollouts on real data.
+Test script for generation.py: loads a checkpoint and runs video rollouts.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 python test_generation.py --checkpoint_dir /path/to/checkpoint [--config config.yaml] [--num_rollouts 2] [--horizon 4]
+    CUDA_VISIBLE_DEVICES=0 python test_generation.py --checkpoint_dir /path/to/checkpoint [--num_rollouts 2] [--horizon 4]
 """
 
 import argparse
 from pathlib import Path
-from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-import yaml
 
 from dreamer.checkpointing import DynamicsCheckpointBundle
 from dreamer.generation import DenoiseSchedule, video_rollout
 from dreamer.parallel import build_parallel
-from dreamer.data import make_dual_iterators, DatasetConfig
+from dreamer.actions import Actions
 
 
 def test_video_rollout(
     checkpoint_dir: str,
-    dataset_cfg: DatasetConfig,
     num_rollouts: int = 2,
     horizon: int = 4,
     output_dir: str = "test_outputs",
 ):
-    """Test video_rollout with real data from the dataset."""
+    """Test video_rollout with synthetic frames."""
     print("\n" + "=" * 60)
-    print("Testing video_rollout with real video data from dataset")
+    print("Testing video_rollout")
     print("=" * 60)
 
     # Create output directory
@@ -47,44 +44,44 @@ def test_video_rollout(
         dynamics = bundle.dynamics
         tokenizer = bundle.tokenizer
 
-        # Get dimensions from config
+        # Get dimensions from checkpoint
+        H = tokenizer.cfg.decoder.H
+        W = tokenizer.cfg.decoder.W
+        C = 3  # RGB
+        B = 2
+        T_ctx = 4
+
+        print(f"Frame dimensions from checkpoint: {H}x{W}x{C}")
+        print(f"Batch size: {B}, Context length: {T_ctx}, Horizon: {horizon}")
+
+        # Get dynamics config
         k_max = dynamics.cfg.k_max
         schedule = DenoiseSchedule.init(n_steps=4, k_max=k_max)
 
-        # Create data loader
-        print(f"Loading dataset from {dataset_cfg.data_dir}...")
-        short_loader, _ = make_dual_iterators(
-            dataset_cfg,
-            short_T=dataset_cfg.T,
-            long_T=dataset_cfg.T,
-            num_workers=0,  # Single worker for testing
+        # Create synthetic frames (random but reasonable range)
+        frames_ctx = jnp.ones((B, T_ctx, H, W, C), dtype=jnp.uint8) * 128  # mid-gray
+
+        # Create synthetic actions (all zeros/noop)
+        actions_ctx = Actions(
+            binary=jnp.zeros((B, T_ctx, dynamics.cfg.num_binary_actions), dtype=jnp.int32),
+            categorical=jnp.zeros((B, T_ctx), dtype=jnp.int32),
+            continuous=jnp.zeros(
+                (B, T_ctx, dynamics.cfg.continuous_action_dim), dtype=jnp.float32
+            ),
+        )
+        actions_future = Actions(
+            binary=jnp.zeros((B, horizon, dynamics.cfg.num_binary_actions), dtype=jnp.int32),
+            categorical=jnp.zeros((B, horizon), dtype=jnp.int32),
+            continuous=jnp.zeros(
+                (B, horizon, dynamics.cfg.continuous_action_dim), dtype=jnp.float32
+            ),
         )
 
-        # Get one batch
-        iterator = iter(short_loader)
-        batch = next(iterator)
-
-        videos = batch["videos"]  # (B, T, H, W, C)
-        actions = batch["actions"]  # Actions pytree
-
-        B, T, H, W, C = videos.shape
-        print(f"Loaded batch: videos shape {videos.shape}, actions shape")
-        print(f"  Binary actions: {actions.binary.shape}")
-        print(f"  Categorical actions: {actions.categorical.shape}")
-        print(f"  Continuous actions: {actions.continuous.shape}")
-
-        # Split into context and future
-        T_ctx = min(4, T - horizon)
-        if T_ctx + horizon > T:
-            print(f"Warning: T={T} is too small for T_ctx={T_ctx} + horizon={horizon}")
-            T_ctx = T - horizon
-
-        frames_ctx = videos[:, :T_ctx]
-        actions_ctx = jax.tree.map(lambda x: x[:, :T_ctx] if x is not None else None, actions)
-
-        print(f"\nContext: {T_ctx} frames")
-        print(f"Horizon: {horizon} frames")
-        print(f"Frame size: {H}x{W}x{C}")
+        print(f"Context frames shape: {frames_ctx.shape}")
+        if actions_ctx.binary is not None:
+            print(f"Context actions: binary {actions_ctx.binary.shape}, categorical {actions_ctx.categorical.shape}")
+        if actions_future.binary is not None:
+            print(f"Future actions: binary {actions_future.binary.shape}, categorical {actions_future.categorical.shape}")
 
         # Test video rollout
         print("\nRunning video_rollout...")
@@ -93,7 +90,7 @@ def test_video_rollout(
             result = video_rollout(
                 tokenizer=tokenizer,
                 dynamics=dynamics,
-                policy=actions[:, T_ctx : T_ctx + horizon],  # Use ground-truth actions
+                policy=actions_future,
                 schedule=schedule,
                 frames_ctx=frames_ctx,
                 actions_ctx=actions_ctx,
@@ -105,20 +102,18 @@ def test_video_rollout(
             pred_frames = result["frames"]
             pred_latents = result["latents"]
             print(f"  Rollout {rollout_idx + 1}:")
-            print(f"    Input frames shape: {frames_ctx.shape}")
             print(f"    Output frames shape: {pred_frames.shape}")
             print(f"    Output latents shape: {pred_latents.shape}")
 
             # Verify shapes
-            assert (
-                pred_frames.shape[0] == B
-            ), f"Batch size mismatch: {pred_frames.shape[0]} vs {B}"
+            assert pred_frames.shape[0] == B, f"Batch size mismatch"
             assert (
                 pred_frames.shape[1] == T_ctx + horizon
             ), f"Time steps mismatch: {pred_frames.shape[1]} vs {T_ctx + horizon}"
             assert (
-                pred_frames.shape[2:] == (H, W, C)
-            ), f"Frame size mismatch: {pred_frames.shape[2:]} vs {(H, W, C)}"
+                pred_frames.shape[2] == H and pred_frames.shape[3] == W
+            ), f"Frame size mismatch"
+            assert pred_frames.shape[4] == C, f"Channel mismatch"
             print(f"    ✓ Shape checks passed")
 
             # Save visualization (first sample in batch, context + generated)
@@ -151,11 +146,6 @@ def main():
     parser = argparse.ArgumentParser(description="Test generation.py with a checkpoint")
     parser.add_argument("--checkpoint_dir", required=True, help="Path to checkpoint directory")
     parser.add_argument(
-        "--config",
-        default="configs/default.yaml",
-        help="Path to dataset config file (YAML)",
-    )
-    parser.add_argument(
         "--num_rollouts", type=int, default=2, help="Number of rollouts to test"
     )
     parser.add_argument(
@@ -171,24 +161,10 @@ def main():
         print(f"Error: checkpoint directory {checkpoint_dir} not found")
         return 1
 
-    # Load dataset config
-    config_path = Path(args.config)
-    if not config_path.exists():
-        print(f"Error: config file {config_path} not found")
-        return 1
-
-    with open(config_path) as f:
-        cfg_dict = yaml.safe_load(f)
-
-    # Extract dataset config
-    dataset_cfg_dict = cfg_dict.get("dataset", {})
-    dataset_cfg = DatasetConfig(**dataset_cfg_dict)
-
     print(f"\n{'='*60}")
-    print("Generation.py Test Suite")
+    print("Generation.py Test")
     print(f"{'='*60}")
     print(f"Checkpoint: {checkpoint_dir}")
-    print(f"Dataset config: {config_path}")
     print(f"Num rollouts: {args.num_rollouts}")
     print(f"Horizon: {args.horizon}")
     print(f"Output directory: {args.output_dir}")
@@ -196,7 +172,6 @@ def main():
     try:
         test_video_rollout(
             str(checkpoint_dir),
-            dataset_cfg,
             num_rollouts=args.num_rollouts,
             horizon=args.horizon,
             output_dir=args.output_dir,
