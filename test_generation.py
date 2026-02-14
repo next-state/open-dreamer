@@ -18,7 +18,7 @@ from dreamer.checkpointing import DynamicsCheckpointBundle
 from dreamer.generation import DenoiseSchedule, video_rollout
 from dreamer.parallel import build_parallel
 from dreamer.actions import Actions
-from dreamer.data import make_dual_iterators, DatasetConfig
+from dreamer.data import make_dual_iterators
 
 
 def test_video_rollout(
@@ -62,12 +62,7 @@ def test_video_rollout(
 
         # Load real data from dataset
         print(f"Loading dataset...")
-        dataset_cfg = DatasetConfig(
-            H=H, W=W, C=C,
-            num_binary_actions=dynamics.cfg.num_binary_actions,
-            categorical_action_dim=dynamics.cfg.categorical_action_dim,
-            continuous_action_dim=dynamics.cfg.continuous_action_dim,
-        )
+        dataset_cfg = dynamics.cfg.dataset
 
         short_loader, _ = make_dual_iterators(
             dataset_cfg,
