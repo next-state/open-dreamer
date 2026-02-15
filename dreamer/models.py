@@ -7,7 +7,8 @@ from einops import rearrange, repeat
 import math
 from .utils import (
     Modality, TokenLayout,
-    RunningNormalizer,
+    normalize_with_dataset_stats,
+    unnormalize_with_dataset_stats,
     to_jnp_dtype,
     patchify, unpatchify
 )
@@ -735,10 +736,11 @@ class BlockCausalTransformer(nnx.Module):
 class Encoder(nnx.Module):
     """Vision encoder with MAE masking."""
 
-    def __init__(self, cfg: EncoderModelConfig, *, pixel_normalizer: RunningNormalizer, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: EncoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
-        self.pixel_normalizer = pixel_normalizer
+        self.dataset_mean = cfg.dataset_mean
+        self.dataset_std = cfg.dataset_std
         dtype = to_jnp_dtype(cfg.dtype)
         param_dtype = to_jnp_dtype(cfg.param_dtype)
 
@@ -763,10 +765,7 @@ class Encoder(nnx.Module):
         # Videos in the [0, 255] range
         B, T, H, W, C = videos.shape
 
-        videos_01 = videos.astype(jnp.float32) / 255.0
-        if not deterministic:
-            self.pixel_normalizer.update(videos_01)
-        normalized_videos = self.pixel_normalizer.normalize(videos_01)
+        normalized_videos = normalize_with_dataset_stats(videos, mean=self.dataset_mean, std=self.dataset_std)
         patch_tokens = patchify(normalized_videos, patch=self.patch_size)
         proj_patches = self.patch_proj(patch_tokens)  # (B, T, Np, D)
 
@@ -810,12 +809,13 @@ class Decoder(nnx.Module):
     reconstructions at per-patch query tokens.
     """
 
-    def __init__(self, cfg: DecoderModelConfig, *, pixel_normalizer: RunningNormalizer, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: DecoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
         self.H = cfg.H
         self.W = cfg.W
-        self.pixel_normalizer = pixel_normalizer
+        self.dataset_mean = cfg.dataset_mean
+        self.dataset_std = cfg.dataset_std
         dtype = to_jnp_dtype(cfg.dtype)
         param_dtype = to_jnp_dtype(cfg.param_dtype)
 
@@ -872,7 +872,7 @@ class Decoder(nnx.Module):
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
         pred_btnd = self.patch_head(x_patches)  # (B, T, Np, D_patch)
         out_normalized_frames = unpatchify(pred_btnd, patch=self.patch_size, H=self.H, W=self.W)
-        out_frames = self.pixel_normalizer.unnormalize(out_normalized_frames) * 255.0
+        out_frames = unnormalize_with_dataset_stats(out_normalized_frames, mean=self.dataset_mean, std=self.dataset_std)
         return out_frames, new_caches
 
 class Tokenizer(nnx.Module):
@@ -881,27 +881,18 @@ class Tokenizer(nnx.Module):
     def __init__(self, cfg: TokenizerModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.cfg = cfg
 
-        # Running normalizers (EMA-tracked, checkpointed as BatchStat)
-        self.pixel_normalizer = RunningNormalizer(shape=(3,))
-        self.latent_normalizer = RunningNormalizer(shape=(cfg.encoder.d_bottleneck,))
-
-        # Create encoder and decoder (share the same pixel_normalizer)
-        self.encoder = Encoder(cfg.encoder, pixel_normalizer=self.pixel_normalizer, mesh_rules=mesh_rules, rngs=rngs)
-        self.decoder = Decoder(cfg.decoder, pixel_normalizer=self.pixel_normalizer, mesh_rules=mesh_rules, rngs=rngs)
+        # Create encoder and decoder
+        self.encoder = Encoder(cfg.encoder, mesh_rules=mesh_rules, rngs=rngs)
+        self.decoder = Decoder(cfg.decoder, mesh_rules=mesh_rules, rngs=rngs)
 
     def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None):
         z, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs)
-        if not deterministic:
-            self.latent_normalizer.update(z)
         recon, _ = self.decoder(z, deterministic=deterministic, rngs=rngs)
         return recon, aux
 
     def encode(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None):
         # Always returns unpacked: (B, T, n_latents, d_bottleneck)
-        latents, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs)
-        if not deterministic:
-            self.latent_normalizer.update(latents)
-        return latents, aux
+        return self.encoder(videos, deterministic=deterministic, rngs=rngs)
 
     def decode(self, z, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None):
         # Always expects unpacked: (B, T, n_latents, d_bottleneck)

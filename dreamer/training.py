@@ -17,7 +17,7 @@ from dreamer.generation import DenoiseSchedule
 from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
-from dreamer.utils import _ensure_dir, apply_border
+from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents
 
 
 # ---------------------------
@@ -161,6 +161,9 @@ def shortcut_forcing_step(
 
     B, T, _, _ = latents.shape
     emax = jnp.log2(k_max).astype(jnp.int32)
+
+    # Normalize latents before corruption.
+    latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
 
     # Sample tau and noise at full resolution.
     key_sigma, key_noise, key_dropout = jax.random.split(rng, 3)
@@ -568,8 +571,9 @@ def run_evaluation(
         gt_frames_for_metrics = original_frames
 
     dt = time.time() - t0
-    normalized_pred = tokenizer.pixel_normalizer.normalize(pred_frames[:, -horizon:] / 255.0)
-    normalized_gt = tokenizer.pixel_normalizer.normalize(gt_frames_for_metrics[:, -horizon:] / 255.0)
+    dataset_std = cfg.dataset.dataset_std[0]
+    normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
+    normalized_gt = normalize_with_dataset_stats(gt_frames_for_metrics[:, -horizon:], mean=0, std=dataset_std)
     mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
     psnr = float(compute_psnr(pred_frames[:, -horizon:] / 255, gt_frames_for_metrics[:, -horizon:] / 255))
 

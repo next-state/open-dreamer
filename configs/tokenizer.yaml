@@ -31,6 +31,9 @@ tokenizer:
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
+
   decoder:
     n_latents: ${tokenizer.encoder.n_latents}
     d_bottleneck: ${tokenizer.encoder.d_bottleneck}
@@ -52,7 +55,10 @@ tokenizer:
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
-max_steps: 30_000
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
+
+max_steps: 300_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:

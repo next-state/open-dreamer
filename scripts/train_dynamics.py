@@ -70,7 +70,6 @@ def train_step(
         latents = jax.lax.stop_gradient(latents)
 
     latents = latents.astype(dynamics.dtype)
-    latents = tokenizer.latent_normalizer.normalize(latents)
 
     # Training step
     step_key = jax.random.fold_in(master_key, step)

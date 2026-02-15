@@ -166,29 +166,6 @@ class TokenLayout:
         return cls(aux_data)
 
 
-class RunningNormalizer(nnx.Module):
-    """EMA-based running mean/variance tracker with normalize/unnormalize."""
-    def __init__(self, shape, beta=0.999):
-        self.beta = beta
-        self.mean = nnx.BatchStat(jnp.zeros(shape))
-        self.var = nnx.BatchStat(jnp.ones(shape))
-
-    def update(self, x):
-        reduce_axes = tuple(range(x.ndim - len(self.mean.value.shape)))
-        batch_mean = jnp.mean(x, axis=reduce_axes)
-        batch_var = jnp.var(x, axis=reduce_axes)
-        self.mean.value = self.beta * self.mean.value + (1 - self.beta) * batch_mean
-        self.var.value = self.beta * self.var.value + (1 - self.beta) * batch_var
-
-    def normalize(self, x, eps=1e-8):
-        std = jnp.sqrt(jnp.maximum(self.var.value, eps))
-        return (x - self.mean.value) / std
-
-    def unnormalize(self, x, eps=1e-8):
-        std = jnp.sqrt(jnp.maximum(self.var.value, eps))
-        return x * std + self.mean.value
-
-
 def normalize_with_dataset_stats(videos, *, mean, std):
     """
     Normalize videos using dataset-level statistics.
