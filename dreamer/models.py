@@ -1,4 +1,3 @@
-from numpy.distutils.unixccompiler import UnixCCompiler__compile
 import einops
 import jax.numpy as jnp
 from flax import nnx
