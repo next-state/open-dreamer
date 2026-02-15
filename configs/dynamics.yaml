@@ -31,6 +31,7 @@ dynamics:
     dropout_rate: 0.00
     k_max: 64
     context_length: 192  # Attention window for sliding window attention
+    use_residual_lambdas: true
     use_bias: false
     use_rmsnorm_scale: true
     dtype: ${dtype}

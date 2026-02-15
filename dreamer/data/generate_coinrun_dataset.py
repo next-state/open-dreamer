@@ -234,7 +234,7 @@ def generate_episodes(num_episodes, split):
 
     # Close writer
     writer.close()
-    print(f"Done generating {split} split (wrote {writer.shard_idx} shards)")
+    print(f"Done generating {split} split (wrote {writer.num_shards} shards)")
     return episode_metadata
 
 

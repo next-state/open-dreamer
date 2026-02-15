@@ -1,3 +1,4 @@
+from numpy.distutils.unixccompiler import UnixCCompiler__compile
 import einops
 import jax.numpy as jnp
 from flax import nnx
@@ -632,13 +633,25 @@ class BlockCausalTransformer(nnx.Module):
                  mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
                  use_seq_parallel: bool = False,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
+                 use_residual_lambdas: bool = False, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
         self.depth = depth
         self.time_every = time_every
+        self.use_residual_lambdas = use_residual_lambdas
         self.dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
+
+        if use_residual_lambdas:
+            self.resid_lambdas = nnx.Param(
+                jnp.ones(depth, dtype=param_dtype),
+                sharding_names=(None,)  # Small per-layer params, no sharding needed
+            )
+            self.x0_lambdas = nnx.Param(
+                jnp.zeros(depth, dtype=param_dtype),
+                sharding_names=(None,)  # Small per-layer params, no sharding needed
+            )
 
         # Create layers
         self.layers = nnx.List([
@@ -678,8 +691,14 @@ class BlockCausalTransformer(nnx.Module):
             output tensor and updated caches (always returns tuple, caches can be None)
         """
         new_caches = {} if caches is not None else None
+        x0 = x
 
         for i, layer in enumerate(self.layers):
+            if self.use_residual_lambdas:
+                resid_lambda = self.resid_lambdas.value[i].astype(self.dtype)
+                x0_lambda = self.x0_lambdas.value[i].astype(self.dtype)
+                x = resid_lambda * x + x0_lambda * x0
+
             time_index = i // self.time_every
             is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
@@ -705,7 +724,9 @@ class BlockCausalTransformer(nnx.Module):
 
     def count_excluded_params(self) -> int:
         """Count params excluded from FLOP estimation (per-layer scalars)."""
-        return 0
+        if not self.use_residual_lambdas:
+            return 0
+        return self.resid_lambdas.value.size + self.x0_lambdas.value.size
 
 
 # ============================================================================
@@ -732,6 +753,7 @@ class Encoder(nnx.Module):
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=dtype, param_dtype=param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -809,6 +831,7 @@ class Decoder(nnx.Module):
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=dtype, param_dtype=param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -1092,6 +1115,7 @@ class Dynamics(nnx.Module):
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=self.dtype, param_dtype=self.param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
