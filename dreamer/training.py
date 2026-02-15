@@ -510,6 +510,52 @@ def compute_policy_loss(
 # Evaluation and visualization
 # ---------------------------
 
+@nnx.jit(static_argnames=("schedule_config", "horizon", "ctx_length", "use_latent_data", "max_eval_videos"))
+def compute_eval(
+    tokenizer,
+    dynamics,
+    val_data,
+    val_actions,
+    rng,
+    schedule_config,
+    horizon,
+    ctx_length,
+    use_latent_data,
+    policy=None,
+    task_embedder=None,
+    max_eval_videos=4,
+):
+    """Pure-JAX core of evaluation: sample_video + metrics + visualization grid."""
+    sample_kwargs = dict(
+        tokenizer=tokenizer, dynamics=dynamics, actions=val_actions,
+        horizon=horizon, schedule_config=schedule_config, rng=rng,
+        policy=policy, task_embedder=task_embedder,
+    )
+    if use_latent_data:
+        sample_kwargs["frames"] = None
+        sample_kwargs["latents"] = val_data
+    else:
+        sample_kwargs["frames"] = val_data
+
+    pred_frames, gt_decoded_frames, original_frames = sample_video(**sample_kwargs)
+    gt_frames_for_metrics = original_frames if original_frames is not None else gt_decoded_frames
+
+    # Compute metrics on device
+    normalized_pred = tokenizer.pixel_normalizer.normalize(pred_frames[:, -horizon:] / 255.0)
+    normalized_gt = tokenizer.pixel_normalizer.normalize(gt_frames_for_metrics[:, -horizon:] / 255.0)
+    mse = jnp.mean((normalized_pred - normalized_gt) ** 2)
+    psnr = compute_psnr(pred_frames[:, -horizon:] / 255, gt_frames_for_metrics[:, -horizon:] / 255)
+
+    # Build visualization grid on device
+    num_videos = min(max_eval_videos, pred_frames.shape[0])
+    pred_frames_bordered = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
+
+    frames_list = [gt_decoded_frames] + ([original_frames] if original_frames is not None else []) + [pred_frames_bordered]
+    stacked_frames = jnp.stack(frames_list)[:, :num_videos]
+
+    return mse, psnr, stacked_frames
+
+
 def run_evaluation(
     cfg: DynamicsConfig | HeadsConfig,
     step: int,
@@ -525,74 +571,63 @@ def run_evaluation(
     task_embedder: TaskEmbedder | None = None,
     omega: jax.Array | float = 0.0,
     alpha: jax.Array | float = 0.7,
+    save_videos_separately: bool = False,
+    sample_offset: int = 0,
 ):
-    """Run periodic evaluation: sample videos, compute metrics, and save visualization."""
+    """Run periodic evaluation: sample videos, compute metrics, and save visualization.
+    save_videos_separately and sample_offset are used for saving videos separately for FVD evaluation. 
+    """
     del omega, alpha
 
     k_max = dynamics.cfg.k_max
     schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
     tag = "diffusion"
 
-    t0 = time.time()
     T = val_data.shape[1]
     assert T > 5, f"Sequence length {T} must be > 5"
     ctx_length = 4
     horizon = T - ctx_length
 
-    if use_latent_data:
-        pred_frames, gt_decoded_frames, _ = sample_video(
-            tokenizer,
-            dynamics,
-            frames=None,
-            actions=val_actions,
-            horizon=horizon,
-            schedule_config=schedule_diffusion,
-            rng=rng,
-            policy=policy,
-            task_embedder=task_embedder,
-            latents=val_data,
-        )
-        gt_frames_for_metrics = gt_decoded_frames
-    else:
-        pred_frames, gt_decoded_frames, original_frames = sample_video(
-            tokenizer,
-            dynamics,
-            frames=val_data,
-            actions=val_actions,
-            horizon=horizon,
-            schedule_config=schedule_diffusion,
-            rng=rng,
-            policy=policy,
-            task_embedder=task_embedder,
-        )
-        gt_frames_for_metrics = original_frames
+    # When saving separately, keep all B samples; otherwise cap at 4 for the grid
+    max_eval_videos = val_data.shape[0] if save_videos_separately else 4
 
+    t0 = time.time()
+    mse, psnr, stacked_frames = compute_eval(
+        tokenizer, dynamics, val_data, val_actions, rng,
+        schedule_diffusion, horizon, ctx_length, use_latent_data,
+        policy=policy, task_embedder=task_embedder,
+        max_eval_videos=max_eval_videos,
+    )
+    mse = float(mse)
+    psnr = float(psnr)
     dt = time.time() - t0
-    normalized_pred = tokenizer.pixel_normalizer.normalize(pred_frames[:, -horizon:] / 255.0)
-    normalized_gt = tokenizer.pixel_normalizer.normalize(gt_frames_for_metrics[:, -horizon:] / 255.0)
-    mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
-    psnr = float(compute_psnr(pred_frames[:, -horizon:] / 255, gt_frames_for_metrics[:, -horizon:] / 255))
 
-    print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
-
-    num_videos = min(4, pred_frames.shape[0])
-    pred_frames = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
-
-    if use_latent_data:
-        frames_list = [gt_decoded_frames, pred_frames]
-    else:
-        frames_list = [gt_decoded_frames, original_frames, pred_frames]
-    stacked_frames = jnp.stack(frames_list)[:, :num_videos]
-    videos = rearrange(stacked_frames, "S B T H W C -> T (B H) (S W) C", B=num_videos)
+    print(f"[eval:{tag}:jit] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
 
     tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
-    mp4_path = tag_dir / f"{tag}_grid.mp4"
 
     try:
-        videos = jax.device_get(videos)
-        iio.imwrite(str(mp4_path), videos, fps=5, plugin="pyav", codec="libx264")
+        stacked_frames = jax.device_get(stacked_frames)
+        if save_videos_separately:
+            video_type_names = (
+                ["gt_decoded", "pred"] if use_latent_data
+                else ["gt_decoded", "original", "pred"]
+            )
+            B = stacked_frames.shape[1]
+            for s, name in enumerate(video_type_names):
+                for b in range(B):
+                    idx = sample_offset + b
+                    mp4_path = tag_dir / f"{tag}_jit_{name}_{idx:04d}.mp4"
+                    iio.imwrite(str(mp4_path), stacked_frames[s, b], fps=5, plugin="pyav", codec="libx264")
+                logger.log_video(step, f"eval/{tag}/video/{name}", tag_dir)
+        else:
+            B = stacked_frames.shape[1]
+            videos = rearrange(stacked_frames, "S B T H W C -> T (B H) (S W) C", B=B)
+            mp4_path = tag_dir / f"{tag}_jit_grid.mp4"
+            iio.imwrite(str(mp4_path), videos, fps=5, plugin="pyav", codec="libx264")
+            logger.log_video(step, f"eval/{tag}/video", mp4_path)
     except Exception as e:
-        print(f"[eval:{tag}] MP4 write failed: {e}")
+        print(f"[eval:{tag}:jit] MP4 write failed: {e}")
 
     logger.log_metrics(
         step,
@@ -605,5 +640,4 @@ def run_evaluation(
         prefix="eval/",
     )
 
-    if videos is not None:
-        logger.log_video(step, f"eval/{tag}/video", mp4_path)
+    return mse, psnr, dt

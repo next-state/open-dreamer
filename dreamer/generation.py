@@ -1,18 +1,25 @@
+import dataclasses
 import math
 from typing import Any, Tuple
 
 import einops
 import jax
 import jax.numpy as jnp
-from flax.struct import dataclass
 
 from .actions import Actions
 from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 
 
-@dataclass
+@dataclasses.dataclass(frozen=True)
 class DenoiseSchedule:
-    """Simple denoising schedule shared by rollout utilities."""
+    """Simple denoising schedule shared by rollout utilities.
+
+    Uses a plain Python dataclass (frozen + hashable) so it can be passed as a
+    static argument to JIT-compiled functions.  The JAX arrays ``tau_values``
+    and ``tau_indices`` are hashed by their shape and dtype (not element values)
+    which is fine because the schedule is uniquely determined by
+    ``(num_steps, k_max, tau_ctx)``.
+    """
 
     num_steps: int
     k_max: int
@@ -23,6 +30,14 @@ class DenoiseSchedule:
     step_idx_ctx: int
     tau_idx_ctx: int
     tau_ctx: float
+
+    def __hash__(self):
+        return hash((self.num_steps, self.k_max, self.tau_ctx))
+
+    def __eq__(self, other):
+        if not isinstance(other, DenoiseSchedule):
+            return NotImplemented
+        return (self.num_steps, self.k_max, self.tau_ctx) == (other.num_steps, other.k_max, other.tau_ctx)
 
     @classmethod
     def init(cls, num_steps: int, k_max: int = 256, tau_ctx: float = 1.0) -> "DenoiseSchedule":
@@ -185,9 +200,8 @@ def latent_rollout(
         dtype=latents_ctx.dtype,
     )
 
-    emax = int(math.log2(schedule.k_max))
-    step_idx_ctx = jnp.full((B, T_ctx), emax, dtype=jnp.int32)
-    tau_idx_ctx = jnp.full((B, T_ctx), schedule.k_max - 1, dtype=jnp.int32)
+    step_idx_ctx = jnp.full((B, T_ctx), schedule.step_idx_ctx, dtype=jnp.int32)
+    tau_idx_ctx = jnp.full((B, T_ctx), schedule.tau_idx_ctx, dtype=jnp.int32)
 
     _, (h_seq, caches) = dynamics(
         actions_ctx,

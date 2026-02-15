@@ -1,0 +1,23 @@
+defaults:
+  - dynamics
+  - _self_
+
+# Path to dynamics checkpoint (contains both dynamics + tokenizer)
+dynamics_ckpt: ""
+
+# Mode: "both" runs generate then evaluate, "generate" only saves videos,
+# "evaluate" only computes FVD from previously saved videos
+mode: "both"
+
+# Generation settings
+num_videos: 256
+batch_size: 8
+ctx_length: 4
+horizon: null  # null = T - ctx_length
+
+# Video I/O
+video_dir: ./logs/eval_fvd_videos
+
+# FVD evaluation settings
+i3d_bs: 32
+pred_frames_only: true  # if true, FVD only over predicted frames (exclude context)

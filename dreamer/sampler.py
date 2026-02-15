@@ -1,20 +1,15 @@
-# sampling logic for debugging / visualization. Not JIT friendly.
+# sampling logic for debugging / visualization.
+# Callers should JIT-compile sample_video externally (e.g. via @nnx.jit wrapper).
 from __future__ import annotations
 from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from einops import rearrange
 from flax import nnx
 
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
-from .generation import DenoiseSchedule, video_rollout, latent_rollout
-
-
-# ---------------------------
-# Multi-frame rollout wrapper
-# ---------------------------
+from .generation import DenoiseSchedule, latent_rollout
 
 def sample_video(
     tokenizer: Tokenizer,
@@ -31,7 +26,8 @@ def sample_video(
     alpha: jax.Array | float = 0.7,
 ) -> Tuple[jax.Array, jax.Array, jax.Array | None]:
     """
-    Sample video predictions using Tokenizer and Dynamics.
+    Sample video predictions using Tokenizer and Dynamics. 
+    Important: Make sure this function is JIT-compiled for decoder to work.
 
     Args:
         tokenizer: Tokenizer NNX model (has encode/decode methods)
@@ -80,21 +76,9 @@ def sample_video(
 
     # Single-shot context corruption for visualization "floor" only
     latents_ctx = latents_ctx_clean
-    # if schedule_config.tau_ctx < 1.0:  # FIXME: this is NOT taken from the evaluation config
-    #     rng, nkey = jax.random.split(rng)
-    #     noise = jax.random.normal(nkey, latents_ctx_clean.shape, latents_ctx_clean.dtype)
-    #     tau = jnp.asarray(schedule_config.tau_ctx, latents_ctx_clean.dtype)
-    #     latents_ctx = tau * latents_ctx_clean + (1.0 - tau) * noise
 
     # Decode GT latents for visualization
-    # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
-    @nnx.jit
-    def decode_jit(z):
-        frames, _ = tokenizer.decode(z, deterministic=True)
-        return frames
-
-    gt_decoded_frames = decode_jit(latents)
-    gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
+    gt_decoded_frames = jnp.clip(tokenizer.decode(latents, deterministic=True)[0], 0, 255).astype(jnp.uint8)
 
     # Rollout
     # Use policy if provided, otherwise use ground truth future actions
@@ -127,8 +111,7 @@ def sample_video(
     pred_latents = tokenizer.latent_normalizer.unnormalize(rollout_result['latents'])
 
     # Decode predicted latents to frames
-    # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
-    pred_frames = decode_jit(pred_latents)
+    pred_frames = tokenizer.decode(pred_latents, deterministic=True)[0]
     pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
 
