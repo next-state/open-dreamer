@@ -25,7 +25,7 @@ from dreamer.generation import DenoiseSchedule
 from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
-from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents
+from dreamer.utils import _ensure_dir, apply_border
 
 
 # ---------------------------
@@ -219,15 +219,9 @@ def compute_flow_loss(
             mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
             mse_per_token: tuple of scalars. MSE loss 
     """
-    z_mean, z_logvar = jnp.split(z_pred, 2, axis=-1)
-    mse = (z_mean-z_target)**2
-    log_prob = z_logvar + jnp.exp(-z_logvar)*mse  # (B, T, S, D)
-    
-    
-    # Apply ramp weighting and reduce
-    # weight = ramp_weight(sigma, min_weight=1., max_weight=0.1)
-    
-    return jnp.mean(log_prob), jnp.mean(mse)
+    mse = (z_pred - z_target)**2
+
+    return jnp.mean(mse), jnp.mean(mse)
 
 
 def compute_bootstrap_loss(
@@ -256,20 +250,15 @@ def compute_bootstrap_loss(
             mse_per_token: tuple of scalars. MSE loss 
     """
     # Convert full-step prediction to velocity
-    z_mean, z_logvar = jnp.split(z_pred, 2, axis=-1)
-    v_hat = (z_mean - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
-    v_logvar = z_logvar - jnp.log(jnp.maximum(1.0 - sigma[..., None, None], 1e-8))
-    
+    v_hat = (z_pred - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
+
     # Target velocity is average of two half-steps (stop gradient)
     v_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-    
+
     # MSE in v-space, scaled to x-space
     v_diff = (v_hat - v_target) ** 2
-    boot_per_token = v_logvar + jnp.exp(-v_logvar)*v_diff
-    
-    
-    # Apply ramp weighting and reduce
-    return jnp.mean(boot_per_token), jnp.mean(v_diff)
+
+    return jnp.mean(v_diff), jnp.mean(v_diff)
 
 
 # ---------------------------
@@ -314,9 +303,6 @@ def shortcut_forcing_step(
     B, T, S, D = latents.shape
     B_emp = B - B_self
     emax = jnp.log2(k_max).astype(jnp.int32)
-
-    # Normalize latents before corruption (all operations happen in normalized space)
-    latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
 
     # Split RNG
     key_sigma, key_step, key_noise, key_dropout1, key_dropout2, key_dropout3 = jax.random.split(rng, 6)
@@ -798,9 +784,8 @@ def run_evaluation(
 
         # Compute metrics
         dt = time.time() - t0
-        dataset_std = cfg.dataset.dataset_std[0]
-        normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
-        normalized_gt = normalize_with_dataset_stats(gt_frames_for_metrics[:, -horizon:], mean=0, std=dataset_std)
+        normalized_pred = tokenizer.pixel_normalizer.normalize(pred_frames[:, -horizon:].astype(jnp.float32) / 255.0)
+        normalized_gt = tokenizer.pixel_normalizer.normalize(gt_frames_for_metrics[:, -horizon:].astype(jnp.float32) / 255.0)
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
         psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames_for_metrics[:, -horizon:]/255))
 

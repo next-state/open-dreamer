@@ -3,23 +3,18 @@ defaults:
   - dataset: minecraft_vpt
   - _self_
 
-run_name: tokenizer-512
-
-dataset:
-  dataloader_cfg:
-    B: 2
-    T: 256
+run_name: tokenizer-asymmetric
 
 ckpt:
   max_to_keep: 1
-  save_interval_steps: 10_000
+  save_interval_steps: 1_000
 
 tokenizer:
   encoder:
     n_latents: 512
     d_bottleneck: 16
-    depth: 7
-    d_model: ${mul:64,${sum:${tokenizer.encoder.depth},${tokenizer.decoder.depth}}}
+    depth: 8
+    d_model: ${mul:128,${tokenizer.encoder.depth}}
     n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
     dropout_rate: 0.0
@@ -30,45 +25,37 @@ tokenizer:
     mae_p_min: 0.0
     mae_p_max: 0.9
     patch_size: ${dataset.patch_size}
-    use_residual_lambdas: true
     use_bias: false
     use_rmsnorm_scale: true
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
-    dataset_mean: ${dataset.dataset_mean}
-    dataset_std: ${dataset.dataset_std}
-
   decoder:
     n_latents: ${tokenizer.encoder.n_latents}
     d_bottleneck: ${tokenizer.encoder.d_bottleneck}
-    depth: ${tokenizer.encoder.depth}
-    d_model: ${tokenizer.encoder.d_model}
-    n_heads: ${tokenizer.encoder.n_heads}
-    n_kv_heads: ${tokenizer.encoder.n_kv_heads}
+    depth: 4
+    d_model: ${mul:128,${tokenizer.decoder.depth}}
+    n_heads: ${floordiv:${tokenizer.decoder.d_model},64}
+    n_kv_heads: ${max:1,${floordiv:${tokenizer.decoder.n_heads},8}}
     dropout_rate: ${tokenizer.encoder.dropout_rate}
     qk_norm_type: ${tokenizer.encoder.qk_norm_type}
     rope_theta: ${tokenizer.encoder.rope_theta}
-    time_every: ${tokenizer.encoder.time_every}
+    time_every: 3
     H: ${sum:${dataset.padding_H[0]},${dataset.padding_H[1]},${dataset.H}}
     W: ${sum:${dataset.padding_W[0]},${dataset.padding_W[1]},${dataset.W}}
     patch_size: ${dataset.patch_size}
     d_patch: ${mul:${dataset.patch_size},${dataset.patch_size},${dataset.C}}
-    use_residual_lambdas: ${tokenizer.encoder.use_residual_lambdas}
     use_bias: ${tokenizer.encoder.use_bias}
     use_rmsnorm_scale: ${tokenizer.encoder.use_rmsnorm_scale}
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
-    dataset_mean: ${dataset.dataset_mean}
-    dataset_std: ${dataset.dataset_std}
-
-max_steps: 300_000
+max_steps: 30_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
-  lr: 0.0003  # constant LR or peak LR for schedules
+  lr: 0.003  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05
@@ -77,7 +64,7 @@ lr_schedule:
 
 optimizer:
   optimizer_type: muon
-  weight_decay: 0.1
+  weight_decay: 0.0001
   # AdamW params (for embeddings/biases)
   adam_lr_ratio: 1.0
   adam_b1: 0.9
@@ -92,4 +79,4 @@ optimizer:
 lpips_weight: 0.2
 lpips_frac: 0.5
 visualize_every: 1000
-parallel_strategy: sp
+parallel_strategy: data

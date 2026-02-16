@@ -147,8 +147,8 @@ def main():
         
         print(f"Loaded dynamics model with config: {dynamics.cfg}")
 
-        # Determine data type from dynamics config
-        use_latent_data = hasattr(dynamics.cfg, 'latent_mean') and dynamics.cfg.latent_mean is not None
+        # Determine data type (latent normalizer with non-unit variance indicates latent data was used)
+        use_latent_data = hasattr(tokenizer, 'latent_normalizer')
 
         # Build dataset config for validation data
         if args.data_path is not None:

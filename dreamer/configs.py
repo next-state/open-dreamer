@@ -57,9 +57,6 @@ class DatasetConfig:
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] = (0.288675, 0.288675, 0.288675)  # sqrt(1/12)
     
-    latent_mean: tuple[float, ...] | None = None
-    latent_std: tuple[float, ...] | None = None
-
     # Reward-biased slicing probability (0.0 = disabled, 0.8 = 80% chance to include windows with nonzero reward)
     p_include_reward: float = 0.0
 
@@ -84,15 +81,11 @@ class EncoderModelConfig:
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
-    use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
-
-    dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
-    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
 @dataclass(frozen=False)
@@ -109,7 +102,6 @@ class DecoderModelConfig:
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
-    use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
@@ -117,9 +109,6 @@ class DecoderModelConfig:
     param_dtype: str = "float32"
     H: int = 64  # sum(DatasetConfig.padding_H, DatasetConfig.H)
     W: int = 64  # sum(DatasetConfig.padding_W, DatasetConfig.W)
-
-    dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
-    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
 @dataclass(frozen=False)
@@ -161,8 +150,6 @@ class DynamicsModelConfig:
     categorical_action_dim: int = 0
     continuous_action_dim: int = 0
     
-    latent_mean: tuple[float, ...] | None = None
-    latent_std: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=False)

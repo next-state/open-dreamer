@@ -37,10 +37,10 @@ OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
 OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
 OmegaConf.register_new_resolver("max", lambda *args: max(args))
 
-jax.config.update("jax_compilation_cache_dir", "/scratch/jax_cache")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+# jax.config.update("jax_compilation_cache_dir", "/scratch/jax_cache")
+# jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
 
 
 # ---------------------------
@@ -74,6 +74,9 @@ def train_step(
         latents = jax.lax.stop_gradient(latents)
 
     latents = latents.astype(dynamics.dtype)
+
+    # Normalize latents using tokenizer's running normalizer (cast back to model dtype)
+    latents = tokenizer.latent_normalizer.normalize(latents).astype(dynamics.dtype)
 
     B = latents.shape[0]
     B_self = int(B * bootstrap_fraction)

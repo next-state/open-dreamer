@@ -13,14 +13,12 @@ from flax import nnx
 from jaxlpips import LPIPS
 from omegaconf import OmegaConf
 from tqdm import tqdm
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-
 from dreamer.configs import TokenizerConfig
 from dreamer.training import compute_psnr
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
-from dreamer.parallel import build_parallel, MeshRules
+from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 
 from dreamer.checkpointing import (
@@ -28,7 +26,6 @@ from dreamer.checkpointing import (
     build_checkpoint_manager,
 )
 from dreamer.utils import (
-    normalize_with_dataset_stats,
     count_parameters_by_component,
     setup_training_directories,
     build_lr_schedule,
@@ -84,16 +81,16 @@ def lpips_on_mae_recon(lpips_model: LPIPS, pred, target, subsample_frac=1.0):
 # Train step
 # ------------------------
 
-@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"))
-def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | None, videos, *, mae_key, dropout_key, step, 
-               lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
+@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "log_gradients", "tokenizer_loss_type"))
+def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | None, videos, *, mae_key, dropout_key, step,
+               lpips_weight, lpips_frac, log_gradients: bool, tokenizer_loss_type: str):
 
     def loss_fn(model: Tokenizer):
         rngs = nnx.Rngs(mae=mae_key, dropout=dropout_key)
         pred, (mae_mask, keep_prob) = model(videos, deterministic=False, rngs=rngs)
 
-        pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
-        target_norm = normalize_with_dataset_stats(videos, mean=dataset_mean, std=dataset_std)
+        pred_norm = model.pixel_normalizer.normalize(pred / 255.0)
+        target_norm = model.pixel_normalizer.normalize(videos.astype(jnp.float32) / 255.0)
         if tokenizer_loss_type == "mae":
             mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
         elif tokenizer_loss_type == "mse":
@@ -177,9 +174,7 @@ def run(cfg: TokenizerConfig):
     )
 
     # Parallelism
-    mesh = jax.make_mesh((2, jax.local_device_count()//2), ('data', 'seq'))
-    data_sharding = NamedSharding(mesh, P('data', 'seq', None, None))
-    mesh_rules = MeshRules(data='data', seq='seq')
+    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
     with logger, jax.set_mesh(mesh):
         key = jax.random.key(cfg.seed)
@@ -222,7 +217,7 @@ def run(cfg: TokenizerConfig):
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset, device=data_sharding)
 
-        with build_checkpoint_manager(cfg.ckpt, ckpt_dir) as checkpoint_manager:
+        with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=TokenizerCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
             scaling.start_training()
@@ -242,8 +237,6 @@ def run(cfg: TokenizerConfig):
                     bundle.tokenizer, bundle.tokenizer_optimizer, lpips_model, batch["videos"],
                     mae_key=mae_key, dropout_key=dropout_key, step=step,
                     lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
-                    dataset_mean=tuple(cfg.dataset.dataset_mean),
-                    dataset_std=tuple(cfg.dataset.dataset_std),
                     log_gradients=cfg.logger.log_gradients,
                     tokenizer_loss_type=cfg.tokenizer_loss_type
                 )

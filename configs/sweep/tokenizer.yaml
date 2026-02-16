@@ -25,9 +25,6 @@ parameters:
   encoder.qk_norm_type:
     values: [qknorm, quest]
 
-  encoder.use_residual_lambdas:
-    values: [true]
-  
   encoder.use_rmsnorm_scale:
     values: [true, false]
 
@@ -66,4 +63,4 @@ command:
   - run
   - ${program}
   - ${args_no_hyphens}
-  - run_name=${encoder.dropout_rate}_${encoder.qk_norm_type}_${encoder.use_residual_lambdas}_${encoder.use_rmsnorm_scale}_lr${lr_schedule.lr}/${optimizer.adam_lr_ratio}_${lr_schedule.warmup_ratio}_${lr_schedule.decay_ratio}_b1${optimizer.adam_b1}_b2${optimizer.adam_b2}_wd${optimizer.weight_decay}    
+  - run_name=${encoder.dropout_rate}_${encoder.qk_norm_type}_${encoder.use_rmsnorm_scale}_lr${lr_schedule.lr}/${optimizer.adam_lr_ratio}_${lr_schedule.warmup_ratio}_${lr_schedule.decay_ratio}_b1${optimizer.adam_b1}_b2${optimizer.adam_b2}_wd${optimizer.weight_decay}

@@ -11,6 +11,33 @@ from hydra.core.hydra_config import HydraConfig
 from dreamer.configs import LRScheduleConfig, OptimizerConfig
 
 
+# --- RunningNormalizer ---
+
+class RunningNormalizer(nnx.Module):
+    """EMA-based running normalizer that tracks mean and variance."""
+
+    def __init__(self, shape: tuple[int, ...], beta: float = 0.999):
+        self.beta = beta
+        self.mean = nnx.BatchStat(jnp.zeros(shape))
+        self.var = nnx.BatchStat(jnp.ones(shape))
+
+    def update(self, x: jnp.ndarray):
+        """Update running statistics with a new batch. x: (..., *shape)."""
+        # Reduce over all dims except the last len(shape) dims
+        n_reduce = x.ndim - self.mean.value.ndim
+        reduce_axes = tuple(range(n_reduce))
+        batch_mean = jnp.mean(x, axis=reduce_axes)
+        batch_var = jnp.var(x, axis=reduce_axes)
+        self.mean.value = self.beta * self.mean.value + (1 - self.beta) * batch_mean
+        self.var.value = self.beta * self.var.value + (1 - self.beta) * batch_var
+
+    def normalize(self, x: jnp.ndarray) -> jnp.ndarray:
+        return (x - self.mean.value) / jnp.sqrt(self.var.value + 1e-8)
+
+    def unnormalize(self, x: jnp.ndarray) -> jnp.ndarray:
+        return x * jnp.sqrt(self.var.value + 1e-8) + self.mean.value
+
+
 # --- dtype helpers ---
 
 def to_jnp_dtype(dtype: str | jnp.dtype) -> jnp.dtype:

@@ -109,12 +109,15 @@ def sample_video(
     else:
         initial_agent_tokens = None
 
+    # Normalize latents before rollout
+    latents_ctx_norm = tokenizer.latent_normalizer.normalize(latents_ctx)
+
     # Use latent_rollout for both paths (frames already encoded to latents above)
     rollout_result = latent_rollout(
         dynamics,
         policy=actions_future if policy is None else policy,
         schedule=schedule_config,
-        latents_ctx=latents_ctx,
+        latents_ctx=latents_ctx_norm,
         actions_ctx=actions_ctx,
         num_steps=horizon,
         rng=rng,
@@ -124,9 +127,12 @@ def sample_video(
         alpha=alpha,
     )
 
+    # Unnormalize predicted latents before decoding
+    rollout_latents = tokenizer.latent_normalizer.unnormalize(rollout_result['latents'])
+
     # Decode predicted latents to frames
     # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
-    pred_frames = decode_jit(rollout_result['latents'])
+    pred_frames = decode_jit(rollout_latents)
     pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
 

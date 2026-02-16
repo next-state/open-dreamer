@@ -5,7 +5,6 @@ import jax.numpy as jnp
 from typing import Any, Tuple
 from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 from .actions import Actions
-from .utils import normalize_latents, unnormalize_latents
 from flax.struct import dataclass
 
 
@@ -150,8 +149,8 @@ def next_latent(
             actions_input, step_indices, tau_indices, latent_input,
             task_embeddings=task_embedding, deterministic=True, caches=caches
         )
-        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :C]  # (B, 1, n_spatial, D_s)
-        
+        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
+
         # Guidance https://arxiv.org/pdf/2502.07849
         def apply_guidance():
             # Unconditional dynamics call (no context)
@@ -160,8 +159,7 @@ def next_latent(
                 task_embeddings=task_embedding[:,-1:] if task_embedding is not None else None, deterministic=True, caches=None
             )
             # Classifier-free guidance: pred = uncond + (1 + omega) * (cond - uncond) * |cond - uncond|^(2 * exponent)
-            latent_diff = latent_clean_pred - latent_uncond_pred[...,:C]
-            # TODO: edit logvar distance between scores
+            latent_diff = latent_clean_pred - latent_uncond_pred
             result = latent_clean_pred + (1.0 + omega) * latent_diff * (latent_diff**2).mean(axis = (1,2,3), keepdims=True)**exponent
             return result
             
@@ -207,10 +205,6 @@ def next_latent(
     # Print latent std as a function of timestep
     # jax.debug.print("Timestep {s}, Latent Std: {std}", s=s, std=jnp.std(latent_t_final))
     
-    # Unnormalize output so caller receives latents in original space
-    latent_t_final = unnormalize_latents(latent_t_final, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
-
-
     return latent_t_final, h_last, caches_new, rng
 
 def next_frame(
@@ -307,9 +301,8 @@ def latent_rollout(
     B, T_ctx, n_spatial, D_s = latents_ctx.shape
     latent_shape = (B, 1, n_spatial, D_s)
 
-    # Normalize context latents for dynamics (keep original for output)
+    # Keep original for output (caller handles normalization)
     latents_ctx_orig = latents_ctx
-    latents_ctx = normalize_latents(latents_ctx, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
     # Initialize caches and process context
     window_size = T_ctx + num_steps
@@ -421,13 +414,16 @@ def video_rollout(
         rngs=rngs
     )  # Encode returns (B, T, L, D)
 
+    # Normalize latents before rollout
+    latents_ctx_norm = tokenizer.latent_normalizer.normalize(latents_ctx)
+
     # Latent Rollout
     # Returns dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
     rollout_result = latent_rollout(
         dynamics,
         policy,
         schedule,
-        latents_ctx,
+        latents_ctx_norm,
         actions_ctx,
         num_steps,
         rng,
@@ -437,9 +433,12 @@ def video_rollout(
         alpha=alpha,
     )
 
+    # Unnormalize latents before decoding
+    rollout_latents = tokenizer.latent_normalizer.unnormalize(rollout_result['latents'])
+
     # Decode
     pred_frames, _ = tokenizer.decode(
-        rollout_result['latents'],
+        rollout_latents,
         deterministic=True
     )
 
