@@ -58,7 +58,7 @@ tokenizer:
     dataset_mean: ${dataset.dataset_mean}
     dataset_std: ${dataset.dataset_std}
 
-max_steps: 60_000
+max_steps: 30_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:
