@@ -127,13 +127,38 @@ def compute_psnr(pred, target):
     psnr_per_sample = -10.0 * jnp.log(mse_per_sample) / jnp.log(10.0)
     return jnp.mean(psnr_per_sample)
     
+
+def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float = 1.0) -> jnp.ndarray:
+    weight = (max_weight - min_weight) * sigma + min_weight
+    return weight[...,None,None]
+
+
 def compute_flow_loss(
     z_pred: jnp.ndarray,
     z_target: jnp.ndarray,
+    sigma: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Flow matching loss in x-space (direct prediction of clean latents)."""
-    mse = jnp.mean((z_pred - z_target) ** 2)
-    return mse, mse
+    """
+    Flow matching loss in x-space (direct prediction of clean latents).
+    
+    Args:
+        z_pred: (B, T, S, D) Predicted clean latents
+        z_target: (B, T, S, D) Ground truth clean latents
+        sigma: (B, T) Signal levels (used for weighting)
+        per_example: If True, return (B, T) losses; else return scalar
+        
+    Returns:
+        loss: Tuple[jnp.float32, jnp.float32]
+            mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
+            mse_per_token: tuple of scalars. MSE loss 
+    """
+    mse_per_token = (z_pred - z_target) ** 2  # (B, T, S, D)
+    mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
+
+
+    # Apply ramp weighting and reduce
+    weights = ramp_weight(sigma)
+    return jnp.mean(mse_per_step * weights), jnp.mean(mse_per_step)
 
 
 # ---------------------------
@@ -186,11 +211,11 @@ def shortcut_forcing_step(
         rngs=rngs,
     )
 
-    loss_flow, flow_mse = compute_flow_loss(z_pred, latents)
+    loss_flow, flow_mse_unweighted = compute_flow_loss(z_pred, latents, sigma)
     loss_boot = jnp.array(0.0, dtype=latents.dtype)
 
     losses = {"total": loss_flow, "flow": loss_flow, "bootstrap": loss_boot}
-    aux = {"flow_mse": flow_mse, "bootstrap_mse": loss_boot, "h_states": h_states}
+    aux = {"flow_mse": flow_mse_unweighted, "bootstrap_mse": loss_boot, "h_states": h_states}
     return losses, aux
 
 
