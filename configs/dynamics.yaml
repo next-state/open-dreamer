@@ -3,16 +3,16 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics
+run_name: dynamics-high-lr
 tokenizer_ckpt: logs/tokenizer-asymmetric/checkpoints/
 
 ckpt:
-  max_to_keep: 1
+  max_to_keep: 0
   save_interval_steps: 1_000
 
 dataset:
   dataloader_cfg:
-    B: 32
+    B: 16
     T: 32
   C: 16
 
@@ -44,7 +44,7 @@ max_steps: 150_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
-  lr: 3e-3  # constant LR or peak LR for schedules
+  lr: 1e-2  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05
@@ -53,7 +53,7 @@ lr_schedule:
 
 optimizer:
   optimizer_type: muon
-  weight_decay: 0.00
+  weight_decay: 0.0
   # AdamW params (for embeddings/biases)
   adam_lr_ratio: 1.0
   adam_b1: 0.9

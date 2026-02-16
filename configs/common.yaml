@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 run_name: ???
-use_wandb: true
+use_wandb: false
 dataset: ???
 scaling_tokens_per_param: 0.0
 scaling_flops_budget: 0.0
@@ -19,7 +19,7 @@ logger:
   use_wandb: ${use_wandb}
   wandb_entity: Null
   wandb_project: tiny_dreamer_4
-  log_every: 100
+  log_every: 1
   max_steps: ${max_steps}
   log_gradients: false
 

@@ -181,12 +181,14 @@ class RunningNormalizer(nnx.Module):
         self.var.value = self.beta * self.var.value + (1 - self.beta) * batch_var
 
     def normalize(self, x, eps=1e-8):
-        std = jnp.sqrt(jnp.maximum(self.var.value, eps))
-        return (x - self.mean.value) / std
+        mean = self.mean.value.astype(x.dtype)
+        std = jnp.sqrt(jnp.maximum(self.var.value, eps)).astype(x.dtype)
+        return (x - mean) / std
 
     def unnormalize(self, x, eps=1e-8):
-        std = jnp.sqrt(jnp.maximum(self.var.value, eps))
-        return x * std + self.mean.value
+        mean = self.mean.value.astype(x.dtype)
+        std = jnp.sqrt(jnp.maximum(self.var.value, eps)).astype(x.dtype)
+        return x * std + mean
 
 
 def normalize_with_dataset_stats(videos, *, mean, std):

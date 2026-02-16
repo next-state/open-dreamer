@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt
   - _self_
 
-run_name: tokenizer-asymmetric
+run_name: tokenizer-symmetric
 
 ckpt:
   max_to_keep: 1
