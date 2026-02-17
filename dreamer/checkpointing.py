@@ -142,10 +142,16 @@ class CheckpointBundle:
                 models[field_name] = model_cls(cfg, mesh_rules=mesh_rules, rngs=rngs)
 
             # Restore weights
-            restore_kwargs = {
-                name: ocp.args.StandardRestore(nnx.state(model))
-                for name, model in models.items()
-            }
+            restore_kwargs = {}
+            for name, model in models.items():
+                # Allow loading older/newer checkpoints with minor tree mismatches.
+                # Extra on-disk fields are ignored; missing fields keep init values.
+                target_state = nnx.state(model)
+                restore_kwargs[name] = ocp.args.PyTreeRestore(
+                    item=target_state,
+                    restore_args=ocp.checkpoint_utils.construct_restore_args(target_state),
+                    partial_restore=True,
+                )
             restore_args = ocp.args.Composite(**restore_kwargs)
             restored = checkpoint_manager.restore(step, args=restore_args)
 
@@ -185,7 +191,12 @@ class CheckpointBundle:
 
         for field in fields(self):
             field_value = getattr(self, field.name)
-            restore_kwargs[field.name] = ocp.args.StandardRestore(nnx.state(field_value))
+            target_state = nnx.state(field_value)
+            restore_kwargs[field.name] = ocp.args.PyTreeRestore(
+                item=target_state,
+                restore_args=ocp.checkpoint_utils.construct_restore_args(target_state),
+                partial_restore=True,
+            )
 
         restore_kwargs["rngs"] = ocp.args.StandardRestore({"key": rng})
 

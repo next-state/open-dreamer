@@ -25,10 +25,14 @@ tokenizer:
     mae_p_min: 0.0
     mae_p_max: 0.9
     patch_size: ${dataset.patch_size}
+    use_residual_lambdas: false
     use_bias: false
     use_rmsnorm_scale: true
     dtype: ${dtype}
     param_dtype: ${param_dtype}
+
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
 
   decoder:
     n_latents: ${tokenizer.encoder.n_latents}
@@ -45,12 +49,16 @@ tokenizer:
     W: ${sum:${dataset.padding_W[0]},${dataset.padding_W[1]},${dataset.W}}
     patch_size: ${dataset.patch_size}
     d_patch: ${mul:${dataset.patch_size},${dataset.patch_size},${dataset.C}}
+    use_residual_lambdas: ${tokenizer.encoder.use_residual_lambdas}
     use_bias: ${tokenizer.encoder.use_bias}
     use_rmsnorm_scale: ${tokenizer.encoder.use_rmsnorm_scale}
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
-max_steps: 30_000
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
+
+max_steps: 60_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:

@@ -25,7 +25,7 @@ from dreamer.generation import DenoiseSchedule
 from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
-from dreamer.utils import _ensure_dir, apply_border
+from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents
 
 
 # ---------------------------
@@ -232,8 +232,9 @@ def compute_bootstrap_loss(z_pred: jnp.ndarray, z_tilde: jnp.ndarray, b_prime: j
     # MSE in v-space, scaled back to x-space by (1-sigma)^2
     v_diff = (v_hat - v_target) ** 2
     scale = (1.0 - sigma)[..., None, None] ** 2
+    x_diff = v_diff * scale
 
-    return jnp.mean(v_diff * scale), jnp.mean(v_diff * scale)
+    return jnp.mean(x_diff), jnp.mean(x_diff)
 
 
 # ---------------------------
@@ -351,7 +352,7 @@ def bootstrap_forward(
     z1_half1, *_ = dynamics_model(
         actions, step_idx_half, sigma_idx, z_tilde,
         context_length=context_length, time_mask=time_mask,
-        task_embeddings=task_embeddings, deterministic=False, rngs=rngs2,
+        task_embeddings=task_embeddings, deterministic=True, rngs=rngs2,
     )
     z1_half1 = z1_half1[..., :D]
     b_prime = (z1_half1 - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
@@ -362,7 +363,7 @@ def bootstrap_forward(
     z1_half2, *_ = dynamics_model(
         actions, step_idx_half, sigma_idx_plus, z_prime,
         context_length=context_length, time_mask=time_mask,
-        task_embeddings=task_embeddings, deterministic=False, rngs=rngs3,
+        task_embeddings=task_embeddings, deterministic=True, rngs=rngs3,
     )
     z1_half2 = z1_half2[..., :D]
     b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
@@ -403,6 +404,9 @@ def shortcut_forcing_step(
     """
     B = latents.shape[0]
     B_emp = B - B_self
+
+    # Normalize latents before corruption.
+    latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
 
     key_sigma, key_step, key_noise, key_dropout1, key_dropout2, key_dropout3 = jax.random.split(rng, 6)
 
@@ -831,8 +835,16 @@ def run_evaluation(
 
         # Compute metrics
         dt = time.time() - t0
-        normalized_pred = tokenizer.pixel_normalizer.normalize(pred_frames[:, -horizon:].astype(jnp.float32) / 255.0)
-        normalized_gt = tokenizer.pixel_normalizer.normalize(gt_frames_for_metrics[:, -horizon:].astype(jnp.float32) / 255.0)
+        normalized_pred = normalize_with_dataset_stats(
+            pred_frames[:, -horizon:],
+            mean=cfg.dataset.dataset_mean,
+            std=cfg.dataset.dataset_std,
+        )
+        normalized_gt = normalize_with_dataset_stats(
+            gt_frames_for_metrics[:, -horizon:],
+            mean=cfg.dataset.dataset_mean,
+            std=cfg.dataset.dataset_std,
+        )
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
         psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames_for_metrics[:, -horizon:]/255))
 

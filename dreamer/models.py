@@ -7,7 +7,8 @@ from einops import rearrange, repeat
 import math
 from .utils import (
     Modality, TokenLayout,
-    RunningNormalizer,
+    normalize_with_dataset_stats,
+    unnormalize_with_dataset_stats,
     to_jnp_dtype,
     patchify, unpatchify
 )
@@ -632,13 +633,25 @@ class BlockCausalTransformer(nnx.Module):
                  mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
                  use_seq_parallel: bool = False,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
+                 use_residual_lambdas: bool = False, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
         self.depth = depth
         self.time_every = time_every
+        self.use_residual_lambdas = use_residual_lambdas
         self.dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
+
+        if use_residual_lambdas:
+            self.resid_lambdas = nnx.Param(
+                jnp.ones(depth, dtype=param_dtype),
+                sharding_names=(None,)  # Small per-layer params, no sharding needed
+            )
+            self.x0_lambdas = nnx.Param(
+                jnp.zeros(depth, dtype=param_dtype),
+                sharding_names=(None,)  # Small per-layer params, no sharding needed
+            )
 
         # Create layers
         self.layers = nnx.List([
@@ -678,8 +691,14 @@ class BlockCausalTransformer(nnx.Module):
             output tensor and updated caches (always returns tuple, caches can be None)
         """
         new_caches = {} if caches is not None else None
+        x0 = x
 
         for i, layer in enumerate(self.layers):
+            if self.use_residual_lambdas:
+                resid_lambda = self.resid_lambdas.value[i].astype(self.dtype)
+                x0_lambda = self.x0_lambdas.value[i].astype(self.dtype)
+                x = resid_lambda * x + x0_lambda * x0
+
             time_index = i // self.time_every
             is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
@@ -705,7 +724,9 @@ class BlockCausalTransformer(nnx.Module):
 
     def count_excluded_params(self) -> int:
         """Count params excluded from FLOP estimation (per-layer scalars)."""
-        return 0
+        if not self.use_residual_lambdas:
+            return 0
+        return self.resid_lambdas.value.size + self.x0_lambdas.value.size
 
 
 # ============================================================================
@@ -715,10 +736,11 @@ class BlockCausalTransformer(nnx.Module):
 class Encoder(nnx.Module):
     """Vision encoder with MAE masking."""
 
-    def __init__(self, cfg: EncoderModelConfig, *, pixel_normalizer: RunningNormalizer, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: EncoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
-        self.pixel_normalizer = pixel_normalizer
+        self.dataset_mean = cfg.dataset_mean
+        self.dataset_std = cfg.dataset_std
         dtype = to_jnp_dtype(cfg.dtype)
         param_dtype = to_jnp_dtype(cfg.param_dtype)
 
@@ -732,6 +754,7 @@ class Encoder(nnx.Module):
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=dtype, param_dtype=param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -742,10 +765,7 @@ class Encoder(nnx.Module):
         # Videos in the [0, 255] range
         B, T, H, W, C = videos.shape
 
-        videos_01 = videos.astype(jnp.float32) / 255.0
-        if not deterministic:
-            self.pixel_normalizer.update(videos_01)
-        normalized_videos = self.pixel_normalizer.normalize(videos_01)
+        normalized_videos = normalize_with_dataset_stats(videos, mean=self.dataset_mean, std=self.dataset_std)
         patch_tokens = patchify(normalized_videos, patch=self.patch_size)
         proj_patches = self.patch_proj(patch_tokens)  # (B, T, Np, D)
 
@@ -789,12 +809,13 @@ class Decoder(nnx.Module):
     reconstructions at per-patch query tokens.
     """
 
-    def __init__(self, cfg: DecoderModelConfig, *, pixel_normalizer: RunningNormalizer, mesh_rules: MeshRules, rngs: nnx.Rngs):
+    def __init__(self, cfg: DecoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
         self.H = cfg.H
         self.W = cfg.W
-        self.pixel_normalizer = pixel_normalizer
+        self.dataset_mean = cfg.dataset_mean
+        self.dataset_std = cfg.dataset_std
         dtype = to_jnp_dtype(cfg.dtype)
         param_dtype = to_jnp_dtype(cfg.param_dtype)
 
@@ -809,6 +830,7 @@ class Decoder(nnx.Module):
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=dtype, param_dtype=param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -850,7 +872,7 @@ class Decoder(nnx.Module):
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
         pred_btnd = self.patch_head(x_patches)  # (B, T, Np, D_patch)
         out_normalized_frames = unpatchify(pred_btnd, patch=self.patch_size, H=self.H, W=self.W)
-        out_frames = self.pixel_normalizer.unnormalize(out_normalized_frames) * 255.0
+        out_frames = unnormalize_with_dataset_stats(out_normalized_frames, mean=self.dataset_mean, std=self.dataset_std)
         return out_frames, new_caches
 
 class Tokenizer(nnx.Module):
@@ -859,27 +881,18 @@ class Tokenizer(nnx.Module):
     def __init__(self, cfg: TokenizerModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.cfg = cfg
 
-        # Running normalizers (EMA-tracked, checkpointed as BatchStat)
-        self.pixel_normalizer = RunningNormalizer(shape=(3,))
-        self.latent_normalizer = RunningNormalizer(shape=(cfg.encoder.d_bottleneck,))
-
-        # Create encoder and decoder (share the same pixel_normalizer)
-        self.encoder = Encoder(cfg.encoder, pixel_normalizer=self.pixel_normalizer, mesh_rules=mesh_rules, rngs=rngs)
-        self.decoder = Decoder(cfg.decoder, pixel_normalizer=self.pixel_normalizer, mesh_rules=mesh_rules, rngs=rngs)
+        # Create encoder and decoder
+        self.encoder = Encoder(cfg.encoder, mesh_rules=mesh_rules, rngs=rngs)
+        self.decoder = Decoder(cfg.decoder, mesh_rules=mesh_rules, rngs=rngs)
 
     def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None):
         z, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs)
-        if not deterministic:
-            self.latent_normalizer.update(z)
         recon, _ = self.decoder(z, deterministic=deterministic, rngs=rngs)
         return recon, aux
 
     def encode(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None):
         # Always returns unpacked: (B, T, n_latents, d_bottleneck)
-        latents, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs)
-        if not deterministic:
-            self.latent_normalizer.update(latents)
-        return latents, aux
+        return self.encoder(videos, deterministic=deterministic, rngs=rngs)
 
     def decode(self, z, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None):
         # Always expects unpacked: (B, T, n_latents, d_bottleneck)
@@ -1092,6 +1105,7 @@ class Dynamics(nnx.Module):
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=self.dtype, param_dtype=self.param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
         )
 

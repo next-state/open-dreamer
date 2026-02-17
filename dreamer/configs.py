@@ -80,12 +80,15 @@ class EncoderModelConfig:
     time_every: int = 4
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
-
+    use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
+
+    dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
+    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
 @dataclass(frozen=False)
@@ -102,7 +105,7 @@ class DecoderModelConfig:
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
-
+    use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
@@ -110,6 +113,9 @@ class DecoderModelConfig:
     param_dtype: str = "float32"
     H: int = 64  # sum(DatasetConfig.padding_H, DatasetConfig.H)
     W: int = 64  # sum(DatasetConfig.padding_W, DatasetConfig.W)
+
+    dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
+    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
 @dataclass(frozen=False)
@@ -133,7 +139,7 @@ class DynamicsModelConfig:
     time_every: int = 4
     mlp_ratio: float = 4.0
     dropout_rate: float = 0.0
-
+    use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
@@ -150,6 +156,9 @@ class DynamicsModelConfig:
     num_binary_actions: int = 0
     categorical_action_dim: int = 0
     continuous_action_dim: int = 0
+    
+    latent_mean: tuple[float, ...] | None = None
+    latent_std: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=False)
