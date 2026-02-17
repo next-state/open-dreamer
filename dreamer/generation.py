@@ -9,7 +9,7 @@ from .utils import normalize_latents, unnormalize_latents
 from flax.struct import dataclass
 
 
-LATENT_NORM_CLIP = 10.0
+LATENT_NORM_CLIP = 4.0
 
 @dataclass
 class DenoiseSchedule:
@@ -23,6 +23,7 @@ class DenoiseSchedule:
         step_idx: log2(k) ∈ {0, 1, 2, ..., log2(K_max)} for denoising.
         tau_values: signal levels used during the denoising τ = [0, d, 2d, ..., 1 - d, 1].
         tau_indices: indices of the signal levels used during the denoising τ_idx = [0, k, 2k, ..., k_max].
+        beta_values: precomputed Euler step mixing coefficients for each step, where beta[s] = (1 - tau[s+1]) / (1 - tau[s]).
         step_idx_ctx: step index for context frames (may differ from step_idx for finer tau_ctx control).
         tau_idx_ctx: tau index for slightly noised context frames, snapped to step_idx_ctx ladder.
         tau_ctx: noise level of context frames during autoregressive rollout.
@@ -34,12 +35,13 @@ class DenoiseSchedule:
     step_idx: int
     tau_values: jax.Array
     tau_indices: jax.Array
+    beta_values: jax.Array
     step_idx_ctx: int
     tau_idx_ctx: int
-    tau_ctx: float
+    tau_ctx: jax.Array
 
     @classmethod
-    def init(cls, num_steps: int, k_max: int = 256, tau_ctx_target: float = 0.9) -> "DenoiseSchedule":
+    def init(cls, num_steps: int, k_max: int = 256, tau_ctx_target: float = 0.9, dtype=jnp.float32) -> "DenoiseSchedule":
         """
         Create a DenoiseSchedule object.
         Args:
@@ -47,6 +49,7 @@ class DenoiseSchedule:
             k_max: Maximum value of k (noise resolution).
             tau_ctx_target: Target noise level for context frames during autoregressive rollout.
                            Will be snapped down to the nearest valid tau on an appropriate ladder.
+            dtype: Dtype for precomputed arrays (should match model dtype).
         Returns:
             DenoiseSchedule object.
         """
@@ -54,8 +57,9 @@ class DenoiseSchedule:
 
         d = 1 / num_steps
         step_idx = int(math.log2(num_steps))
-        tau_values = jnp.linspace(0.0, 1.0, num_steps + 1)
+        tau_values = jnp.linspace(0.0, 1.0, num_steps + 1, dtype=dtype)
         tau_indices = jnp.arange(num_steps + 1) * (k_max // num_steps)
+        beta_values = (1.0 - tau_values[1:]) / jnp.maximum(1.0 - tau_values[:-1], 1e-8)
 
         # Snap tau_ctx to an appropriate ladder:
         emax = int(math.log2(k_max))
@@ -68,10 +72,10 @@ class DenoiseSchedule:
             step_idx_ctx = emax - 1
             K_ctx = k_max // 2  # emax - 1 ladder has K = k_max / 2
         j_ctx = int(tau_ctx_target * K_ctx)  # floor to ensure some noise
-        tau_ctx = j_ctx / K_ctx
+        tau_ctx = jnp.array(j_ctx / K_ctx, dtype=dtype)
         tau_idx_ctx = j_ctx * (k_max // K_ctx)
 
-        return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, step_idx_ctx, tau_idx_ctx, tau_ctx)
+        return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
     
 # ---------------------------
 # Single-step τ-ladder denoiser
@@ -125,8 +129,7 @@ def next_latent(
     action = action[:, None, ...]  # expand squeezed-out time dimension
     
     def refinement_step(latent_t, s):
-        tau_prev, tau_curr = schedule.tau_values[s], schedule.tau_values[s+1]
-        alpha = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
+        beta = schedule.beta_values[s]
 
         step_idx = schedule.step_idx
         tau_idx_val = schedule.tau_indices[s]
@@ -165,7 +168,7 @@ def next_latent(
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
 
         # Per-step mixing toward clean latent
-        latent_t_new = (1.0 - alpha) * latent_t + alpha * latent_clean_pred
+        latent_t_new = beta * latent_t + (1.0 - beta) * latent_clean_pred
         latent_t_new = jnp.clip(latent_t_new, -LATENT_NORM_CLIP, LATENT_NORM_CLIP)
 
         return latent_t_new, h_last

@@ -246,34 +246,36 @@ def compute_bootstrap_loss(
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Bootstrap self-consistency loss for shortcut forcing.
-    
+
     Trains the model to predict the same endpoint whether taking one large step
-    or two smaller steps. Loss is computed in v-space but scaled to x-space.
-    
+    or two smaller steps. Computed directly in x-space by algebraically cancelling
+    the (1-σ)² and 1/(1-σ) terms:
+        (1-σ)² · ||(z_pred - z_tilde)/(1-σ) - v_target||²
+      = ||z_pred - (z_tilde + (1-σ)·v_target)||²
+
     Args:
         z_pred: (B, T, S, D) Predicted latent from full step
         z_tilde: (B, T, S, D) Initial noisy latent
         b_prime: (B, T, S, D) Velocity from first half-step
         b_doubleprime: (B, T, S, D) Velocity from second half-step
         sigma: (B, T) Signal levels
-        
+
     Returns:
         loss: Tuple[jnp.float32, jnp.float32]
             mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
-            mse_per_token: tuple of scalars. MSE loss 
+            mse_per_token: tuple of scalars. MSE loss
     """
-    # Convert full-step prediction to velocity
-    v_hat = (z_pred - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
-    
-    # Target velocity is average of two half-steps (stop gradient)
+    # Target velocity is average of two half-steps (stop gradient, clipped)
     v_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-    
-    # MSE in v-space, scaled to x-space
-    v_diff = (v_hat - v_target) ** 2
-    boot_per_token = (1.0 - sigma[..., None, None]) ** 2 * v_diff
+    v_target = jnp.clip(v_target, -4.0, 4.0)
+
+    # X-space target avoids the numerically unstable 1/(1-σ) division in v_hat
+    one_minus_sigma = (1.0 - sigma)[..., None, None]
+    x_target = z_tilde + one_minus_sigma * v_target
+
+    boot_per_token = (z_pred - x_target) ** 2
     boot_per_step = jnp.mean(boot_per_token, axis=(2, 3))  # (B, T)
-    
-    
+
     # Apply ramp weighting and reduce
     weights = ramp_weight(sigma)
     return jnp.mean(boot_per_step * weights), jnp.mean(boot_per_step)
@@ -326,7 +328,7 @@ def shortcut_forcing_step(
     latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
 
     # Split RNG
-    key_sigma_emp, key_sigma_self, key_step, key_noise, key_dropout1, key_dropout2, key_dropout3 = jax.random.split(rng, 7)
+    key_sigma_emp, key_sigma_self, key_step, key_noise, key_dropout1 = jax.random.split(rng, 5)
 
     # --- Step indices ---
     # Empirical rows: always use finest step (d_min)
@@ -358,9 +360,10 @@ def shortcut_forcing_step(
     sigma_full = jnp.concatenate([sigma_emp, sigma_self], axis=0)
     sigma_idx_full = jnp.concatenate([sigma_idx_emp, sigma_idx_self], axis=0)
     
-    # --- Corrupt latents: z_tilde = (1 - sigma) * z0 + sigma * z1 ---
+    # --- Corrupt latents: z_tilde = (1 - (1-eps)*sigma) * z0 + sigma * z1 ---
+    # The 1e-5 epsilon prevents the ODE from becoming singular at sigma=1
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
-    z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
+    z_tilde = (1.0 - (1.0 - 1e-5) * sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
     
     # --- Forward pass (full batch) ---
     rngs1 = nnx.Rngs(dropout=key_dropout1)
@@ -391,23 +394,22 @@ def shortcut_forcing_step(
         sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
 
         # First half-step
-        rngs2 = nnx.Rngs(dropout=key_dropout2)
         z1_half1, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs2
+            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
         )
         z1_half1 = jax.lax.stop_gradient(z1_half1)
-        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-8)
+        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 0.05)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
+        z_prime = jnp.clip(z_prime, -4.0, 4.0)
 
         # Second half-step
-        rngs3 = nnx.Rngs(dropout=key_dropout3)
         z1_half2, *_ = dynamics_model(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=False, rngs=rngs3
+            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
         )
         z1_half2 = jax.lax.stop_gradient(z1_half2)
-        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
+        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 0.05)
 
         # Bootstrap loss (computed unconditionally)
         loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
