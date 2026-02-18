@@ -744,7 +744,6 @@ def compute_policy_loss(
 # Evaluation and visualization
 # ---------------------------
 
-@jax.jit
 def run_evaluation(
     cfg: DynamicsConfig | HeadsConfig,
     step: int,

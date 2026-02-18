@@ -89,6 +89,7 @@ class EncoderModelConfig:
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
+    context_length: int | None = None  # sliding window size for temporal attention; None = full causal
 
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
@@ -114,6 +115,7 @@ class DecoderModelConfig:
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
+    context_length: int | None = None  # sliding window size for temporal attention; None = full causal
     H: int = 64  # sum(DatasetConfig.padding_H, DatasetConfig.H)
     W: int = 64  # sum(DatasetConfig.padding_W, DatasetConfig.W)
 

@@ -737,6 +737,7 @@ class Encoder(nnx.Module):
         self.patch_size = cfg.patch_size
         self.dataset_mean = cfg.dataset_mean
         self.dataset_std = cfg.dataset_std
+        self.context_length = cfg.context_length
         dtype = to_jnp_dtype(cfg.dtype)
         param_dtype = to_jnp_dtype(cfg.param_dtype)
 
@@ -789,7 +790,8 @@ class Encoder(nnx.Module):
         space_mask = layout.build_space_mask("encoder")  # (1, 1, q_len, k_len)
 
         # Feed tokens into transformer
-        encoded_tokens, _ = self.transformer(tokens, space_mask=space_mask, deterministic=deterministic, rngs=rngs)
+        time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
+        encoded_tokens, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, rngs=rngs)
 
         # Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
@@ -812,6 +814,7 @@ class Decoder(nnx.Module):
         self.W = cfg.W
         self.dataset_mean = cfg.dataset_mean
         self.dataset_std = cfg.dataset_std
+        self.context_length = cfg.context_length
         dtype = to_jnp_dtype(cfg.dtype)
         param_dtype = to_jnp_dtype(cfg.param_dtype)
 
@@ -862,7 +865,8 @@ class Decoder(nnx.Module):
         layout = self.get_token_layout()
         space_mask = layout.build_space_mask("decoder")
 
-        x, new_caches = self.transformer(tokens, space_mask=space_mask, deterministic=deterministic, caches=caches, rngs=rngs)
+        time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
+        x, new_caches = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, caches=caches, rngs=rngs)
 
         # Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
