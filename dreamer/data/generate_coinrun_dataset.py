@@ -4,20 +4,31 @@ Episodes are saved individually as memory-mapped files for efficient loading.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from procgen import ProcgenGym3Env
 import tyro
 import json
 import os
-import pickle
 from gym3 import types_np
-from array_record.python.array_record_module import ArrayRecordWriter
+
+from dreamer.data.shard_writer import ShardWriter
 
 
-def save_chunks(file_idx, chunks_per_file, output_dir, obs_chunks, act_chunks=None, rew_chunks=None):
-    os.makedirs(output_dir, exist_ok=True)
+def save_chunks_with_writer(writer: ShardWriter, obs_chunks, act_chunks=None, rew_chunks=None, chunks_per_file=100):
+    """Save chunks using ShardWriter.
 
+    Args:
+        writer: ShardWriter instance to write records to
+        obs_chunks: List of observation chunks to save
+        act_chunks: Optional list of action chunks
+        rew_chunks: Optional list of reward chunks
+        chunks_per_file: Number of chunks to save per file
+
+    Returns:
+        Tuple of (metadata, remaining obs_chunks, remaining act_chunks, remaining rew_chunks)
+    """
     metadata = []
     while len(obs_chunks) >= chunks_per_file:
         chunk_batch = obs_chunks[:chunks_per_file]
@@ -30,8 +41,7 @@ def save_chunks(file_idx, chunks_per_file, output_dir, obs_chunks, act_chunks=No
         if rew_chunks:
             rew_chunk_batch = rew_chunks[:chunks_per_file]
             rew_chunks = rew_chunks[chunks_per_file:]
-        episode_path = os.path.join(output_dir, f"data_{file_idx:04d}.array_record")
-        writer = ArrayRecordWriter(str(episode_path), "group_size:1")
+
         seq_lens = []
         for idx, chunk in enumerate(chunk_batch):
             seq_len = chunk.shape[0]
@@ -50,19 +60,17 @@ def save_chunks(file_idx, chunks_per_file, output_dir, obs_chunks, act_chunks=No
                     rew_chunk_batch[idx]
                 ), f"Observation data length and reward sequence length do not match: {len(chunk)} != {len(rew_chunk_batch[idx])}"
                 chunk_record["rewards"] = rew_chunk_batch[idx]
-            writer.write(pickle.dumps(chunk_record))
-        writer.close()
-        file_idx += 1
+            writer.write(chunk_record)
+
         metadata.append(
             {
-                "path": episode_path,
                 "num_chunks": len(chunk_batch),
                 "avg_seq_len": np.mean(seq_lens),
             }
         )
-        print(f"Created {episode_path} with {len(chunk_batch)} video chunks")
+        print(f"Wrote {len(chunk_batch)} video chunks to shard")
 
-    return metadata, file_idx, obs_chunks, act_chunks, rew_chunks
+    return metadata, obs_chunks, act_chunks, rew_chunks
 
 
 @dataclass
@@ -96,8 +104,15 @@ def generate_episodes(num_episodes, split):
     obs_chunks = []
     act_chunks = []
     rew_chunks = []
-    file_idx = 0
-    output_dir_split = os.path.join(args.output_dir, split)
+    output_dir_split = Path(args.output_dir) / split
+
+    # Create shard writer (using pickle serialization for CoinRun)
+    writer = ShardWriter(
+        output_dir_split,
+        records_per_shard=args.chunks_per_file,
+        serialization_format="pickle"
+    )
+
     while episode_idx < num_episodes:
         seed = np.random.randint(0, 10000)
         env = ProcgenGym3Env(num=1, env_name="coinrun", start_level=seed)
@@ -157,8 +172,8 @@ def generate_episodes(num_episodes, split):
             act_chunks.extend(act_chunks_data)
             rew_chunks.extend(rew_chunks_data)
 
-            ep_metadata, file_idx, obs_chunks, act_chunks, rew_chunks = save_chunks(
-                file_idx, args.chunks_per_file, output_dir_split, obs_chunks, act_chunks, rew_chunks
+            ep_metadata, obs_chunks, act_chunks, rew_chunks = save_chunks_with_writer(
+                writer, obs_chunks, act_chunks, rew_chunks, args.chunks_per_file
             )
             episode_metadata.extend(ep_metadata)
 
@@ -173,7 +188,9 @@ def generate_episodes(num_episodes, split):
             "Consider changing the chunk_size and chunks_per_file parameters to prevent data-loss.",
         )
 
-    print(f"Done generating {split} split")
+    # Close writer
+    writer.close()
+    print(f"Done generating {split} split (wrote {writer.num_shards} shards)")
     return episode_metadata
 
 

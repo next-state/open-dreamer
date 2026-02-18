@@ -22,15 +22,15 @@ from pathlib import Path
 import decord
 import grain
 import jax
-import msgpack
 import numpy as np
-from array_record.python.array_record_module import ArrayRecordWriter
 from flax import nnx
 from tqdm import tqdm
 
 from dreamer.actions import parse_action_dicts
 from dreamer.checkpointing import TokenizerCheckpointBundle
 from dreamer.parallel import build_parallel
+from dreamer.data.transforms import ProcessMinecraftEpisodeAndSlice
+from dreamer.data.shard_writer import ShardWriter
 
 decord.bridge.set_bridge("native")
 
@@ -42,56 +42,14 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 
 # ==============================================================================
-# Serialization
+# Serialization (imported from shared module)
 # ==============================================================================
 
+from dreamer.data.serialization import serialize_msgpack_record, deserialize_msgpack_record
 
-def _encode_value(value):
-    """Encode a single value, handling arrays and nested dicts."""
-    if isinstance(value, np.ndarray):
-        return {
-            "_type": "ndarray",
-            "data": value.tobytes(),
-            "shape": list(value.shape),
-            "dtype": str(value.dtype),
-        }
-    elif isinstance(value, dict):
-        return {k: _encode_value(v) for k, v in value.items()}
-    else:
-        return value
-
-
-def serialize_record(record: dict) -> bytes:
-    """Serialize record using msgpack (no pickle).
-
-    Arrays are serialized via tobytes() with shape/dtype metadata.
-    Nested dicts are recursively encoded.
-    """
-    encoded = {k: _encode_value(v) for k, v in record.items()}
-    return msgpack.packb(encoded, use_bin_type=True)
-
-
-def _decode_value(value):
-    """Decode a single value, handling arrays and nested dicts."""
-    if isinstance(value, dict):
-        if value.get("_type") == "ndarray":
-            shape = tuple(value["shape"])
-            dtype = value["dtype"]
-            return np.frombuffer(value["data"], dtype=dtype).reshape(shape)
-        else:
-            return {k: _decode_value(v) for k, v in value.items()}
-    else:
-        return value
-
-
-def deserialize_record(data: bytes) -> dict:
-    """Deserialize record from msgpack format.
-
-    Reconstructs numpy arrays from bytes + shape/dtype metadata.
-    Nested dicts are recursively decoded.
-    """
-    encoded = msgpack.unpackb(data, raw=False)
-    return {k: _decode_value(v) for k, v in encoded.items()}
+# Backward compatibility aliases
+serialize_record = serialize_msgpack_record
+deserialize_record = deserialize_msgpack_record
 
 
 # ==============================================================================
@@ -102,12 +60,19 @@ def deserialize_record(data: bytes) -> dict:
 class MinecraftVPTProcessFullEpisode(grain.transforms.Map):
     """Decode full MP4 video for tokenization (no slicing).
 
-    Reuses the decord pattern from MinecraftVPTProcessEpisodeAndSlice in data.py.
-    Applies spatial padding to make dimensions divisible by patch_size (16).
+    Uses ProcessMinecraftEpisodeAndSlice with full_episode=True, then adds action parsing.
     """
 
-    def __init__(self, patch_size: int = 16):
-        self.patch_size = patch_size
+    def __init__(self):
+        # Use the shared transform with full_episode mode
+        # Note: Map needs random_map to be called with rng, but we'll handle that
+        self.processor = ProcessMinecraftEpisodeAndSlice(
+            seq_len=0,  # Ignored when full_episode=True
+            image_h=128,  # Dummy values
+            image_w=128,
+            image_c=3,
+            full_episode=True,
+        )
 
     def _calculate_padding(self, dimension: int) -> tuple[int, int]:
         """Calculate (top/left, bottom/right) padding to make dimension divisible by patch_size."""
@@ -119,15 +84,17 @@ class MinecraftVPTProcessFullEpisode(grain.transforms.Map):
         return (padding_start, padding_end)
 
     def map(self, element: bytes) -> dict:
+        # Create a dummy RNG for the processor
+        rng = np.random.default_rng(0)
+
+        # Get video from shared processor
+        result = self.processor.random_map(element, rng)
+
+        # Parse actions from original data
         data = pickle.loads(element)
 
-        # Decord pattern from data.py:138-149
-        mp4_bytes = io.BytesIO(data["video"])
-        vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(0), num_threads=1)
-        frames = vr.get_batch(list(range(len(vr)))).asnumpy()
-
         # Apply spatial padding to make H, W divisible by patch_size
-        frames = frames.astype(np.float32)  # (T, H, W, C) in [0, 255]
+        frames = result["videos"]  # (T, H, W, C) in [0, 255]
         padding_h = self._calculate_padding(frames.shape[1])
         padding_w = self._calculate_padding(frames.shape[2])
         frames = np.pad(
@@ -246,45 +213,6 @@ class DeviceShardedIterator:
 
 
 # ==============================================================================
-# Shard Writing
-# ==============================================================================
-
-
-class ShardWriter:
-    """Write records to output shards, maintaining records_per_shard records per shard."""
-
-    def __init__(self, output_dir: Path, records_per_shard: int = 1000):
-        self.output_dir = output_dir
-        self.records_per_shard = records_per_shard
-        self.writer = None
-        self.shard_idx = 0
-        self.records_in_shard = 0
-        self.total_records = 0
-
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def _open_new_shard(self):
-        if self.writer is not None:
-            self.writer.close()
-        path = self.output_dir / f"shard-{self.shard_idx:05d}.array_record"
-        self.writer = ArrayRecordWriter(str(path), "group_size:1")
-        self.shard_idx += 1
-        self.records_in_shard = 0
-
-    def write(self, record: dict):
-        if self.writer is None or self.records_in_shard >= self.records_per_shard:
-            self._open_new_shard()
-        self.writer.write(serialize_record(record))
-        self.records_in_shard += 1
-        self.total_records += 1
-
-    def close(self):
-        if self.writer is not None:
-            self.writer.close()
-            self.writer = None
-
-
-# ==============================================================================
 # Main
 # ==============================================================================
 
@@ -375,9 +303,13 @@ def main():
             sharded_keys=("videos",),
         )
 
-        # Create shard writer
+        # Create shard writer (using msgpack serialization)
         output_dir = Path(args.output_dir)
-        writer = ShardWriter(output_dir, records_per_shard=args.records_per_shard)
+        writer = ShardWriter(
+            output_dir,
+            records_per_shard=args.records_per_shard,
+            serialization_format="msgpack"
+        )
 
         # Create metadata directory for stats
         metadata_dir = output_dir / "metadata"

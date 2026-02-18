@@ -10,8 +10,9 @@ ckpt:
   save_interval_steps: 100_000
 
 dataset:
-  B: 128
-  T: 32
+  dataloader_cfg:
+    B: 128
+    T: 32
 
 d_model: 256
 n_agent: 8

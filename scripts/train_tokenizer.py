@@ -177,9 +177,11 @@ def run(cfg: TokenizerConfig):
     )
 
     # Parallelism
-    mesh = jax.make_mesh((2, jax.local_device_count()//2), ('data', 'seq'))
-    data_sharding = NamedSharding(mesh, P('data', 'seq', None, None))
-    mesh_rules = MeshRules(data='data', seq='seq')
+    mesh, data_sharding, mesh_rules = build_parallel("data") # simple data parallel, if you finetune on longer sequences comment this line and uncomment the three below
+    # mesh = jax.make_mesh((2, jax.local_device_count()//2), ('data', 'seq'))
+    # data_sharding = NamedSharding(mesh, P('data', 'seq', None, None, None))
+    # mesh_rules = MeshRules(data='data', seq='seq')
+    
 
     with logger, jax.set_mesh(mesh):
         key = jax.random.key(cfg.seed)
@@ -193,12 +195,13 @@ def run(cfg: TokenizerConfig):
 
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_patches = (cfg.dataset.H // cfg.tokenizer.encoder.patch_size) * (cfg.dataset.W // cfg.tokenizer.encoder.patch_size)
+        B, T = cfg.dataset.dataloader_cfg.B, cfg.dataset.dataloader_cfg.T
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=tokenizer.estimate_flops(batch_size=cfg.dataset.B, seq_length=cfg.dataset.T),
-            data_tokens_per_step=cfg.dataset.B * cfg.dataset.T * n_patches,
-            total_tokens_per_step=cfg.dataset.B * cfg.dataset.T * (n_patches + cfg.tokenizer.encoder.n_latents),
+            flops_per_step=tokenizer.estimate_flops(batch_size=B, seq_length=T),
+            data_tokens_per_step=B * T * n_patches,
+            total_tokens_per_step=B * T * (n_patches + cfg.tokenizer.encoder.n_latents),
             logger=logger,
             run_dir=run_dir,
         )
@@ -219,26 +222,15 @@ def run(cfg: TokenizerConfig):
         )
 
         # Data iterator
-        train_dataloader = make_iterator(cfg.dataset)
-        train_iterator = iter(train_dataloader)
+        train_dataloader = make_iterator(cfg.dataset, device=data_sharding)
 
-        with build_checkpoint_manager(
-            cfg.ckpt, ckpt_dir,
-            item_names=TokenizerCheckpointBundle.get_item_names(
-                iterator_names=("train_dataloader_state",)
-            )
-        ) as checkpoint_manager:
+        with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=TokenizerCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
-            iterators = {"train_dataloader_state": train_iterator}
-            start_step, bundle, iterators, rng = bundle.restore(
-                checkpoint_manager, iterators, rng
-            )
-            train_iterator = iterators["train_dataloader_state"]
-
+            start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
             scaling.start_training()
 
             # Training loop
-            pbar = tqdm(enumerate(train_iterator, start=start_step), initial=start_step,total=cfg.max_steps)
+            pbar = tqdm(enumerate(train_dataloader, start=start_step), initial=start_step,total=cfg.max_steps)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
@@ -248,10 +240,8 @@ def run(cfg: TokenizerConfig):
                 mae_key, dropout_key = jax.random.split(step_rng)
 
                 # Shard batch data
-                videos = jax.device_put(batch["videos"], data_sharding)
-
                 aux = train_step(
-                    bundle.tokenizer, bundle.tokenizer_optimizer, lpips_model, videos,
+                    bundle.tokenizer, bundle.tokenizer_optimizer, lpips_model, batch["videos"],
                     mae_key=mae_key, dropout_key=dropout_key, step=step,
                     lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
                     dataset_mean=tuple(cfg.dataset.dataset_mean),
@@ -287,8 +277,7 @@ def run(cfg: TokenizerConfig):
                     )
 
                 # Checkpointing
-                iterators = {"train_dataloader_state": train_iterator}
-                bundle.maybe_save(checkpoint_manager, step, iterators, rng)
+                bundle.maybe_save(checkpoint_manager, step, rng)
 
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization

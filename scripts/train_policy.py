@@ -53,7 +53,8 @@ from dreamer.models import (
     RewardHeadMTP,
     ValueHead,
 )
-from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn
+from dreamer.data import make_iterator
+# TODO: make_env_reset_fn and make_env_step_fn not yet implemented
 from dreamer.configs import RLConfig
 from dreamer.parallel import ParallelContext
 from dreamer.utils import (

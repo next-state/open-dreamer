@@ -10,7 +10,8 @@ dtype: ${dtype}
 param_dtype: ${param_dtype}
 
 dataset:
-  B: 64
+  dataloader_cfg:
+    B: 64
 
 action_dim: 4
 
