@@ -4,20 +4,15 @@ defaults:
   - _self_
 
 run_name: dynamics
-tokenizer_ckpt: logs/tokenizer-512/checkpoints/
+tokenizer_ckpt: logs/tokenizer/checkpoints/
 
 ckpt:
   max_to_keep: 1
-  save_interval_steps: 10_000
+  save_interval_steps: 1_000
 
 dataset:
-  dataloader_cfg:
-    B: 32
-    T: 64
-    short_T: ${short_T}
-    long_T: ${long_T}
-    long_ratio: ${long_batch_ratio}
-  C: 16
+  B: 32
+  T: 32
 
 dynamics:
     d_bottleneck: 16
