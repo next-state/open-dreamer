@@ -973,7 +973,7 @@ def run_x0_visualization(
     pil_img = Image.fromarray(grid)
     draw = ImageDraw.Draw(pil_img)
     for t in range(T):
-        draw.text((t * W + 2, 2), f"\u03c4={sigma_cpu[t]:.2f}", fill=(255, 255, 255))
+        draw.text((t * W + 2, 2), f"sigma={float(sigma_cpu[t]):.2f}", fill=(255, 255, 255))
 
     img_array = np.array(pil_img)
 
