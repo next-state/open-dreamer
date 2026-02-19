@@ -779,6 +779,7 @@ def run_evaluation(
     vis_dir: Path,
     rng: jax.Array,
     logger,
+    pixel_normalizer=None,
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
     omega: jax.Array | float = 0.0,
@@ -801,6 +802,8 @@ def run_evaluation(
         vis_dir: Directory to save visualizations
         rng: Random key
         logger: Logger instance for logging metrics and videos
+        pixel_normalizer: Optional running normalizer for pixel-space metrics. If provided,
+            metrics are computed in this normalized space.
         policy: Optional policy model for action sampling
         task_embedder: Optional task embedder for agent tokens
         omega: Guidance strength (0 = no guidance). See https://arxiv.org/pdf/2502.07849
@@ -828,7 +831,8 @@ def run_evaluation(
                 tokenizer, dynamics, frames=None,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=rng, policy=policy, task_embedder=task_embedder,
-                latents=val_data, omega=omega, alpha=alpha
+                latents=val_data, omega=omega, alpha=alpha,
+                pixel_normalizer=pixel_normalizer,
             )
             # For metrics, compare pred vs gt_decoded (both from latents)
             gt_frames_for_metrics = gt_decoded_frames
@@ -837,14 +841,18 @@ def run_evaluation(
                 tokenizer, dynamics, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=rng, policy=policy, task_embedder=task_embedder,
-                omega=omega, alpha=alpha
+                omega=omega, alpha=alpha,
+                pixel_normalizer=pixel_normalizer,
             )
             # For metrics, compare pred vs original frames
             gt_frames_for_metrics = original_frames
 
         # Compute metrics
         dt = time.time() - t0
-        if tokenizer is not None and hasattr(tokenizer, "pixel_normalizer") and not is_pixel_mode:
+        if pixel_normalizer is not None:
+            normalized_pred = pixel_normalizer.normalize(pred_frames[:, -horizon:].astype(jnp.float32) / 255.0)
+            normalized_gt = pixel_normalizer.normalize(gt_frames_for_metrics[:, -horizon:].astype(jnp.float32) / 255.0)
+        elif tokenizer is not None and hasattr(tokenizer, "pixel_normalizer") and not is_pixel_mode:
             normalized_pred = tokenizer.pixel_normalizer.normalize(pred_frames[:, -horizon:].astype(jnp.float32) / 255.0)
             normalized_gt = tokenizer.pixel_normalizer.normalize(gt_frames_for_metrics[:, -horizon:].astype(jnp.float32) / 255.0)
         else:
@@ -858,10 +866,21 @@ def run_evaluation(
                 mean=cfg.dataset.dataset_mean,
                 std=cfg.dataset.dataset_std,
             )
-        mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
+        mse_norm = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
+        mse = float(
+            jnp.mean(
+                (
+                    pred_frames[:, -horizon:].astype(jnp.float32) / 255.0
+                    - gt_frames_for_metrics[:, -horizon:].astype(jnp.float32) / 255.0
+                ) ** 2
+            )
+        )
         psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames_for_metrics[:, -horizon:]/255))
 
-        print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
+        print(
+            f"[eval:{tag}] step={step:06d} | horizon={horizon} | "
+            f"MSE={mse:.6g} | MSE_norm={mse_norm:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s"
+        )
 
         # Build visualization
         num_videos = min(4, pred_frames.shape[0])
@@ -892,6 +911,7 @@ def run_evaluation(
         # Log metrics and video
         logger.log_metrics(step, {
             f"{tag}/mse": mse,
+            f"{tag}/mse_norm": mse_norm,
             f"{tag}/psnr": psnr,
             f"{tag}/horizon": horizon,
             f"{tag}/eval_time": dt,

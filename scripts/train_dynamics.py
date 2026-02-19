@@ -287,6 +287,7 @@ def run(cfg: DynamicsConfig):
                         vis_dir=vis_dir,
                         rng=eval_key,
                         logger=logger,
+                        pixel_normalizer=pixel_normalizer,
                     )
                     eval_metrics = eval_step(
                         bundle.dynamics,

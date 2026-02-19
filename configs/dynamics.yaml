@@ -11,7 +11,7 @@ ckpt:
 
 dataset:
   dataloader_cfg:
-    B: 32
+    B: 24
     T: 32
 
 dynamics:

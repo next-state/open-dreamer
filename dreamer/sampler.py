@@ -26,6 +26,7 @@ def sample_video(
     rng: jax.Array,
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
+    pixel_normalizer=None,
     latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
     omega: jax.Array | float = 0.0,
     alpha: jax.Array | float = 0.7,
@@ -45,6 +46,8 @@ def sample_video(
                 during rollout instead of using ground truth future actions.
         task_embedder: Optional task embedder. Required when policy is provided to generate
                 agent tokens for the dynamics model.
+        pixel_normalizer: Optional running normalizer for pixel-space dynamics.
+                If provided, frames are normalized before rollout and unnormalized after.
         latents: Optional pre-tokenized latents (B, T, n_latents, d_bottleneck). If provided,
                 skips tokenizer encoding. Latents should already be unpacked.
     Returns:
@@ -62,10 +65,14 @@ def sample_video(
 
         frames = frames.astype(jnp.float32)
         B, T, H, W, C = frames.shape
-        frames_norm = frames / 255.0
+        frames_01 = frames / 255.0
+        if pixel_normalizer is not None:
+            frames_model = pixel_normalizer.normalize(frames_01)
+        else:
+            frames_model = frames_01
 
         # Split context vs future
-        frames_ctx, _ = frames_norm[:, :-horizon], frames_norm[:, -horizon:]
+        frames_ctx, _ = frames_model[:, :-horizon], frames_model[:, -horizon:]
         actions_ctx, actions_future = actions[:, :-horizon], actions[:, -horizon:]
 
         T_ctx = frames_ctx.shape[1]
@@ -88,7 +95,13 @@ def sample_video(
             deterministic=True,
         )
 
-        pred_frames = jnp.clip(rollout_result["frames"] * 255.0, 0.0, 255.0).astype(jnp.uint8)
+        pred_model = rollout_result["frames"]
+        if pixel_normalizer is not None:
+            pred_01 = pixel_normalizer.unnormalize(pred_model)
+        else:
+            pred_01 = pred_model
+
+        pred_frames = jnp.clip(pred_01 * 255.0, 0.0, 255.0).astype(jnp.uint8)
         gt_frames = jnp.clip(frames, 0.0, 255.0).astype(jnp.uint8)
         return pred_frames, gt_frames, gt_frames
 
