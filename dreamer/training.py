@@ -25,7 +25,7 @@ from dreamer.generation import DenoiseSchedule
 from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
-from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents
+from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents, unnormalize_latents
 
 
 # ---------------------------
@@ -857,3 +857,129 @@ def run_evaluation(
 
         if videos is not None:
             logger.log_video(step, f"eval/{tag}/video", mp4_path)
+
+
+# ---------------------------
+# x0 visualization
+# ---------------------------
+
+@nnx.jit(static_argnames=("k_max", "T", "context_length", "use_latent_data"))
+def vis_dynamics_step(
+    tokenizer,
+    dynamics,
+    data: jnp.ndarray,
+    actions,
+    *,
+    master_key: jax.Array,
+    step: int,
+    T: int,
+    k_max: int,
+    context_length: int | None,
+    use_latent_data: bool,
+):
+    """Single-sequence (B=1) forward pass for x0 visualization.
+
+    Returns z_tilde, z_pred, latents_norm (all shape (1,T,S,D)) and sigma (1,T).
+    """
+    if use_latent_data:
+        latents = data
+    else:
+        latents, _ = tokenizer.encode(data, deterministic=True)
+        latents = jax.lax.stop_gradient(latents)
+
+    latents = latents.astype(dynamics.dtype)
+    latents_norm = normalize_latents(latents, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+
+    step_key = jax.random.fold_in(master_key, step)
+    key_sigma, key_noise = jax.random.split(step_key)
+
+    emax = jnp.log2(k_max).astype(jnp.int32)
+    step_idx = jnp.full((1, T), emax, dtype=jnp.int32)
+
+    sigma, sigma_idx = sample_tau_for_step(
+        key_sigma, (1, T), k_max, step_idx, dtype=latents.dtype, include_endpoint=True
+    )
+
+    z0 = jax.random.normal(key_noise, latents_norm.shape, dtype=latents.dtype)
+    z_tilde = (1.0 - (1.0 - 1e-5) * sigma[..., None, None]) * z0 + sigma[..., None, None] * latents_norm
+
+    z_pred, _ = dynamics(
+        actions, step_idx, sigma_idx, z_tilde,
+        context_length=context_length, time_mask=None, task_embeddings=None, deterministic=True,
+    )
+
+    return z_tilde, z_pred, latents_norm, sigma
+
+
+def run_x0_visualization(
+    cfg,
+    step: int,
+    tokenizer,
+    dynamics,
+    *,
+    data: jnp.ndarray,
+    actions,
+    master_key: jax.Array,
+    use_latent_data: bool,
+    vis_dir: Path,
+    logger,
+):
+    """Decode noisy input, x0 prediction, and ground-truth as a contact sheet.
+
+    Rows: [gt (green border), z_tilde / noisy input (yellow), z_pred / x0 prediction (blue)]
+    Columns: one per time step, labelled with τ value.
+    """
+    from PIL import Image, ImageDraw
+    import numpy as np
+
+    k_max = cfg.dynamics.k_max
+    context_length = cfg.dynamics.context_length
+    T = int(data.shape[1])
+
+    z_tilde, z_pred, latents_norm, sigma = vis_dynamics_step(
+        tokenizer, dynamics, data, actions,
+        master_key=master_key,
+        step=step,
+        T=T,
+        k_max=k_max,
+        context_length=context_length,
+        use_latent_data=use_latent_data,
+    )
+
+    # Decode each set of latents (unnormalize first, then run tokenizer decoder)
+    @nnx.jit
+    def decode_latents(z_norm):
+        z = unnormalize_latents(z_norm, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+        frames, _ = tokenizer.decode(z, deterministic=True)
+        return jnp.clip(frames, 0, 255).astype(jnp.uint8)
+
+    gt_frames    = jax.device_get(decode_latents(latents_norm))  # (1, T, H, W, 3)
+    noisy_frames = jax.device_get(decode_latents(z_tilde))       # (1, T, H, W, 3)
+    pred_frames  = jax.device_get(decode_latents(z_pred))        # (1, T, H, W, 3)
+    sigma_cpu    = jax.device_get(sigma)[0]                       # (T,)
+
+    H, W = gt_frames.shape[2], gt_frames.shape[3]
+    label_h = 20
+
+    # Build (3*H + label_h) × (T*W) contact sheet
+    grid = np.zeros((label_h + 3 * H, T * W, 3), dtype=np.uint8)
+    for t in range(T):
+        x = t * W
+        grid[label_h:label_h + H,         x:x + W] = gt_frames[0, t]
+        grid[label_h + H:label_h + 2 * H, x:x + W] = noisy_frames[0, t]
+        grid[label_h + 2 * H:,            x:x + W] = pred_frames[0, t]
+
+    # Stamp τ labels
+    pil_img = Image.fromarray(grid)
+    draw = ImageDraw.Draw(pil_img)
+    for t in range(T):
+        draw.text((t * W + 2, 2), f"\u03c4={sigma_cpu[t]:.2f}", fill=(255, 255, 255))
+
+    img_array = np.array(pil_img)
+
+    # Save PNG
+    out_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+    Image.fromarray(img_array).save(str(out_dir / "x0_vis.png"))
+
+    # Log
+    logger.log_image(step, "x0_vis", img_array, caption=f"step {step}")

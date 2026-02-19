@@ -15,7 +15,7 @@ from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, shift_actions
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
-from dreamer.training import run_evaluation, shortcut_forcing_step
+from dreamer.training import run_evaluation, run_x0_visualization, shortcut_forcing_step
 from dreamer.checkpointing import (
     DynamicsCheckpointBundle,
     TokenizerCheckpointBundle,
@@ -227,6 +227,15 @@ def run(cfg: DynamicsConfig):
                         val_data=val_data, val_actions=val_actions,
                         use_latent_data=use_latent_data,
                         vis_dir=vis_dir, rng=rng, logger=logger
+                    )
+                    run_x0_visualization(
+                        cfg, step, bundle.tokenizer, bundle.dynamics,
+                        data=input_tensor[:1],
+                        actions=actions[:1],
+                        master_key=master_key,
+                        use_latent_data=use_latent_data,
+                        vis_dir=vis_dir,
+                        logger=logger,
                     )
 
                 # Training step
