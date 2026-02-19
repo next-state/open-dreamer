@@ -265,6 +265,18 @@ class DynamicsCheckpointBundle(CheckpointBundle):
 
 
 @dataclass
+class DynamicsOnlyCheckpointBundle(CheckpointBundle):
+    """Bundle for dynamics-only checkpoint save/restore (no tokenizer)."""
+
+    _model_registry: ClassVar[dict[str, tuple[type, type]]] = {
+        "dynamics": (DynamicsModelConfig, Dynamics),
+    }
+
+    dynamics: Dynamics
+    dynamics_optimizer: Optional[nnx.Optimizer] = None
+
+
+@dataclass
 class HeadsCheckpointBundle(CheckpointBundle):
     """Bundle for heads checkpoint save/restore.
 

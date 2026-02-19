@@ -2,8 +2,8 @@ program: scripts/train_dynamics.py
 method: random
 
 metric:
-  name: eval/diffusion/psnr
-  goal: maximize
+  name: train/flow_mse
+  goal: minimize
 
 parameters:
   max_lr:

@@ -1050,6 +1050,186 @@ class ActionEncoder(nnx.Module):
         return out
 
 
+def _row_rms_normalize(x: jnp.ndarray, eps: float) -> jnp.ndarray:
+    """Normalize each row to unit RMS."""
+    rms = jnp.sqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+    return x / rms
+
+
+def _build_query_coords(num_queries: int, coord_dim: int) -> jnp.ndarray:
+    """Create normalized query coordinates in [-1, 1]."""
+    coord_dim = max(1, coord_dim)
+
+    if coord_dim == 1:
+        if num_queries == 1:
+            return jnp.zeros((1, 1), dtype=jnp.float32)
+        return jnp.linspace(-1.0, 1.0, num_queries, dtype=jnp.float32)[:, None]
+
+    side = int(math.ceil(math.sqrt(num_queries)))
+    ids = jnp.arange(num_queries, dtype=jnp.int32)
+    y = ids // side
+    x = ids % side
+
+    if side > 1:
+        x = (2.0 * x.astype(jnp.float32) / (side - 1)) - 1.0
+        y = (2.0 * y.astype(jnp.float32) / (side - 1)) - 1.0
+    else:
+        x = jnp.zeros_like(ids, dtype=jnp.float32)
+        y = jnp.zeros_like(ids, dtype=jnp.float32)
+
+    base = jnp.stack([x, y], axis=-1)
+    if coord_dim == 2:
+        return base
+
+    extra = jnp.zeros((num_queries, coord_dim - 2), dtype=jnp.float32)
+    return jnp.concatenate([base, extra], axis=-1)
+
+
+def _encode_coords(coords: jnp.ndarray, encoding: str, num_freqs: int) -> jnp.ndarray:
+    """Encode query coordinates with DCT-style or sinusoidal basis."""
+    num_freqs = max(1, num_freqs)
+    encoding = encoding.lower()
+
+    if encoding == "dct":
+        coords01 = (coords + 1.0) * 0.5
+        freqs = jnp.arange(num_freqs, dtype=jnp.float32)
+        angles = math.pi * coords01[..., None] * freqs  # (..., coord_dim, num_freqs)
+        encoded = jnp.cos(angles)
+        return rearrange(encoded, "... c f -> ... (c f)")
+
+    if encoding == "sincos":
+        freqs = 2.0 ** jnp.arange(num_freqs, dtype=jnp.float32)
+        angles = math.pi * coords[..., None] * freqs  # (..., coord_dim, num_freqs)
+        sin = jnp.sin(angles)
+        cos = jnp.cos(angles)
+        return rearrange(jnp.concatenate([sin, cos], axis=-1), "... c f -> ... (c f)")
+
+    raise ValueError(f"Unsupported coordinate encoding: {encoding}. Use 'dct' or 'sincos'.")
+
+
+class NeuralFieldDecoder(nnx.Module):
+    """Patch-wise neural field decoder with per-token dynamic MLP weights."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        token_dim: int,
+        packing_factor: int,
+        hidden_dim: int = 64,
+        coord_dim: int = 2,
+        num_freqs: int = 8,
+        coord_encoding: str = "dct",
+        use_noisy_input: bool = True,
+        row_norm: bool = True,
+        feature_norm: bool = True,
+        norm_eps: float = 1e-6,
+        use_bias: bool = False,
+        dtype: Any = jnp.float32,
+        param_dtype: Any = jnp.float32,
+        mesh_rules: MeshRules,
+        rngs: nnx.Rngs,
+    ):
+        self.d_model = d_model
+        self.token_dim = token_dim
+        self.packing_factor = packing_factor
+        self.hidden_dim = hidden_dim
+        self.use_noisy_input = use_noisy_input
+        self.row_norm = row_norm
+        self.feature_norm = feature_norm
+        self.norm_eps = norm_eps
+        self.dtype = to_jnp_dtype(dtype)
+
+        param_dtype = to_jnp_dtype(param_dtype)
+
+        coords = _build_query_coords(packing_factor, coord_dim)
+        coord_features = _encode_coords(coords, coord_encoding, num_freqs)
+        self.coord_features = nnx.Variable(coord_features.astype(self.dtype))
+
+        self.coord_feature_dim = int(coord_features.shape[-1])
+        self.input_dim = self.coord_feature_dim + (token_dim if use_noisy_input else 0)
+        self.output_dim = token_dim
+
+        self.w1_size = hidden_dim * self.input_dim
+        self.b1_size = hidden_dim
+        self.w2_size = self.output_dim * hidden_dim
+        self.b2_size = self.output_dim
+        self.total_dynamic_params = self.w1_size + self.b1_size + self.w2_size + self.b2_size
+
+        self.hyper_proj = nnx.Linear(
+            d_model,
+            self.total_dynamic_params,
+            use_bias=use_bias,
+            dtype=self.dtype,
+            param_dtype=param_dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')),
+            rngs=rngs,
+        )
+
+    def __call__(self, spatial_states: jnp.ndarray, packed_noisy_tokens: jnp.ndarray) -> jnp.ndarray:
+        """
+        Args:
+            spatial_states: (B, T, N_spatial, d_model)
+            packed_noisy_tokens: (B, T, N_spatial, packing_factor * token_dim)
+        Returns:
+            Packed predictions: (B, T, N_spatial, packing_factor * token_dim)
+        """
+        B, T, N_spatial, _ = spatial_states.shape
+        packed_noisy = rearrange(
+            packed_noisy_tokens,
+            "b t n (p d) -> b t n p d",
+            p=self.packing_factor,
+        )
+
+        coord_features = self.coord_features.value.astype(spatial_states.dtype)
+        coord_features = jnp.broadcast_to(
+            coord_features[None, None, None, :, :],
+            (B, T, N_spatial, self.packing_factor, self.coord_feature_dim),
+        )
+
+        if self.use_noisy_input:
+            field_inputs = jnp.concatenate([coord_features, packed_noisy], axis=-1)
+        else:
+            field_inputs = coord_features
+
+        dynamic_params = self.hyper_proj(spatial_states)
+
+        i = 0
+        w1 = dynamic_params[..., i:i + self.w1_size]
+        i += self.w1_size
+        b1 = dynamic_params[..., i:i + self.b1_size]
+        i += self.b1_size
+        w2 = dynamic_params[..., i:i + self.w2_size]
+        i += self.w2_size
+        b2 = dynamic_params[..., i:i + self.b2_size]
+
+        w1 = rearrange(w1, "b t n (h i) -> b t n h i", h=self.hidden_dim, i=self.input_dim)
+        w2 = rearrange(w2, "b t n (o h) -> b t n o h", o=self.output_dim, h=self.hidden_dim)
+
+        if self.row_norm:
+            w1 = _row_rms_normalize(w1, eps=self.norm_eps)
+            w2 = _row_rms_normalize(w2, eps=self.norm_eps)
+
+        hidden = jnp.einsum("btnpi,btnhi->btnph", field_inputs, w1)
+        hidden = hidden + b1[..., None, :]
+        hidden = jax.nn.silu(hidden)
+
+        if self.feature_norm:
+            hidden = _row_rms_normalize(hidden, eps=self.norm_eps)
+
+        out = jnp.einsum("btnph,btnoh->btnpo", hidden, w2)
+        out = out + b2[..., None, :]
+
+        return rearrange(out.astype(self.dtype), "b t n p d -> b t n (p d)")
+
+    def estimate_flops(self, batch_size: int, seq_length: int, n_spatial: int) -> int:
+        """Rough estimate for dynamic-query MLP compute (forward + backward)."""
+        n_queries = batch_size * seq_length * n_spatial * self.packing_factor
+        per_query = self.input_dim * self.hidden_dim + self.hidden_dim * self.output_dim
+        # 2 for multiply-add, ~3x for backward
+        return int(6 * 2 * n_queries * per_query)
+
+
 class Dynamics(nnx.Module):
     """Dynamics model (world model)."""
 
@@ -1065,9 +1245,28 @@ class Dynamics(nnx.Module):
         self.packing_factor = cfg.packing_factor
         self.n_register = cfg.n_register
         self.k_max = cfg.k_max
+        self.input_space = getattr(cfg, "input_space", "latent")
+        self.patch_size = getattr(cfg, "patch_size", 8)
+        self.image_channels = getattr(cfg, "image_channels", 3)
+        self.decoder_type = getattr(cfg, "decoder_type", "linear")
+
+        if self.input_space == "latent":
+            self.token_dim = cfg.d_bottleneck
+        elif self.input_space == "pixel":
+            self.token_dim = self.patch_size * self.patch_size * self.image_channels
+        else:
+            raise ValueError(f"Unsupported dynamics input_space={self.input_space}. Use 'latent' or 'pixel'.")
 
         # Project spatial tokens
-        self.spatial_proj = nnx.Linear(cfg.d_bottleneck * cfg.packing_factor, cfg.d_model, use_bias=cfg.use_bias, dtype=self.dtype, param_dtype=self.param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.spatial_proj = nnx.Linear(
+            self.token_dim * cfg.packing_factor,
+            cfg.d_model,
+            use_bias=cfg.use_bias,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')),
+            rngs=rngs,
+        )
 
         # Register tokens
         self.register_tokens = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_register, cfg.d_model), dtype=self.param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
@@ -1117,14 +1316,44 @@ class Dynamics(nnx.Module):
             rngs=rngs
         )
 
-        # Output head (zero-init)
-        self.flow_x_head = nnx.Linear(
-            cfg.d_model, cfg.d_bottleneck * cfg.packing_factor,
-            use_bias=cfg.use_bias,
-            kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
-            bias_init=nnx.initializers.zeros,
-            dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs
-        )
+        if self.decoder_type == "linear":
+            # Default projection head.
+            self.flow_x_head = nnx.Linear(
+                cfg.d_model,
+                self.token_dim * cfg.packing_factor,
+                use_bias=cfg.use_bias,
+                kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
+                bias_init=nnx.initializers.zeros,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                rngs=rngs,
+            )
+            self.neural_field_decoder = None
+        elif self.decoder_type == "neural_field":
+            self.flow_x_head = None
+            self.neural_field_decoder = NeuralFieldDecoder(
+                d_model=cfg.d_model,
+                token_dim=self.token_dim,
+                packing_factor=cfg.packing_factor,
+                hidden_dim=getattr(cfg, "field_hidden_dim", 64),
+                coord_dim=getattr(cfg, "field_coord_dim", 2),
+                num_freqs=getattr(cfg, "field_num_freqs", 8),
+                coord_encoding=getattr(cfg, "field_coord_encoding", "dct"),
+                use_noisy_input=getattr(cfg, "field_use_noisy_input", True),
+                row_norm=getattr(cfg, "field_row_norm", True),
+                feature_norm=getattr(cfg, "field_feature_norm", True),
+                norm_eps=getattr(cfg, "field_norm_eps", 1e-6),
+                use_bias=cfg.use_bias,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                mesh_rules=mesh_rules,
+                rngs=rngs,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported dynamics decoder_type={self.decoder_type}. "
+                "Use 'linear' or 'neural_field'."
+            )
 
     def get_token_layout(self, n_latents: int, n_agent: int = 0) -> TokenLayout:
         """Get token layout.
@@ -1172,7 +1401,7 @@ class Dynamics(nnx.Module):
         actions: Actions,
         step_indices,
         tau_indices,
-        unpacked_enc_tokens,
+        model_inputs,
         *,
         context_length: int | None = None,
         time_mask: jnp.ndarray | None = None,
@@ -1186,7 +1415,9 @@ class Dynamics(nnx.Module):
             actions: Actions object
             step_indices: (B, T) int32 — step indices for embedding lookup
             tau_indices: (B, T) int32 - signal indices for embedding lookup
-            unpacked_enc_tokens: (B, T, n_latents, d_bottleneck) unpacked encoder tokens
+            model_inputs:
+                - latent mode: (B, T, n_tokens, d_bottleneck)
+                - pixel mode: (B, T, H, W, C)
             context_length: optional context length for sliding window attention. If provided,
                            creates local_window_size=(context_length - 1, 0) for causal sliding window.
             time_mask: optional (B, 1, T, T) boolean mask for temporal attention
@@ -1198,10 +1429,38 @@ class Dynamics(nnx.Module):
             action_token:  (B, T, 1, d_model)
             shortcut_token: (B, T, 1, d_model)
         """
-        B, T = unpacked_enc_tokens.shape[:2]
+        frame_hw = None
+        if self.input_space == "pixel":
+            if model_inputs.ndim != 5:
+                raise ValueError(
+                    f"Pixel-space dynamics expects inputs with shape (B, T, H, W, C), got {model_inputs.shape}."
+                )
+            if model_inputs.shape[-1] != self.image_channels:
+                raise ValueError(
+                    f"Expected image_channels={self.image_channels}, got {model_inputs.shape[-1]}."
+                )
+            H, W = model_inputs.shape[-3], model_inputs.shape[-2]
+            if (H % self.patch_size) != 0 or (W % self.patch_size) != 0:
+                raise ValueError(
+                    f"Image size ({H}, {W}) must be divisible by patch_size={self.patch_size}."
+                )
+            frame_hw = (H, W)
+            input_tokens = patchify(model_inputs, patch=self.patch_size)
+        else:
+            if model_inputs.ndim != 4:
+                raise ValueError(
+                    f"Latent-space dynamics expects inputs with shape (B, T, N, D), got {model_inputs.shape}."
+                )
+            input_tokens = model_inputs
+
+        B, T = input_tokens.shape[:2]
+        if (input_tokens.shape[2] % self.packing_factor) != 0:
+            raise ValueError(
+                f"Number of tokens {input_tokens.shape[2]} must be divisible by packing_factor={self.packing_factor}."
+            )
 
         # Pack tokens internally for processing
-        packed_enc_tokens = rearrange(unpacked_enc_tokens, "b t (n p) d -> b t n (p d)", p=self.packing_factor)
+        packed_enc_tokens = rearrange(input_tokens, "b t (n p) d -> b t n (p d)", p=self.packing_factor)
         # Project spatial tokens to d_model
         spatial_tokens = self.spatial_proj(packed_enc_tokens)  # (B, T, n_spatial, d_model)
 
@@ -1232,7 +1491,7 @@ class Dynamics(nnx.Module):
 
         # Make the layout for masking
         n_agent = task_embeddings.shape[2] if task_embeddings is not None else 0
-        n_latents = unpacked_enc_tokens.shape[2]
+        n_latents = input_tokens.shape[2]
         layout = self.get_token_layout(n_latents=n_latents, n_agent=n_agent)
         space_mask = layout.build_space_mask("wm_agent")
 
@@ -1251,10 +1510,25 @@ class Dynamics(nnx.Module):
         )
 
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
-        x1_hat_packed = self.flow_x_head(spatial_tokens)  # (B, T, n_spatial, d_spatial)
+        if self.decoder_type == "neural_field":
+            if self.neural_field_decoder is None:
+                raise ValueError("Neural field decoder is not initialized.")
+            x1_hat_packed = self.neural_field_decoder(
+                spatial_states=spatial_tokens,
+                packed_noisy_tokens=packed_enc_tokens,
+            )
+        else:
+            if self.flow_x_head is None:
+                raise ValueError("Linear flow head is not initialized.")
+            x1_hat_packed = self.flow_x_head(spatial_tokens)  # (B, T, n_spatial, d_spatial)
 
-        # Unpack before returning
-        x1_hat = rearrange(x1_hat_packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
+        # Unpack before returning.
+        x1_hat_tokens = rearrange(x1_hat_packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
+        if self.input_space == "pixel":
+            assert frame_hw is not None
+            x1_hat = unpatchify(x1_hat_tokens, patch=self.patch_size, H=frame_hw[0], W=frame_hw[1])
+        else:
+            x1_hat = x1_hat_tokens
         
         h_t = x[:, :, layout.slices()[Modality.AGENT], :] if task_embeddings is not None else None  # (B,T,n_agent,D) or None
         return x1_hat, (h_t, new_caches)
@@ -1304,7 +1578,12 @@ class Dynamics(nnx.Module):
         # Attention FLOPs
         attn_flops = self.transformer.estimate_attention_flops(batch_size, seq_length, S)
 
-        return int(weight_flops + attn_flops)
+        decoder_flops = 0
+        if self.decoder_type == "neural_field" and self.neural_field_decoder is not None:
+            n_spatial = n_latents // self.packing_factor
+            decoder_flops = self.neural_field_decoder.estimate_flops(batch_size, seq_length, n_spatial)
+
+        return int(weight_flops + attn_flops + decoder_flops)
 
 
 class TaskEmbedder(nnx.Module):

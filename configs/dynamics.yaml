@@ -1,10 +1,9 @@
 defaults:
   - common
-  - dataset: minecraft_vpt_latent
+  - dataset: minecraft_vpt
   - _self_
 
 run_name: dynamics-high-lr
-tokenizer_ckpt: logs/tokenizer-asymmetric/checkpoints/
 
 ckpt:
   max_to_keep: 0
@@ -12,9 +11,8 @@ ckpt:
 
 dataset:
   dataloader_cfg:
-    B: 16
-    T: 32
-  C: 16
+    B: 4
+    T: 8
 
 dynamics:
     d_bottleneck: 16
@@ -35,6 +33,18 @@ dynamics:
     use_rmsnorm_scale: true
     dtype: ${dtype}
     param_dtype: ${param_dtype}
+    input_space: pixel
+    patch_size: ${dataset.patch_size}
+    image_channels: ${dataset.C}
+    decoder_type: neural_field
+    field_hidden_dim: 64
+    field_coord_dim: 2
+    field_num_freqs: 8
+    field_coord_encoding: dct
+    field_use_noisy_input: true
+    field_row_norm: true
+    field_feature_norm: true
+    field_norm_eps: 1.0e-6
 
     num_binary_actions: ${dataset.num_binary_actions}
     categorical_action_dim: ${dataset.categorical_action_dim}

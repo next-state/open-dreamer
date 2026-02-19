@@ -4,8 +4,9 @@ defaults:
 name: minecraft_vpt
 data_type: video
 
-array_record_path: /home/ubuntu/minecraft-vpt/arrayrecords-mp4
-index_max: 1500
+array_record_path: /mnt/local/mp4
+index_max: 250
+num_max_samples: -1
 
 dataloader_cfg:
   B: 8

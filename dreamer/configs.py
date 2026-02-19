@@ -140,6 +140,24 @@ class DynamicsModelConfig:
     dtype: str = "float32"
     param_dtype: str = "float32"
 
+    # input representation
+    input_space: str = "latent"  # latent | pixel
+    patch_size: int = 8
+    image_channels: int = 3
+
+    # output decoder
+    decoder_type: str = "linear"  # linear | neural_field
+
+    # neural-field decoder options (used when decoder_type="neural_field")
+    field_hidden_dim: int = 64
+    field_coord_dim: int = 2
+    field_num_freqs: int = 8
+    field_coord_encoding: str = "dct"  # dct | sincos
+    field_use_noisy_input: bool = True
+    field_row_norm: bool = True
+    field_feature_norm: bool = True
+    field_norm_eps: float = 1e-6
+
     # schedule
     k_max: int = 8
 

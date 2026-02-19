@@ -204,6 +204,14 @@ def compute_flow_loss(z_pred: jnp.ndarray, z_target: jnp.ndarray, sigma: jnp.nda
     return jnp.mean(mse), jnp.mean(mse)
 
 
+def _sigma_to_state_shape(sigma: jnp.ndarray, state: jnp.ndarray) -> jnp.ndarray:
+    """Broadcast (B, T) sigma values over trailing state dimensions."""
+    extra_dims = state.ndim - sigma.ndim
+    if extra_dims < 0:
+        raise ValueError(f"State rank {state.ndim} must be >= sigma rank {sigma.ndim}.")
+    return sigma.reshape(*sigma.shape, *([1] * extra_dims))
+
+
 def compute_bootstrap_loss(z_pred: jnp.ndarray, z_tilde: jnp.ndarray, b_prime: jnp.ndarray, b_doubleprime: jnp.ndarray, sigma: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Bootstrap self-consistency loss for shortcut forcing.
@@ -224,14 +232,15 @@ def compute_bootstrap_loss(z_pred: jnp.ndarray, z_tilde: jnp.ndarray, b_prime: j
             mse_per_token: tuple of scalars. MSE loss 
     """
     # Convert full-step prediction to velocity
-    v_hat = (z_pred - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
+    sigma_scaled = _sigma_to_state_shape(sigma, z_tilde)
+    v_hat = (z_pred - z_tilde) / jnp.maximum(1.0 - sigma_scaled, 1e-8)
 
     # Target velocity is average of two half-steps (stop gradient)
     v_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
 
     # MSE in v-space, scaled back to x-space by (1-sigma)^2
     v_diff = (v_hat - v_target) ** 2
-    scale = (1.0 - sigma)[..., None, None] ** 2
+    scale = (1.0 - sigma_scaled) ** 2
 
     return jnp.mean(v_diff * scale), jnp.mean(v_diff * scale)
 
@@ -271,14 +280,15 @@ def flow_forward(
         flow_mse: Scalar unweighted MSE
         aux: Dict with 'h_states' from the forward pass
     """
-    B, T, S, D = latents.shape
+    B, T = latents.shape[:2]
     emax = jnp.log2(k_max).astype(jnp.int32)
 
     step_idx = jnp.full((B, T), emax, dtype=jnp.int32)
     sigma, sigma_idx = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx, dtype=latents.dtype)
 
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
-    z_tilde = (1.0 - sigma[..., None, None]) * z0 + sigma[..., None, None] * latents
+    sigma_scaled = _sigma_to_state_shape(sigma, latents)
+    z_tilde = (1.0 - sigma_scaled) * z0 + sigma_scaled * latents
 
     rngs = nnx.Rngs(dropout=key_dropout)
     z_pred, (h_states, _) = dynamics_model(
@@ -324,13 +334,14 @@ def bootstrap_forward(
         loss_boot: Scalar bootstrap consistency loss
         boot_mse: Scalar unweighted MSE
     """
-    B, T, S, D = latents.shape
+    B, T = latents.shape[:2]
 
     d_self, step_idx = sample_step_excluding_dmin(key_step, (B, T), k_max, dtype=latents.dtype)
     sigma, sigma_idx = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx, dtype=latents.dtype)
 
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
-    z_tilde = (1.0 - sigma[..., None, None]) * z0 + sigma[..., None, None] * latents
+    sigma_scaled = _sigma_to_state_shape(sigma, latents)
+    z_tilde = (1.0 - sigma_scaled) * z0 + sigma_scaled * latents
 
     # Full-step prediction
     rngs1 = nnx.Rngs(dropout=key_dropout1)
@@ -353,9 +364,9 @@ def bootstrap_forward(
         context_length=context_length, time_mask=time_mask,
         task_embeddings=task_embeddings, deterministic=False, rngs=rngs2,
     )
-    z1_half1 = z1_half1[..., :D]
-    b_prime = (z1_half1 - z_tilde) / jnp.maximum(1.0 - sigma[..., None, None], 1e-8)
-    z_prime = z_tilde + b_prime * d_half[..., None, None]
+    b_prime = (z1_half1 - z_tilde) / jnp.maximum(1.0 - sigma_scaled, 1e-8)
+    d_half_scaled = _sigma_to_state_shape(d_half, latents)
+    z_prime = z_tilde + b_prime * d_half_scaled
 
     # Second half-step
     rngs3 = nnx.Rngs(dropout=key_dropout3)
@@ -364,8 +375,8 @@ def bootstrap_forward(
         context_length=context_length, time_mask=time_mask,
         task_embeddings=task_embeddings, deterministic=False, rngs=rngs3,
     )
-    z1_half2 = z1_half2[..., :D]
-    b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-8)
+    sigma_plus_scaled = _sigma_to_state_shape(sigma_plus, latents)
+    b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus_scaled, 1e-8)
 
     loss_boot, boot_mse = compute_bootstrap_loss(z_pred, z_tilde, b_prime, b_doubleprime, sigma)
     return loss_boot, boot_mse
