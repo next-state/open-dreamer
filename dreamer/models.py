@@ -1124,6 +1124,8 @@ class NeuralFieldDecoder(nnx.Module):
         row_norm: bool = True,
         feature_norm: bool = True,
         norm_eps: float = 1e-6,
+        hyper_init_std: float = 1e-3,
+        output_scale_init: float = 0.1,
         use_bias: bool = False,
         dtype: Any = jnp.float32,
         param_dtype: Any = jnp.float32,
@@ -1138,6 +1140,8 @@ class NeuralFieldDecoder(nnx.Module):
         self.row_norm = row_norm
         self.feature_norm = feature_norm
         self.norm_eps = norm_eps
+        self.hyper_init_std = hyper_init_std
+        self.output_scale_init = output_scale_init
         self.dtype = to_jnp_dtype(dtype)
 
         param_dtype = to_jnp_dtype(param_dtype)
@@ -1154,17 +1158,54 @@ class NeuralFieldDecoder(nnx.Module):
         self.b1_size = hidden_dim
         self.w2_size = self.output_dim * hidden_dim
         self.b2_size = self.output_dim
-        self.total_dynamic_params = self.w1_size + self.b1_size + self.w2_size + self.b2_size
-
-        self.hyper_proj = nnx.Linear(
+        # Input-side dynamic parameters.
+        self.hyper_w1 = nnx.Linear(
             d_model,
-            self.total_dynamic_params,
+            self.w1_size,
             use_bias=use_bias,
             dtype=self.dtype,
             param_dtype=param_dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')),
+            kernel_init=nnx.with_partitioning(
+                nnx.initializers.normal(stddev=self.hyper_init_std),
+                mesh_rules('mlp'),
+            ),
             rngs=rngs,
         )
+        self.hyper_b1 = nnx.Linear(
+            d_model,
+            self.b1_size,
+            use_bias=use_bias,
+            dtype=self.dtype,
+            param_dtype=param_dtype,
+            kernel_init=nnx.with_partitioning(
+                nnx.initializers.normal(stddev=self.hyper_init_std),
+                mesh_rules('mlp'),
+            ),
+            rngs=rngs,
+        )
+        # Output-head dynamic parameters (zero-init by request).
+        self.hyper_w2 = nnx.Linear(
+            d_model,
+            self.w2_size,
+            use_bias=use_bias,
+            dtype=self.dtype,
+            param_dtype=param_dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
+            bias_init=nnx.initializers.zeros,
+            rngs=rngs,
+        )
+        self.hyper_b2 = nnx.Linear(
+            d_model,
+            self.b2_size,
+            use_bias=use_bias,
+            dtype=self.dtype,
+            param_dtype=param_dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
+            bias_init=nnx.initializers.zeros,
+            rngs=rngs,
+        )
+        # Trainable global output gain to keep initialization numerically tame.
+        self.output_scale = nnx.Param(jnp.array(self.output_scale_init, dtype=param_dtype))
 
     def __call__(self, spatial_states: jnp.ndarray, packed_noisy_tokens: jnp.ndarray) -> jnp.ndarray:
         """
@@ -1192,16 +1233,10 @@ class NeuralFieldDecoder(nnx.Module):
         else:
             field_inputs = coord_features
 
-        dynamic_params = self.hyper_proj(spatial_states)
-
-        i = 0
-        w1 = dynamic_params[..., i:i + self.w1_size]
-        i += self.w1_size
-        b1 = dynamic_params[..., i:i + self.b1_size]
-        i += self.b1_size
-        w2 = dynamic_params[..., i:i + self.w2_size]
-        i += self.w2_size
-        b2 = dynamic_params[..., i:i + self.b2_size]
+        w1 = self.hyper_w1(spatial_states)
+        b1 = self.hyper_b1(spatial_states)
+        w2 = self.hyper_w2(spatial_states)
+        b2 = self.hyper_b2(spatial_states)
 
         w1 = rearrange(w1, "b t n (h i) -> b t n h i", h=self.hidden_dim, i=self.input_dim)
         w2 = rearrange(w2, "b t n (o h) -> b t n o h", o=self.output_dim, h=self.hidden_dim)
@@ -1219,6 +1254,7 @@ class NeuralFieldDecoder(nnx.Module):
 
         out = jnp.einsum("btnph,btnoh->btnpo", hidden, w2)
         out = out + b2[..., None, :]
+        out = out * self.output_scale.value.astype(out.dtype)
 
         return rearrange(out.astype(self.dtype), "b t n p d -> b t n (p d)")
 
@@ -1343,6 +1379,8 @@ class Dynamics(nnx.Module):
                 row_norm=getattr(cfg, "field_row_norm", True),
                 feature_norm=getattr(cfg, "field_feature_norm", True),
                 norm_eps=getattr(cfg, "field_norm_eps", 1e-6),
+                hyper_init_std=getattr(cfg, "field_hyper_init_std", 1e-3),
+                output_scale_init=getattr(cfg, "field_output_scale_init", 0.1),
                 use_bias=cfg.use_bias,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,

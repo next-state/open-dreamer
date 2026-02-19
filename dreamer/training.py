@@ -25,7 +25,7 @@ from dreamer.generation import DenoiseSchedule
 from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
-from dreamer.utils import _ensure_dir, apply_border
+from dreamer.utils import _ensure_dir, apply_border, normalize_with_dataset_stats
 
 
 # ---------------------------
@@ -807,6 +807,8 @@ def run_evaluation(
         alpha: Guidance alpha parameter for scaling.
     """
     k_max = dynamics.cfg.k_max
+    input_space = getattr(dynamics.cfg, "input_space", "latent")
+    is_pixel_mode = input_space == "pixel"
     schedule_shortcut = DenoiseSchedule.init(4, k_max)
     schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
 
@@ -842,8 +844,20 @@ def run_evaluation(
 
         # Compute metrics
         dt = time.time() - t0
-        normalized_pred = tokenizer.pixel_normalizer.normalize(pred_frames[:, -horizon:].astype(jnp.float32) / 255.0)
-        normalized_gt = tokenizer.pixel_normalizer.normalize(gt_frames_for_metrics[:, -horizon:].astype(jnp.float32) / 255.0)
+        if tokenizer is not None and hasattr(tokenizer, "pixel_normalizer") and not is_pixel_mode:
+            normalized_pred = tokenizer.pixel_normalizer.normalize(pred_frames[:, -horizon:].astype(jnp.float32) / 255.0)
+            normalized_gt = tokenizer.pixel_normalizer.normalize(gt_frames_for_metrics[:, -horizon:].astype(jnp.float32) / 255.0)
+        else:
+            normalized_pred = normalize_with_dataset_stats(
+                pred_frames[:, -horizon:].astype(jnp.float32),
+                mean=cfg.dataset.dataset_mean,
+                std=cfg.dataset.dataset_std,
+            )
+            normalized_gt = normalize_with_dataset_stats(
+                gt_frames_for_metrics[:, -horizon:].astype(jnp.float32),
+                mean=cfg.dataset.dataset_mean,
+                std=cfg.dataset.dataset_std,
+            )
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
         psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames_for_metrics[:, -horizon:]/255))
 
@@ -855,7 +869,7 @@ def run_evaluation(
         # Add red border to context frames in prediction
         pred_frames = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
 
-        if use_latent_data:
+        if use_latent_data or is_pixel_mode:
             # 2-column grid: [gt_decoded, pred]
             frames_list = [gt_decoded_frames, pred_frames]
         else:

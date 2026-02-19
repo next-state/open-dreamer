@@ -157,6 +157,8 @@ class DynamicsModelConfig:
     field_row_norm: bool = True
     field_feature_norm: bool = True
     field_norm_eps: float = 1e-6
+    field_hyper_init_std: float = 1e-3
+    field_output_scale_init: float = 0.1
 
     # schedule
     k_max: int = 8

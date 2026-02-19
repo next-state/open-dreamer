@@ -1,6 +1,7 @@
 """Train pixel-space diffusion dynamics with a neural-field decoder."""
 
 import logging
+import os
 
 import hydra
 import jax
@@ -17,8 +18,9 @@ from dreamer.logging import build_logger
 from dreamer.models import Dynamics
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
-from dreamer.training import shortcut_forcing_step
+from dreamer.training import run_evaluation, shortcut_forcing_step
 from dreamer.utils import (
+    RunningNormalizer,
     build_lr_schedule,
     build_optimizer,
     count_parameters_by_component,
@@ -26,6 +28,7 @@ from dreamer.utils import (
 )
 
 # Suppress absl info logs
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 logging.getLogger('absl').setLevel(logging.WARNING)
 
 # Register OmegaConf resolver for arithmetic expressions
@@ -35,8 +38,18 @@ OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
 OmegaConf.register_new_resolver("max", lambda *args: max(args))
 
 
-def _normalize_frames(videos: jnp.ndarray, dtype: jnp.dtype) -> jnp.ndarray:
-    return videos.astype(dtype) / 255.0
+def _normalize_frames(
+    videos: jnp.ndarray,
+    pixel_normalizer: RunningNormalizer,
+    dtype: jnp.dtype,
+    *,
+    update_stats: bool,
+) -> jnp.ndarray:
+    videos_01 = videos.astype(jnp.float32) / 255.0
+    if update_stats:
+        pixel_normalizer.update(videos_01)
+    normalized = pixel_normalizer.normalize(videos_01)
+    return normalized.astype(dtype)
 
 
 def _num_pixel_tokens(cfg: DynamicsConfig) -> int:
@@ -67,6 +80,7 @@ def _num_pixel_tokens(cfg: DynamicsConfig) -> int:
 )
 def train_step(
     dynamics: Dynamics,
+    pixel_normalizer: RunningNormalizer,
     optimizer: nnx.Optimizer,
     videos: jnp.ndarray,      # (B, T, H, W, C)
     actions: Actions,         # (B, T, ...)
@@ -76,7 +90,7 @@ def train_step(
     k_max: int,
     context_length: int | None,
 ):
-    frames = _normalize_frames(videos, dynamics.dtype)
+    frames = _normalize_frames(videos, pixel_normalizer, dynamics.dtype, update_stats=True)
     step_key = jax.random.fold_in(master_key, step)
 
     def loss_fn(model: Dynamics, frames, actions, context_length):
@@ -88,7 +102,7 @@ def train_step(
             k_max=k_max,
             context_length=context_length,
             task_embeddings=None,
-            B_self=frames.shape[0] // 8,
+            B_self=0,
         )
         return losses['total'], aux
 
@@ -108,6 +122,7 @@ def train_step(
 )
 def eval_step(
     dynamics: Dynamics,
+    pixel_normalizer: RunningNormalizer,
     videos: jnp.ndarray,
     actions: Actions,
     *,
@@ -116,7 +131,7 @@ def eval_step(
     k_max: int,
     context_length: int | None,
 ):
-    frames = _normalize_frames(videos, dynamics.dtype)
+    frames = _normalize_frames(videos, pixel_normalizer, dynamics.dtype, update_stats=False)
     step_key = jax.random.fold_in(master_key, step)
 
     losses, aux = shortcut_forcing_step(
@@ -175,7 +190,7 @@ def run(cfg: DynamicsConfig):
     _configure_pixel_neural_field_dynamics(cfg)
 
     # Setup
-    run_dir, ckpt_dir, _ = setup_training_directories(cfg)
+    run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
     # Logging
     logger = build_logger(
@@ -193,6 +208,18 @@ def run(cfg: DynamicsConfig):
 
         # Initialize dynamics
         dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        pixel_normalizer = RunningNormalizer(shape=(cfg.dataset.C,))
+        dataset_mean = jnp.asarray(cfg.dataset.dataset_mean, dtype=jnp.float32)
+        dataset_std = jnp.asarray(cfg.dataset.dataset_std, dtype=jnp.float32)
+        if dataset_mean.shape[0] != cfg.dataset.C or dataset_std.shape[0] != cfg.dataset.C:
+            raise ValueError(
+                f"dataset_mean/std must have {cfg.dataset.C} channels, got "
+                f"{dataset_mean.shape[0]} and {dataset_std.shape[0]}."
+            )
+        # Warm start with dataset-level stats so training begins near zero-mean/unit-variance.
+        pixel_normalizer.mean.value = dataset_mean
+        pixel_normalizer.var.value = jnp.maximum(dataset_std * dataset_std, 1e-6)
+
         param_counts = count_parameters_by_component(dynamics)
         print(f"Parameter counts: {param_counts['total']:,}")
 
@@ -247,10 +274,25 @@ def run(cfg: DynamicsConfig):
                     or step == cfg.max_steps - 1
                 )
                 if should_eval:
+                    val_data = videos[:4]
+                    val_actions = actions[:4]
+                    run_evaluation(
+                        cfg=cfg,
+                        step=step,
+                        tokenizer=None,
+                        dynamics=bundle.dynamics,
+                        val_data=val_data,
+                        val_actions=val_actions,
+                        use_latent_data=False,
+                        vis_dir=vis_dir,
+                        rng=eval_key,
+                        logger=logger,
+                    )
                     eval_metrics = eval_step(
                         bundle.dynamics,
-                        videos[:4],
-                        actions[:4],
+                        pixel_normalizer,
+                        val_data,
+                        val_actions,
                         master_key=eval_key,
                         step=step,
                         k_max=cfg.dynamics.k_max,
@@ -260,6 +302,7 @@ def run(cfg: DynamicsConfig):
 
                 metrics = train_step(
                     bundle.dynamics,
+                    pixel_normalizer,
                     bundle.dynamics_optimizer,
                     videos,
                     actions,

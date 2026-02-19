@@ -9,7 +9,7 @@ from flax import nnx
 
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
-from .generation import DenoiseSchedule, video_rollout, latent_rollout
+from .generation import DenoiseSchedule, video_rollout, latent_rollout, pixel_rollout
 
 
 # ---------------------------
@@ -17,7 +17,7 @@ from .generation import DenoiseSchedule, video_rollout, latent_rollout
 # ---------------------------
 
 def sample_video(
-    tokenizer: Tokenizer,
+    tokenizer: Tokenizer | None,
     dynamics: Dynamics,
     frames: jax.Array | None,   # (B, T, H, W, C) in [0, 255] - None if using latents
     actions: Actions,           # (B, T)
@@ -54,12 +54,52 @@ def sample_video(
     """
     del omega, alpha
 
+    input_space = getattr(dynamics.cfg, "input_space", "latent")
+
+    if input_space == "pixel":
+        if frames is None:
+            raise ValueError("Pixel-space dynamics requires `frames` input for sampling.")
+
+        frames = frames.astype(jnp.float32)
+        B, T, H, W, C = frames.shape
+        frames_norm = frames / 255.0
+
+        # Split context vs future
+        frames_ctx, _ = frames_norm[:, :-horizon], frames_norm[:, -horizon:]
+        actions_ctx, actions_future = actions[:, :-horizon], actions[:, -horizon:]
+
+        T_ctx = frames_ctx.shape[1]
+        if policy is not None:
+            assert task_embedder is not None, "task_embedder is required when policy is provided"
+            task = jnp.zeros((B,), dtype=jnp.int32)
+            initial_agent_tokens = task_embedder(task=task, B=B, T=T_ctx)
+        else:
+            initial_agent_tokens = None
+
+        rollout_result = pixel_rollout(
+            dynamics=dynamics,
+            policy=actions_future if policy is None else policy,
+            schedule=schedule_config,
+            frames_ctx=frames_ctx,
+            actions_ctx=actions_ctx,
+            num_steps=horizon,
+            rng=rng,
+            initial_task_embedding=initial_agent_tokens,
+            deterministic=True,
+        )
+
+        pred_frames = jnp.clip(rollout_result["frames"] * 255.0, 0.0, 255.0).astype(jnp.uint8)
+        gt_frames = jnp.clip(frames, 0.0, 255.0).astype(jnp.uint8)
+        return pred_frames, gt_frames, gt_frames
+
     if latents is not None:
         # Pre-tokenized latent path
         # Latents are already unpacked
         latents = latents.astype(jnp.bfloat16)
         B, T = latents.shape[:2]
     else:
+        if tokenizer is None:
+            raise ValueError("Tokenizer is required for latent-space video sampling.")
         assert frames is not None
         # Video path - encode frames
         B, T, H, W, C = frames.shape
