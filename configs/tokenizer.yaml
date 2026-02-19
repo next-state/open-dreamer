@@ -6,12 +6,13 @@ defaults:
 run_name: tokenizer-asymmetric
 
 dataset:
-  B: 8
-  T: 16
+  dataloader_cfg:
+    B: 8
+    T: 16
 
 ckpt:
   max_to_keep: 1
-  save_interval_steps: 10_000
+  save_interval_steps: 1000
 
 tokenizer:
   encoder:
@@ -32,6 +33,7 @@ tokenizer:
     use_residual_lambdas: false
     use_bias: false
     use_rmsnorm_scale: true
+    context_length: ${dataset.dataloader_cfg.T}
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
@@ -56,13 +58,14 @@ tokenizer:
     use_residual_lambdas: ${tokenizer.encoder.use_residual_lambdas}
     use_bias: ${tokenizer.encoder.use_bias}
     use_rmsnorm_scale: ${tokenizer.encoder.use_rmsnorm_scale}
+    context_length: ${dataset.dataloader_cfg.T}
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
     dataset_mean: ${dataset.dataset_mean}
     dataset_std: ${dataset.dataset_std}
 
-max_steps: 30_000
+max_steps: 50_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:
@@ -76,7 +79,7 @@ lr_schedule:
 
 optimizer:
   optimizer_type: muon
-  weight_decay: 0.1
+  weight_decay: 1e-4
   # AdamW params (for embeddings/biases)
   adam_lr_ratio: 1.0
   adam_b1: 0.9
