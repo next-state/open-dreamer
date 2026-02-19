@@ -63,7 +63,8 @@ class MinecraftVPTProcessFullEpisode(grain.transforms.Map):
     Uses ProcessMinecraftEpisodeAndSlice with full_episode=True, then adds action parsing.
     """
 
-    def __init__(self):
+    def __init__(self, patch_size: int = 16):
+        self.patch_size = patch_size
         # Use the shared transform with full_episode mode
         # Note: Map needs random_map to be called with rng, but we'll handle that
         self.processor = ProcessMinecraftEpisodeAndSlice(
