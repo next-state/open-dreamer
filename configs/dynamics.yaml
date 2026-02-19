@@ -23,14 +23,14 @@ dynamics:
     n_kv_heads: ${max:1,${floordiv:${dynamics.n_heads},8}}
     packing_factor: 2
     n_register: 32
-    qk_norm_type: quest
+    qk_norm_type: qknorm
     rope_theta: 10000.0
     time_every: 4
     mlp_ratio: 4
     dropout_rate: 0.00
     k_max: 128
     context_length: 192  # Attention window for sliding window attention
-    use_residual_lambdas: true
+    use_residual_lambdas: false
     use_bias: false
     use_rmsnorm_scale: true
     dtype: ${dtype}
