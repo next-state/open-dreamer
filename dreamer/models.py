@@ -1063,6 +1063,55 @@ class ActionEncoder(nnx.Module):
         return out
 
 
+class TimestepEmbedder(nnx.Module):
+    """Sinusoidal timestep embedding"""
+
+    def __init__(
+        self,
+        out_dim: int,
+        freq_dim: int = 256,
+        max_period: float = 10000.0,
+        *,
+        dtype,
+        param_dtype,
+        mesh_rules: MeshRules,
+        rngs: nnx.Rngs,
+    ):
+        self.freq_dim = freq_dim
+        self.max_period = max_period
+        self.dtype = dtype
+        self.dense1 = nnx.Linear(
+            freq_dim, out_dim,
+            use_bias=True,
+            kernel_init=nnx.with_partitioning(nnx.initializers.normal(0.02), mesh_rules('mlp')),
+            dtype=dtype, param_dtype=param_dtype, rngs=rngs,
+        )
+        self.dense2 = nnx.Linear(
+            out_dim, out_dim,
+            use_bias=True,
+            kernel_init=nnx.with_partitioning(nnx.initializers.normal(0.02), mesh_rules('mlp')),
+            dtype=dtype, param_dtype=param_dtype, rngs=rngs,
+        )
+
+    def __call__(self, t: jax.Array) -> jax.Array:
+        """Embed scalar timestep(s).
+
+        Args:
+            t: (...) float array of timestep values.
+
+        Returns:
+            (..., out_dim) embedding array.
+        """
+        t = t.astype(jnp.float32)
+        half = self.freq_dim // 2
+        freqs = jnp.exp(-math.log(self.max_period) * jnp.arange(half, dtype=jnp.float32) / half)
+        args = t[..., None] * freqs  # (..., half)
+        emb = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)  # (..., freq_dim)
+        emb = emb.astype(self.dtype)
+        emb = nnx.silu(self.dense1(emb))
+        return self.dense2(emb)
+
+
 class Dynamics(nnx.Module):
     """Dynamics model (world model)."""
 
@@ -1109,26 +1158,18 @@ class Dynamics(nnx.Module):
             mesh_rules=mesh_rules, rngs=rngs
         )
 
-        # Discrete embeddings for shortcut conditioning
-
-        # Step size d ∈ {1, 1/2, 1/4, ..., 1/k_max}
-        # We index steps by: step_idx = log2(1/d) ∈ {0, 1, 2, ..., log2(k_max)}
-        self.num_step_bins = int(math.log2(cfg.k_max)) + 1
+        # Sinusoidal embeddings for shortcut conditioning
+        # step_idx ∈ {0,...,log2(k_max)} passed as float; tau ∈ [0,1] (tau_idx/k_max)
         half_dim = cfg.d_model // 2
-        self.step_embed = nnx.Embed(
-            self.num_step_bins, half_dim,
+        self.step_embed = TimestepEmbedder(
+            out_dim=half_dim,
             dtype=self.dtype, param_dtype=self.param_dtype,
-            embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
-            rngs=rngs
+            mesh_rules=mesh_rules, rngs=rngs,
         )
-
-        # Signal level τ ∈ {0, d, 2d, ..., 1 - d, 1}
-        # We index signals by: signal_idx = τ * k_max ∈ {0, 1, 2, ..., k_max}, k_max + 1 indices
-        self.signal_embed = nnx.Embed(
-            cfg.k_max + 1, half_dim,
+        self.signal_embed = TimestepEmbedder(
+            out_dim=half_dim,
             dtype=self.dtype, param_dtype=self.param_dtype,
-            embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
-            rngs=rngs
+            mesh_rules=mesh_rules, rngs=rngs,
         )
 
         # Output head (zero-init)
@@ -1232,10 +1273,12 @@ class Dynamics(nnx.Module):
             (B, T, self.n_register, self.d_model),
         )
 
-        # Shortcut embeddings (discrete lookup, concatenated to single token)
-        step_emb = self.step_embed(step_indices)       # (B, T, d_model//2)
-        signal_emb = self.signal_embed(tau_indices)    # (B, T, d_model//2)
-        shortcut_token = jnp.concatenate([step_emb, signal_emb], axis=-1)[:, :, None, :]  # (B, T, 1, d_model)
+        # Shortcut embeddings (sinusoidal, concatenated to single token)
+        # step_indices: int log2(K) → float for sinusoidal PE
+        # tau_indices: int τ*k_max → normalize to [0,1] for sinusoidal PE
+        step_emb = self.step_embed(step_indices.astype(jnp.float32))                          # (B, T, d_model//2)
+        signal_emb = self.signal_embed(tau_indices.astype(jnp.float32) / self.k_max)          # (B, T, d_model//2)
+        shortcut_token = jnp.concatenate([step_emb, signal_emb], axis=-1)[:, :, None, :]     # (B, T, 1, d_model)
 
         # Concatenate in declared layout order (`get_token_layout`)
         tokens = [action_token, shortcut_token, spatial_tokens, register_tokens]
@@ -1291,9 +1334,6 @@ class Dynamics(nnx.Module):
                 excluded += binary_emb.embedding.value.size
         if self.action_encoder.categorical_embeds is not None:
             excluded += self.action_encoder.categorical_embeds.embedding.value.size
-        # Shortcut embeddings
-        excluded += self.step_embed.embedding.value.size
-        excluded += self.signal_embed.embedding.value.size
         # Per-layer scalars
         excluded += self.transformer.count_excluded_params()
         return excluded
