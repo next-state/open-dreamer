@@ -166,6 +166,11 @@ class DynamicsModelConfig:
     # attention window for sliding window attention (used when T > context_length)
     context_length: int = 192
 
+    # Denoising stability controls (inference/evaluation; default disabled)
+    denoise_update_scale: float = 1.0
+    denoise_max_residual_rms: float = 0.0
+    denoise_state_clip: float = 0.0
+
     # action conditioning
     num_binary_actions: int = 0
     categorical_action_dim: int = 0
@@ -349,6 +354,10 @@ class DynamicsConfig(BaseExperimentConfig):
 
     # Eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
+
+    # Stability training controls
+    bootstrap_frac: float = 0.0
+    bootstrap_start: int = 0
 
 
 @dataclass(frozen=False)

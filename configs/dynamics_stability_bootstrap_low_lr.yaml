@@ -1,0 +1,10 @@
+defaults:
+  - dynamics_stability_bootstrap
+  - _self_
+
+run_name: dynamics-stability-bootstrap-low-lr
+
+lr_schedule:
+  lr: 1e-3
+  warmup_ratio: 0.01
+  decay_ratio: 0.5

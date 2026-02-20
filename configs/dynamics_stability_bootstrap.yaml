@@ -1,0 +1,16 @@
+defaults:
+  - dynamics
+  - _self_
+
+run_name: dynamics-stability-bootstrap
+max_steps: 120_000
+
+# Turn on bootstrap self-consistency for denoising stability.
+bootstrap_frac: 0.25
+bootstrap_start: 27_500
+
+dynamics:
+  # Contractive denoising updates at inference/eval time.
+  denoise_update_scale: 0.9
+  denoise_max_residual_rms: 0.0
+  denoise_state_clip: 0.0

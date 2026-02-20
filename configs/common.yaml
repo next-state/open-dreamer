@@ -19,7 +19,7 @@ logger:
   use_wandb: ${use_wandb}
   wandb_entity: Null
   wandb_project: tiny_dreamer_4
-  log_every: 1
+  log_every: 100
   max_steps: ${max_steps}
   log_gradients: false
 

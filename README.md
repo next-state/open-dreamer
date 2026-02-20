@@ -57,6 +57,14 @@ uv pip install -e . # install this project as an editable package
 
 The code should run on any relatively recent GPU, but all logic should also run (more slowly) on CPU.
 
+If you see JAX CUDA plugin errors such as `Unable to load cuSPARSE`, run commands through:
+
+```bash
+scripts/with_cuda_env.sh <your command>
+```
+
+This forces `LD_LIBRARY_PATH` to prefer CUDA libraries from `.venv` (`nvidia-*` wheels), avoiding mixed system/venv CUDA library resolution.
+
 ## Training Pipeline
 Dreamer 4 follows a 4-stage training pipeline.
 - **Phase 1**: Train a causal tokenizer (MAE-style) on videos.
@@ -70,16 +78,16 @@ To run the training pipeline, edit the configs in each script's `__main__` block
 
 ```bash
 # Phase 1: Train the causal tokenizer
-python scripts/train_tokenizer.py
+scripts/with_cuda_env.sh python scripts/train_tokenizer.py
 
 # Phase 2: Train the dynamics model (requires tokenizer checkpoint)
-python scripts/train_dynamics.py tokenizer_ckpt=./logs/tokenizer/checkpoints
+scripts/with_cuda_env.sh python scripts/train_dynamics.py tokenizer_ckpt=./logs/tokenizer/checkpoints
 
 # Phase 3: Train BC/reward heads (requires tokenizer + dynamics checkpoints)
-python scripts/train_heads.py tokenizer_ckpt=./logs/tokenizer/checkpoints dynamics_ckpt=./logs/train_dynamics/checkpoints
+scripts/with_cuda_env.sh python scripts/train_heads.py tokenizer_ckpt=./logs/tokenizer/checkpoints dynamics_ckpt=./logs/train_dynamics/checkpoints
 
 # Phase 4: Train policy in imagination (requires BC/reward checkpoint)
-python scripts/train_policy.py heads_ckpt=./logs/heads/checkpoints
+scripts/with_cuda_env.sh python scripts/train_policy.py heads_ckpt=./logs/heads/checkpoints
 ```
 
 All scripts save checkpoints under `logs/{run_name}/checkpoints/` by default. You can also enable wandb logging by adding `use_wandb=True` to the launch command. We use hydra to manage the configurations in `/configs`.

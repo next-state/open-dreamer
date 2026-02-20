@@ -75,7 +75,7 @@ def _num_pixel_tokens(cfg: DynamicsConfig) -> int:
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "context_length"),
+    static_argnames=("k_max", "context_length", "B_self"),
     donate_argnames=("videos", "actions"),
 )
 def train_step(
@@ -89,6 +89,7 @@ def train_step(
     step: int,
     k_max: int,
     context_length: int | None,
+    B_self: int,
 ):
     frames = _normalize_frames(videos, pixel_normalizer, dynamics.dtype, update_stats=True)
     step_key = jax.random.fold_in(master_key, step)
@@ -102,7 +103,7 @@ def train_step(
             k_max=k_max,
             context_length=context_length,
             task_embeddings=None,
-            B_self=0,
+            B_self=B_self,
         )
         return losses['total'], aux
 
@@ -118,7 +119,7 @@ def train_step(
 
 
 @nnx.jit(
-    static_argnames=("k_max", "context_length"),
+    static_argnames=("k_max", "context_length", "B_self"),
 )
 def eval_step(
     dynamics: Dynamics,
@@ -130,6 +131,7 @@ def eval_step(
     step: int,
     k_max: int,
     context_length: int | None,
+    B_self: int,
 ):
     frames = _normalize_frames(videos, pixel_normalizer, dynamics.dtype, update_stats=False)
     step_key = jax.random.fold_in(master_key, step)
@@ -142,7 +144,7 @@ def eval_step(
         k_max=k_max,
         context_length=context_length,
         task_embeddings=None,
-        B_self=0,
+        B_self=B_self,
     )
 
     return {
@@ -273,6 +275,7 @@ def run(cfg: DynamicsConfig):
                     (cfg.write_video_every > 0 and (step % cfg.write_video_every == 0) and step > 0)
                     or step == cfg.max_steps - 1
                 )
+                B_self = int((videos.shape[0] * cfg.bootstrap_frac) if step >= cfg.bootstrap_start else 0)
                 if should_eval:
                     val_data = videos[:4]
                     val_actions = actions[:4]
@@ -298,6 +301,7 @@ def run(cfg: DynamicsConfig):
                         step=step,
                         k_max=cfg.dynamics.k_max,
                         context_length=cfg.dynamics.context_length,
+                        B_self=B_self,
                     )
                     logger.log_metrics(step, jax.device_get(eval_metrics), prefix="eval/")
 
@@ -311,6 +315,7 @@ def run(cfg: DynamicsConfig):
                     step=step,
                     k_max=cfg.dynamics.k_max,
                     context_length=cfg.dynamics.context_length,
+                    B_self=B_self,
                 )
 
                 if logger.should_log(step):

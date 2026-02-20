@@ -23,9 +23,21 @@ class DenoiseSchedule:
     step_idx_ctx: int
     tau_idx_ctx: int
     tau_ctx: float
+    update_scale: float
+    max_residual_rms: float
+    state_clip: float
 
     @classmethod
-    def init(cls, num_steps: int, k_max: int = 256, tau_ctx: float = 1.0) -> "DenoiseSchedule":
+    def init(
+        cls,
+        num_steps: int,
+        k_max: int = 256,
+        tau_ctx: float = 1.0,
+        *,
+        update_scale: float = 1.0,
+        max_residual_rms: float = 0.0,
+        state_clip: float = 0.0,
+    ) -> "DenoiseSchedule":
         if k_max % num_steps != 0:
             raise ValueError(f"k_max={k_max} must be divisible by num_steps={num_steps}")
 
@@ -42,7 +54,47 @@ class DenoiseSchedule:
         tau_idx_ctx = k_max - 1
         tau_ctx = 1.0
 
-        return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, step_idx_ctx, tau_idx_ctx, tau_ctx)
+        return cls(
+            num_steps,
+            k_max,
+            d,
+            step_idx,
+            tau_values,
+            tau_indices,
+            step_idx_ctx,
+            tau_idx_ctx,
+            tau_ctx,
+            float(update_scale),
+            float(max_residual_rms),
+            float(state_clip),
+        )
+
+
+def _stable_refinement_update(
+    state_prev: jax.Array,
+    state_clean: jax.Array,
+    tau_prev: jax.Array,
+    tau_curr: jax.Array,
+    update_scale: float,
+    max_residual_rms: float,
+    state_clip: float,
+) -> jax.Array:
+    """One denoising update with optional trust-region style residual control."""
+    mix = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
+    mix = jnp.clip(mix * jnp.asarray(update_scale, dtype=state_prev.dtype), 0.0, 1.0)
+
+    residual = state_clean - state_prev
+    if max_residual_rms > 0.0:
+        reduce_axes = tuple(range(2, residual.ndim))
+        rms = jnp.sqrt(jnp.mean(residual * residual, axis=reduce_axes, keepdims=True) + 1e-8)
+        cap = jnp.asarray(max_residual_rms, dtype=state_prev.dtype)
+        residual = residual * jnp.minimum(1.0, cap / rms)
+
+    state_next = state_prev + mix * residual
+    if state_clip > 0.0:
+        clip = jnp.asarray(state_clip, dtype=state_prev.dtype)
+        state_next = jnp.clip(state_next, -clip, clip)
+    return state_next
 
 
 def next_latent(
@@ -74,7 +126,6 @@ def next_latent(
     def refinement_step(latent_prev, s):
         tau_prev = schedule.tau_values[s]
         tau_curr = schedule.tau_values[s + 1]
-        mix = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
 
         tau_indices = jnp.full((B, 1), schedule.tau_indices[s], dtype=jnp.int32)
         latent_clean_seq, (h_seq, _) = dynamics(
@@ -89,7 +140,15 @@ def next_latent(
         latent_clean = latent_clean_seq[:, -1:, :, :C]
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq
 
-        latent_next = (1.0 - mix) * latent_prev + mix * latent_clean
+        latent_next = _stable_refinement_update(
+            latent_prev,
+            latent_clean,
+            tau_prev,
+            tau_curr,
+            update_scale=schedule.update_scale,
+            max_residual_rms=schedule.max_residual_rms,
+            state_clip=schedule.state_clip,
+        )
         return latent_next, h_last
 
     latent_t_final, h_history = jax.lax.scan(
@@ -158,7 +217,6 @@ def next_observation(
     def refinement_step(obs_prev, s):
         tau_prev = schedule.tau_values[s]
         tau_curr = schedule.tau_values[s + 1]
-        mix = (tau_curr - tau_prev) / jnp.maximum(1.0 - tau_prev, 1e-8)
 
         tau_indices = jnp.full((B, 1), schedule.tau_indices[s], dtype=jnp.int32)
         obs_clean_seq, (h_seq, _) = dynamics(
@@ -173,7 +231,15 @@ def next_observation(
         obs_clean = obs_clean_seq[:, -1:]
         h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else h_seq
 
-        obs_next = (1.0 - mix) * obs_prev + mix * obs_clean
+        obs_next = _stable_refinement_update(
+            obs_prev,
+            obs_clean,
+            tau_prev,
+            tau_curr,
+            update_scale=schedule.update_scale,
+            max_residual_rms=schedule.max_residual_rms,
+            state_clip=schedule.state_clip,
+        )
         return obs_next, h_last
 
     obs_t_final, h_history = jax.lax.scan(

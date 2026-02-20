@@ -212,6 +212,28 @@ def _sigma_to_state_shape(sigma: jnp.ndarray, state: jnp.ndarray) -> jnp.ndarray
     return sigma.reshape(*sigma.shape, *([1] * extra_dims))
 
 
+def _sample_training_noise(key: jax.Array, latents: jnp.ndarray) -> jnp.ndarray:
+    """
+    Sample base Gaussian noise, then apply per-(batch, channel) shift and log-space scale.
+
+    For latent shape (B, ... , C), shift/scale are shaped (B, 1, ..., 1, C), so they vary
+    across batch and channel while broadcasting over time/spatial/token dimensions.
+    """
+    key_base, key_shift, key_scale = jax.random.split(key, 3)
+    noise = jax.random.normal(key_base, latents.shape, dtype=latents.dtype)
+
+    bc_shape = (latents.shape[0],) + (1,) * (latents.ndim - 2) + (latents.shape[-1],)
+    shift = jax.random.uniform(
+        key_shift,
+        bc_shape,
+        minval=jnp.asarray(-0.2, dtype=latents.dtype),
+        maxval=jnp.asarray(0.2, dtype=latents.dtype),
+        dtype=latents.dtype,
+    )
+    scale = jnp.exp(jax.random.normal(key_scale, bc_shape, dtype=latents.dtype))
+    return (noise + shift) * scale
+
+
 def compute_bootstrap_loss(z_pred: jnp.ndarray, z_tilde: jnp.ndarray, b_prime: jnp.ndarray, b_doubleprime: jnp.ndarray, sigma: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Bootstrap self-consistency loss for shortcut forcing.
@@ -286,7 +308,7 @@ def flow_forward(
     step_idx = jnp.full((B, T), emax, dtype=jnp.int32)
     sigma, sigma_idx = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx, dtype=latents.dtype)
 
-    z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
+    z0 = _sample_training_noise(key_noise, latents)
     sigma_scaled = _sigma_to_state_shape(sigma, latents)
     z_tilde = (1.0 - sigma_scaled) * z0 + sigma_scaled * latents
 
@@ -339,7 +361,7 @@ def bootstrap_forward(
     d_self, step_idx = sample_step_excluding_dmin(key_step, (B, T), k_max, dtype=latents.dtype)
     sigma, sigma_idx = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx, dtype=latents.dtype)
 
-    z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
+    z0 = _sample_training_noise(key_noise, latents)
     sigma_scaled = _sigma_to_state_shape(sigma, latents)
     z_tilde = (1.0 - sigma_scaled) * z0 + sigma_scaled * latents
 
@@ -812,8 +834,23 @@ def run_evaluation(
     k_max = dynamics.cfg.k_max
     input_space = getattr(dynamics.cfg, "input_space", "latent")
     is_pixel_mode = input_space == "pixel"
-    schedule_shortcut = DenoiseSchedule.init(4, k_max)
-    schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
+    denoise_update_scale = float(getattr(dynamics.cfg, "denoise_update_scale", 1.0))
+    denoise_max_residual_rms = float(getattr(dynamics.cfg, "denoise_max_residual_rms", 0.0))
+    denoise_state_clip = float(getattr(dynamics.cfg, "denoise_state_clip", 0.0))
+    schedule_shortcut = DenoiseSchedule.init(
+        4,
+        k_max,
+        update_scale=denoise_update_scale,
+        max_residual_rms=denoise_max_residual_rms,
+        state_clip=denoise_state_clip,
+    )
+    schedule_diffusion = DenoiseSchedule.init(
+        k_max,
+        k_max,
+        update_scale=denoise_update_scale,
+        max_residual_rms=denoise_max_residual_rms,
+        state_clip=denoise_state_clip,
+    )
 
     evaluation_schedules = {"shortcut": schedule_shortcut, "diffusion": schedule_diffusion}
 
