@@ -871,14 +871,40 @@ def run_evaluation(
             print(f"[eval:{tag}] MP4 write failed: {e}")
 
         # Log metrics and video
-        ode_diags_cpu = {k: float(v) for k, v in jax.device_get(ode_diags).items()}
+        ode_diags_cpu = jax.device_get(ode_diags)
+        ode_scalars = {k: float(v) for k, v in ode_diags_cpu.items() if v.ndim == 0}
         logger.log_metrics(step, {
             f"{tag}/mse": mse,
             f"{tag}/psnr": psnr,
             f"{tag}/horizon": horizon,
             f"{tag}/eval_time": dt,
-            **{f"{tag}/ode/{k}": v for k, v in ode_diags_cpu.items()},
+            **{f"{tag}/ode/{k}": v for k, v in ode_scalars.items()},
         }, prefix="eval/")
+
+        # ODE progression plot: one curve per metric, x-axis = τ-ladder step
+        ode_curves = {k.replace('_steps', ''): v for k, v in ode_diags_cpu.items() if v.ndim == 1}
+        if ode_curves:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import io as _io
+            import numpy as _np
+            from PIL import Image as _Image
+
+            fig, axes = plt.subplots(1, len(ode_curves), figsize=(4 * len(ode_curves), 3), squeeze=False)
+            for ax, (name, values) in zip(axes[0], ode_curves.items()):
+                ax.plot(_np.arange(len(values)), values)
+                ax.set_xlabel('τ-step')
+                ax.set_title(name)
+                ax.grid(True, alpha=0.4)
+            fig.suptitle(f'{tag} ODE step={step}', fontsize=9)
+            fig.tight_layout()
+            buf = _io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            ode_plot_img = _np.array(_Image.open(buf).convert('RGB'))
+            plt.close(fig)
+            logger.log_image(step, f"eval/{tag}/ode_progression", ode_plot_img, caption=f"ODE step={step}")
 
         if videos is not None:
             logger.log_video(step, f"eval/{tag}/video", mp4_path)
