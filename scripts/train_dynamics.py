@@ -4,6 +4,7 @@ import hydra
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -113,14 +114,17 @@ def train_step(
         return losses['total'], aux
 
     (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
-        dynamics, 
+        dynamics,
         latents, actions, time_mask, context_length
     )
+
+    # Compute gradient norm for training health diagnostics
+    grad_norm = optax.global_norm(nnx.state(grads))
 
     # Update model with optimizer
     optimizer.update(dynamics, grads)
 
-    return metrics
+    return {**metrics, 'grad_norm': grad_norm}
 
 # ---------------------------
 # Main
@@ -261,8 +265,13 @@ def run(cfg: DynamicsConfig):
                         metrics={
                             "flow_mse": metrics_cpu["flow_mse"],
                             "boot_mse": metrics_cpu["bootstrap_mse"],
+                            "grad_norm": metrics_cpu["grad_norm"],
+                            "flow_mse_low": metrics_cpu["flow_mse_low"],
+                            "flow_mse_mid": metrics_cpu["flow_mse_mid"],
+                            "flow_mse_high": metrics_cpu["flow_mse_high"],
+                            "boot_target_norm": metrics_cpu["boot_target_norm"],
+                            "boot_clip_frac": metrics_cpu["boot_clip_frac"],
                             "lr": lr_schedule(step),
-                            # "batch_type": 1. if use_long else 0,
                             **scaling.get_step_metrics(step),
                         },
                         pbar=pbar,

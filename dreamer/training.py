@@ -213,7 +213,7 @@ def compute_flow_loss(
     z_pred: jnp.ndarray,
     z_target: jnp.ndarray,
     sigma: jnp.ndarray,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Flow matching loss in x-space (direct prediction of clean latents).
     
@@ -230,11 +230,10 @@ def compute_flow_loss(
     """
     mse_per_token = (z_pred - z_target) ** 2  # (B, T, S, D)
     mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
-    
-    
+
     # Apply ramp weighting and reduce
     weights = ramp_weight(sigma)
-    return jnp.mean(mse_per_step * weights), jnp.mean(mse_per_step)
+    return jnp.mean(mse_per_step * weights), jnp.mean(mse_per_step), mse_per_step
 
 
 def compute_bootstrap_loss(
@@ -374,11 +373,21 @@ def shortcut_forcing_step(
     
     # --- Flow loss (empirical rows) ---
     z_pred_emp = z_pred_full[:B_emp]
-    loss_flow, flow_mse_unweighted = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
+    loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
+
+    # Per-σ-bin flow MSE: breaks down where failures occur on the noise schedule
+    mask_low  = sigma_emp < 0.25
+    mask_mid  = (sigma_emp >= 0.25) & (sigma_emp < 0.75)
+    mask_high = sigma_emp >= 0.75
+    flow_mse_low  = jnp.sum(mse_per_step_emp * mask_low)  / jnp.maximum(jnp.sum(mask_low.astype(jnp.float32)),  1.0)
+    flow_mse_mid  = jnp.sum(mse_per_step_emp * mask_mid)  / jnp.maximum(jnp.sum(mask_mid.astype(jnp.float32)),  1.0)
+    flow_mse_high = jnp.sum(mse_per_step_emp * mask_high) / jnp.maximum(jnp.sum(mask_high.astype(jnp.float32)), 1.0)
     
     # --- Bootstrap loss (self-consistency rows) ---
     loss_boot = jnp.array(0.0, dtype=latents.dtype)
     boot_mse_unweighted = jnp.array(0.0, dtype=latents.dtype)
+    boot_target_norm = jnp.array(0.0, dtype=latents.dtype)
+    boot_clip_frac = jnp.array(0.0, dtype=latents.dtype)
     
     if B_self > 0:
         z_pred_self = z_pred_full[B_emp:]
@@ -411,6 +420,11 @@ def shortcut_forcing_step(
         z1_half2 = jax.lax.stop_gradient(z1_half2)
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-5)
 
+        # Bootstrap target health diagnostics (before clipping)
+        v_target_unclipped = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
+        boot_target_norm = jnp.mean(jnp.abs(v_target_unclipped))
+        boot_clip_frac = jnp.mean((jnp.abs(v_target_unclipped) > 4.0).astype(jnp.float32))
+
         # Bootstrap loss (computed unconditionally)
         loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
     
@@ -419,7 +433,16 @@ def shortcut_forcing_step(
     loss_total = ((loss_flow * (B - B_self)) + (loss_boot * B_self)) / B
     
     losses = {'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
-    aux = {'flow_mse': flow_mse_unweighted, 'bootstrap_mse': boot_mse_unweighted, 'h_states': h_states}
+    aux = {
+        'flow_mse': flow_mse_unweighted,
+        'bootstrap_mse': boot_mse_unweighted,
+        'flow_mse_low': flow_mse_low,
+        'flow_mse_mid': flow_mse_mid,
+        'flow_mse_high': flow_mse_high,
+        'boot_target_norm': boot_target_norm,
+        'boot_clip_frac': boot_clip_frac,
+        'h_states': h_states,
+    }
     
     
     return losses, aux
@@ -794,7 +817,7 @@ def run_evaluation(
 
         # Sample video predictions
         if use_latent_data:
-            pred_frames, gt_decoded_frames, _ = sample_video(
+            pred_frames, gt_decoded_frames, _, ode_diags = sample_video(
                 tokenizer, dynamics, frames=None,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=rng, policy=policy, task_embedder=task_embedder,
@@ -803,7 +826,7 @@ def run_evaluation(
             # For metrics, compare pred vs gt_decoded (both from latents)
             gt_frames_for_metrics = gt_decoded_frames
         else:
-            pred_frames, gt_decoded_frames, original_frames = sample_video(
+            pred_frames, gt_decoded_frames, original_frames, ode_diags = sample_video(
                 tokenizer, dynamics, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=rng, policy=policy, task_embedder=task_embedder
@@ -848,12 +871,41 @@ def run_evaluation(
             print(f"[eval:{tag}] MP4 write failed: {e}")
 
         # Log metrics and video
+        ode_diags_cpu = jax.device_get(ode_diags)
+        ode_scalars = {k: float(v) for k, v in ode_diags_cpu.items() if v.ndim == 0}
         logger.log_metrics(step, {
             f"{tag}/mse": mse,
             f"{tag}/psnr": psnr,
             f"{tag}/horizon": horizon,
             f"{tag}/eval_time": dt,
+            **{f"{tag}/ode/{k}": v for k, v in ode_scalars.items()},
         }, prefix="eval/")
+
+        # ODE progression plot: one curve per metric, x-axis = τ-ladder step
+        ode_curves = {k.replace('_steps', ''): v for k, v in ode_diags_cpu.items() if v.ndim == 1}
+        if ode_curves:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import io as _io
+            import numpy as _np
+            from PIL import Image as _Image
+
+            tau_xs = _np.array(schedule_config.tau_values[:-1])  # starting τ of each step
+            fig, axes = plt.subplots(1, len(ode_curves), figsize=(4 * len(ode_curves), 3), squeeze=False)
+            for ax, (name, values) in zip(axes[0], ode_curves.items()):
+                ax.plot(tau_xs, values)
+                ax.set_xlabel('τ')
+                ax.set_title(name)
+                ax.grid(True, alpha=0.4)
+            fig.suptitle(f'{tag} ODE step={step}', fontsize=9)
+            fig.tight_layout()
+            buf = _io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            ode_plot_img = _np.array(_Image.open(buf).convert('RGB'))
+            plt.close(fig)
+            logger.log_image(step, f"eval/{tag}/ode_progression", ode_plot_img, caption=f"ODE step={step}")
 
         if videos is not None:
             logger.log_video(step, f"eval/{tag}/video", mp4_path)

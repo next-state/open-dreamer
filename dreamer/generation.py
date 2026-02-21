@@ -10,6 +10,7 @@ from flax.struct import dataclass
 
 
 LATENT_NORM_CLIP = 4.0
+TAU_IDX_MAX = 120  # Cap τ-ladder: only run refinement steps where tau index <= this value
 
 @dataclass
 class DenoiseSchedule:
@@ -27,9 +28,11 @@ class DenoiseSchedule:
         step_idx_ctx: step index for context frames (may differ from step_idx for finer tau_ctx control).
         tau_idx_ctx: tau index for slightly noised context frames, snapped to step_idx_ctx ladder.
         tau_ctx: noise level of context frames during autoregressive rollout.
+        num_steps_capped: number of τ-ladder steps to run (min(num_steps, steps with tau index <= TAU_IDX_MAX)); concrete int for JAX tracing.
     """
 
     num_steps: int
+    num_steps_capped: int
     k_max: int
     d: float
     step_idx: int
@@ -75,7 +78,12 @@ class DenoiseSchedule:
         tau_ctx = jnp.array(j_ctx / K_ctx, dtype=dtype)
         tau_idx_ctx = j_ctx * (k_max // K_ctx)
 
-        return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
+        # Concrete int: only run steps where tau index <= TAU_IDX_MAX (for jnp.arange in next_latent when traced).
+        step_size = k_max // num_steps
+        max_s = TAU_IDX_MAX // step_size
+        num_steps_capped = min(num_steps, max_s + 1)
+
+        return cls(num_steps, num_steps_capped, k_max, d, step_idx, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
     
 # ---------------------------
 # Single-step τ-ladder denoiser
@@ -93,7 +101,7 @@ def next_latent(
     gru_states: GRUStatesDict | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: Actions | None = None,
-) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, GRUStatesDict | None, jax.Array]:
+) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, GRUStatesDict | None, jax.Array, dict]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
 
@@ -171,18 +179,39 @@ def next_latent(
         latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
 
+        # Per-step ODE diagnostics
+        x0_norm = jnp.mean(jnp.abs(latent_clean_pred))
+        update_mag = jnp.mean(jnp.abs((1.0 - beta) * (latent_clean_pred - latent_t)))
+
         # Per-step mixing toward clean latent
         latent_t_new = beta * latent_t + (1.0 - beta) * latent_clean_pred
+        clip_frac = jnp.mean((jnp.abs(latent_t_new) > LATENT_NORM_CLIP).astype(jnp.float32))
         latent_t_new = jnp.clip(latent_t_new, -LATENT_NORM_CLIP, LATENT_NORM_CLIP)
 
-        return latent_t_new, h_last
+        return latent_t_new, (h_last, x0_norm, update_mag, clip_frac)
 
     # Run τ-ladder with JAX control flow using scan to keep carry/output structure consistent.
-    latent_t_final, h_history = jax.lax.scan(
+    # Only run steps where tau index <= TAU_IDX_MAX (schedule.num_steps_capped is a concrete int for tracing).
+    latent_t_final, (h_history, x0_norm_hist, update_mag_hist, clip_frac_hist) = jax.lax.scan(
         refinement_step,
         noisy_latent,
-        jnp.arange(schedule.num_steps),
+        jnp.arange(schedule.num_steps_capped),
     )
+
+    # Aggregate per-step ODE diagnostics across τ-ladder steps.
+    # Scalar aggregates for cheap scalar logging; raw arrays for progression plots.
+    diag_dict = {
+        'x0_norm_mean': jnp.mean(x0_norm_hist),
+        'x0_norm_max': jnp.max(x0_norm_hist),
+        'update_mag_mean': jnp.mean(update_mag_hist),
+        'update_mag_max': jnp.max(update_mag_hist),
+        'clip_frac_mean': jnp.mean(clip_frac_hist),
+        'clip_frac_max': jnp.max(clip_frac_hist),
+        # Per-τ-step arrays (shape: num_steps,) for plotting
+        'x0_norm_steps': x0_norm_hist,
+        'update_mag_steps': update_mag_hist,
+        'clip_frac_steps': clip_frac_hist,
+    }
 
     if caches is not None:
         # Update caches (and GRU states) by doing one more forward pass with tau_ctx
@@ -209,7 +238,7 @@ def next_latent(
     # Unnormalize output so caller receives latents in original space
     latent_t_final = unnormalize_latents(latent_t_final, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
-    return latent_t_final, h_last, caches_new, gru_states_new, rng
+    return latent_t_final, h_last, caches_new, gru_states_new, rng, diag_dict
 
 def next_frame(
     tokenizer: Tokenizer,
@@ -242,7 +271,7 @@ def next_frame(
         Tuple of (frame as jax.Array, h_last, updated dynamics cache, updated gru_states, updated tokenizer cache, updated rng)
     """
     # Generate next latent using τ-ladder denoising
-    latent, h_last, dynamics_cache_updated, gru_states_new, rng = next_latent(
+    latent, h_last, dynamics_cache_updated, gru_states_new, rng, _ = next_latent(
         dynamics=dynamics,
         schedule=schedule,
         action=action,
@@ -338,14 +367,14 @@ def latent_rollout(
             action = all_actions[:, 0, 0, ...]  # (B, ...) - use first predicted action
 
         # Predict next latent (denoising)
-        latent_next, h_next, caches_next, gru_states_next, rng = next_latent(
+        latent_next, h_next, caches_next, gru_states_next, rng, diag = next_latent(
             dynamics, schedule, action, latent_shape, rng, caches=caches_t, gru_states=gru_states_t, task_embedding=task_embedding
         )
 
-        return (h_next, caches_next, gru_states_next, rng), (latent_next[:, 0], action, h_next) # latent_next is (B, 1, n_spatial, D_s)
+        return (h_next, caches_next, gru_states_next, rng), (latent_next[:, 0], action, h_next, diag)  # latent_next is (B, 1, n_spatial, D_s)
 
     # Run scan
-    _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
+    _, (rollout_latents, rollout_actions, rollout_hidden, rollout_diags) = jax.lax.scan(
         scan_step,
         (h_last, caches, gru_states, rng),
         jnp.arange(num_steps)
@@ -357,6 +386,10 @@ def latent_rollout(
     # h_next has shape (B, 1, n_agent, d_model), so scan output is (t, B, 1, n_agent, d_model)
     rollout_hidden = einops.rearrange(rollout_hidden, 't b 1 n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
 
+    # Aggregate ODE diagnostics: mean over autoregressive steps (axis 0).
+    # Scalar leaves (num_AR_steps,) → scalar; array leaves (num_AR_steps, num_tau_steps) → (num_tau_steps,).
+    ode_diags = jax.tree.map(lambda x: jnp.mean(x, axis=0), rollout_diags)
+
     out_latents = jnp.concatenate((latents_ctx_orig, rollout_latents), axis=1)
 
     return {
@@ -364,7 +397,8 @@ def latent_rollout(
         'actions': rollout_actions,
         'hidden_states': rollout_hidden,
         'context_hidden': h_seq,
-    } 
+        'ode_diags': ode_diags,
+    }
 
 def video_rollout(
     tokenizer: Tokenizer,

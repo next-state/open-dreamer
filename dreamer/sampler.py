@@ -27,7 +27,7 @@ def sample_video(
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
     latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
-) -> Tuple[jax.Array, jax.Array, jax.Array | None]:
+) -> Tuple[jax.Array, jax.Array, jax.Array | None, jax.Array]:
     """
     Sample video predictions using Tokenizer and Dynamics.
 
@@ -123,5 +123,6 @@ def sample_video(
     pred_frames = decode_jit(rollout_result['latents'])
     pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
+    ode_diags = rollout_result.get('ode_diags', {})
 
-    return pred_frames, gt_decoded_frames, original_frames
+    return pred_frames, gt_decoded_frames, original_frames, ode_diags
