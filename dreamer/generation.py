@@ -344,14 +344,14 @@ def latent_rollout(
             action = all_actions[:, 0, 0, ...]  # (B, ...) - use first predicted action
         
         # Predict next latent (denoising)
-        latent_next, h_next, caches_next, rng, _ = next_latent(
+        latent_next, h_next, caches_next, rng, diag = next_latent(
             dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
         )
-        
-        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
+
+        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next, diag)  # latent_next is (B, 1, n_spatial, D_s)
 
     # Run scan
-    _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
+    _, (rollout_latents, rollout_actions, rollout_hidden, rollout_diags) = jax.lax.scan(
         scan_step,
         (h_last, caches, rng),
         jnp.arange(num_steps)
@@ -363,6 +363,9 @@ def latent_rollout(
     # h_next has shape (B, 1, n_agent, d_model), so scan output is (t, B, 1, n_agent, d_model)
     rollout_hidden = einops.rearrange(rollout_hidden, 't b 1 n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
 
+    # Aggregate ODE diagnostics: mean over autoregressive steps (rollout_diags values are shape (num_steps,))
+    ode_diags = jax.tree.map(jnp.mean, rollout_diags)
+
     out_latents = jnp.concatenate((latents_ctx_orig, rollout_latents), axis=1)
 
     return {
@@ -370,7 +373,8 @@ def latent_rollout(
         'actions': rollout_actions,
         'hidden_states': rollout_hidden,
         'context_hidden': h_seq,
-    } 
+        'ode_diags': ode_diags,
+    }
 
 def video_rollout(
     tokenizer: Tokenizer,

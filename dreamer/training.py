@@ -817,7 +817,7 @@ def run_evaluation(
 
         # Sample video predictions
         if use_latent_data:
-            pred_frames, gt_decoded_frames, _ = sample_video(
+            pred_frames, gt_decoded_frames, _, ode_diags = sample_video(
                 tokenizer, dynamics, frames=None,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=rng, policy=policy, task_embedder=task_embedder,
@@ -826,7 +826,7 @@ def run_evaluation(
             # For metrics, compare pred vs gt_decoded (both from latents)
             gt_frames_for_metrics = gt_decoded_frames
         else:
-            pred_frames, gt_decoded_frames, original_frames = sample_video(
+            pred_frames, gt_decoded_frames, original_frames, ode_diags = sample_video(
                 tokenizer, dynamics, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=rng, policy=policy, task_embedder=task_embedder
@@ -871,11 +871,13 @@ def run_evaluation(
             print(f"[eval:{tag}] MP4 write failed: {e}")
 
         # Log metrics and video
+        ode_diags_cpu = {k: float(v) for k, v in jax.device_get(ode_diags).items()}
         logger.log_metrics(step, {
             f"{tag}/mse": mse,
             f"{tag}/psnr": psnr,
             f"{tag}/horizon": horizon,
             f"{tag}/eval_time": dt,
+            **{f"{tag}/ode/{k}": v for k, v in ode_diags_cpu.items()},
         }, prefix="eval/")
 
         if videos is not None:
