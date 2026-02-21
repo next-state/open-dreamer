@@ -10,6 +10,7 @@ from flax.struct import dataclass
 
 
 LATENT_NORM_CLIP = 4.0
+TAU_IDX_MAX = 120  # Cap τ-ladder: only run refinement steps where tau index <= this value
 
 @dataclass
 class DenoiseSchedule:
@@ -179,10 +180,12 @@ def next_latent(
         return latent_t_new, (h_last, x0_norm, update_mag, clip_frac)
 
     # Run τ-ladder with JAX control flow using scan to keep carry/output structure consistent.
+    # Only run steps where tau index <= TAU_IDX_MAX (stop if tau step index > 120).
+    steps_to_run = jnp.sum(schedule.tau_indices[: schedule.num_steps] <= TAU_IDX_MAX)
     latent_t_final, (h_history, x0_norm_hist, update_mag_hist, clip_frac_hist) = jax.lax.scan(
         refinement_step,
         noisy_latent,
-        jnp.arange(schedule.num_steps),
+        jnp.arange(steps_to_run),
     )
 
     # Aggregate per-step ODE diagnostics across τ-ladder steps.
