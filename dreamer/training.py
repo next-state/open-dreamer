@@ -213,7 +213,7 @@ def compute_flow_loss(
     z_pred: jnp.ndarray,
     z_target: jnp.ndarray,
     sigma: jnp.ndarray,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Flow matching loss in x-space (direct prediction of clean latents).
     
@@ -230,11 +230,10 @@ def compute_flow_loss(
     """
     mse_per_token = (z_pred - z_target) ** 2  # (B, T, S, D)
     mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
-    
-    
+
     # Apply ramp weighting and reduce
     weights = ramp_weight(sigma)
-    return jnp.mean(mse_per_step * weights), jnp.mean(mse_per_step)
+    return jnp.mean(mse_per_step * weights), jnp.mean(mse_per_step), mse_per_step
 
 
 def compute_bootstrap_loss(
@@ -374,11 +373,21 @@ def shortcut_forcing_step(
     
     # --- Flow loss (empirical rows) ---
     z_pred_emp = z_pred_full[:B_emp]
-    loss_flow, flow_mse_unweighted = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
+    loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
+
+    # Per-σ-bin flow MSE: breaks down where failures occur on the noise schedule
+    mask_low  = sigma_emp < 0.25
+    mask_mid  = (sigma_emp >= 0.25) & (sigma_emp < 0.75)
+    mask_high = sigma_emp >= 0.75
+    flow_mse_low  = jnp.sum(mse_per_step_emp * mask_low)  / jnp.maximum(jnp.sum(mask_low.astype(jnp.float32)),  1.0)
+    flow_mse_mid  = jnp.sum(mse_per_step_emp * mask_mid)  / jnp.maximum(jnp.sum(mask_mid.astype(jnp.float32)),  1.0)
+    flow_mse_high = jnp.sum(mse_per_step_emp * mask_high) / jnp.maximum(jnp.sum(mask_high.astype(jnp.float32)), 1.0)
     
     # --- Bootstrap loss (self-consistency rows) ---
     loss_boot = jnp.array(0.0, dtype=latents.dtype)
     boot_mse_unweighted = jnp.array(0.0, dtype=latents.dtype)
+    boot_target_norm = jnp.array(0.0, dtype=latents.dtype)
+    boot_clip_frac = jnp.array(0.0, dtype=latents.dtype)
     
     if B_self > 0:
         z_pred_self = z_pred_full[B_emp:]
@@ -411,6 +420,11 @@ def shortcut_forcing_step(
         z1_half2 = jax.lax.stop_gradient(z1_half2)
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 0.05)
 
+        # Bootstrap target health diagnostics (before clipping)
+        v_target_unclipped = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
+        boot_target_norm = jnp.mean(jnp.abs(v_target_unclipped))
+        boot_clip_frac = jnp.mean((jnp.abs(v_target_unclipped) > 4.0).astype(jnp.float32))
+
         # Bootstrap loss (computed unconditionally)
         loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
     
@@ -419,7 +433,16 @@ def shortcut_forcing_step(
     loss_total = ((loss_flow * (B - B_self)) + (loss_boot * B_self)) / B
     
     losses = {'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
-    aux = {'flow_mse': flow_mse_unweighted, 'bootstrap_mse': boot_mse_unweighted, 'h_states': h_states}
+    aux = {
+        'flow_mse': flow_mse_unweighted,
+        'bootstrap_mse': boot_mse_unweighted,
+        'flow_mse_low': flow_mse_low,
+        'flow_mse_mid': flow_mse_mid,
+        'flow_mse_high': flow_mse_high,
+        'boot_target_norm': boot_target_norm,
+        'boot_clip_frac': boot_clip_frac,
+        'h_states': h_states,
+    }
     
     
     return losses, aux

@@ -92,7 +92,7 @@ def next_latent(
     caches: KVCachesDict | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: Actions | None = None,
-) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array]:
+) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array, dict]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
 
@@ -167,18 +167,33 @@ def next_latent(
         latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
 
+        # Per-step ODE diagnostics
+        x0_norm = jnp.mean(jnp.abs(latent_clean_pred))
+        update_mag = jnp.mean(jnp.abs((1.0 - beta) * (latent_clean_pred - latent_t)))
+
         # Per-step mixing toward clean latent
         latent_t_new = beta * latent_t + (1.0 - beta) * latent_clean_pred
+        clip_frac = jnp.mean((jnp.abs(latent_t_new) > LATENT_NORM_CLIP).astype(jnp.float32))
         latent_t_new = jnp.clip(latent_t_new, -LATENT_NORM_CLIP, LATENT_NORM_CLIP)
 
-        return latent_t_new, h_last
+        return latent_t_new, (h_last, x0_norm, update_mag, clip_frac)
 
     # Run τ-ladder with JAX control flow using scan to keep carry/output structure consistent.
-    latent_t_final, h_history = jax.lax.scan(
+    latent_t_final, (h_history, x0_norm_hist, update_mag_hist, clip_frac_hist) = jax.lax.scan(
         refinement_step,
         noisy_latent,
         jnp.arange(schedule.num_steps),
     )
+
+    # Aggregate per-step ODE diagnostics across τ-ladder steps
+    diag_dict = {
+        'x0_norm_mean': jnp.mean(x0_norm_hist),
+        'x0_norm_max': jnp.max(x0_norm_hist),
+        'update_mag_mean': jnp.mean(update_mag_hist),
+        'update_mag_max': jnp.max(update_mag_hist),
+        'clip_frac_mean': jnp.mean(clip_frac_hist),
+        'clip_frac_max': jnp.max(clip_frac_hist),
+    }
     
     if caches is not None:
         # Update caches by doing one more forward pass with tau_ctx
@@ -204,7 +219,7 @@ def next_latent(
     # Unnormalize output so caller receives latents in original space
     latent_t_final = unnormalize_latents(latent_t_final, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
-    return latent_t_final, h_last, caches_new, rng
+    return latent_t_final, h_last, caches_new, rng, diag_dict
 
 def next_frame(
     tokenizer: Tokenizer,
@@ -235,7 +250,7 @@ def next_frame(
         Tuple of (frame as jax.Array, h_last, updated dynamics cache, updated tokenizer cache, updated rng)
     """
     # Generate next latent using τ-ladder denoising
-    latent, h_last, dynamics_cache_updated, rng = next_latent(
+    latent, h_last, dynamics_cache_updated, rng, _ = next_latent(
         dynamics=dynamics,
         schedule=schedule,
         action=action,
@@ -329,7 +344,7 @@ def latent_rollout(
             action = all_actions[:, 0, 0, ...]  # (B, ...) - use first predicted action
         
         # Predict next latent (denoising)
-        latent_next, h_next, caches_next, rng = next_latent(
+        latent_next, h_next, caches_next, rng, _ = next_latent(
             dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
         )
         
