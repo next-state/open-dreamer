@@ -891,10 +891,11 @@ def run_evaluation(
             import numpy as _np
             from PIL import Image as _Image
 
+            tau_xs = _np.array(schedule_config.tau_values[:-1])  # starting τ of each step
             fig, axes = plt.subplots(1, len(ode_curves), figsize=(4 * len(ode_curves), 3), squeeze=False)
             for ax, (name, values) in zip(axes[0], ode_curves.items()):
-                ax.plot(_np.arange(len(values)), values)
-                ax.set_xlabel('τ-step')
+                ax.plot(tau_xs, values)
+                ax.set_xlabel('τ')
                 ax.set_title(name)
                 ax.grid(True, alpha=0.4)
             fig.suptitle(f'{tag} ODE step={step}', fontsize=9)
