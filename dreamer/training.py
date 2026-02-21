@@ -399,7 +399,7 @@ def shortcut_forcing_step(
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
         )
         z1_half1 = jax.lax.stop_gradient(z1_half1)
-        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 0.05)
+        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-5)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
         z_prime = jnp.clip(z_prime, -4.0, 4.0)
 
@@ -409,7 +409,7 @@ def shortcut_forcing_step(
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
         )
         z1_half2 = jax.lax.stop_gradient(z1_half2)
-        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 0.05)
+        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-5)
 
         # Bootstrap loss (computed unconditionally)
         loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
