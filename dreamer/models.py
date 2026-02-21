@@ -120,7 +120,8 @@ class KVCache:
         return k_ordered, v_ordered, final_mask
 
 
-KVCachesDict = Dict[int, KVCache]  # Type alias for KV cache dictionaries
+KVCachesDict = Dict[int, KVCache]      # Type alias for KV cache dictionaries
+GRUStatesDict = Dict[int, jnp.ndarray]  # {time_layer_idx: hidden state (B*S, D)}
 
 
 def create_transformer_caches(
@@ -164,6 +165,60 @@ def create_transformer_caches(
 # ============================================================================
 # Building Blocks
 # ============================================================================
+
+class GRUTimeMixer(nnx.Module):
+    """Pre-normed GRU recurrence over the time dimension.
+
+    Operates on (B_flat, T, D) tensors. Supports both full-sequence training
+    (h0=None, scans over all T) and single-step inference (h0 provided, T=1).
+    """
+
+    def __init__(self, dim: int, dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.dim = dim
+        self.dtype = to_jnp_dtype(dtype)
+        param_dtype = to_jnp_dtype(param_dtype)
+
+        self.norm = nnx.RMSNorm(dim, use_scale=True, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
+        # Fused update-gate + reset-gate: [x, h] -> [z, r]
+        self.W_gates = nnx.Linear(2 * dim, 2 * dim, use_bias=False, dtype=self.dtype, param_dtype=param_dtype,
+                                  kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        # New hidden-state candidate: [x, r*h] -> h_tilde
+        self.W_state = nnx.Linear(2 * dim, dim, use_bias=False, dtype=self.dtype, param_dtype=param_dtype,
+                                  kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+
+    def __call__(self, x: jnp.ndarray, h0: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Args:
+            x:  (B_flat, T, D)
+            h0: (B_flat, D) initial hidden state, or None (zeros)
+
+        Returns:
+            h_seq:   (B_flat, T, D) hidden states at every time step
+            h_final: (B_flat, D)   last hidden state
+        """
+        x = self.norm(x).astype(self.dtype)
+        B, T, D = x.shape
+
+        if h0 is None:
+            h0 = jnp.zeros((B, D), dtype=self.dtype)
+
+        W_gates = self.W_gates
+        W_state = self.W_state
+
+        def gru_step(h, x_t):
+            xh = jnp.concatenate([x_t, h], axis=-1)          # (B, 2D)
+            gates = jax.nn.sigmoid(W_gates(xh))               # (B, 2D)
+            z, r = jnp.split(gates, 2, axis=-1)               # update, reset
+            h_tilde = jax.nn.tanh(W_state(
+                jnp.concatenate([x_t, r * h], axis=-1)))      # (B, D)
+            h_new = (1.0 - z) * h + z * h_tilde
+            return h_new, h_new                                # carry, output
+
+        h_final, h_seq = jax.lax.scan(gru_step, h0, x.transpose(1, 0, 2))  # scan over T
+        h_seq = h_seq.transpose(1, 0, 2)                      # (B, T, D)
+        return h_seq, h_final
+
 
 class RotaryEmbedding1D(nnx.Module):
     """Rotary Position Embedding with precomputed frequencies."""
@@ -327,6 +382,8 @@ class GroupedQueryAttention(nnx.Module):
                  is_causal: bool = False, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
                  use_seq_parallel: bool = False,
+                 use_gated_values: bool = False,
+                 use_value_residuals: bool = False,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.dim = dim
@@ -339,6 +396,8 @@ class GroupedQueryAttention(nnx.Module):
         self.use_bias = use_bias
         self.use_rmsnorm_scale = use_rmsnorm_scale
         self.use_seq_parallel = use_seq_parallel
+        self.use_gated_values = use_gated_values
+        self.use_value_residuals = use_value_residuals
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
         self.dtype = dtype
@@ -360,6 +419,16 @@ class GroupedQueryAttention(nnx.Module):
 
         self.rope = RotaryEmbedding1D(dim=head_dim, theta=self.rope_theta, dtype=dtype, param_dtype=param_dtype)
 
+        # Gated values: per-query-head sigmoid gate applied to attention output
+        if self.use_gated_values:
+            self.to_gates = nnx.Linear(dim, num_heads, use_bias=False, dtype=dtype, param_dtype=param_dtype,
+                                       kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('attn')), rngs=rngs)
+
+        # Value residuals: learned mixing of current v with the initial-layer value residual
+        if self.use_value_residuals:
+            self.to_value_mix = nnx.Linear(dim, num_kv_heads, use_bias=False, dtype=dtype, param_dtype=param_dtype,
+                                           kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('attn')), rngs=rngs)
+
     def __call__(
             self,
             x,
@@ -368,6 +437,7 @@ class GroupedQueryAttention(nnx.Module):
             local_window_size: int | tuple[int, int] | None = None,
             deterministic: bool = True,
             cache: KVCache | None = None,
+            residual_values: jnp.ndarray | None = None,
             rngs: nnx.Rngs | None = None
         ):
         """
@@ -379,11 +449,19 @@ class GroupedQueryAttention(nnx.Module):
         H = dimensions of each attention head
         K = number of key/value heads
         G = number of groups, which equals to N // K
+        residual_values: (B, T, kv_dim) where kv_dim = num_kv_heads * head_dim, or None
         """
         q = self.to_q(x)
         q = rearrange(q, "B T (N H) -> B T N H", N=self.num_heads)
         kv = self.to_kv(x)
         k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
+
+        # Value residuals: lerp between current v and the initial-layer value projection
+        if self.use_value_residuals and residual_values is not None:
+            rv = rearrange(residual_values, "B T (K H) -> B T K H", K=self.num_kv_heads)
+            mix = jax.nn.sigmoid(self.to_value_mix(x))   # (B, T, K)
+            mix = mix[:, :, :, None]                      # (B, T, K, 1)
+            v = (1.0 - mix) * v + mix * rv               # lerp
 
         scale = q.shape[-1] ** -0.5
         if self.qk_norm_type == 'qknorm':
@@ -468,6 +546,11 @@ class GroupedQueryAttention(nnx.Module):
                 local_window_size=local_window_size
             )  # TODO: try setting implementation="cudnn"
 
+        # Gated values: per-query-head sigmoid gate on the attention output
+        if self.use_gated_values:
+            gates = jax.nn.sigmoid(self.to_gates(x))   # (B, T, N)
+            attn = attn * gates[:, :, :, None]          # (B, T, N, H)
+
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
@@ -481,14 +564,16 @@ class SpaceSelfAttention(nnx.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 use_gated_values: bool = False, use_value_residuals: bool = False,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
             rope_theta=rope_theta, is_causal=False,
             use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
-            dtype=dtype, param_dtype=param_dtype, 
+            use_gated_values=use_gated_values, use_value_residuals=use_value_residuals,
+            dtype=dtype, param_dtype=param_dtype,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -500,14 +585,20 @@ class SpaceSelfAttention(nnx.Module):
             local_window_size: int | tuple[int, int] | None = None,
             deterministic: bool = True,
             cache: KVCache | None = None,
+            residual_values: jnp.ndarray | None = None,
             rngs: nnx.Rngs | None = None
         ):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
-        # Note: local_window_size is ignored for space attention (just for compatibility)
+        # residual_values: (B, T, S, kv_dim) or None
         B, T, S, D = x.shape
-        x = rearrange(x, "B T S D -> (B T) S D")
+        x_flat = rearrange(x, "B T S D -> (B T) S D")
 
-        out, _ = self.attn(x, mask=mask, deterministic=deterministic, cache=None, rngs=rngs)
+        rv_flat = None
+        if residual_values is not None:
+            rv_flat = rearrange(residual_values, "B T S KD -> (B T) S KD")
+
+        out, _ = self.attn(x_flat, mask=mask, deterministic=deterministic, cache=None,
+                           residual_values=rv_flat, rngs=rngs)
 
         out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
         return out, None  # Return None for cache consistency
@@ -519,6 +610,7 @@ class TimeSelfAttention(nnx.Module):
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
                  use_seq_parallel: bool = False,
+                 use_gated_values: bool = False, use_value_residuals: bool = False,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.attn = GroupedQueryAttention(
@@ -527,6 +619,7 @@ class TimeSelfAttention(nnx.Module):
             rope_theta=rope_theta, is_causal=True,
             use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
             use_seq_parallel=use_seq_parallel,
+            use_gated_values=use_gated_values, use_value_residuals=use_value_residuals,
             dtype=dtype, param_dtype=param_dtype,
             mesh_rules=mesh_rules, rngs=rngs
         )
@@ -539,16 +632,23 @@ class TimeSelfAttention(nnx.Module):
         local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         cache: KVCache | None = None,
+        residual_values: jnp.ndarray | None = None,
         rngs: nnx.Rngs | None = None
     ):
         # x: (B, T, S, D) -> attention across T, causal
+        # residual_values: (B, T, S, kv_dim) or None
         B, T, S, D = x.shape
-        x = rearrange(x, "B T S D -> (B S) T D")
+        x_flat = rearrange(x, "B T S D -> (B S) T D")
 
         if mask is not None and mask.ndim >= 3 and mask.shape[0] == B:
             mask = repeat(mask, 'B ... -> (B S) ...', S=S)
 
-        out, new_cache = self.attn(x, mask=mask, local_window_size=local_window_size, cache=cache, deterministic=deterministic, rngs=rngs)
+        rv_flat = None
+        if residual_values is not None:
+            rv_flat = rearrange(residual_values, "B T S KD -> (B S) T KD")
+
+        out, new_cache = self.attn(x_flat, mask=mask, local_window_size=local_window_size, cache=cache,
+                                   residual_values=rv_flat, deterministic=deterministic, rngs=rngs)
 
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         return out, new_cache
@@ -561,6 +661,8 @@ class BlockCausalLayer(nnx.Module):
                  mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4,
                  rope_theta: float = 10000.0, use_bias: bool = False,
                  use_rmsnorm_scale: bool = True, use_seq_parallel: bool = False,
+                 use_gru: bool = False, use_gated_values: bool = False,
+                 use_value_residuals: bool = False,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  rngs: nnx.Rngs, mesh_rules: MeshRules):
         self.layer_index = layer_index
@@ -577,9 +679,16 @@ class BlockCausalLayer(nnx.Module):
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
                 use_seq_parallel=use_seq_parallel,
+                use_gated_values=use_gated_values, use_value_residuals=use_value_residuals,
                 dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             )
+            # GRU: only for time-attention layers
+            if use_gru:
+                self.gru_mixer = GRUTimeMixer(dim=dim, dtype=dtype, param_dtype=param_dtype,
+                                              mesh_rules=mesh_rules, rngs=rngs)
+            else:
+                self.gru_mixer = None
         else:
             # SpaceSelfAttention doesn't need seq_parallel - it operates on (B*T, S, D)
             # with T already in the batch dimension
@@ -587,9 +696,11 @@ class BlockCausalLayer(nnx.Module):
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
+                use_gated_values=use_gated_values, use_value_residuals=use_value_residuals,
                 dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             )
+            self.gru_mixer = None
 
         # MLP
         self.mlp = MLP(dim, mlp_ratio, dropout_rate, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
@@ -603,8 +714,19 @@ class BlockCausalLayer(nnx.Module):
         time_local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         cache: KVCache | None = None,
+        residual_values: jnp.ndarray | None = None,
+        gru_state: jnp.ndarray | None = None,
         rngs: nnx.Rngs | None = None
     ):
+        # GRU pre-processing: applied as a residual before time attention
+        new_gru_state = None
+        if self.use_time and self.gru_mixer is not None:
+            B, T, S, D = x.shape
+            x_flat = rearrange(x, "B T S D -> (B S) T D")
+            gru_out, new_gru_state = self.gru_mixer(x_flat, h0=gru_state)
+            gru_out = rearrange(gru_out, "(B S) T D -> B T S D", B=B, S=S)
+            x = x + gru_out
+
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
         if self.use_time:
@@ -613,13 +735,15 @@ class BlockCausalLayer(nnx.Module):
         else:
             attn_mask = space_mask
             local_window_size = None
-        y, new_cache = self.attn(y, mask=attn_mask, local_window_size=local_window_size, deterministic=deterministic, cache=cache, rngs=rngs)
+        y, new_cache = self.attn(y, mask=attn_mask, local_window_size=local_window_size,
+                                 deterministic=deterministic, cache=cache,
+                                 residual_values=residual_values, rngs=rngs)
         x = x + y
 
         # MLP
         y = self.mlp(x, deterministic=deterministic, rngs=rngs)
         x = x + y
-        return x, new_cache
+        return x, new_cache, new_gru_state
 
 class BlockCausalTransformer(nnx.Module):
     """Stack of block-causal transformer layers."""
@@ -629,6 +753,10 @@ class BlockCausalTransformer(nnx.Module):
                  mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
                  use_seq_parallel: bool = False,
+                 use_gru: bool = False,
+                 use_value_residuals: bool = False,
+                 use_gated_values: bool = False,
+                 n_hyper_streams: int = 1,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
                  use_residual_lambdas: bool = False, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
@@ -636,6 +764,8 @@ class BlockCausalTransformer(nnx.Module):
         self.depth = depth
         self.time_every = time_every
         self.use_residual_lambdas = use_residual_lambdas
+        self.use_value_residuals = use_value_residuals
+        self.n_hyper_streams = n_hyper_streams
         self.dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
 
@@ -649,6 +779,26 @@ class BlockCausalTransformer(nnx.Module):
                 sharding_names=(None,)  # Small per-layer params, no sharding needed
             )
 
+        # Value residual: project initial x to kv_dim before any layer
+        if use_value_residuals:
+            kv_dim = n_kv_heads * (d_model // n_heads)
+            self.v_residual_norm = nnx.RMSNorm(d_model, use_scale=use_rmsnorm_scale,
+                                                dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
+            self.v_residual_proj = nnx.Linear(d_model, kv_dim, use_bias=False,
+                                               dtype=to_jnp_dtype(dtype), param_dtype=param_dtype,
+                                               kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')),
+                                               rngs=rngs)
+
+        # Hyper connections: per-layer read (alpha) and write (beta) weights over streams
+        # n_hyper_streams=1 means standard residuals (alpha/beta unused)
+        if n_hyper_streams > 1:
+            # alpha[l]: softmax-normalized read weights; init so stream 0 dominates
+            alpha_init = jnp.zeros((depth, n_hyper_streams), dtype=param_dtype).at[:, 0].set(5.0)
+            self.hyper_alpha = nnx.Param(alpha_init, sharding_names=(None, None))
+            # beta[l]: unconstrained write weights; init so output goes only to stream 0
+            beta_init = jnp.zeros((depth, n_hyper_streams), dtype=param_dtype).at[:, 0].set(1.0)
+            self.hyper_beta = nnx.Param(beta_init, sharding_names=(None, None))
+
         # Create layers
         self.layers = nnx.List([
             BlockCausalLayer(
@@ -657,6 +807,8 @@ class BlockCausalTransformer(nnx.Module):
                 mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
                 use_seq_parallel=use_seq_parallel,
+                use_gru=use_gru, use_gated_values=use_gated_values,
+                use_value_residuals=use_value_residuals,
                 dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             ) for i in range(depth)
@@ -671,8 +823,9 @@ class BlockCausalTransformer(nnx.Module):
         time_local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
+        gru_states: GRUStatesDict | None = None,
         rngs: nnx.Rngs | None = None
-    ) -> Tuple[jax.Array, KVCachesDict | None]:
+    ) -> Tuple[jax.Array, KVCachesDict | None, GRUStatesDict | None]:
         """
         Args:
             x: (B, T, S, D) input tensor
@@ -681,30 +834,72 @@ class BlockCausalTransformer(nnx.Module):
             time_local_window_size: optional local window size for time attention (left, right) or int for symmetric
             deterministic: whether to use deterministic mode (no dropout)
             caches: optional dict mapping layer_index -> KVCache
+            gru_states: optional dict mapping time_layer_index -> GRU hidden state (B*S, D)
             rngs: optional RNG state for dropout
 
         Returns:
-            output tensor and updated caches (always returns tuple, caches can be None)
+            (output tensor, updated kv_caches, updated gru_states)
         """
         new_caches = {} if caches is not None else None
+        new_gru_states = {} if gru_states is not None else None
         x0 = x
 
+        # Compute value residual from the initial x (before any layer)
+        residual_values = None
+        if self.use_value_residuals:
+            residual_values = self.v_residual_proj(self.v_residual_norm(x))  # (B, T, S, kv_dim)
+
+        # Expand to hyper streams: h[..., 0, :] = x, rest = 0
+        if self.n_hyper_streams > 1:
+            h = jnp.zeros((*x.shape[:-1], self.n_hyper_streams, x.shape[-1]), dtype=x.dtype)
+            h = h.at[..., 0, :].set(x)
+
         for i, layer in enumerate(self.layers):
-            if self.use_residual_lambdas:
+            # Residual lambda scaling (only when n_hyper_streams == 1)
+            if self.use_residual_lambdas and self.n_hyper_streams == 1:
                 resid_lambda = self.resid_lambdas.value[i].astype(self.dtype)
                 x0_lambda = self.x0_lambdas.value[i].astype(self.dtype)
                 x = resid_lambda * x + x0_lambda * x0
 
+            # Hyper connections: read x_in from streams
+            if self.n_hyper_streams > 1:
+                alpha_norm = jax.nn.softmax(self.hyper_alpha.value[i])        # (n,)
+                x_in = jnp.einsum('...nd, n -> ...d', h, alpha_norm)          # (B, T, S, D)
+            else:
+                x_in = x
+
             time_index = i // self.time_every
             is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
+            gru_state_i = gru_states.get(time_index) if gru_states is not None and is_time_layer else None
 
-            x, new_cache_i = layer(x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs)
+            x_out, new_cache_i, new_gru_state_i = layer(
+                x_in,
+                space_mask=space_mask, time_mask=time_mask,
+                time_local_window_size=time_local_window_size,
+                deterministic=deterministic, cache=cache_i,
+                residual_values=residual_values,
+                gru_state=gru_state_i, rngs=rngs
+            )
+
+            # Hyper connections: write delta to streams, OR standard update
+            if self.n_hyper_streams > 1:
+                delta = x_out - x_in                                           # net layer change
+                beta_i = self.hyper_beta.value[i]                              # (n,)
+                h = h + jnp.einsum('...d, n -> ...nd', delta, beta_i)
+            else:
+                x = x_out
 
             if new_caches is not None and new_cache_i is not None:
                 new_caches[time_index] = new_cache_i
+            if new_gru_states is not None and new_gru_state_i is not None:
+                new_gru_states[time_index] = new_gru_state_i
 
-        return x, new_caches
+        # Reduce streams back to (B, T, S, D)
+        if self.n_hyper_streams > 1:
+            x = jnp.sum(h, axis=-2)
+
+        return x, new_caches, new_gru_states
 
     def estimate_attention_flops(self, batch_size: int, seq_time: int, seq_space: int) -> int:
         """Attention FLOPs per training step (forward + backward).
@@ -750,6 +945,10 @@ class Encoder(nnx.Module):
             time_every=cfg.time_every, rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
+            use_gru=getattr(cfg, 'use_gru', False),
+            use_value_residuals=getattr(cfg, 'use_value_residuals', False),
+            use_gated_values=getattr(cfg, 'use_gated_values', False),
+            n_hyper_streams=getattr(cfg, 'n_hyper_streams', 1),
             dtype=dtype, param_dtype=param_dtype,
             use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
@@ -791,7 +990,7 @@ class Encoder(nnx.Module):
 
         # Feed tokens into transformer
         time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
-        encoded_tokens, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, rngs=rngs)
+        encoded_tokens, _, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, rngs=rngs)
 
         # Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
@@ -828,6 +1027,10 @@ class Decoder(nnx.Module):
             time_every=cfg.time_every, rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
+            use_gru=getattr(cfg, 'use_gru', False),
+            use_value_residuals=getattr(cfg, 'use_value_residuals', False),
+            use_gated_values=getattr(cfg, 'use_gated_values', False),
+            n_hyper_streams=getattr(cfg, 'n_hyper_streams', 1),
             dtype=dtype, param_dtype=param_dtype,
             use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
@@ -866,7 +1069,7 @@ class Decoder(nnx.Module):
         space_mask = layout.build_space_mask("decoder")
 
         time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
-        x, new_caches = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, caches=caches, rngs=rngs)
+        x, new_caches, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, caches=caches, rngs=rngs)
 
         # Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
@@ -1153,6 +1356,10 @@ class Dynamics(nnx.Module):
             mlp_ratio=cfg.mlp_ratio, time_every=cfg.time_every, rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
+            use_gru=getattr(cfg, 'use_gru', False),
+            use_value_residuals=getattr(cfg, 'use_value_residuals', False),
+            use_gated_values=getattr(cfg, 'use_gated_values', False),
+            n_hyper_streams=getattr(cfg, 'n_hyper_streams', 1),
             dtype=self.dtype, param_dtype=self.param_dtype,
             use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
@@ -1222,6 +1429,29 @@ class Dynamics(nnx.Module):
             dtype=dtype
         )
 
+    def create_static_gru_states(self, batch_size: int, n_latents: int,
+                                 n_agent: int = 0, dtype=jnp.float32) -> GRUStatesDict:
+        """Creates zero-filled GRU hidden states for each time-attention layer.
+
+        Args:
+            batch_size: Batch size
+            n_latents: Number of unpacked latent tokens (will be packed internally)
+            n_agent: Number of agent tokens
+            dtype: Data type for state buffers
+
+        Returns:
+            Dict mapping time_layer_index -> zero hidden state (batch_size * S, d_model)
+        """
+        layout = self.get_token_layout(n_latents=n_latents, n_agent=n_agent)
+        S = layout.S
+        states: GRUStatesDict = {}
+        for i in range(self.depth):
+            if (i + 1) % self.cfg.time_every == 0:
+                time_index = i // self.cfg.time_every
+                states[time_index] = jnp.zeros((batch_size * S, self.d_model),
+                                                dtype=to_jnp_dtype(dtype))
+        return states
+
     def __call__(
         self,
         actions: Actions,
@@ -1234,8 +1464,9 @@ class Dynamics(nnx.Module):
         task_embeddings: jnp.ndarray | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
+        gru_states: GRUStatesDict | None = None,
         rngs: nnx.Rngs | None = None
-    ) -> Tuple[jax.Array, Tuple[jax.Array | None, KVCachesDict | None]]:
+    ) -> Tuple[jax.Array, Tuple[jax.Array | None, KVCachesDict | None, GRUStatesDict | None]]:
         """
         Args:
             actions: Actions object
@@ -1298,12 +1529,13 @@ class Dynamics(nnx.Module):
         if context_length is not None:
             time_local_window_size = (context_length - 1, 0)
 
-        x, new_caches = self.transformer(
+        x, new_caches, new_gru_states = self.transformer(
             tokens, space_mask=space_mask,
             time_mask=time_mask,
             time_local_window_size=time_local_window_size,
             deterministic=deterministic,
             caches=caches,
+            gru_states=gru_states,
             rngs=rngs
         )
 
@@ -1312,9 +1544,9 @@ class Dynamics(nnx.Module):
 
         # Unpack before returning
         x1_hat = rearrange(x1_hat_packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
-        
+
         h_t = x[:, :, layout.slices()[Modality.AGENT], :] if task_embeddings is not None else None  # (B,T,n_agent,D) or None
-        return x1_hat, (h_t, new_caches)
+        return x1_hat, (h_t, new_caches, new_gru_states)
 
     def num_scaling_params(self) -> int:
         """Total params for scaling law analysis (Chinchilla-style, includes all)."""

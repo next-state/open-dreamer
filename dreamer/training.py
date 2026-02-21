@@ -367,7 +367,7 @@ def shortcut_forcing_step(
     
     # --- Forward pass (full batch) ---
     rngs1 = nnx.Rngs(dropout=key_dropout1)
-    z_pred_full, (h_states, _) = dynamics_model(
+    z_pred_full, (h_states, _, _) = dynamics_model(
         actions, step_idx_full, sigma_idx_full, z_tilde,
         context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
     )

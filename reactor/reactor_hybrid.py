@@ -440,7 +440,7 @@ class HybridVideoModel(VideoModel):
         dummy_action = jnp.full((1, 1), 4, dtype=jnp.int32)
         
         # Make dummy call to trigger JIT compilation
-        _, _, self.dynamics_cache, self.tokenizer_cache, self.rng = self.next_frame_compiled(
+        _, _, self.dynamics_cache, _, self.tokenizer_cache, self.rng = self.next_frame_compiled(
             action=dummy_action,
             dynamics_cache=self.dynamics_cache,
             tokenizer_cache=self.tokenizer_cache,
@@ -513,7 +513,7 @@ class HybridVideoModel(VideoModel):
                     
                 else:
                     # === IMAGINATION MODE ===
-                    frame_jax, self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = \
+                    frame_jax, self.h_last, self.dynamics_cache, _, self.tokenizer_cache, self.rng = \
                         self.next_frame_compiled(
                             action=action,
                             dynamics_cache=self.dynamics_cache,

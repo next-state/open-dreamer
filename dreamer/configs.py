@@ -87,6 +87,10 @@ class EncoderModelConfig:
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
+    use_gru: bool = False            # GRU recurrence before each time-attention layer
+    use_value_residuals: bool = False  # Value residuals from initial x (arxiv:2410.17897)
+    use_gated_values: bool = False   # Per-head sigmoid gate on attention output
+    n_hyper_streams: int = 1         # Hyper connections streams (1 = standard residual)
     dtype: str = "float32"
     param_dtype: str = "float32"
     context_length: int | None = None  # sliding window size for temporal attention; None = full causal
@@ -113,6 +117,10 @@ class DecoderModelConfig:
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
+    use_gru: bool = False
+    use_value_residuals: bool = False
+    use_gated_values: bool = False
+    n_hyper_streams: int = 1
     dtype: str = "float32"
     param_dtype: str = "float32"
     context_length: int | None = None  # sliding window size for temporal attention; None = full causal
@@ -148,6 +156,10 @@ class DynamicsModelConfig:
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
+    use_gru: bool = False
+    use_value_residuals: bool = False
+    use_gated_values: bool = False
+    n_hyper_streams: int = 1
     dtype: str = "float32"
     param_dtype: str = "float32"
 

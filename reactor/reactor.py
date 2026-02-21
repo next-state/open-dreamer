@@ -255,7 +255,7 @@ class DreamerVideoModel(VideoModel):
         latents_noised = init_latents*self.schedule.tau_ctx + (1-self.schedule.tau_ctx)*jax.random.normal(rng_warmup, shape=init_latents.shape, dtype=init_latents.dtype)
         
         # Run through dynamics to warm up cache
-        _, (_, self.dynamics_cache) = self.dynamics(
+        _, (_, self.dynamics_cache, _) = self.dynamics(
             actions_ctx,
             step_indices,
             tau_indices,
@@ -301,7 +301,7 @@ class DreamerVideoModel(VideoModel):
                     current_action = self.current_action
                 
                 # Generate next frame
-                frame_jax, h, self.dynamics_cache, self.tokenizer_cache, self.rng = self.next_frame_compiled(
+                frame_jax, h, self.dynamics_cache, _, self.tokenizer_cache, self.rng = self.next_frame_compiled(
                     action=current_action,
                     dynamics_cache=self.dynamics_cache,
                     tokenizer_cache=self.tokenizer_cache,
