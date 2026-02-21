@@ -4,7 +4,7 @@ defaults:
   - _self_
 
 run_name: dynamics
-tokenizer_ckpt: logs/tokenizer/checkpoints/
+tokenizer_ckpt: logs/tokenizer-window/checkpoints/
 
 ckpt:
   max_to_keep: 1
