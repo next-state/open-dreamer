@@ -4,12 +4,13 @@ defaults:
 name: minecraft_vpt
 data_type: video
 
-array_record_path: /home/ubuntu/minecraft-vpt/arrayrecords-mp4
+array_record_path: /home/data/arrayrecords-mp4
 index_max: 1500
+num_max_samples: -1
 
 dataloader_cfg:
-  B: 8
-  T: 4
+  B: 16
+  T: 32
   num_workers: 16
   prefetch_buffer_size: 10
   device_prefetch_buffer_size: 1
@@ -30,8 +31,5 @@ patch_size: 20
 num_binary_actions: 23  # keyboard actions
 categorical_action_dim: 121  # mouse actions
 continuous_action_dim: 0
-
-dataset_mean: [0.2241, 0.2348, 0.2086]
-dataset_std: [0.1809, 0.1874, 0.2282]
 
 p_include_reward: 0.0

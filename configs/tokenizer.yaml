@@ -13,7 +13,7 @@ tokenizer:
   encoder:
     n_latents: 512
     d_bottleneck: 16
-    depth: 8
+    depth: 10
     d_model: ${mul:128,${tokenizer.encoder.depth}}
     n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
@@ -33,7 +33,7 @@ tokenizer:
   decoder:
     n_latents: ${tokenizer.encoder.n_latents}
     d_bottleneck: ${tokenizer.encoder.d_bottleneck}
-    depth: 4
+    depth: 5
     d_model: ${mul:128,${tokenizer.decoder.depth}}
     n_heads: ${floordiv:${tokenizer.decoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.decoder.n_heads},8}}
@@ -50,7 +50,7 @@ tokenizer:
     dtype: ${dtype}
     param_dtype: ${param_dtype}
 
-max_steps: 30_000
+max_steps: 150_000
 tokenizer_loss_type: mse  # mse | mae
 
 lr_schedule:
