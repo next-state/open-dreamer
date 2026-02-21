@@ -28,9 +28,11 @@ class DenoiseSchedule:
         step_idx_ctx: step index for context frames (may differ from step_idx for finer tau_ctx control).
         tau_idx_ctx: tau index for slightly noised context frames, snapped to step_idx_ctx ladder.
         tau_ctx: noise level of context frames during autoregressive rollout.
+        num_steps_capped: number of τ-ladder steps to run (min(num_steps, steps with tau index <= TAU_IDX_MAX)); concrete int for JAX tracing.
     """
 
     num_steps: int
+    num_steps_capped: int
     k_max: int
     d: float
     step_idx: int
@@ -76,7 +78,12 @@ class DenoiseSchedule:
         tau_ctx = jnp.array(j_ctx / K_ctx, dtype=dtype)
         tau_idx_ctx = j_ctx * (k_max // K_ctx)
 
-        return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
+        # Concrete int: only run steps where tau index <= TAU_IDX_MAX (for jnp.arange in next_latent when traced).
+        step_size = k_max // num_steps
+        max_s = TAU_IDX_MAX // step_size
+        num_steps_capped = min(num_steps, max_s + 1)
+
+        return cls(num_steps, num_steps_capped, k_max, d, step_idx, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
     
 # ---------------------------
 # Single-step τ-ladder denoiser
@@ -180,12 +187,11 @@ def next_latent(
         return latent_t_new, (h_last, x0_norm, update_mag, clip_frac)
 
     # Run τ-ladder with JAX control flow using scan to keep carry/output structure consistent.
-    # Only run steps where tau index <= TAU_IDX_MAX (stop if tau step index > 120).
-    steps_to_run = jnp.sum(schedule.tau_indices[: schedule.num_steps] <= TAU_IDX_MAX)
+    # Only run steps where tau index <= TAU_IDX_MAX (schedule.num_steps_capped is a concrete int for tracing).
     latent_t_final, (h_history, x0_norm_hist, update_mag_hist, clip_frac_hist) = jax.lax.scan(
         refinement_step,
         noisy_latent,
-        jnp.arange(steps_to_run),
+        jnp.arange(schedule.num_steps_capped),
     )
 
     # Aggregate per-step ODE diagnostics across τ-ladder steps.
