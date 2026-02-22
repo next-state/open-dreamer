@@ -1,0 +1,19 @@
+defaults:
+  - dataset: minecraft_vpt_latent   # override with e.g. dataset=coinrun
+  - _self_
+
+dynamics_ckpt: ???          # Required: path to DynamicsCheckpointBundle checkpoint dir
+
+run_name: eval_dynamics
+use_wandb: false
+parallel_strategy: data
+seed: 0
+
+# Evaluation settings
+output_dir: eval_outputs    # Where to save videos / PNGs
+B: 4                        # Number of sequences to sample
+step: 0                     # Step label stamped on output filenames
+
+hydra:
+  run:
+    dir: ${output_dir}
