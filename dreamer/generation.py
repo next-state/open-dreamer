@@ -90,8 +90,9 @@ def next_latent(
     prefill_length: int | None = None,
     task_embedding: jax.Array | None = None,  # (B, T_ctx+1, n_agent, d_model)
     caches: KVCachesDict | None = None,
-    latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
+    latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s) roughly, padded out to max_len
     actions_ctx: Actions | None = None,
+    cur_len: int | jax.Array | None = None,                  # Current length of context sequence when non-cached
 ) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
@@ -120,11 +121,12 @@ def next_latent(
 
     latents_ctx_noised = None
     if latents_ctx is not None and caches is None:
-        latents_prefill = latents_ctx[:, :prefill_length]
-        latents_decode = latents_ctx[:, prefill_length:]
-        noise_decode = jax.random.normal(rng_ctx, latents_decode.shape)
-        latents_decode_noised = latents_decode * schedule.tau_ctx + (1 - schedule.tau_ctx) * noise_decode
-        latents_ctx_noised = jnp.concatenate([latents_prefill, latents_decode_noised], axis=1)
+        # Apply noise to the entire context array. We use jnp.where to only noise frames >= prefill_length.
+        noise_decode = jax.random.normal(rng_ctx, latents_ctx.shape)
+        latents_noised = latents_ctx * schedule.tau_ctx + (1 - schedule.tau_ctx) * noise_decode
+        
+        time_idx = jnp.arange(latents_ctx.shape[1])[None, :, None, None]
+        latents_ctx_noised = jnp.where((time_idx >= prefill_length) & (time_idx < cur_len), latents_noised, latents_ctx)
 
     action = action[:, None, ...]  # expand squeezed-out time dimension
 
@@ -143,20 +145,23 @@ def next_latent(
             assert task_embedding is None or task_embedding.shape[1] == noisy_latent.shape[1], f"task_embedding.shape = {task_embedding.shape}, noisy_latent.shape = {noisy_latent.shape}"
         
         else: # Used only for debugging.
-            assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None
-            latent_input  = jnp.concatenate([latents_ctx_noised, latent_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
-            actions_input = jax.tree.map(lambda x, y: jnp.concatenate([x, y], axis=1), actions_ctx, action)  # (B, T_ctx+1)
-
-            decode_length = latents_ctx_noised.shape[1] - prefill_length
-            step_idx_prefill= jnp.full((B, prefill_length), schedule.emax, dtype=jnp.int32)
-            step_idx_decode = jnp.full((B, decode_length),  schedule.step_idx_ctx, dtype=jnp.int32)
-            step_idx_curr   = jnp.full((B, 1), step_idx, dtype=jnp.int32)
-            step_indices    = jnp.concatenate([step_idx_prefill, step_idx_decode, step_idx_curr], axis=1)
+            assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None and cur_len is not None
+            # Insert latent_t into latents_ctx_noised at cur_len
+            latent_input = jax.lax.dynamic_update_slice(latents_ctx_noised, latent_t, (0, cur_len, 0, 0))
             
-            tau_idx_prefill= jnp.full((B, prefill_length), schedule.k_max, dtype=jnp.int32)
-            tau_idx_decode = jnp.full((B, decode_length), schedule.tau_idx_ctx, dtype=jnp.int32)
-            tau_idx_curr   = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
-            tau_indices    = jnp.concatenate([tau_idx_prefill, tau_idx_decode, tau_idx_curr], axis=1)  # (B, T_ctx+1)
+            # Insert action into actions_ctx at cur_len
+            def update_action(x_c, a_c):
+                return jax.lax.dynamic_update_slice(x_c, a_c, (0, cur_len) + (0,) * (a_c.ndim-2))
+            actions_input = jax.tree.map(update_action, actions_ctx, action)
+
+            # Create step indices array
+            time_idx_2d = jnp.arange(latents_ctx_noised.shape[1])[None, :]
+            
+            step_idx_curr_arr = jnp.where(time_idx_2d < prefill_length, schedule.emax, schedule.step_idx_ctx)
+            step_indices = jnp.where(time_idx_2d == cur_len, step_idx, step_idx_curr_arr)
+            
+            tau_idx_curr_arr = jnp.where(time_idx_2d < prefill_length, schedule.k_max, schedule.tau_idx_ctx)
+            tau_indices = jnp.where(time_idx_2d == cur_len, tau_idx_val, tau_idx_curr_arr)
 
         # Dynamics call
         latent_clean_pred_seq, (h_seq, _) = dynamics(
@@ -164,8 +169,17 @@ def next_latent(
             task_embeddings=task_embedding, deterministic=True, caches=caches
         )
 
-        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
-        h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
+        if caches is not None:
+            latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
+            h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
+        else:
+            latent_clean_pred = jax.lax.dynamic_slice(latent_clean_pred_seq, (0, cur_len, 0, 0), (B, 1, n_spatial, D_s))
+            if isinstance(h_seq, jax.Array):
+                h_last = jax.lax.dynamic_slice(h_seq, (0, cur_len, 0, 0), (B, 1, h_seq.shape[2], h_seq.shape[3]))
+            elif isinstance(h_seq, type(None)):
+                h_last = None
+            else:
+                h_last = h_seq
 
         # Per-step mixing toward clean latent
         latent_t_new = beta * latent_t + (1.0 - beta) * latent_clean_pred
@@ -316,9 +330,24 @@ def latent_rollout(
     else:
         caches, task_embedding, h_seq, h_last = None, None, None, None
 
+    if not use_kv_cache:
+        # Pad context sequences to maximum window size
+        pad_len = num_steps
+        latents_ctx_padded = jnp.pad(latents_ctx, ((0,0), (0, pad_len), (0,0), (0,0)))
+        
+        def pad_action(x):
+            pad_width = [(0,0)] * x.ndim
+            pad_width[1] = (0, pad_len)
+            return jnp.pad(x, pad_width)
+        actions_ctx_padded = jax.tree.map(pad_action, actions_ctx)
+    else:
+        latents_ctx_padded = latents_ctx
+        actions_ctx_padded = actions_ctx
+
     # 2. Scan loop for rollout
     def scan_step(carry, step_idx):
-        h_t, caches_t, rng = carry
+        h_t, caches_t, rng, latents_ctx_carry, actions_ctx_carry = carry
+        cur_len = T_ctx + step_idx
 
         # Sample action
         rng, rng_policy = jax.random.split(rng)
@@ -332,15 +361,27 @@ def latent_rollout(
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng = next_latent(
             dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding,
-            latents_ctx=latents_ctx, actions_ctx=actions_ctx, prefill_length=T_ctx
+            latents_ctx=latents_ctx_carry, actions_ctx=actions_ctx_carry, prefill_length=T_ctx, cur_len=cur_len
         )
         
-        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
+        if not use_kv_cache:
+            # Re-normalize to append to standard normal context window representation
+            latent_next_norm = normalize_latents(latent_next, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+            latents_ctx_next = jax.lax.dynamic_update_slice(latents_ctx_carry, latent_next_norm, (0, cur_len, 0, 0))
+            
+            def update_action_carry(x_c, a_c):
+                return jax.lax.dynamic_update_slice(x_c, a_c[:, None, ...], (0, cur_len) + (0,) * (a_c.ndim-1))
+            actions_ctx_next = jax.tree.map(update_action_carry, actions_ctx_carry, action)
+        else:
+            latents_ctx_next = latents_ctx_carry
+            actions_ctx_next = actions_ctx_carry
+        
+        return (h_next, caches_next, rng, latents_ctx_next, actions_ctx_next), (latent_next[:, 0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
 
     # Run scan
     _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
         scan_step,
-        (h_last, caches, rng),
+        (h_last, caches, rng, latents_ctx_padded, actions_ctx_padded),
         jnp.arange(num_steps)
     )
 
