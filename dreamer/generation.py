@@ -9,8 +9,6 @@ from .utils import normalize_latents, unnormalize_latents
 from flax.struct import dataclass
 
 
-LATENT_NORM_CLIP = 4.0
-
 @dataclass
 class DenoiseSchedule:
     """
@@ -169,7 +167,6 @@ def next_latent(
 
         # Per-step mixing toward clean latent
         latent_t_new = beta * latent_t + (1.0 - beta) * latent_clean_pred
-        latent_t_new = jnp.clip(latent_t_new, -LATENT_NORM_CLIP, LATENT_NORM_CLIP)
 
         return latent_t_new, h_last
 
@@ -200,8 +197,6 @@ def next_latent(
 
     assert isinstance(h_last, jax.Array) or h_last is None
 
-    latent_t_final = jnp.clip(latent_t_final, -LATENT_NORM_CLIP, LATENT_NORM_CLIP)
-    # Unnormalize output so caller receives latents in original space
     latent_t_final = unnormalize_latents(latent_t_final, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
     return latent_t_final, h_last, caches_new, rng

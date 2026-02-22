@@ -780,7 +780,7 @@ def run_evaluation(
     """
     k_max = dynamics.cfg.k_max
     schedule_shortcut = DenoiseSchedule.init(4, k_max)
-    schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
+    schedule_diffusion = DenoiseSchedule.init(64, k_max)
 
     evaluation_schedules = {"shortcut": schedule_shortcut, "diffusion": schedule_diffusion}
 
