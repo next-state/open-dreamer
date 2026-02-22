@@ -53,6 +53,7 @@ from dreamer.data.serialization import serialize_msgpack_record, deserialize_msg
 # Backward compatibility aliases
 serialize_record = serialize_msgpack_record
 deserialize_record = deserialize_msgpack_record
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 
 VIDEO_DTYPE_MAP = {
     "uint8": np.uint8,
@@ -468,6 +469,18 @@ def main():
             )
             return latents
 
+        def _pad_and_shard(chunk_np: np.ndarray, target_len: int) -> jax.Array:
+            """Pad a numpy chunk on host then device_put with sharding.
+
+            Keeps the array sharded from the start — no GPU-0 spike.
+            """
+            pad_t = target_len - chunk_np.shape[1]
+            if pad_t > 0:
+                pad_spec = [(0, 0)] * chunk_np.ndim
+                pad_spec[1] = (0, pad_t)
+                chunk_np = np.pad(chunk_np, pad_spec, mode="constant")
+            return jax.device_put(chunk_np, data_sharding)
+
         # Process all batches
         total_videos = 0
         # Welford's online algorithm for numerically stable mean/variance
@@ -489,31 +502,57 @@ def main():
                 pad_size = batch["_pad_size"]
 
                 # Encode in temporal chunks to reduce peak memory.
+                # Each chunk is encoded, gathered to numpy immediately, then the
+                # JAX array is deleted — so only one chunk lives on device at a
+                # time.  Concatenation happens in numpy to avoid GPU-0 gather.
                 if args.chunk_len and args.chunk_len > 0:
                     t_total = videos.shape[1]
-                    latents_chunks = []
+                    np_chunks = []
                     for start in range(0, t_total, args.chunk_len):
                         end = min(start + args.chunk_len, t_total)
-                        chunk = videos[:, start:end]
                         chunk_len = end - start
+
                         if chunk_len < args.chunk_len:
-                            pad_width = [(0, 0)] * chunk.ndim
-                            pad_width[1] = (0, args.chunk_len - chunk_len)
-                            chunk = jnp.pad(chunk, pad_width, mode="constant")
+                            # Gather the short tail to numpy, pad there, then
+                            # device_put with sharding — avoids recompilation
+                            # and keeps the array properly sharded.
+                            tail_shards = sorted(
+                                videos[:, start:end].addressable_shards,
+                                key=lambda s: s.index,
+                            )
+                            tail_np = np.concatenate(
+                                [np.asarray(s.data) for s in tail_shards], axis=0,
+                            )
+                            chunk = _pad_and_shard(tail_np, args.chunk_len)
+                        else:
+                            chunk = videos[:, start:end]
+
                         latents_chunk = encode_batch(chunk)
+
+                        # Immediately gather to numpy per-shard (no GPU-0 spike).
+                        chunk_shards = sorted(
+                            latents_chunk.addressable_shards,
+                            key=lambda s: s.index,
+                        )
+                        chunk_np = np.concatenate(
+                            [np.asarray(s.data) for s in chunk_shards], axis=0,
+                        )
+                        # Trim temporal padding from the last (short) chunk.
                         if chunk_len < args.chunk_len:
-                            latents_chunk = latents_chunk[:, :chunk_len]
-                        latents_chunks.append(latents_chunk)
-                    latents = jnp.concatenate(latents_chunks, axis=1)
+                            chunk_np = chunk_np[:, :chunk_len]
+                        np_chunks.append(chunk_np)
+                        del latents_chunk  # free device memory before next chunk
+
+                    latents_np = np.concatenate(np_chunks, axis=1)
                 else:
                     latents = encode_batch(videos)
 
-                # Gather from local addressable shards (avoids device-0 gather spikes).
-                shards = sorted(latents.addressable_shards, key=lambda s: s.index)
-                latents_np = np.concatenate(
-                    [np.asarray(shard.data) for shard in shards],
-                    axis=0,
-                )
+                    # Gather from local addressable shards (avoids device-0 gather spikes).
+                    shards = sorted(latents.addressable_shards, key=lambda s: s.index)
+                    latents_np = np.concatenate(
+                        [np.asarray(shard.data) for shard in shards],
+                        axis=0,
+                    )
 
                 if pad_size > 0:
                     latents_np = latents_np[:batch_size]
