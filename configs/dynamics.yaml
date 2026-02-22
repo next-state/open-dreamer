@@ -14,6 +14,7 @@ dataset:
   dataloader_cfg:
     B: 32
     T: 32
+    frame_skip: 2
 
 dynamics:
     d_bottleneck: 16

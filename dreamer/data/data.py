@@ -48,6 +48,11 @@ def make_iterator(
     num_workers = dataloader_cfg.num_workers
     prefetch_buffer_size = dataloader_cfg.prefetch_buffer_size
     device_prefetch_buffer_size = dataloader_cfg.device_prefetch_buffer_size
+    T = dataloader_cfg.T
+    frame_skip = getattr(dataloader_cfg, "frame_skip", 1)
+    raw_len = (
+        1 + (T - 1) * frame_skip if frame_skip > 1 else T
+    )
     # Build array record paths using utility
     use_latent_data = cfg.data_type == "latent"
     dataset_type = "latent" if use_latent_data else cfg.name
@@ -80,33 +85,41 @@ def make_iterator(
     # Build operations based on dataset type and data type
     if use_latent_data:
         # Pre-tokenized latent data path
-        operations = [ProcessLatentAndSlice(seq_len=dataloader_cfg.T)]
+        operations = [
+            EpisodeLengthFilter(
+                seq_len=raw_len,
+                format_hint="latent",
+                print_filter_warnings=print_filter_warnings,
+            ),
+            ProcessLatentAndSlice(seq_len=T, frame_skip=frame_skip),
+        ]
     elif cfg.name == "minecraft_vpt":
         operations = [
             EpisodeLengthFilter(
-                seq_len=dataloader_cfg.T,
+                seq_len=raw_len,
                 format_hint="vpt",
                 print_filter_warnings=print_filter_warnings,
             ),
             ProcessMinecraftEpisodeAndSlice(
-                seq_len=dataloader_cfg.T,
+                seq_len=T,
                 image_h=cfg.H,
                 image_w=cfg.W,
                 image_c=cfg.C,
                 padding_h=cfg.padding_H,
                 padding_w=cfg.padding_W,
                 patch_size=cfg.patch_size,
+                frame_skip=frame_skip,
             )
         ]
     else:
         operations = [
             EpisodeLengthFilter(
-                seq_len=dataloader_cfg.T,
+                seq_len=raw_len,
                 format_hint="coinrun",
                 print_filter_warnings=print_filter_warnings,
             ),
             ProcessEpisodeAndSlice(
-                seq_len=dataloader_cfg.T,
+                seq_len=T,
                 image_h=cfg.H,
                 image_w=cfg.W,
                 image_c=cfg.C,
@@ -114,6 +127,7 @@ def make_iterator(
                 padding_w=cfg.padding_W,
                 p_include_reward=cfg.p_include_reward,
                 patch_size=cfg.patch_size,
+                frame_skip=frame_skip,
             ),
         ]
             
@@ -209,6 +223,7 @@ def make_dual_iterator(
         dl_cfg = DataloaderConfig(
             B=dataloader_cfg.B,
             T=T,
+            frame_skip=getattr(dataloader_cfg, "frame_skip", 1),
             num_workers=num_workers // 2,
             prefetch_buffer_size=(prefetch_buffer_size + 1) // 2,
             device_prefetch_buffer_size=(device_prefetch_buffer_size + 1) // 2,

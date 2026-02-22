@@ -10,7 +10,8 @@ class DataloaderConfig:
     # Batch and sequence dimensions
     B: int = 32  # batch size
     T: int = 64  # sequence length
-    
+    frame_skip: int = 1  # take every frame_skip-th frame; 1 = no skip
+
     # Common parameters
     num_workers: int = 16
     prefetch_buffer_size: int = 10
