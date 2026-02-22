@@ -9,9 +9,12 @@ use_wandb: false
 parallel_strategy: data
 seed: 0
 
+dataset:
+  dataloader_cfg:
+    B: 4                    # Number of sequences to sample
+
 # Evaluation settings
 output_dir: eval_outputs    # Where to save videos / PNGs
-B: 4                        # Number of sequences to sample
 step: 0                     # Step label stamped on output filenames
 
 hydra:

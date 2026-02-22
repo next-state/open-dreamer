@@ -1,21 +1,17 @@
-import dataclasses
 import logging
 import types
 from pathlib import Path
 
 import hydra
 import jax
-import jax.numpy as jnp
-from flax import nnx
 from omegaconf import OmegaConf
 
-from dreamer.configs import DatasetConfig, LoggerConfig
+from dreamer.configs import LoggerConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.parallel import build_parallel
 from dreamer.training import run_evaluation, run_x0_visualization
 from dreamer.checkpointing import DynamicsCheckpointBundle
-from dreamer.utils import from_dict
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
@@ -43,28 +39,23 @@ def run(cfg):
         bundle = DynamicsCheckpointBundle.from_pretrained(cfg.dynamics_ckpt, mesh_rules=mesh_rules)
         print(f"Loaded dynamics model (k_max={bundle.dynamics.cfg.k_max}, depth={bundle.dynamics.cfg.depth})")
 
-        # Build typed DatasetConfig from Hydra DictConfig, then override batch size
-        dataset_cfg = from_dict(DatasetConfig, OmegaConf.to_container(cfg.dataset, resolve=True))
-        dataset_cfg.dataloader_cfg = dataclasses.replace(dataset_cfg.dataloader_cfg, B=cfg.B)
-
-        use_latent_data = dataset_cfg.data_type == "latent"
+        use_latent_data = cfg.dataset.data_type == "latent"
 
         # Load one batch of data
-        print(f"Loading data from: {dataset_cfg.array_record_path}")
-        iterator = make_iterator(dataset_cfg, device=data_sharding)
+        print(f"Loading data from: {cfg.dataset.array_record_path}")
+        iterator = make_iterator(cfg.dataset, device=data_sharding)
         batch = next(iter(iterator))
 
         actions = batch["actions"]
         input_tensor = batch.get("latents") if use_latent_data else batch.get("videos")
-        T = input_tensor.shape[1]
         print(f"Batch loaded: shape={input_tensor.shape}, use_latent_data={use_latent_data}")
 
-        # Build a minimal cfg namespace that satisfies run_evaluation and run_x0_visualization:
-        #   run_evaluation uses: eval_cfg.dataset.dataset_std
-        #   run_x0_visualization uses: eval_cfg.dynamics.k_max, eval_cfg.dynamics.context_length
+        # run_evaluation needs cfg.dataset.dataset_std
+        # run_x0_visualization needs cfg.dynamics.k_max and cfg.dynamics.context_length
+        # Both are available directly: dataset_std from cfg.dataset, dynamics fields from the loaded model
         eval_cfg = types.SimpleNamespace(
             dynamics=bundle.dynamics.cfg,
-            dataset=types.SimpleNamespace(dataset_std=dataset_cfg.dataset_std),
+            dataset=types.SimpleNamespace(dataset_std=tuple(cfg.dataset.dataset_std)),
         )
 
         # Output directory and logger
@@ -82,12 +73,12 @@ def run(cfg):
             rng, eval_key = jax.random.split(rng)
 
             run_evaluation(
-                eval_cfg,
+                eval_cfg,  # type: ignore[arg-type]
                 step=cfg.step,
                 tokenizer=bundle.tokenizer,
                 dynamics=bundle.dynamics,
-                val_data=input_tensor[:cfg.B],
-                val_actions=actions[:cfg.B],
+                val_data=input_tensor,
+                val_actions=actions,
                 use_latent_data=use_latent_data,
                 vis_dir=vis_dir,
                 rng=eval_key,
@@ -97,7 +88,7 @@ def run(cfg):
             rng, x0_key = jax.random.split(rng)
 
             run_x0_visualization(
-                eval_cfg,
+                eval_cfg,  # type: ignore[arg-type]
                 step=cfg.step,
                 tokenizer=bundle.tokenizer,
                 dynamics=bundle.dynamics,
