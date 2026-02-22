@@ -264,6 +264,7 @@ def latent_rollout(
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
     deterministic: bool = False,
+    use_kv_cache: bool = False,
 ):
     """
     Autoregressive rollout in latent space.
@@ -278,6 +279,7 @@ def latent_rollout(
         rng: Random number generator key
         initial_task_embedding: Optional (B, T_ctx, n_agent, D) agent tokens for context.
         deterministic: Whether to sample deterministic actions from the policy.
+        use_kv_cache: Whether to use KV caching in dynamics for faster rollout.
         
     Returns:
         Dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
@@ -300,15 +302,18 @@ def latent_rollout(
     step_idx_prefill = jnp.full((B, T_ctx), emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
     tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)  # tau=1.0
 
-    # Dynamics call for prefill
-    _, (h_seq, caches) = dynamics(
-        actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
-        task_embeddings=initial_task_embedding, caches=caches, deterministic=True
-    )
+    if use_kv_cache:
+        # Dynamics call for prefill
+        _, (h_seq, caches) = dynamics(
+            actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
+            task_embeddings=initial_task_embedding, caches=caches, deterministic=True
+        )
 
-    # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
-    task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
-    h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
+        # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
+        task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
+        h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
+    else:
+        caches, task_embedding, h_seq, h_last = None, None, None, None
 
     # 2. Scan loop for rollout
     def scan_step(carry, step_idx):
@@ -325,7 +330,8 @@ def latent_rollout(
         
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng = next_latent(
-            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
+            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding,
+            latents_ctx=latents_ctx, actions_ctx=actions_ctx, prefill_length=T_ctx
         )
         
         return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
