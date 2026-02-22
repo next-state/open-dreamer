@@ -19,6 +19,7 @@ class DenoiseSchedule:
         k_max: a power of two, maximum noise resolution used during diffusion training. In the paper, it's 256.
         d: Step size d=1/k ∈ {1, 1/2, 1/4, ..., 1/k_max} during inference, where k is num_steps.
         step_idx: log2(k) ∈ {0, 1, 2, ..., log2(K_max)} for denoising.
+        emax: log2(k_max), the maximum step index.
         tau_values: signal levels used during the denoising τ = [0, d, 2d, ..., 1 - d, 1].
         tau_indices: indices of the signal levels used during the denoising τ_idx = [0, k, 2k, ..., k_max].
         beta_values: precomputed Euler step mixing coefficients for each step, where beta[s] = (1 - tau[s+1]) / (1 - tau[s]).
@@ -31,6 +32,7 @@ class DenoiseSchedule:
     k_max: int
     d: float
     step_idx: int
+    emax: int
     tau_values: jax.Array
     tau_indices: jax.Array
     beta_values: jax.Array
@@ -73,7 +75,7 @@ class DenoiseSchedule:
         tau_ctx = jnp.array(j_ctx / K_ctx, dtype=dtype)
         tau_idx_ctx = j_ctx * (k_max // K_ctx)
 
-        return cls(num_steps, k_max, d, step_idx, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
+        return cls(num_steps, k_max, d, step_idx, emax, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
     
 # ---------------------------
 # Single-step τ-ladder denoiser
@@ -125,7 +127,7 @@ def next_latent(
         latents_ctx_noised = jnp.concatenate([latents_prefill, latents_decode_noised], axis=1)
 
     action = action[:, None, ...]  # expand squeezed-out time dimension
-    
+
     def refinement_step(latent_t, s):
         beta = schedule.beta_values[s]
 
@@ -146,7 +148,7 @@ def next_latent(
             actions_input = jax.tree.map(lambda x, y: jnp.concatenate([x, y], axis=1), actions_ctx, action)  # (B, T_ctx+1)
 
             decode_length = latents_ctx_noised.shape[1] - prefill_length
-            step_idx_prefill= jnp.full((B, prefill_length), step_idx, dtype=jnp.int32)
+            step_idx_prefill= jnp.full((B, prefill_length), schedule.emax, dtype=jnp.int32)
             step_idx_decode = jnp.full((B, decode_length),  schedule.step_idx_ctx, dtype=jnp.int32)
             step_idx_curr   = jnp.full((B, 1), step_idx, dtype=jnp.int32)
             step_indices    = jnp.concatenate([step_idx_prefill, step_idx_decode, step_idx_curr], axis=1)
@@ -298,8 +300,7 @@ def latent_rollout(
 
     # Run dynamics on context to prefill caches and get last hidden state
     # Use clean signal for ground truth context
-    emax = int(math.log2(schedule.k_max))
-    step_idx_prefill = jnp.full((B, T_ctx), emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
+    step_idx_prefill = jnp.full((B, T_ctx), schedule.emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
     tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)  # tau=1.0
 
     if use_kv_cache:
