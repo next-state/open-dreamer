@@ -368,7 +368,8 @@ class GroupedQueryAttention(nnx.Module):
             local_window_size: int | tuple[int, int] | None = None,
             deterministic: bool = True,
             cache: KVCache | None = None,
-            rngs: nnx.Rngs | None = None
+            rngs: nnx.Rngs | None = None,
+            return_weights: bool = False,
         ):
         """
         https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html
@@ -433,6 +434,15 @@ class GroupedQueryAttention(nnx.Module):
             )
             new_cache = None
 
+            if return_weights:
+                G = self.num_heads // self.num_kv_heads
+                k_exp = jnp.repeat(k_full, G, axis=2)  # (B, S, N, H)
+                logits = jnp.einsum('B T N H, B S N H -> B N T S', q, k_exp) * scale
+                logits = jnp.where(causal_mask, logits, jnp.finfo(logits.dtype).min)
+                attn_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+            else:
+                attn_weights = None
+
         else:
             # Standard non-SP path
             # RoPE
@@ -468,12 +478,26 @@ class GroupedQueryAttention(nnx.Module):
                 local_window_size=local_window_size
             )  # TODO: try setting implementation="cudnn"
 
+            if return_weights:
+                G = self.num_heads // self.num_kv_heads
+                k_exp = jnp.repeat(k_attn, G, axis=2)  # (B, S, N, H)
+                logits = jnp.einsum('B T N H, B S N H -> B N T S', q, k_exp) * scale
+                if mask_attn is not None:
+                    logits = jnp.where(mask_attn, logits, jnp.finfo(logits.dtype).min)
+                elif attn_is_causal:
+                    T_q, T_k = q.shape[1], k_attn.shape[1]
+                    causal = jnp.tril(jnp.ones((T_q, T_k), dtype=jnp.bool_))
+                    logits = jnp.where(causal[None, None], logits, jnp.finfo(logits.dtype).min)
+                attn_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+            else:
+                attn_weights = None
+
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
         out = self.dropout(out, deterministic=deterministic, rngs=rngs)
 
-        return out, new_cache
+        return out, new_cache, attn_weights
 
 class SpaceSelfAttention(nnx.Module):
     """Space self-attention with modality routing."""
@@ -500,17 +524,19 @@ class SpaceSelfAttention(nnx.Module):
             local_window_size: int | tuple[int, int] | None = None,
             deterministic: bool = True,
             cache: KVCache | None = None,
-            rngs: nnx.Rngs | None = None
+            rngs: nnx.Rngs | None = None,
+            return_weights: bool = False,
         ):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
         # Note: local_window_size is ignored for space attention (just for compatibility)
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B T) S D")
 
-        out, _ = self.attn(x, mask=mask, deterministic=deterministic, cache=None, rngs=rngs)
-
+        out, _, attn_weights = self.attn(x, mask=mask, deterministic=deterministic, cache=None, rngs=rngs, return_weights=return_weights)
         out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
-        return out, None  # Return None for cache consistency
+        if attn_weights is not None:
+            attn_weights = rearrange(attn_weights, "(B T) N S1 S2 -> B T N S1 S2", B=B, T=T)
+        return out, None, attn_weights
 
 class TimeSelfAttention(nnx.Module):
     """Time self-attention."""
@@ -539,7 +565,8 @@ class TimeSelfAttention(nnx.Module):
         local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         cache: KVCache | None = None,
-        rngs: nnx.Rngs | None = None
+        rngs: nnx.Rngs | None = None,
+        return_weights: bool = False,
     ):
         # x: (B, T, S, D) -> attention across T, causal
         B, T, S, D = x.shape
@@ -548,10 +575,11 @@ class TimeSelfAttention(nnx.Module):
         if mask is not None and mask.ndim >= 3 and mask.shape[0] == B:
             mask = repeat(mask, 'B ... -> (B S) ...', S=S)
 
-        out, new_cache = self.attn(x, mask=mask, local_window_size=local_window_size, cache=cache, deterministic=deterministic, rngs=rngs)
-
+        out, new_cache, attn_weights = self.attn(x, mask=mask, local_window_size=local_window_size, cache=cache, deterministic=deterministic, rngs=rngs, return_weights=return_weights)
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
-        return out, new_cache
+        if attn_weights is not None:
+            attn_weights = rearrange(attn_weights, "(B S) N T1 T2 -> B S N T1 T2", B=B, S=S)
+        return out, new_cache, attn_weights
 
 class BlockCausalLayer(nnx.Module):
     """Single block-causal transformer layer (alternating space/time attention)."""
@@ -603,7 +631,8 @@ class BlockCausalLayer(nnx.Module):
         time_local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         cache: KVCache | None = None,
-        rngs: nnx.Rngs | None = None
+        rngs: nnx.Rngs | None = None,
+        return_weights: bool = False,
     ):
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
@@ -613,13 +642,13 @@ class BlockCausalLayer(nnx.Module):
         else:
             attn_mask = space_mask
             local_window_size = None
-        y, new_cache = self.attn(y, mask=attn_mask, local_window_size=local_window_size, deterministic=deterministic, cache=cache, rngs=rngs)
+        y, new_cache, attn_weights = self.attn(y, mask=attn_mask, local_window_size=local_window_size, deterministic=deterministic, cache=cache, rngs=rngs, return_weights=return_weights)
         x = x + y
 
         # MLP
         y = self.mlp(x, deterministic=deterministic, rngs=rngs)
         x = x + y
-        return x, new_cache
+        return x, new_cache, attn_weights
 
 class BlockCausalTransformer(nnx.Module):
     """Stack of block-causal transformer layers."""
@@ -671,8 +700,9 @@ class BlockCausalTransformer(nnx.Module):
         time_local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
-        rngs: nnx.Rngs | None = None
-    ) -> Tuple[jax.Array, KVCachesDict | None]:
+        rngs: nnx.Rngs | None = None,
+        return_weights: bool = False,
+    ) -> Tuple[jax.Array, KVCachesDict | None, list | None]:
         """
         Args:
             x: (B, T, S, D) input tensor
@@ -682,11 +712,13 @@ class BlockCausalTransformer(nnx.Module):
             deterministic: whether to use deterministic mode (no dropout)
             caches: optional dict mapping layer_index -> KVCache
             rngs: optional RNG state for dropout
+            return_weights: if True, all_weights is populated with per-layer attention matrices
 
         Returns:
-            output tensor and updated caches (always returns tuple, caches can be None)
+            (x, new_caches, all_weights) — all_weights is None when return_weights=False.
         """
         new_caches = {} if caches is not None else None
+        all_weights: list | None = [] if return_weights else None
         x0 = x
 
         for i, layer in enumerate(self.layers):
@@ -699,12 +731,14 @@ class BlockCausalTransformer(nnx.Module):
             is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
 
-            x, new_cache_i = layer(x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs)
+            x, new_cache_i, w_i = layer(x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs, return_weights=return_weights)
+            if all_weights is not None:
+                all_weights.append(w_i)
 
             if new_caches is not None and new_cache_i is not None:
                 new_caches[time_index] = new_cache_i
 
-        return x, new_caches
+        return x, new_caches, all_weights
 
     def estimate_attention_flops(self, batch_size: int, seq_time: int, seq_space: int) -> int:
         """Attention FLOPs per training step (forward + backward).
@@ -791,7 +825,7 @@ class Encoder(nnx.Module):
 
         # Feed tokens into transformer
         time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
-        encoded_tokens, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, rngs=rngs)
+        encoded_tokens, _, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, rngs=rngs)
 
         # Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
@@ -866,7 +900,7 @@ class Decoder(nnx.Module):
         space_mask = layout.build_space_mask("decoder")
 
         time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
-        x, new_caches = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, caches=caches, rngs=rngs)
+        x, new_caches, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, caches=caches, rngs=rngs)
 
         # Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
@@ -1298,7 +1332,7 @@ class Dynamics(nnx.Module):
         if context_length is not None:
             time_local_window_size = (context_length - 1, 0)
 
-        x, new_caches = self.transformer(
+        x, new_caches, _ = self.transformer(
             tokens, space_mask=space_mask,
             time_mask=time_mask,
             time_local_window_size=time_local_window_size,

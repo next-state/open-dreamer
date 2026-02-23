@@ -1032,3 +1032,161 @@ def run_x0_visualization(
 
     # Log
     logger.log_image(step, "x0_vis", img_array, caption=f"step {step}")
+
+
+def run_attention_visualization(
+    cfg,
+    step: int,
+    tokenizer,
+    dynamics,
+    *,
+    data: jnp.ndarray,
+    actions,
+    use_latent_data: bool,
+    vis_dir: Path,
+    logger,
+):
+    """Visualize per-layer attention weights to diagnose attention entropy collapse.
+
+    Produces two plots:
+      1. Entropy heatmap — (n_layers × n_heads), colour = mean entropy over query positions.
+         Low values indicate attention collapse (each query attends to ≤1 position).
+      2. Temporal attention matrices — one T×T heatmap per temporal layer (every time_every
+         layers), averaged over spatial tokens and attention heads.
+
+    These plots are inspired by the Self Forcing paper (arXiv 2506.08009) and can be used to
+    compare healthy (small dataset) vs collapsed (large dataset) attention patterns.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from PIL import Image
+    from einops import rearrange
+
+    # --- 1. Prepare a single sample of latents (B=1) ---
+    sample_data = data[:1]      # (1, T, ...)
+    sample_actions = actions[:1]  # (1, T, ...)
+
+    if use_latent_data:
+        latents = sample_data.astype(dynamics.dtype)
+    else:
+        latents, _ = tokenizer.encode(sample_data, deterministic=True)
+        latents = jax.lax.stop_gradient(latents).astype(dynamics.dtype)
+
+    latents = normalize_latents(latents, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+
+    B, T = latents.shape[0], latents.shape[1]
+
+    # --- 2. Build the token sequence (mirrors Dynamics.__call__) ---
+    # Use clean-data signal level (τ=1, finest step size)
+    tau_indices  = jnp.full((B, T), dynamics.cfg.k_max, dtype=jnp.int32)   # σ=1.0
+    step_indices = jnp.zeros((B, T), dtype=jnp.int32)                       # step=1/k_max
+
+    packed_enc_tokens = rearrange(latents, "b t (n p) d -> b t n (p d)", p=dynamics.packing_factor)
+    spatial_tokens = dynamics.spatial_proj(packed_enc_tokens)
+    action_token   = dynamics.action_encoder(actions=sample_actions, batch_time_shape=(B, T))
+    register_tokens = jnp.broadcast_to(
+        dynamics.register_tokens.value.astype(dynamics.dtype)[None, None],
+        (B, T, dynamics.n_register, dynamics.d_model),
+    )
+    step_emb   = dynamics.step_embed(step_indices.astype(jnp.float32))
+    signal_emb = dynamics.signal_embed(tau_indices.astype(jnp.float32) / dynamics.k_max)
+    shortcut_token = jnp.concatenate([step_emb, signal_emb], axis=-1)[:, :, None, :]
+
+    tokens = jnp.concatenate([action_token, shortcut_token, spatial_tokens, register_tokens], axis=2)
+
+    n_latents = latents.shape[2]
+    layout = dynamics.get_token_layout(n_latents=n_latents, n_agent=0)
+    space_mask = layout.build_space_mask("wm_agent")
+
+    # --- 3. Forward pass with attention weight capture (no JIT) ---
+    _, _, all_weights = dynamics.transformer(
+        tokens,
+        space_mask=space_mask,
+        time_mask=None,
+        time_local_window_size=None,
+        deterministic=True,
+        caches=None,
+        rngs=None,
+        return_weights=True,
+    )
+
+    all_weights = jax.device_get(all_weights)  # list of numpy arrays, one per layer
+
+    # --- 4. Compute per-layer per-head mean entropy ---
+    n_layers = len(all_weights)
+    time_every = dynamics.cfg.time_every
+    n_heads = dynamics.cfg.n_heads
+
+    entropies = np.zeros((n_layers, n_heads), dtype=np.float32)
+    time_layer_weights = {}  # layer_idx -> (N, T, T) averaged over B and S
+
+    for i, w in enumerate(all_weights):
+        if w is None:
+            continue
+        is_time = (i + 1) % time_every == 0
+        if is_time:
+            # w: (B, S, N, T, T) — causal temporal attention
+            w_np = np.array(w)                   # (B, S, N, T, T)
+            w_avg = w_np.mean(axis=(0, 1))       # (N, T, T)
+            time_layer_weights[i] = w_avg
+            # entropy along key axis, averaged over query tokens
+            H = -np.where(w_avg > 0, w_avg * np.log(w_avg + 1e-9), 0.0).sum(axis=-1)  # (N, T)
+            entropies[i] = H.mean(axis=-1)       # (N,)
+        else:
+            # w: (B, T, N, S, S) — spatial attention
+            w_np = np.array(w)                   # (B, T, N, S, S)
+            w_avg = w_np.mean(axis=(0, 1))       # (N, S, S)
+            H = -np.where(w_avg > 0, w_avg * np.log(w_avg + 1e-9), 0.0).sum(axis=-1)  # (N, S)
+            entropies[i] = H.mean(axis=-1)       # (N,)
+
+    # --- 5. Build figure ---
+    n_time_layers = len(time_layer_weights)
+    n_cols = 1 + max(n_time_layers, 1)
+    fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, max(4, 0.35 * n_layers + 1)))
+
+    # Left panel: entropy heatmap (n_layers × n_heads)
+    ax_ent = axes[0]
+    im = ax_ent.imshow(entropies, aspect="auto", cmap="viridis", interpolation="nearest")
+    fig.colorbar(im, ax=ax_ent, label="mean entropy (nats)")
+    ax_ent.set_xlabel("head")
+    ax_ent.set_ylabel("layer")
+    ax_ent.set_title("attention entropy\n(lower = more collapsed)")
+    ytick_labels = []
+    for li in range(n_layers):
+        is_t = (li + 1) % time_every == 0
+        ytick_labels.append(f"{li} {'[T]' if is_t else '[S]'}")
+    ax_ent.set_yticks(range(n_layers))
+    ax_ent.set_yticklabels(ytick_labels, fontsize=7)
+
+    # Right panels: temporal attention matrices
+    for j, (li, w_avg) in enumerate(sorted(time_layer_weights.items())):
+        ax = axes[1 + j]
+        # Average over heads for a single T×T map
+        w_mean = w_avg.mean(axis=0)  # (T, T)
+        im2 = ax.imshow(w_mean, aspect="auto", cmap="plasma", interpolation="nearest",
+                        vmin=0, vmax=w_mean.max())
+        fig.colorbar(im2, ax=ax)
+        ax.set_title(f"layer {li} [T]\ntime attn (avg heads)")
+        ax.set_xlabel("key pos")
+        ax.set_ylabel("query pos")
+
+    for j in range(n_time_layers, n_cols - 1):
+        axes[1 + j].axis("off")
+
+    fig.suptitle(f"Attention weights — step {step}", fontsize=11)
+    fig.tight_layout()
+
+    # --- 6. Convert figure to numpy array ---
+    import io
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    buf.seek(0)
+    img_array = np.array(Image.open(buf))[:, :, :3]  # drop alpha if present
+    plt.close(fig)
+
+    # --- 7. Save and log ---
+    out_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+    Image.fromarray(img_array).save(str(out_dir / "attn_vis.png"))
+    logger.log_image(step, "attn_vis", img_array, caption=f"step {step}")
