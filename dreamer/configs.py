@@ -146,6 +146,12 @@ class DynamicsModelConfig:
     # attention window for sliding window attention (used when T > context_length)
     context_length: int = 192
 
+    # EDM-style sigma-dependent skip connection (Karras et al. 2022, arxiv:2206.00364)
+    # sigma_data: assumed std of clean data; controls the c_skip/c_out/c_in preconditioning curves.
+    # Latents are normalized to unit variance by normalize_latents(), so sigma_data=1.0 is correct.
+    # Set to 0.0 to disable (falls back to raw network output with no skip connection).
+    sigma_data: float = 1.0
+
     # action conditioning
     num_binary_actions: int = 0
     categorical_action_dim: int = 0

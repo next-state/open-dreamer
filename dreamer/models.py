@@ -1200,8 +1200,28 @@ class Dynamics(nnx.Module):
         """
         B, T = unpacked_enc_tokens.shape[:2]
 
+        # EDM sigma-dependent preconditioning (Karras et al. 2022, arxiv:2206.00364).
+        # tau ∈ [0, 1]: tau=0 is pure noise, tau=1 is clean → noise level σ = 1 − tau.
+        # sigma_data = assumed std of clean latents; use 1.0 since latents are unit-normalized.
+        sigma_data = self.cfg.sigma_data
+        use_edm = sigma_data > 0.0
+        if use_edm:
+            tau = tau_indices.astype(jnp.float32) / self.k_max         # (B, T)
+            sigma = 1.0 - tau                                           # (B, T)
+            sigma2 = sigma ** 2
+            sigma_data2 = sigma_data ** 2
+            denom = jnp.sqrt(sigma2 + sigma_data2)                      # (B, T)
+            # Broadcast to (B, T, 1, 1) for element-wise ops on latent tokens
+            c_skip = (sigma_data2 / (sigma2 + sigma_data2))[:, :, None, None].astype(self.dtype)
+            c_out  = (sigma * sigma_data / denom)[:, :, None, None].astype(self.dtype)
+            c_in   = (1.0 / denom)[:, :, None, None].astype(self.dtype)
+            scaled_enc_tokens = unpacked_enc_tokens * c_in
+        else:
+            c_skip = c_out = None
+            scaled_enc_tokens = unpacked_enc_tokens
+
         # Pack tokens internally for processing
-        packed_enc_tokens = rearrange(unpacked_enc_tokens, "b t (n p) d -> b t n (p d)", p=self.packing_factor)
+        packed_enc_tokens = rearrange(scaled_enc_tokens, "b t (n p) d -> b t n (p d)", p=self.packing_factor)
         # Project spatial tokens to d_model
         spatial_tokens = self.spatial_proj(packed_enc_tokens)  # (B, T, n_spatial, d_model)
 
@@ -1254,7 +1274,13 @@ class Dynamics(nnx.Module):
         x1_hat_packed = self.flow_x_head(spatial_tokens)  # (B, T, n_spatial, d_spatial)
 
         # Unpack before returning
-        x1_hat = rearrange(x1_hat_packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
+        x1_hat_raw = rearrange(x1_hat_packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
+
+        # Apply EDM skip connection: D = c_skip·x_noisy + c_out·F(c_in·x_noisy)
+        if use_edm:
+            x1_hat = c_skip * unpacked_enc_tokens + c_out * x1_hat_raw
+        else:
+            x1_hat = x1_hat_raw
         
         h_t = x[:, :, layout.slices()[Modality.AGENT], :] if task_embeddings is not None else None  # (B,T,n_agent,D) or None
         return x1_hat, (h_t, new_caches)
