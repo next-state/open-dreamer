@@ -7,6 +7,7 @@ from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 from .actions import Actions
 from .utils import normalize_latents, unnormalize_latents
 from flax.struct import dataclass
+from tqdm import tqdm
 
 
 @dataclass
@@ -142,7 +143,8 @@ def next_latent(
 
             assert task_embedding is None or task_embedding.shape[1] == noisy_latent.shape[1], f"task_embedding.shape = {task_embedding.shape}, noisy_latent.shape = {noisy_latent.shape}"
         
-        else: # Used only for debugging.
+        else:
+            # Used only for debugging.
             assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None
             latent_input  = jnp.concatenate([latents_ctx_noised, latent_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
             actions_input = jax.tree.map(lambda x, y: jnp.concatenate([x, y], axis=1), actions_ctx, action)  # (B, T_ctx+1)
@@ -256,6 +258,7 @@ def next_frame(
     
     return frame, h_last, dynamics_cache_updated, tokenizer_cache_updated, rng
 
+
 def latent_rollout(
     dynamics: Dynamics,
     policy: PolicyHeadMTP | Actions,
@@ -293,30 +296,7 @@ def latent_rollout(
     latents_ctx_orig = latents_ctx
     latents_ctx = normalize_latents(latents_ctx, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
-    # Initialize caches and process context
-    window_size = T_ctx + num_steps
-    n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
-    caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
-
-    # Run dynamics on context to prefill caches and get last hidden state
-    # Use clean signal for ground truth context
-    step_idx_prefill = jnp.full((B, T_ctx), schedule.emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
-    tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)  # tau=1.0
-
-    if use_kv_cache:
-        # Dynamics call for prefill
-        _, (h_seq, caches) = dynamics(
-            actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
-            task_embeddings=initial_task_embedding, caches=caches, deterministic=True
-        )
-
-        # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
-        task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
-        h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
-    else:
-        caches, task_embedding, h_seq, h_last = None, None, None, None
-
-    # 2. Scan loop for rollout
+    # Scan loop for rollout
     def scan_step(carry, step_idx):
         h_t, caches_t, rng = carry
 
@@ -331,26 +311,69 @@ def latent_rollout(
         
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng = next_latent(
-            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding,
-            latents_ctx=latents_ctx, actions_ctx=actions_ctx, prefill_length=T_ctx
+            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
         )
         
-        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next) # latent_next is (B, 1, n_spatial, D_s) 
+        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next) # latent_next[:, 0] to remove time dimension
 
-    # Run scan
-    _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
-        scan_step,
-        (h_last, caches, rng),
-        jnp.arange(num_steps)
-    )
 
-    # Unpack results
-    rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
-    rollout_actions = jax.tree.map(lambda x: einops.rearrange(x, 't b ... -> b t ...'), rollout_actions)
-    # h_next has shape (B, 1, n_agent, d_model), so scan output is (t, B, 1, n_agent, d_model)
-    rollout_hidden = einops.rearrange(rollout_hidden, 't b 1 n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
+    if use_kv_cache:
+        # Initialize caches and process context
+        window_size = T_ctx + num_steps
+        n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
+        caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
 
-    out_latents = jnp.concatenate((latents_ctx_orig, rollout_latents), axis=1)
+        # Run dynamics on context to prefill caches and get last hidden state
+        # Use clean signal for ground truth context
+        step_idx_prefill = jnp.full((B, T_ctx), schedule.emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
+        tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)  # tau=1.0
+        
+        _, (h_seq, caches) = dynamics(
+            actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
+            task_embeddings=initial_task_embedding, caches=caches, deterministic=True
+        )
+
+        # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
+        task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
+        h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
+
+        # Run scan
+        _, (rollout_latents, rollout_actions, rollout_hidden) = jax.lax.scan(
+            scan_step,
+            (h_last, caches, rng),
+            jnp.arange(num_steps)
+        )
+
+        # Unpack results
+        rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
+        rollout_actions = jax.tree.map(lambda x: einops.rearrange(x, 't b ... -> b t ...'), rollout_actions)
+        # h_next has shape (B, 1, n_agent, d_model), so scan output is (t, B, 1, n_agent, d_model)
+        rollout_hidden = einops.rearrange(rollout_hidden, 't b 1 n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
+
+        out_latents = jnp.concatenate((latents_ctx_orig, rollout_latents), axis=1)
+    else:
+        # Run scan without KV caching in Python for-loop to support debugging
+        
+        # Not Implemented:
+        h_seq, rollout_hidden = None, None
+        if not isinstance(policy, Actions):
+                raise NotImplementedError
+
+        for step_idx in tqdm(range(num_steps)):
+            action = policy[:, step_idx]
+
+            # Predict next latent
+            latent_next, _, _, rng = next_latent(
+                dynamics, schedule, action, latent_shape, rng, caches=None, task_embedding=None,
+                latents_ctx=latents_ctx, actions_ctx=actions_ctx, prefill_length=T_ctx
+            )
+
+            latents_ctx = jnp.concatenate([latents_ctx, latent_next], axis=1)
+            action = action[:, None, ...]
+            actions_ctx = jax.tree.map(lambda x, y: jnp.concatenate([x, y], axis=1), actions_ctx, action)
+
+        out_latents = jnp.concatenate((latents_ctx_orig, latents_ctx[:, T_ctx:]), axis=1)
+        rollout_actions = actions_ctx
 
     return {
         'latents': out_latents,
