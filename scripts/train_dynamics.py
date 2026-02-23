@@ -220,6 +220,8 @@ def run(cfg: DynamicsConfig):
                 videos = batch.get("videos")
                 latents = batch.get("latents")
                 input_tensor = latents if latents is not None else videos
+
+                actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
                 
 
                 # Validation step before training (as input buffers might be donated)
@@ -270,7 +272,6 @@ def run(cfg: DynamicsConfig):
                             "flow_mse_mid": metrics_cpu["flow_mse_mid"],
                             "flow_mse_high": metrics_cpu["flow_mse_high"],
                             "boot_target_norm": metrics_cpu["boot_target_norm"],
-                            "boot_clip_frac": metrics_cpu["boot_clip_frac"],
                             "lr": lr_schedule(step),
                             **scaling.get_step_metrics(step),
                         },

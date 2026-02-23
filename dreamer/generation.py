@@ -7,10 +7,8 @@ from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 from .actions import Actions
 from .utils import normalize_latents, unnormalize_latents
 from flax.struct import dataclass
+from tqdm import tqdm
 
-
-LATENT_NORM_CLIP = 4.0
-TAU_IDX_MAX = 120  # Cap τ-ladder: only run refinement steps where tau index <= this value
 
 @dataclass
 class DenoiseSchedule:
@@ -22,6 +20,7 @@ class DenoiseSchedule:
         k_max: a power of two, maximum noise resolution used during diffusion training. In the paper, it's 256.
         d: Step size d=1/k ∈ {1, 1/2, 1/4, ..., 1/k_max} during inference, where k is num_steps.
         step_idx: log2(k) ∈ {0, 1, 2, ..., log2(K_max)} for denoising.
+        emax: log2(k_max), the maximum step index.
         tau_values: signal levels used during the denoising τ = [0, d, 2d, ..., 1 - d, 1].
         tau_indices: indices of the signal levels used during the denoising τ_idx = [0, k, 2k, ..., k_max].
         beta_values: precomputed Euler step mixing coefficients for each step, where beta[s] = (1 - tau[s+1]) / (1 - tau[s]).
@@ -32,10 +31,10 @@ class DenoiseSchedule:
     """
 
     num_steps: int
-    num_steps_capped: int
     k_max: int
     d: float
     step_idx: int
+    emax: int
     tau_values: jax.Array
     tau_indices: jax.Array
     beta_values: jax.Array
@@ -78,12 +77,7 @@ class DenoiseSchedule:
         tau_ctx = jnp.array(j_ctx / K_ctx, dtype=dtype)
         tau_idx_ctx = j_ctx * (k_max // K_ctx)
 
-        # Concrete int: only run steps where tau index <= TAU_IDX_MAX (for jnp.arange in next_latent when traced).
-        step_size = k_max // num_steps
-        max_s = TAU_IDX_MAX // step_size
-        num_steps_capped = min(num_steps, max_s + 1)
-
-        return cls(num_steps, num_steps_capped, k_max, d, step_idx, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
+        return cls(num_steps, k_max, d, step_idx, emax, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
     
 # ---------------------------
 # Single-step τ-ladder denoiser
@@ -135,7 +129,7 @@ def next_latent(
         latents_ctx_noised = jnp.concatenate([latents_prefill, latents_decode_noised], axis=1)
 
     action = action[:, None, ...]  # expand squeezed-out time dimension
-    
+
     def refinement_step(latent_t, s):
         beta = schedule.beta_values[s]
 
@@ -150,13 +144,14 @@ def next_latent(
 
             assert task_embedding is None or task_embedding.shape[1] == noisy_latent.shape[1], f"task_embedding.shape = {task_embedding.shape}, noisy_latent.shape = {noisy_latent.shape}"
         
-        else: # Used only for debugging.
+        else:
+            # Used only for debugging.
             assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None
             latent_input  = jnp.concatenate([latents_ctx_noised, latent_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
             actions_input = jax.tree.map(lambda x, y: jnp.concatenate([x, y], axis=1), actions_ctx, action)  # (B, T_ctx+1)
 
             decode_length = latents_ctx_noised.shape[1] - prefill_length
-            step_idx_prefill= jnp.full((B, prefill_length), step_idx, dtype=jnp.int32)
+            step_idx_prefill= jnp.full((B, prefill_length), schedule.emax, dtype=jnp.int32)
             step_idx_decode = jnp.full((B, decode_length),  schedule.step_idx_ctx, dtype=jnp.int32)
             step_idx_curr   = jnp.full((B, 1), step_idx, dtype=jnp.int32)
             step_indices    = jnp.concatenate([step_idx_prefill, step_idx_decode, step_idx_curr], axis=1)
@@ -181,17 +176,15 @@ def next_latent(
 
         # Per-step mixing toward clean latent
         latent_t_new = beta * latent_t + (1.0 - beta) * latent_clean_pred
-        clip_frac = jnp.mean((jnp.abs(latent_t_new) > LATENT_NORM_CLIP).astype(jnp.float32))
-        latent_t_new = jnp.clip(latent_t_new, -LATENT_NORM_CLIP, LATENT_NORM_CLIP)
 
-        return latent_t_new, (h_last, x0_norm, update_mag, clip_frac)
+        return latent_t_new, (h_last, x0_norm, update_mag)
 
     # Run τ-ladder with JAX control flow using scan to keep carry/output structure consistent.
     # Only run steps where tau index <= TAU_IDX_MAX (schedule.num_steps_capped is a concrete int for tracing).
-    latent_t_final, (h_history, x0_norm_hist, update_mag_hist, clip_frac_hist) = jax.lax.scan(
+    latent_t_final, (h_history, x0_norm_hist, update_mag_hist) = jax.lax.scan(
         refinement_step,
         noisy_latent,
-        jnp.arange(schedule.num_steps_capped),
+        jnp.arange(schedule.num_steps),
     )
 
     # Aggregate per-step ODE diagnostics across τ-ladder steps.
@@ -201,12 +194,9 @@ def next_latent(
         'x0_norm_max': jnp.max(x0_norm_hist),
         'update_mag_mean': jnp.mean(update_mag_hist),
         'update_mag_max': jnp.max(update_mag_hist),
-        'clip_frac_mean': jnp.mean(clip_frac_hist),
-        'clip_frac_max': jnp.max(clip_frac_hist),
         # Per-τ-step arrays (shape: num_steps,) for plotting
         'x0_norm_steps': x0_norm_hist,
         'update_mag_steps': update_mag_hist,
-        'clip_frac_steps': clip_frac_hist,
     }
     
     if caches is not None:
@@ -229,8 +219,6 @@ def next_latent(
 
     assert isinstance(h_last, jax.Array) or h_last is None
 
-    latent_t_final = jnp.clip(latent_t_final, -LATENT_NORM_CLIP, LATENT_NORM_CLIP)
-    # Unnormalize output so caller receives latents in original space
     latent_t_final = unnormalize_latents(latent_t_final, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
     return latent_t_final, h_last, caches_new, rng, diag_dict
@@ -288,6 +276,7 @@ def next_frame(
     
     return frame, h_last, dynamics_cache_updated, tokenizer_cache_updated, rng
 
+
 def latent_rollout(
     dynamics: Dynamics,
     policy: PolicyHeadMTP | Actions,
@@ -298,6 +287,7 @@ def latent_rollout(
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
     deterministic: bool = False,
+    use_kv_cache: bool = True,
 ):
     """
     Autoregressive rollout in latent space.
@@ -312,6 +302,7 @@ def latent_rollout(
         rng: Random number generator key
         initial_task_embedding: Optional (B, T_ctx, n_agent, D) agent tokens for context.
         deterministic: Whether to sample deterministic actions from the policy.
+        use_kv_cache: Whether to use KV caching in dynamics for faster rollout.
         
     Returns:
         Dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
@@ -323,28 +314,7 @@ def latent_rollout(
     latents_ctx_orig = latents_ctx
     latents_ctx = normalize_latents(latents_ctx, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
-    # Initialize caches and process context
-    window_size = T_ctx + num_steps
-    n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
-    caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
-
-    # Run dynamics on context to prefill caches and get last hidden state
-    # Use clean signal for ground truth context
-    emax = int(math.log2(schedule.k_max))
-    step_idx_prefill = jnp.full((B, T_ctx), emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
-    tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)  # tau=1.0
-
-    # Dynamics call for prefill
-    _, (h_seq, caches) = dynamics(
-        actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
-        task_embeddings=initial_task_embedding, caches=caches, deterministic=True
-    )
-
-    # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
-    task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
-    h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
-
-    # 2. Scan loop for rollout
+    # Scan loop for rollout
     def scan_step(carry, step_idx):
         h_t, caches_t, rng = carry
 
@@ -361,27 +331,75 @@ def latent_rollout(
         latent_next, h_next, caches_next, rng, diag = next_latent(
             dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
         )
+        
+        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next, diag) # latent_next[:, 0] to remove time dimension
 
-        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next, diag)  # latent_next is (B, 1, n_spatial, D_s)
 
-    # Run scan
-    _, (rollout_latents, rollout_actions, rollout_hidden, rollout_diags) = jax.lax.scan(
-        scan_step,
-        (h_last, caches, rng),
-        jnp.arange(num_steps)
-    )
+    if use_kv_cache:
+        # Initialize caches and process context
+        window_size = T_ctx + num_steps
+        n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
+        caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
 
-    # Unpack results
-    rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
-    rollout_actions = jax.tree.map(lambda x: einops.rearrange(x, 't b ... -> b t ...'), rollout_actions)
-    # h_next has shape (B, 1, n_agent, d_model), so scan output is (t, B, 1, n_agent, d_model)
-    rollout_hidden = einops.rearrange(rollout_hidden, 't b 1 n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
+        # Run dynamics on context to prefill caches and get last hidden state
+        # Use clean signal for ground truth context
+        step_idx_prefill = jnp.full((B, T_ctx), schedule.emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
+        tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)  # tau=1.0
+        
+        _, (h_seq, caches) = dynamics(
+            actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
+            task_embeddings=initial_task_embedding, caches=caches, deterministic=True
+        )
 
-    # Aggregate ODE diagnostics: mean over autoregressive steps (axis 0).
-    # Scalar leaves (num_AR_steps,) → scalar; array leaves (num_AR_steps, num_tau_steps) → (num_tau_steps,).
-    ode_diags = jax.tree.map(lambda x: jnp.mean(x, axis=0), rollout_diags)
+        # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
+        task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
+        h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
 
-    out_latents = jnp.concatenate((latents_ctx_orig, rollout_latents), axis=1)
+        # Run scan
+        _, (rollout_latents, rollout_actions, rollout_hidden, rollout_diags) = jax.lax.scan(
+            scan_step,
+            (h_last, caches, rng),
+            jnp.arange(num_steps)
+        )
+
+        # Unpack results
+        rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')
+        rollout_actions = jax.tree.map(lambda x: einops.rearrange(x, 't b ... -> b t ...'), rollout_actions)
+        # h_next has shape (B, 1, n_agent, d_model), so scan output is (t, B, 1, n_agent, d_model)
+        rollout_hidden = einops.rearrange(rollout_hidden, 't b 1 n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
+
+        # Aggregate ODE diagnostics: mean over autoregressive steps (axis 0).
+        # Scalar leaves (num_AR_steps,) → scalar; array leaves (num_AR_steps, num_tau_steps) → (num_tau_steps,).
+        ode_diags = jax.tree.map(lambda x: jnp.mean(x, axis=0), rollout_diags)
+
+        out_latents = jnp.concatenate((latents_ctx_orig, rollout_latents), axis=1)
+    else:
+        # Run scan without KV caching in Python for-loop to support debugging
+        
+        # Not Implemented:
+        h_seq, rollout_hidden = None, None
+        if not isinstance(policy, Actions):
+                raise NotImplementedError
+
+        pred_latents = []
+        for step_idx in tqdm(range(num_steps)):
+            action = policy[:, step_idx]
+
+            # Predict next latent
+            latent_next, _, _, rng, diag = next_latent(
+                dynamics, schedule, action, latent_shape, rng, caches=None, task_embedding=None,
+                latents_ctx=latents_ctx, actions_ctx=actions_ctx, prefill_length=T_ctx
+            )
+
+            pred_latents.append(latent_next[:, 0])  # Remove time dimension
+            latent_next_norm = normalize_latents(latent_next, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+            latents_ctx = jnp.concatenate([latents_ctx, latent_next_norm], axis=1)
+            action = action[:, None, ...]
+            actions_ctx = jax.tree.map(lambda x, y: jnp.concatenate([x, y], axis=1), actions_ctx, action)
+
+        out_latents = jnp.concatenate((latents_ctx_orig, jnp.stack(pred_latents, axis=1)), axis=1)
+        rollout_actions = actions_ctx
+        ode_diags = None
 
     return {
         'latents': out_latents,

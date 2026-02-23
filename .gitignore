@@ -1,5 +1,6 @@
 logs/
 outputs/
+eval_outputs/
 overfit_exps/
 *.out
 slurm_outs/

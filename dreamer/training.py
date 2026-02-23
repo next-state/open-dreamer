@@ -387,7 +387,6 @@ def shortcut_forcing_step(
     loss_boot = jnp.array(0.0, dtype=latents.dtype)
     boot_mse_unweighted = jnp.array(0.0, dtype=latents.dtype)
     boot_target_norm = jnp.array(0.0, dtype=latents.dtype)
-    boot_clip_frac = jnp.array(0.0, dtype=latents.dtype)
     
     if B_self > 0:
         z_pred_self = z_pred_full[B_emp:]
@@ -408,7 +407,7 @@ def shortcut_forcing_step(
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
         )
         z1_half1 = jax.lax.stop_gradient(z1_half1)
-        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 0.05)
+        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-5)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
         z_prime = jnp.clip(z_prime, -4.0, 4.0)
 
@@ -418,12 +417,11 @@ def shortcut_forcing_step(
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
         )
         z1_half2 = jax.lax.stop_gradient(z1_half2)
-        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 0.05)
+        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-5)
 
         # Bootstrap target health diagnostics (before clipping)
         v_target_unclipped = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
         boot_target_norm = jnp.mean(jnp.abs(v_target_unclipped))
-        boot_clip_frac = jnp.mean((jnp.abs(v_target_unclipped) > 4.0).astype(jnp.float32))
 
         # Bootstrap loss (computed unconditionally)
         loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
@@ -440,7 +438,6 @@ def shortcut_forcing_step(
         'flow_mse_mid': flow_mse_mid,
         'flow_mse_high': flow_mse_high,
         'boot_target_norm': boot_target_norm,
-        'boot_clip_frac': boot_clip_frac,
         'h_states': h_states,
     }
     
@@ -803,7 +800,7 @@ def run_evaluation(
     """
     k_max = dynamics.cfg.k_max
     schedule_shortcut = DenoiseSchedule.init(4, k_max)
-    schedule_diffusion = DenoiseSchedule.init(k_max, k_max)
+    schedule_diffusion = DenoiseSchedule.init(64, k_max)
 
     evaluation_schedules = {"shortcut": schedule_shortcut, "diffusion": schedule_diffusion}
 
@@ -892,7 +889,7 @@ def run_evaluation(
             from PIL import Image as _Image
 
             tau_xs = _np.array(schedule_config.tau_values[:-1])  # starting τ of each step
-            fig, axes = plt.subplots(1, len(ode_curves), figsize=(4 * len(ode_curves), 3), squeeze=False)
+            fig, axes = plt.subplots(1, len(ode_curves), figsize=(4 * len(ode_curves), 2), squeeze=False)
             for ax, (name, values) in zip(axes[0], ode_curves.items()):
                 ax.plot(tau_xs, values)
                 ax.set_xlabel('τ')
