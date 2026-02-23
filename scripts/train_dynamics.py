@@ -216,6 +216,8 @@ def run(cfg: DynamicsConfig):
                 videos = batch.get("videos")
                 latents = batch.get("latents")
                 input_tensor = latents if latents is not None else videos
+
+                actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
                 
 
                 # Validation step before training (as input buffers might be donated)

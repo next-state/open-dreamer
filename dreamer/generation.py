@@ -269,7 +269,7 @@ def latent_rollout(
     rng: jax.Array,
     initial_task_embedding: jax.Array | None = None,
     deterministic: bool = False,
-    use_kv_cache: bool = False,
+    use_kv_cache: bool = True,
 ):
     """
     Autoregressive rollout in latent space.
