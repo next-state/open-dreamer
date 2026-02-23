@@ -359,6 +359,7 @@ def latent_rollout(
         if not isinstance(policy, Actions):
                 raise NotImplementedError
 
+        pred_latents = []
         for step_idx in tqdm(range(num_steps)):
             action = policy[:, step_idx]
 
@@ -368,11 +369,13 @@ def latent_rollout(
                 latents_ctx=latents_ctx, actions_ctx=actions_ctx, prefill_length=T_ctx
             )
 
-            latents_ctx = jnp.concatenate([latents_ctx, latent_next], axis=1)
+            pred_latents.append(latent_next[:, 0])  # Remove time dimension
+            latent_next_norm = normalize_latents(latent_next, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+            latents_ctx = jnp.concatenate([latents_ctx, latent_next_norm], axis=1)
             action = action[:, None, ...]
             actions_ctx = jax.tree.map(lambda x, y: jnp.concatenate([x, y], axis=1), actions_ctx, action)
 
-        out_latents = jnp.concatenate((latents_ctx_orig, latents_ctx[:, T_ctx:]), axis=1)
+        out_latents = jnp.concatenate((latents_ctx_orig, jnp.stack(pred_latents, axis=1)), axis=1)
         rollout_actions = actions_ctx
 
     return {
