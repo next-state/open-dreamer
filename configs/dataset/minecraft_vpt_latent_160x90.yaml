@@ -1,0 +1,11 @@
+defaults:
+  - minecraft_vpt_latent
+  - _self_
+
+name: minecraft_vpt_latent_160x90
+
+# Path to latent shards produced by tokenize_minecraft_dataset.py with 160x90 tokenizer
+array_record_path: /mnt/data/tokenized_data_160x90
+
+H: 90
+W: 160

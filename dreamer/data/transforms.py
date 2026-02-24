@@ -12,7 +12,6 @@ import io
 import pickle
 from typing import Any
 import jax
-import jax.numpy as jnp
 
 import decord
 import grain
@@ -252,6 +251,8 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             full_episode: If True, return full episode without slicing (for tokenization)
         """
         self.seq_len = seq_len
+        self.image_h = image_h
+        self.image_w = image_w
         self.padding_h = tuple(padding_h) if isinstance(padding_h, list) else padding_h
         self.padding_w = tuple(padding_w) if isinstance(padding_w, list) else padding_w
         self.full_episode = full_episode
@@ -275,10 +276,14 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
         """
         data = pickle.loads(element)
 
-        # Decode MP4 bytes using decord
+        # Decode MP4 bytes using decord, resizing at decode time to avoid
+        # loading full-resolution frames into memory when downscaling
         mp4_bytes = io.BytesIO(data["video"])
         cpu_idx = int(rng.integers(0, 2))
-        vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(cpu_idx), num_threads=1)
+        vr = decord.VideoReader(
+            mp4_bytes, ctx=decord.cpu(cpu_idx), num_threads=1,
+            width=self.image_w, height=self.image_h,
+        )
 
         episode_len = len(vr)
 

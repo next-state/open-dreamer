@@ -81,7 +81,7 @@ def make_iterator(
     if use_latent_data:
         # Pre-tokenized latent data path
         operations = [ProcessLatentAndSlice(seq_len=dataloader_cfg.T)]
-    elif cfg.name == "minecraft_vpt":
+    elif cfg.name.startswith("minecraft_vpt"):
         operations = [
             EpisodeLengthFilter(
                 seq_len=dataloader_cfg.T,

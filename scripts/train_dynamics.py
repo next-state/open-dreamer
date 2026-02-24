@@ -84,7 +84,7 @@ def train_step(
             k_max=k_max,
             context_length=context_length,
             task_embeddings=None,
-            B_self = latents.shape[0]//8,
+            B_self = 0,
         )
 
         return losses['total'], aux

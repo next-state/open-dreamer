@@ -72,23 +72,37 @@ LATENT_DTYPE_MAP = {
 
 
 class MinecraftVPTProcessFullEpisode(grain.transforms.Map):
-    """Decode full MP4 episodes for tokenization and parse VPT actions."""
+    """Decode full MP4 episodes for tokenization and parse VPT actions.
 
-    def __init__(self, *, video_dtype: np.dtype, decord_threads: int):
+    When image_h and image_w are provided, decord decodes directly at that
+    resolution (reduces memory vs decoding full-res then resizing).
+    """
+
+    def __init__(
+        self,
+        *,
+        video_dtype: np.dtype,
+        decord_threads: int,
+        image_h: int | None = None,
+        image_w: int | None = None,
+    ):
         self.video_dtype = np.dtype(video_dtype)
         self.decord_threads = max(1, int(decord_threads))
+        self.image_h = image_h
+        self.image_w = image_w
 
     def map(self, element: bytes) -> dict[str, Any]:
         # Parse once (the previous implementation parsed twice per sample).
         data = pickle.loads(element)
 
-        # Decode full episode as uint8 then cast only if requested.
+        # Decode at target resolution when image_h/image_w set (reduces memory vs decode-then-resize)
         mp4_bytes = io.BytesIO(data["video"])
-        vr = decord.VideoReader(
-            mp4_bytes,
-            ctx=decord.cpu(0),
-            num_threads=self.decord_threads,
-        )
+        vr_kw = {"ctx": decord.cpu(0), "num_threads": self.decord_threads}
+        if self.image_h is not None and self.image_w is not None:
+            vr_kw["width"] = self.image_w
+            vr_kw["height"] = self.image_h
+        vr = decord.VideoReader(mp4_bytes, **vr_kw)
+
         frame_indices = np.arange(len(vr), dtype=np.int64)
         videos = vr.get_batch(frame_indices).asnumpy()
         if videos.dtype != self.video_dtype:
@@ -116,8 +130,14 @@ def make_tokenization_iterator(
     prefetch_buffer_size: int,
     decord_threads: int,
     video_dtype: np.dtype,
+    image_h: int | None = None,
+    image_w: int | None = None,
 ):
-    """Create dataloader for tokenization (sequential, no shuffle, full episodes)."""
+    """Create dataloader for tokenization (sequential, no shuffle, full episodes).
+
+    When image_h and image_w are provided, decoded frames are resized to that
+    resolution before batching (e.g. to match a tokenizer trained at 160x90).
+    """
     # Generate shard paths (same pattern as data.py:179)
     all_shards = sorted(Path(input_dir).glob("shard-*.array_record"))
     if num_shards is not None:
@@ -143,6 +163,8 @@ def make_tokenization_iterator(
         MinecraftVPTProcessFullEpisode(
             video_dtype=video_dtype,
             decord_threads=decord_threads,
+            image_h=image_h,
+            image_w=image_w,
         ),
         grain.transforms.Batch(batch_size=batch_size, drop_remainder=False),
     ]
@@ -422,6 +444,9 @@ def main():
         print(f"[tokenize] Tokenizer loaded successfully")
         print(f"[tokenize] n_latents: {tokenizer.encoder.n_latents}")
         print(f"[tokenize] d_bottleneck: {tokenizer.cfg.encoder.d_bottleneck}")
+        image_h = tokenizer.decoder.H
+        image_w = tokenizer.decoder.W
+        print(f"[tokenize] Target resolution: H={image_h}, W={image_w}")
 
         # Create dataloader with device sharding
         base_dataloader = make_tokenization_iterator(
@@ -433,6 +458,8 @@ def main():
             prefetch_buffer_size=args.prefetch_buffer_size,
             decord_threads=args.decord_threads,
             video_dtype=video_dtype,
+            image_h=image_h,
+            image_w=image_w,
         )
         dataloader = DeviceShardedIterator(
             base_dataloader,

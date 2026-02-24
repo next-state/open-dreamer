@@ -3,8 +3,8 @@ defaults:
 
 name: minecraft_vpt_latent
 data_type: latent
-array_record_path: /home/ubuntu/minecraft-vpt/arrayrecords-latents/
-index_max: 11
+array_record_path: /mnt/data/tokenized_data  
+index_max: 9
 num_max_samples: -1
 
 num_binary_actions: 23
@@ -12,8 +12,8 @@ categorical_action_dim: 121
 continuous_action_dim: 0
 
 dataloader_cfg:
-  B: 8
-  T: 4
+  B: 64
+  T: 32
   num_workers: 16
   prefetch_buffer_size: 10
   device_prefetch_buffer_size: 1

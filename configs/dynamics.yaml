@@ -12,7 +12,7 @@ ckpt:
 
 dataset:
   dataloader_cfg:
-    B: 16
+    B: 32
     T: 32
   C: 16
 

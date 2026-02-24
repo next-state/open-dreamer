@@ -1,0 +1,14 @@
+defaults:
+  - minecraft_vpt
+  - _self_
+
+name: minecraft_vpt_160x90
+array_record_path: /home/sacco/arrayrecords-mp4
+index_max: 100
+
+
+H: 90
+W: 160
+padding_H: [0, 0]
+padding_W: [0, 0]
+patch_size: 10
