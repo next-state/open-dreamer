@@ -199,9 +199,29 @@ def compute_psnr(pred, target):
     psnr_per_sample = -10.0 * jnp.log(mse_per_sample) / jnp.log(10.0)
     return jnp.mean(psnr_per_sample)
     
-def compute_flow_loss(z_pred: jnp.ndarray, z_target: jnp.ndarray, sigma: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    mse = (z_pred - z_target)**2
-    return jnp.mean(mse), jnp.mean(mse)
+def compute_flow_loss(
+    z_pred: jnp.ndarray,
+    z_target: jnp.ndarray,
+    tau: jnp.ndarray,
+    *,
+    sigma_data: float = 1.0,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Flow loss at d_min in x-space.
+
+    For x_tau = tau * x + (1 - tau) * eps and EDM-style preconditioning,
+    use weight w(tau) = 1/sigma_data^2 + (tau / (1 - tau))^2.
+    """
+    mse = (z_pred - z_target) ** 2
+    if sigma_data > 0.0:
+        tau_bt = tau[..., None, None]
+        b2 = (1.0 - tau_bt) ** 2
+        sigma_data2 = jnp.asarray(sigma_data ** 2, dtype=mse.dtype)
+        weight = (1.0 / sigma_data2) + (tau_bt ** 2) / jnp.maximum(b2, 1e-8)
+        flow_loss = mse * weight
+    else:
+        flow_loss = mse
+    return jnp.mean(flow_loss), jnp.mean(mse)
 
 
 def compute_bootstrap_loss(z_pred: jnp.ndarray, z_tilde: jnp.ndarray, b_prime: jnp.ndarray, b_doubleprime: jnp.ndarray, sigma: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -275,19 +295,21 @@ def flow_forward(
     emax = jnp.log2(k_max).astype(jnp.int32)
 
     step_idx = jnp.full((B, T), emax, dtype=jnp.int32)
-    sigma, sigma_idx = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx, dtype=latents.dtype)
+    tau, tau_idx = sample_tau_for_step(key_sigma, (B, T), k_max, step_idx, dtype=latents.dtype)
 
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
-    z_tilde = (1.0 - sigma[..., None, None]) * z0 + sigma[..., None, None] * latents
+    z_tilde = (1.0 - tau[..., None, None]) * z0 + tau[..., None, None] * latents
 
     rngs = nnx.Rngs(dropout=key_dropout)
     z_pred, (h_states, _) = dynamics_model(
-        actions, step_idx, sigma_idx, z_tilde,
+        actions, step_idx, tau_idx, z_tilde,
         context_length=context_length, time_mask=time_mask,
         task_embeddings=task_embeddings, deterministic=False, rngs=rngs,
     )
 
-    loss_flow, flow_mse = compute_flow_loss(z_pred, latents, sigma)
+    loss_flow, flow_mse = compute_flow_loss(
+        z_pred, latents, tau, sigma_data=dynamics_model.cfg.sigma_data
+    )
     return loss_flow, flow_mse, {'h_states': h_states}
 
 

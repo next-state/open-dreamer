@@ -230,7 +230,7 @@ def run(cfg: TokenizerConfig):
             scaling.start_training()
 
             # Training loop
-            pbar = tqdm(enumerate(train_dataloader, start=start_step), initial=start_step,total=cfg.max_steps)
+            pbar = tqdm(enumerate(train_dataloader, start=start_step), initial=start_step,total=cfg.max_steps, dynamic_ncols=True)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break

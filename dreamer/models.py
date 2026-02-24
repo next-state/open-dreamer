@@ -1200,21 +1200,23 @@ class Dynamics(nnx.Module):
         """
         B, T = unpacked_enc_tokens.shape[:2]
 
-        # EDM sigma-dependent preconditioning (Karras et al. 2022, arxiv:2206.00364).
-        # tau ∈ [0, 1]: tau=0 is pure noise, tau=1 is clean → noise level σ = 1 − tau.
-        # sigma_data = assumed std of clean latents; use 1.0 since latents are unit-normalized.
+        # EDM-style preconditioning adapted to this forward process:
+        # x_tau = tau * x + (1 - tau) * eps, tau ∈ [0, 1].
+        # This is not the raw EDM x + sigma * eps parameterization, so coefficients are
+        # derived in (a, b)-form with a=tau and b=(1-tau), assuming E[x^2]=sigma_data^2.
         sigma_data = self.cfg.sigma_data
         use_edm = sigma_data > 0.0
         if use_edm:
-            tau = tau_indices.astype(jnp.float32) / self.k_max         # (B, T)
-            sigma = 1.0 - tau                                           # (B, T)
-            sigma2 = sigma ** 2
+            tau = tau_indices.astype(jnp.float32) / self.k_max          # (B, T)
+            a = tau                                                      # clean coefficient
+            b = 1.0 - tau                                                # noise coefficient
             sigma_data2 = sigma_data ** 2
-            denom = jnp.sqrt(sigma2 + sigma_data2)                      # (B, T)
+            den = b ** 2 + sigma_data2 * a ** 2                         # (B, T)
+            sqrt_den = jnp.sqrt(den)                                     # (B, T)
             # Broadcast to (B, T, 1, 1) for element-wise ops on latent tokens
-            c_skip = (sigma_data2 / (sigma2 + sigma_data2))[:, :, None, None].astype(self.dtype)
-            c_out  = (sigma * sigma_data / denom)[:, :, None, None].astype(self.dtype)
-            c_in   = (1.0 / denom)[:, :, None, None].astype(self.dtype)
+            c_skip = (sigma_data2 * a / den)[:, :, None, None].astype(self.dtype)
+            c_out  = (b * sigma_data / sqrt_den)[:, :, None, None].astype(self.dtype)
+            c_in   = (1.0 / sqrt_den)[:, :, None, None].astype(self.dtype)
             scaled_enc_tokens = unpacked_enc_tokens * c_in
         else:
             c_skip = c_out = None
