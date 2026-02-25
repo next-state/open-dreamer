@@ -220,7 +220,7 @@ def apply_ot_coupling(
     from ott.geometry import pointcloud
     from ott.solvers import linear
 
-    geom = pointcloud.PointCloud(x, y, epsilon=epsilon, scale_cost=scale_cost)
+    geom = pointcloud.PointCloud(x, y, epsilon=epsilon, scale_cost=scale_cost or "mean")
     out = linear.solve(
         geom,
         a=a,

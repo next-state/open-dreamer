@@ -161,7 +161,7 @@ class DynamicsModelConfig:
     ot_threshold: float = 1e-3
     ot_lse_mode: bool = True
     ot_soft_coupling: bool = True
-    ot_scale_cost: str | None = None
+    ot_scale_cost: str = "mean"
 
     # attention window for sliding window attention (used when T > context_length)
     context_length: int = 192

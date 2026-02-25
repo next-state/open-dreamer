@@ -50,7 +50,7 @@ dynamics:
     ot_threshold: 1e-3
     ot_lse_mode: true
     ot_soft_coupling: true
-    ot_scale_cost: null
+    ot_scale_cost: mean
 
 bootstrap_start: 50_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
