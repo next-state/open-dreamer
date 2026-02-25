@@ -238,6 +238,10 @@ def apply_ot_coupling(
         col_sum = jnp.sum(P, axis=0, keepdims=True)
         col_sum = jnp.maximum(col_sum, 1e-8)
         x_coupled = (P.T @ x) / col_sum.T
+        # Renormalize per sample to match N(0, 1) statistics.
+        mean = jnp.mean(x_coupled, axis=1, keepdims=True)
+        var = jnp.mean((x_coupled - mean) ** 2, axis=1, keepdims=True)
+        x_coupled = x_coupled / jnp.max(jnp.sqrt(var), 1e-8)
     elif pairing == "argmax":
         # Hard assignment per y sample (not necessarily a permutation).
         idx = jnp.argmax(P, axis=0)
