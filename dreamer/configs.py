@@ -160,7 +160,7 @@ class DynamicsModelConfig:
     ot_max_iter: int = 50
     ot_threshold: float = 1e-3
     ot_lse_mode: bool = True
-    ot_soft_coupling: bool = True
+    ot_pairing: str = "sample"  # "sample" | "argmax" | "barycentric"
     ot_scale_cost: str = "mean"
 
     # attention window for sliding window attention (used when T > context_length)

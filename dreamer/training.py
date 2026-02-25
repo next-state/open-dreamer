@@ -190,13 +190,14 @@ def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float =
 def apply_ot_coupling(
     z0: jnp.ndarray,
     z1: jnp.ndarray,
+    rng: jax.Array | None,
     *,
     enabled: bool,
     epsilon: float | None,
     max_iterations: int,
     threshold: float,
     lse_mode: bool,
-    soft_coupling: bool,
+    pairing: str,
     scale_cost: str,
 ) -> jnp.ndarray:
     """
@@ -232,15 +233,24 @@ def apply_ot_coupling(
 
     P = jax.lax.stop_gradient(out.matrix)
 
-    if soft_coupling:
+    if pairing == "barycentric":
         # Map y-indexed samples to x via column-normalized transport.
         col_sum = jnp.sum(P, axis=0, keepdims=True)
         col_sum = jnp.maximum(col_sum, 1e-8)
         x_coupled = (P.T @ x) / col_sum.T
-    else:
+    elif pairing == "argmax":
         # Hard assignment per y sample (not necessarily a permutation).
         idx = jnp.argmax(P, axis=0)
         x_coupled = x[idx]
+    elif pairing == "sample":
+        if rng is None:
+            raise ValueError("apply_ot_coupling: rng is required for pairing='sample'.")
+        keys = jax.random.split(rng, B)
+        logits = jnp.log(jnp.maximum(P.T, 1e-8))
+        idx = jax.vmap(jax.random.categorical)(keys, logits)
+        x_coupled = x[idx]
+    else:
+        raise ValueError(f"apply_ot_coupling: unknown pairing mode '{pairing}'.")
 
     return x_coupled.reshape(z0.shape).astype(z0.dtype)
 
@@ -385,7 +395,7 @@ def shortcut_forcing_step(
     latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
 
     # Split RNG
-    key_sigma_emp, key_sigma_self, key_step, key_noise, key_dropout1 = jax.random.split(rng, 5)
+    key_sigma_emp, key_sigma_self, key_step, key_noise, key_dropout1, key_ot = jax.random.split(rng, 6)
 
     # --- Step indices ---
     # Empirical rows: always use finest step (d_min)
@@ -423,12 +433,13 @@ def shortcut_forcing_step(
     z0 = apply_ot_coupling(
         z0,
         latents,
+        key_ot,
         enabled=dynamics_model.cfg.ot_enabled,
         epsilon=dynamics_model.cfg.ot_epsilon,
         max_iterations=dynamics_model.cfg.ot_max_iter,
         threshold=dynamics_model.cfg.ot_threshold,
         lse_mode=dynamics_model.cfg.ot_lse_mode,
-        soft_coupling=dynamics_model.cfg.ot_soft_coupling,
+        pairing=dynamics_model.cfg.ot_pairing,
         scale_cost=dynamics_model.cfg.ot_scale_cost,
     )
     z_tilde = (1.0 - (1.0 - 1e-5) * sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
