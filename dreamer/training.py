@@ -187,6 +187,63 @@ def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float =
     return (max_weight - min_weight) * sigma + min_weight
 
 
+def apply_ot_coupling(
+    z0: jnp.ndarray,
+    z1: jnp.ndarray,
+    *,
+    enabled: bool,
+    epsilon: float,
+    max_iterations: int,
+    threshold: float,
+    lse_mode: bool,
+    soft_coupling: bool,
+) -> jnp.ndarray:
+    """
+    Apply minibatch OT coupling between noise (z0) and data (z1).
+
+    Coupling is computed at the per-sequence level, treating each (T, S, D)
+    sequence as one sample. The output is a reweighted/assigned z0 aligned to
+    the ordering of z1.
+    """
+    if (not enabled) or (z0.shape[0] < 2):
+        return z0
+
+    B = z0.shape[0]
+    x = z0.reshape(B, -1).astype(jnp.float32)
+    y = z1.reshape(B, -1).astype(jnp.float32)
+
+    a = jnp.full((B,), 1.0 / B, dtype=jnp.float32)
+    b = jnp.full((B,), 1.0 / B, dtype=jnp.float32)
+
+    # Local import to avoid hard dependency if OT is disabled.
+    from ott.geometry import pointcloud
+    from ott.solvers import linear
+
+    geom = pointcloud.PointCloud(x, y, epsilon=epsilon)
+    out = linear.solve(
+        geom,
+        a=a,
+        b=b,
+        lse_mode=lse_mode,
+        threshold=threshold,
+        max_iterations=max_iterations,
+    )
+
+    P = jax.lax.stop_gradient(out.matrix)
+
+    if soft_coupling:
+        # Map y-indexed samples to x via column-normalized transport.
+        col_sum = jnp.sum(P, axis=0, keepdims=True)
+        col_sum = jnp.maximum(col_sum, 1e-8)
+        x_coupled = (P.T @ x) / col_sum.T
+    else:
+        # Hard assignment per y sample (not necessarily a permutation).
+        idx = jnp.argmax(P, axis=0)
+        x_coupled = x[idx]
+
+    return x_coupled.reshape(z0.shape).astype(z0.dtype)
+
+
 # ---------------------------
 # Loss computation
 # ---------------------------
@@ -362,6 +419,16 @@ def shortcut_forcing_step(
     # --- Corrupt latents: z_tilde = (1 - (1-eps)*sigma) * z0 + sigma * z1 ---
     # The 1e-5 epsilon prevents the ODE from becoming singular at sigma=1
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
+    z0 = apply_ot_coupling(
+        z0,
+        latents,
+        enabled=dynamics_model.cfg.ot_enabled,
+        epsilon=dynamics_model.cfg.ot_epsilon,
+        max_iterations=dynamics_model.cfg.ot_max_iter,
+        threshold=dynamics_model.cfg.ot_threshold,
+        lse_mode=dynamics_model.cfg.ot_lse_mode,
+        soft_coupling=dynamics_model.cfg.ot_soft_coupling,
+    )
     z_tilde = (1.0 - (1.0 - 1e-5) * sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
     
     # --- Forward pass (full batch) ---

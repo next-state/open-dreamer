@@ -12,6 +12,7 @@ dependencies = [
     "jax[cuda12]",
     "jaxlpips",
     "matplotlib",
+    "ott-jax",
     "optax",
     "tqdm",
     "wandb",

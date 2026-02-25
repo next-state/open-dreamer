@@ -43,6 +43,14 @@ dynamics:
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
 
+    # Optimal transport coupling (minibatch OT)
+    ot_enabled: false
+    ot_epsilon: 0.05
+    ot_max_iter: 50
+    ot_threshold: 1e-3
+    ot_lse_mode: true
+    ot_soft_coupling: true
+
 bootstrap_start: 50_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
 image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)

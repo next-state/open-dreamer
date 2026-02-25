@@ -154,6 +154,14 @@ class DynamicsModelConfig:
     # schedule
     k_max: int = 8
 
+    # optimal transport coupling (minibatch OT)
+    ot_enabled: bool = False
+    ot_epsilon: float = 0.05
+    ot_max_iter: int = 50
+    ot_threshold: float = 1e-3
+    ot_lse_mode: bool = True
+    ot_soft_coupling: bool = True
+
     # attention window for sliding window attention (used when T > context_length)
     context_length: int = 192
 

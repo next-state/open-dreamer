@@ -3,7 +3,7 @@ defaults:
 
 name: minecraft_vpt_latent
 data_type: latent
-array_record_path: /home/ubuntu/latents-0219
+array_record_path: /home/diego/latents-0219
 index_max: 10
 num_max_samples: -1
 
