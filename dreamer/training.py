@@ -197,7 +197,7 @@ def apply_ot_coupling(
     threshold: float,
     lse_mode: bool,
     soft_coupling: bool,
-    scale_cost: str | None,
+    scale_cost: str,
 ) -> jnp.ndarray:
     """
     Apply minibatch OT coupling between noise (z0) and data (z1).
@@ -220,7 +220,7 @@ def apply_ot_coupling(
     from ott.geometry import pointcloud
     from ott.solvers import linear
 
-    geom = pointcloud.PointCloud(x, y, epsilon=epsilon, scale_cost=scale_cost or "mean")
+    geom = pointcloud.PointCloud(x, y, epsilon=epsilon, scale_cost=scale_cost)
     out = linear.solve(
         geom,
         a=a,
