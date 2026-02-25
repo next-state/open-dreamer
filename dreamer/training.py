@@ -192,11 +192,12 @@ def apply_ot_coupling(
     z1: jnp.ndarray,
     *,
     enabled: bool,
-    epsilon: float,
+    epsilon: float | None,
     max_iterations: int,
     threshold: float,
     lse_mode: bool,
     soft_coupling: bool,
+    scale_cost: str | None,
 ) -> jnp.ndarray:
     """
     Apply minibatch OT coupling between noise (z0) and data (z1).
@@ -219,7 +220,7 @@ def apply_ot_coupling(
     from ott.geometry import pointcloud
     from ott.solvers import linear
 
-    geom = pointcloud.PointCloud(x, y, epsilon=epsilon)
+    geom = pointcloud.PointCloud(x, y, epsilon=epsilon, scale_cost=scale_cost)
     out = linear.solve(
         geom,
         a=a,
@@ -428,6 +429,7 @@ def shortcut_forcing_step(
         threshold=dynamics_model.cfg.ot_threshold,
         lse_mode=dynamics_model.cfg.ot_lse_mode,
         soft_coupling=dynamics_model.cfg.ot_soft_coupling,
+        scale_cost=dynamics_model.cfg.ot_scale_cost,
     )
     z_tilde = (1.0 - (1.0 - 1e-5) * sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
     

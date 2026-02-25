@@ -156,11 +156,12 @@ class DynamicsModelConfig:
 
     # optimal transport coupling (minibatch OT)
     ot_enabled: bool = False
-    ot_epsilon: float = 0.05
+    ot_epsilon: float | None = None
     ot_max_iter: int = 50
     ot_threshold: float = 1e-3
     ot_lse_mode: bool = True
     ot_soft_coupling: bool = True
+    ot_scale_cost: str | None = None
 
     # attention window for sliding window attention (used when T > context_length)
     context_length: int = 192
