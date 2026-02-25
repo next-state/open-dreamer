@@ -128,6 +128,9 @@ def run(cfg: DynamicsConfig):
         tokenizer_bundle = TokenizerCheckpointBundle.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
         tokenizer = tokenizer_bundle.tokenizer
         tokenizer_cfg = tokenizer.cfg
+        
+        tokenizer.latent_normalizer.mean = nnx.BatchStat(jnp.zeros((16,)))
+        tokenizer.latent_normalizer.var = nnx.BatchStat(jnp.ones(16,))
 
         # Initialize dynamics
         dynamics = Dynamics(cfg.dynamics, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))

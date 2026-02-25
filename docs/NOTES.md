@@ -87,6 +87,7 @@ dreamer4-jax-private/
 
 | Issue | Location | Details |
 |-------|----------|---------|
+| Inference-time path broken | — | Current code does not work at inference time. |
 | RL training (PMPO) | `train_policy.py`, `new_train_policy.py` | Both import non-existent modules (`ParallelContext`, `ImaginationConfig`, `make_manager`, `MetricLogger`). No working RL loop. |
 | Bootstrap loss unused in dynamics | `train_dynamics.py` | Always sets `B_self=0`, so only flow loss runs. Bootstrap only activates in `train_heads.py`. |
 | Ramp loss weight unused | `training.py` | `ramp_weight()` function exists but is never called in the loss computation. |
