@@ -349,11 +349,6 @@ class DynamicsConfig(BaseExperimentConfig):
     bootstrap_fraction: float = 0.25  # Fraction of batch used for bootstrap samples
     image_fraction: float = 0.3
 
-    # Alternating batch lengths (paper: "Sequence length" paragraph)
-    short_T: int = 64
-    long_T: int = 256
-    long_batch_ratio: float = 0.0  # Fraction of batches that use long_T
-
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
 

@@ -10,7 +10,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import DynamicsConfig
-from dreamer.data import make_iterator  
+from dreamer.data import make_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, shift_actions
@@ -164,8 +164,9 @@ def run(cfg: DynamicsConfig):
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
-        B, T = cfg.dataset.dataloader_cfg.B, cfg.dataset.dataloader_cfg.T
-        avg_T = int(cfg.long_batch_ratio * cfg.long_T + (1 - cfg.long_batch_ratio) * cfg.short_T)
+        dl_cfg = cfg.dataset.dataloader_cfg
+        B, T = dl_cfg.B, dl_cfg.T  # FIXME: use actual T from the batch
+        avg_T = int(dl_cfg.long_ratio * dl_cfg.long_T + (1 - dl_cfg.long_ratio) * dl_cfg.short_T)
 
         # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
         dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
@@ -201,7 +202,7 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        dataloader = make_iterator(cfg.dataset, device=data_sharding)
+        dataloader = make_dual_iterator(cfg.dataset, device=data_sharding)
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
@@ -213,7 +214,7 @@ def run(cfg: DynamicsConfig):
                 if step >= cfg.max_steps:
                     break
 
-                rng, tokenizer_key, master_key = jax.random.split(rng, num=3)
+                rng, master_key = jax.random.split(rng, num=2)
 
                 # Use pre-allocated batch
                 actions = batch["actions"]
@@ -222,7 +223,6 @@ def run(cfg: DynamicsConfig):
                 input_tensor = latents if latents is not None else videos
 
                 actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
-                
 
                 # Validation step before training (as input buffers might be donated)
                 if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
@@ -253,6 +253,7 @@ def run(cfg: DynamicsConfig):
                     )
 
                 # Training step
+                B, T = input_tensor.shape[:2]
                 metrics = train_step(
                     bundle.tokenizer, bundle.dynamics, 
                     bundle.dynamics_optimizer, input_tensor, actions,
@@ -281,6 +282,7 @@ def run(cfg: DynamicsConfig):
                             "flow_mse_high": metrics_cpu["flow_mse_high"],
                             "boot_target_norm": metrics_cpu["boot_target_norm"],
                             "lr": lr_schedule(step),
+                            "T": T,
                             **scaling.get_step_metrics(step),
                         },
                         pbar=pbar,
