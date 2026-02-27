@@ -1,8 +1,6 @@
-import copy
-from dataclasses import replace
 import io
+import logging
 import pickle
-from typing import Any
 
 import grain
 import jax
@@ -165,16 +163,17 @@ def make_iterator(
 
 class AlternatingIterator(grain.IterDataset):
     def __init__(self, short_iterator, long_iterator, long_ratio: float, seed: int) -> None:
-        self.short_iterator = short_iterator
-        self.long_iterator = long_iterator
+        # Normalize inputs to Python iterators; Grain IterDataset objects require iter(...)
+        # before next(...) can be called.
+        self.short_iterator = iter(short_iterator)
+        self.long_iterator = iter(long_iterator)
         self.long_ratio = long_ratio
         self._rng_key = jax.random.key(seed)
 
     def __next__(self):
         self._rng_key, subkey = jax.random.split(self._rng_key)
-        if float(jax.random.uniform(subkey)) < self.long_ratio:
-            return True, next(self.long_iterator)
-        return False, next(self.short_iterator)
+        use_long = bool(jax.random.bernoulli(subkey, p=self.long_ratio))
+        return next(self.long_iterator if use_long else self.short_iterator)
 
     def __iter__(self):
         return self
@@ -200,45 +199,29 @@ def make_dual_iterator(
     
     short_T = dataloader_cfg.short_T
     long_T = dataloader_cfg.long_T
+    assert long_T % short_T == 0, f"long_T ({long_T}) must be a multiple of short_T ({short_T})"
     long_ratio = dataloader_cfg.long_ratio
     num_workers = dataloader_cfg.num_workers
     prefetch_buffer_size = dataloader_cfg.prefetch_buffer_size
     device_prefetch_buffer_size = dataloader_cfg.device_prefetch_buffer_size
     
     if short_T == long_T:
-        print("short_T == long_T, using just one iterator")
-        iterator = make_iterator(
-            cfg,
-            seed=seed,
-            print_filter_warnings=print_filter_warnings,
-            device=device,
-            dtype=dtype,
-            seq_len=short_T,
-        )
+        logging.warning("short_T == long_T, using just one iterator")
+        iterator = make_iterator(cfg, seed=seed, print_filter_warnings=print_filter_warnings, device=device, dtype=dtype, seq_len=short_T)
         return iterator
         
     # Create iterators for short and long sequences
     iterators = []
     for T in [short_T, long_T]:
         # Split loader resources evenly across the short/long iterators.
-        dl_cfg = replace(
-            dataloader_cfg,
-            short_T=T,
-            long_T=T,
-            long_ratio=0.0,
+        dl_cfg = DataloaderConfig(
+            B=dataloader_cfg.B * long_T//T, # This is to make sure that the number of elements inside of each tensor is the same.
             num_workers=max(1, num_workers // 2),
-            prefetch_buffer_size=(prefetch_buffer_size + 1) // 2,
-            device_prefetch_buffer_size=(device_prefetch_buffer_size + 1) // 2,
+            prefetch_buffer_size=max(1, (prefetch_buffer_size + 1) // 2),
+            device_prefetch_buffer_size=max(1, (device_prefetch_buffer_size + 1) // 2),
+            short_T=T, long_T=T, long_ratio=0.0, start_step=getattr(dataloader_cfg, "start_step", 0), dtype=dataloader_cfg.dtype
         )
-        it = make_iterator(
-            cfg=cfg,
-            seed=seed + T,
-            print_filter_warnings=print_filter_warnings,
-            device=device,
-            dtype=dtype,
-            dataloader_cfg=dl_cfg,
-            seq_len=T,
-        )
+        it = make_iterator(cfg=cfg, seed=seed + T, print_filter_warnings=print_filter_warnings, device=device, dtype=dtype, dataloader_cfg=dl_cfg, seq_len=T)
         iterators.append(it)
 
     iterator = AlternatingIterator(iterators[0], iterators[1], long_ratio, seed)

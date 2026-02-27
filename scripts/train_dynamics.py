@@ -1,3 +1,4 @@
+import os
 import logging
 
 import hydra
@@ -31,6 +32,8 @@ from dreamer.utils import (
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
+
 
 # Register OmegaConf resolver for arithmetic expressions
 OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
