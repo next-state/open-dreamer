@@ -7,9 +7,8 @@ from typing import Literal
 @dataclass(frozen=True, unsafe_hash=True)
 class DataloaderConfig:
     """Configuration for dataloader parameters."""
-    # Batch and sequence dimensions
+    # Batch dimension
     B: int = 32  # batch size
-    T: int = 64  # sequence length
     
     # Common parameters
     num_workers: int = 16

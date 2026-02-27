@@ -165,7 +165,7 @@ def run(cfg: DynamicsConfig):
         n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
         dl_cfg = cfg.dataset.dataloader_cfg
-        B, T = dl_cfg.B, dl_cfg.T  # FIXME: use actual T from the batch
+        B = dl_cfg.B
         avg_T = int(dl_cfg.long_ratio * dl_cfg.long_T + (1 - dl_cfg.long_ratio) * dl_cfg.short_T)
 
         # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset

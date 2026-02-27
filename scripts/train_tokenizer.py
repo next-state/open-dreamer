@@ -195,7 +195,13 @@ def run(cfg: TokenizerConfig):
 
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_patches = (cfg.dataset.H // cfg.tokenizer.encoder.patch_size) * (cfg.dataset.W // cfg.tokenizer.encoder.patch_size)
-        B, T = cfg.dataset.dataloader_cfg.B, cfg.dataset.dataloader_cfg.T
+        dl_cfg = cfg.dataset.dataloader_cfg
+        if dl_cfg.short_T != dl_cfg.long_T:
+            raise ValueError(
+                "Tokenizer training expects a single sequence length (short_T == long_T). "
+                "Set both values equal or switch this script to make_dual_iterator."
+            )
+        B, T = dl_cfg.B, dl_cfg.short_T
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],

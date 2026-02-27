@@ -1,11 +1,20 @@
+import copy
+from dataclasses import replace
+import io
+import pickle
+from typing import Any
+
 import grain
 import jax
 from jax import numpy as jnp
+import numpy as np
 from grain._src.python.dataset import dataset as grain_dataset
 from grain.transforms import Batch
 
-from dreamer.configs import DatasetConfig
+from dreamer.actions import Actions
+from dreamer.configs import DatasetConfig, DataloaderConfig
 from dreamer.data.path_utils import build_dataset_paths
+from dreamer.data.serialization import deserialize_msgpack_record
 from dreamer.data.transforms import (
     CastDtype,
     EpisodeLengthFilter,
@@ -13,7 +22,6 @@ from dreamer.data.transforms import (
     ProcessLatentAndSlice,
     ProcessMinecraftEpisodeAndSlice,
 )
-
 
 # ==============================================================================
 # Factory
@@ -26,18 +34,29 @@ def make_iterator(
     print_filter_warnings: bool = False,
     device = None,
     dtype = None,
-    T: int | None = None,
+    dataloader_cfg: DataloaderConfig | None = None,
+    seq_len: int | None = None,
 ):
     """Creates a data loading pipeline using Grain from a DatasetConfig.
 
     Args:
         cfg: Dataset configuration
-        dataloader_cfg: Dataloader configuration (defaults to cfg.dataloader_cfg if None)
+        dataloader_cfg: Optional dataloader override (defaults to cfg.dataloader_cfg)
+        seq_len: Optional explicit sequence length override
         seed: Random seed
         print_filter_warnings: Whether to print filter warnings
         device: Device for prefetching
     """
-    dataloader_cfg = cfg.dataloader_cfg
+    if dataloader_cfg is None:
+        dataloader_cfg = cfg.dataloader_cfg
+
+    if seq_len is None:
+        if dataloader_cfg.short_T != dataloader_cfg.long_T:
+            raise ValueError(
+                "Ambiguous sequence length: short_T != long_T. "
+                "Pass seq_len explicitly or use make_dual_iterator."
+            )
+        seq_len = dataloader_cfg.short_T
     
     num_workers = dataloader_cfg.num_workers
     prefetch_buffer_size = dataloader_cfg.prefetch_buffer_size
@@ -64,28 +83,26 @@ def make_iterator(
     source = grain.sources.ArrayRecordDataSource(array_record_paths)
 
     sampler = grain.samplers.IndexSampler(
-        num_records=len(source),
+        num_records = cfg.num_max_samples if cfg.num_max_samples>0 else len(source),
         shard_options=grain.sharding.ShardByJaxProcess(drop_remainder=True),
         shuffle=True,
         num_epochs=None,
         seed=seed,
     )
 
-    effective_T = T if T is not None else dataloader_cfg.T
-
     # Build operations based on dataset type and data type
     if use_latent_data:
         # Pre-tokenized latent data path
-        operations = [ProcessLatentAndSlice(seq_len=effective_T)]
-    elif cfg.name == "minecraft_vpt":
+        operations = [ProcessLatentAndSlice(seq_len=seq_len)]
+    elif cfg.name.startswith("minecraft_vpt"):
         operations = [
             EpisodeLengthFilter(
-                seq_len=effective_T,
+                seq_len=seq_len,
                 format_hint="vpt",
                 print_filter_warnings=print_filter_warnings,
             ),
             ProcessMinecraftEpisodeAndSlice(
-                seq_len=effective_T,
+                seq_len=seq_len,
                 image_h=cfg.H,
                 image_w=cfg.W,
                 image_c=cfg.C,
@@ -97,12 +114,12 @@ def make_iterator(
     else:
         operations = [
             EpisodeLengthFilter(
-                seq_len=effective_T,
+                seq_len=seq_len,
                 format_hint="coinrun",
                 print_filter_warnings=print_filter_warnings,
             ),
             ProcessEpisodeAndSlice(
-                seq_len=effective_T,
+                seq_len=seq_len,
                 image_h=cfg.H,
                 image_w=cfg.W,
                 image_c=cfg.C,
@@ -141,11 +158,13 @@ def make_iterator(
         device_buffer_size=device_prefetch_buffer_size if prefetch_buffer_size is not None else prefetch_buffer_size,
     )
     
-    return iter(iter_dataset)
+    return iter_dataset
+
+
+
 
 class AlternatingIterator(grain.IterDataset):
     def __init__(self, short_iterator, long_iterator, long_ratio: float, seed: int) -> None:
-        # Normalize both inputs to true iterators (supports IterDataset inputs).
         self.short_iterator = short_iterator
         self.long_iterator = long_iterator
         self.long_ratio = long_ratio
@@ -154,12 +173,11 @@ class AlternatingIterator(grain.IterDataset):
     def __next__(self):
         self._rng_key, subkey = jax.random.split(self._rng_key)
         if float(jax.random.uniform(subkey)) < self.long_ratio:
-            return next(self.long_iterator)
-        return next(self.short_iterator)
+            return True, next(self.long_iterator)
+        return False, next(self.short_iterator)
 
     def __iter__(self):
         return self
-
 
 def make_dual_iterator(
     cfg: DatasetConfig,
@@ -183,32 +201,49 @@ def make_dual_iterator(
     short_T = dataloader_cfg.short_T
     long_T = dataloader_cfg.long_T
     long_ratio = dataloader_cfg.long_ratio
+    num_workers = dataloader_cfg.num_workers
+    prefetch_buffer_size = dataloader_cfg.prefetch_buffer_size
+    device_prefetch_buffer_size = dataloader_cfg.device_prefetch_buffer_size
     
     if short_T == long_T:
+        print("short_T == long_T, using just one iterator")
         iterator = make_iterator(
             cfg,
             seed=seed,
             print_filter_warnings=print_filter_warnings,
             device=device,
             dtype=dtype,
+            seq_len=short_T,
         )
         return iterator
         
     # Create iterators for short and long sequences
     iterators = []
     for T in [short_T, long_T]:
+        # Split loader resources evenly across the short/long iterators.
+        dl_cfg = replace(
+            dataloader_cfg,
+            short_T=T,
+            long_T=T,
+            long_ratio=0.0,
+            num_workers=max(1, num_workers // 2),
+            prefetch_buffer_size=(prefetch_buffer_size + 1) // 2,
+            device_prefetch_buffer_size=(device_prefetch_buffer_size + 1) // 2,
+        )
         it = make_iterator(
             cfg=cfg,
-            T=T,
             seed=seed + T,
             print_filter_warnings=print_filter_warnings,
             device=device,
             dtype=dtype,
+            dataloader_cfg=dl_cfg,
+            seq_len=T,
         )
         iterators.append(it)
 
     iterator = AlternatingIterator(iterators[0], iterators[1], long_ratio, seed)
     return iterator
+    
 
 
 # ==============================================================================
@@ -237,8 +272,7 @@ class DataLoaderIteratorWrapper(grain_dataset.IterDataset):
     
     def set_state(self, state):
         self._count = state.get("count", 0)
-
-
+        
 # ==============================================================================
 # Adapted from grain.experimental.device_put
 # ==============================================================================
@@ -275,8 +309,18 @@ def device_put(
 
   jax_dtype = getattr(jnp, dtype, None) if dtype else None
   
+  def _make_sharding(leaf):
+    """Adapt sharding to leaf rank by truncating the partition spec."""
+    if not isinstance(device, jax.sharding.NamedSharding):
+      return device
+    if not hasattr(leaf, 'ndim') or leaf.ndim >= len(device.spec):
+      return device
+    truncated = jax.sharding.PartitionSpec(*device.spec[:leaf.ndim])
+    return jax.sharding.NamedSharding(device.mesh, truncated)
+
   def _transfer(x):
-    x = jax.device_put(x, device)
+    shardings = jax.tree.map(_make_sharding, x)
+    x = jax.device_put(x, shardings)
     if jax_dtype is not None:
       x = jax.tree.map(lambda a: a.astype(jax_dtype) if a is not None and jnp.issubdtype(a.dtype, jnp.floating) else a, x)
     return x

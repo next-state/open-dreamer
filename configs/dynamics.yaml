@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics
+run_name: dynamics-abc
 tokenizer_ckpt: logs/tokenizer-window/checkpoints/
 
 ckpt:
@@ -16,7 +16,7 @@ dataset:
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
     short_T: 32
-    long_T: 48
+    long_T: 32
     long_ratio: 0.1  # Fraction of batches that use long_T
 
 dynamics:
@@ -64,7 +64,7 @@ max_steps: 100_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
-  lr: 3e-3  # constant LR or peak LR for schedules
+  lr: 3e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05
