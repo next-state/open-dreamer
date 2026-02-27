@@ -6,11 +6,10 @@ Bundles have `from_pretrained` class methods for loading checkpoints for inferen
 (without optimizers).
 """
 from __future__ import annotations
-from aiohttp.abc import AbstractAccessLogger
 
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
-from typing import ClassVar, Optional, Self
+from typing import ClassVar, Self
 
 import jax
 import orbax.checkpoint as ocp
@@ -100,7 +99,7 @@ class CheckpointBundle:
         cls,
         checkpoint_path: str,
         mesh_rules: MeshRules,
-        rngs: Optional[nnx.Rngs] = None,
+        rngs: nnx.Rngs | None = None,
     ) -> Self:
         """Load bundle from checkpoint (without optimizers).
 
@@ -243,7 +242,7 @@ class TokenizerCheckpointBundle(CheckpointBundle):
     }
 
     tokenizer: Tokenizer
-    tokenizer_optimizer: Optional[nnx.Optimizer] = None
+    tokenizer_optimizer: nnx.Optimizer | None = None
 
 
 @dataclass
@@ -261,7 +260,7 @@ class DynamicsCheckpointBundle(CheckpointBundle):
 
     dynamics: Dynamics
     tokenizer: Tokenizer
-    dynamics_optimizer: Optional[nnx.Optimizer] = None
+    dynamics_optimizer: nnx.Optimizer | None = None
 
 
 @dataclass
@@ -285,8 +284,8 @@ class HeadsCheckpointBundle(CheckpointBundle):
     task_embedder: TaskEmbedder
     policy_head: PolicyHeadMTP
     reward_head: RewardHeadMTP
-    dynamics_optimizer: Optional[nnx.Optimizer] = None
-    task_embedder_optimizer: Optional[nnx.Optimizer] = None
-    policy_optimizer: Optional[nnx.Optimizer] = None
-    reward_optimizer: Optional[nnx.Optimizer] = None
-    loss_normalizer: Optional[RMSLossNormalizer] = None
+    dynamics_optimizer: nnx.Optimizer | None = None
+    task_embedder_optimizer: nnx.Optimizer | None = None
+    policy_optimizer: nnx.Optimizer | None = None
+    reward_optimizer: nnx.Optimizer | None = None
+    loss_normalizer: RMSLossNormalizer | None = None
