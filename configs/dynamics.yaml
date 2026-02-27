@@ -64,7 +64,7 @@ max_steps: 100_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
-  lr: 3e-4  # constant LR or peak LR for schedules
+  lr: 3e-3  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05

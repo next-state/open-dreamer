@@ -212,7 +212,7 @@ def run(cfg: DynamicsConfig):
             scaling.start_training()
 
 
-            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps)
+            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break

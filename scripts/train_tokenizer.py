@@ -17,7 +17,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dreamer.configs import TokenizerConfig
 from dreamer.training import compute_psnr
-from dreamer.data import make_iterator
+from dreamer.data import make_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
 from dreamer.parallel import build_parallel, MeshRules
@@ -37,6 +37,8 @@ from dreamer.utils import (
 
 # disable preallocation completely
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.98'
+jax.config.update("jax_default_device", None)
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
@@ -196,39 +198,44 @@ def run(cfg: TokenizerConfig):
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_patches = (cfg.dataset.H // cfg.tokenizer.encoder.patch_size) * (cfg.dataset.W // cfg.tokenizer.encoder.patch_size)
         dl_cfg = cfg.dataset.dataloader_cfg
-        if dl_cfg.short_T != dl_cfg.long_T:
-            raise ValueError(
-                "Tokenizer training expects a single sequence length (short_T == long_T). "
-                "Set both values equal or switch this script to make_dual_iterator."
-            )
-        B, T = dl_cfg.B, dl_cfg.short_T
+        short_T = dl_cfg.short_T
+        long_T = dl_cfg.long_T
+        long_ratio = dl_cfg.long_ratio
+
+        # make_dual_iterator rescales batch size as B(T)=B_long * long_T // T.
+        # This keeps B*T constant across short/long steps.
+        # TODO: make the ScalingContext estimate the flops instead of passing it externally
+        B_long = dl_cfg.B
+        B_short = B_long * long_T // short_T
+        tokens_per_step_bt = B_long * long_T
+
+        # Expected FLOPs per step under alternating short/long batches.
+        flops_short = tokenizer.estimate_flops(batch_size=B_short, seq_length=short_T)
+        flops_long = tokenizer.estimate_flops(batch_size=B_long, seq_length=long_T)
+        expected_flops_per_step = (1.0 - long_ratio) * flops_short + long_ratio * flops_long
+
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=tokenizer.estimate_flops(batch_size=B, seq_length=T),
-            data_tokens_per_step=B * T * n_patches,
-            total_tokens_per_step=B * T * (n_patches + cfg.tokenizer.encoder.n_latents),
+            flops_per_step=expected_flops_per_step,
+            data_tokens_per_step=tokens_per_step_bt * n_patches,
+            total_tokens_per_step=tokens_per_step_bt * (n_patches + cfg.tokenizer.encoder.n_latents),
             logger=logger,
             run_dir=run_dir,
         )
 
-        # Build learning rate schedule
+        # Build learning rate schedule and optimizer
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
-
-        # Build optimizer
         optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule, d_model=cfg.tokenizer.encoder.d_model)
 
         # Initialize LPIPS model once (avoids repeated HF downloads during JIT tracing)
         lpips_model = LPIPS(pretrained_network="alexnet") if cfg.lpips_weight > 0 else None
 
         # Create checkpoint bundle
-        bundle = TokenizerCheckpointBundle(
-            tokenizer=tokenizer,
-            tokenizer_optimizer=optimizer,
-        )
+        bundle = TokenizerCheckpointBundle(tokenizer=tokenizer, tokenizer_optimizer=optimizer)
 
         # Data iterator
-        train_dataloader = make_iterator(cfg.dataset, device=data_sharding)
+        train_dataloader = make_dual_iterator(cfg.dataset, device=data_sharding)
 
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=TokenizerCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
@@ -236,7 +243,7 @@ def run(cfg: TokenizerConfig):
             scaling.start_training()
 
             # Training loop
-            pbar = tqdm(enumerate(train_dataloader, start=start_step), initial=start_step,total=cfg.max_steps)
+            pbar = tqdm(enumerate(train_dataloader, start=start_step), initial=start_step,total=cfg.max_steps, dynamic_ncols=True)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
