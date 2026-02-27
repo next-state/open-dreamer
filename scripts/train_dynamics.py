@@ -9,7 +9,7 @@ from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from dreamer.configs import DynamicsConfig
+from dreamer.configs import DynamicsConfig, OptimalTransportConfig
 from dreamer.data import make_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
@@ -49,7 +49,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_fraction", "use_latent_data"),
+    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -67,6 +67,7 @@ def train_step(
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
     bootstrap_fraction: float,
     use_latent_data: bool,    # True if data is already latents, False if data is videos
+    ot_cfg: OptimalTransportConfig,
 ):
     if use_latent_data:
         latents = data
@@ -109,6 +110,7 @@ def train_step(
             context_length=context_length, # Builds sliding window attention
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
+            ot_cfg=ot_cfg,
         )
 
         return losses['total'], aux
@@ -147,6 +149,9 @@ def run(cfg: DynamicsConfig):
     with logger, jax.set_mesh(mesh):
         key = jax.random.PRNGKey(cfg.seed)
         rng, init_key = jax.random.split(key)
+
+        # Build a plain dataclass OT config for JIT static args.
+        ot_cfg = OptimalTransportConfig(**cfg.ot)  # ty: ignore[invalid-argument-type]
 
         # Check if using latent data (pre-tokenized)
         use_latent_data = cfg.dataset.data_type == "latent"
@@ -265,6 +270,7 @@ def run(cfg: DynamicsConfig):
                     context_length=cfg.dynamics.context_length,
                     bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                     use_latent_data=use_latent_data,
+                    ot_cfg=ot_cfg,
                 )
 
                 # Logging
