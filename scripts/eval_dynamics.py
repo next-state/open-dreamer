@@ -36,8 +36,10 @@ def run(cfg):
     with jax.set_mesh(mesh):
         # Load checkpoint (includes both dynamics and tokenizer)
         print(f"Loading checkpoint from: {cfg.dynamics_ckpt}")
-        bundle = DynamicsCheckpointBundle.from_pretrained(cfg.dynamics_ckpt, mesh_rules=mesh_rules)
-        print(f"Loaded dynamics model (k_max={bundle.dynamics.cfg.k_max}, depth={bundle.dynamics.cfg.depth})")
+        bundle = DynamicsCheckpointBundle.from_pretrained(
+            cfg.dynamics_ckpt, mesh_rules=mesh_rules, model_names={"dynamics_ema", "tokenizer"}
+        )
+        print(f"Loaded dynamics model (k_max={bundle.dynamics_ema.cfg.k_max}, depth={bundle.dynamics_ema.cfg.depth})")
 
         use_latent_data = cfg.dataset.data_type == "latent"
 
@@ -54,7 +56,7 @@ def run(cfg):
         # run_x0_visualization needs cfg.dynamics.k_max and cfg.dynamics.context_length
         # Both are available directly: dataset_std from cfg.dataset, dynamics fields from the loaded model
         eval_cfg = types.SimpleNamespace(
-            dynamics=bundle.dynamics.cfg,
+            dynamics=bundle.dynamics_ema.cfg,
             dataset=types.SimpleNamespace(dataset_std=tuple(cfg.dataset.dataset_std)),
         )
 
@@ -76,7 +78,7 @@ def run(cfg):
                 eval_cfg,  # type: ignore[arg-type]
                 step=cfg.step,
                 tokenizer=bundle.tokenizer,
-                dynamics=bundle.dynamics,
+                dynamics=bundle.dynamics_ema,
                 val_data=input_tensor,
                 val_actions=actions,
                 use_latent_data=use_latent_data,
@@ -91,7 +93,7 @@ def run(cfg):
                 eval_cfg,  # type: ignore[arg-type]
                 step=cfg.step,
                 tokenizer=bundle.tokenizer,
-                dynamics=bundle.dynamics,
+                dynamics=bundle.dynamics_ema,
                 data=input_tensor[:1],
                 actions=actions[:1],
                 master_key=x0_key,
