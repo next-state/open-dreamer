@@ -58,6 +58,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 def train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
+    dynamics_ema: Dynamics,   # Used as target network for bootstrap half-steps
     optimizer: nnx.Optimizer,
     data: jnp.ndarray,        # Full batch: videos (B, T, H, W, C) or latents (B, T, n_latents, d_bottleneck)
     actions: Actions,         # Full batch (B, T, ...)
@@ -113,6 +114,7 @@ def train_step(
             context_length=context_length, # Builds sliding window attention
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
+            bootstrap_model=dynamics_ema,  # EMA as stable target network for half-steps
             ot_cfg=ot_cfg,
         )
 
@@ -130,6 +132,25 @@ def train_step(
     optimizer.update(dynamics, grads)
 
     return {**metrics, 'grad_norm': grad_norm}
+
+def build_ema_model(dynamics: Dynamics) -> Dynamics:
+    ema = nnx.clone(dynamics)
+    params = nnx.state(ema, nnx.Param)
+    nnx.update(ema, jax.tree.map(lambda p: p.astype(jnp.float32), params))
+    return ema
+
+
+@nnx.jit(static_argnames=("ema_decay",))
+def ema_update_step(dynamics: Dynamics, dynamics_ema: Dynamics, *, ema_decay: float):
+    online_params = nnx.state(dynamics, nnx.Param)
+    ema_params    = nnx.state(dynamics_ema, nnx.Param)
+    # Keep EMA in float32 to avoid bf16 quantization (tiny EMA increments get rounded to 0)
+    updated_ema = jax.tree.map(
+        lambda e, o: ema_decay * e + (1.0 - ema_decay) * o.astype(e.dtype),
+        ema_params, online_params,
+    )
+    nnx.update(dynamics_ema, updated_ema)
+
 
 # ---------------------------
 # Main
@@ -203,9 +224,13 @@ def run(cfg: DynamicsConfig):
         # Build optimizer
         optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model)
 
+        # Build EMA model
+        dynamics_ema = build_ema_model(dynamics)
+
         # Create checkpoint bundle (includes frozen tokenizer for self-contained checkpoints)
         bundle = DynamicsCheckpointBundle(
             dynamics=dynamics,
+            dynamics_ema=dynamics_ema,
             tokenizer=tokenizer,
             dynamics_optimizer=optimizer,
         )
@@ -236,34 +261,32 @@ def run(cfg: DynamicsConfig):
                 if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
                     val_data = input_tensor[:4]
                     val_actions = actions[:4]
-                    run_evaluation(
-                        cfg, step, bundle.tokenizer, bundle.dynamics,
-                        val_data=val_data, val_actions=val_actions,
-                        use_latent_data=use_latent_data,
-                        vis_dir=vis_dir, rng=rng, logger=logger
-                    )
-                    run_x0_visualization(
-                        cfg, step, bundle.tokenizer, bundle.dynamics,
-                        data=input_tensor[:1],
-                        actions=actions[:1],
-                        master_key=master_key,
-                        use_latent_data=use_latent_data,
-                        vis_dir=vis_dir,
-                        logger=logger,
-                    )
-                    run_attention_visualization(
-                        cfg, step, bundle.tokenizer, bundle.dynamics,
-                        data=input_tensor[:1],
-                        actions=actions[:1],
-                        use_latent_data=use_latent_data,
-                        vis_dir=vis_dir,
-                        logger=logger,
-                    )
+                    for eval_name, eval_dynamics in [("online", bundle.dynamics), ("ema", bundle.dynamics_ema)]:
+                        run_evaluation(
+                            cfg, step, bundle.tokenizer, eval_dynamics,
+                            val_data=val_data, val_actions=val_actions,
+                            use_latent_data=use_latent_data,
+                            vis_dir=vis_dir, rng=rng, logger=logger, name=eval_name,
+                        )
+                        run_x0_visualization(
+                            cfg, step, bundle.tokenizer, eval_dynamics,
+                            data=input_tensor[:1], actions=actions[:1],
+                            master_key=master_key,
+                            use_latent_data=use_latent_data,
+                            vis_dir=vis_dir, logger=logger, name=eval_name,
+                        )
+                        run_attention_visualization(
+                            cfg, step, bundle.tokenizer,
+                            dynamics=eval_dynamics,
+                            data=input_tensor[:1], actions=actions[:1],
+                            use_latent_data=use_latent_data,
+                            vis_dir=vis_dir, logger=logger, name=eval_name,
+                        )
 
                 # Training step
                 B, T = input_tensor.shape[:2]
                 metrics = train_step(
-                    bundle.tokenizer, bundle.dynamics, 
+                    bundle.tokenizer, bundle.dynamics, bundle.dynamics_ema,
                     bundle.dynamics_optimizer, input_tensor, actions,
                     master_key=master_key,
                     step=step,
@@ -275,6 +298,9 @@ def run(cfg: DynamicsConfig):
                     use_latent_data=use_latent_data,
                     ot_cfg=ot_cfg,
                 )
+
+                # EMA update
+                ema_update_step(bundle.dynamics, bundle.dynamics_ema, ema_decay=cfg.ema_decay)
 
                 # Logging
                 if logger.should_log(step):

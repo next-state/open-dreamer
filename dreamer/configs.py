@@ -364,6 +364,9 @@ class DynamicsConfig(BaseExperimentConfig):
     # Eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
+    # EMA model
+    ema_decay: float = 0.999
+
 
 @dataclass(frozen=False)
 class HeadsConfig(BaseExperimentConfig):

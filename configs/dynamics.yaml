@@ -12,11 +12,11 @@ ckpt:
 
 dataset:
   dataloader_cfg:
-    B: 32
+    B: 8
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
-    short_T: 32
-    long_T: 32
+    short_T: 64
+    long_T: 256
     long_ratio: 0.1  # Fraction of batches that use long_T
 
 dynamics:
@@ -46,6 +46,8 @@ dynamics:
     num_binary_actions: ${dataset.num_binary_actions}
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
+
+ema_decay: 0.999
 
 bootstrap_start: 50_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
