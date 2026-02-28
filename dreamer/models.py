@@ -734,7 +734,7 @@ class BlockCausalTransformer(nnx.Module):
                 x0_lambda = self.x0_lambdas.value[i].astype(self.dtype)
                 x = resid_lambda * x + x0_lambda * x0
 
-            cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
+            cache_i = caches.get(time_index) if caches is not None and layer.use_time else None
 
             x, new_cache_i, w_i = layer(x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs, return_weights=return_weights)
             if all_weights is not None:
