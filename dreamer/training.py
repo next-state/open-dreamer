@@ -882,6 +882,7 @@ def run_evaluation(
         name: Optional prefix for log keys (e.g. "online", "ema"). None for no prefix.
     """
     log_prefix = f"{name}/" if name else ""
+    eval_prefix = f"{log_prefix}eval/"
 
     k_max = dynamics.cfg.k_max
     schedule_shortcut = DenoiseSchedule.init(4, k_max)
@@ -954,17 +955,15 @@ def run_evaluation(
 
         # Log metrics and video
         ode_diags_cpu = jax.device_get(ode_diags)
-        ode_scalars = {k: float(v) for k, v in ode_diags_cpu.items() if v.ndim == 0}
         logger.log_metrics(step, {
-            f"{log_prefix}{tag}/mse": mse,
-            f"{log_prefix}{tag}/psnr": psnr,
-            f"{log_prefix}{tag}/horizon": horizon,
-            f"{log_prefix}{tag}/eval_time": dt,
-            **{f"{log_prefix}{tag}/ode/{k}": v for k, v in ode_scalars.items()},
-        }, prefix="eval/")
+            f"{tag}/mse": mse,
+            f"{tag}/psnr": psnr,
+            f"{tag}/horizon": horizon,
+            f"{tag}/eval_time": dt,
+        }, prefix=eval_prefix)
 
         # ODE progression plot: one curve per metric, x-axis = τ-ladder step
-        ode_curves = {k.replace('_steps', ''): v for k, v in ode_diags_cpu.items() if v.ndim == 1}
+        ode_curves = ode_diags_cpu.items()
         if ode_curves:
             import matplotlib
             matplotlib.use('Agg')
@@ -975,7 +974,7 @@ def run_evaluation(
 
             tau_xs = _np.array(schedule_config.tau_values[:-1])  # starting τ of each step
             fig, axes = plt.subplots(1, len(ode_curves), figsize=(4 * len(ode_curves), 2), squeeze=False)
-            for ax, (curve_name, values) in zip(axes[0], ode_curves.items()):
+            for ax, (curve_name, values) in zip(axes[0], ode_curves):
                 ax.plot(tau_xs, values)
                 ax.set_xlabel('τ')
                 ax.set_title(curve_name)
@@ -987,10 +986,10 @@ def run_evaluation(
             buf.seek(0)
             ode_plot_img = _np.array(_Image.open(buf).convert('RGB'))
             plt.close(fig)
-            logger.log_image(step, f"eval/{log_prefix}{tag}/ode_progression", ode_plot_img, caption=f"ODE step={step}")
+            logger.log_image(step, f"{eval_prefix}{tag}/ode_progression", ode_plot_img, caption=f"ODE step={step}")
 
         if videos is not None:
-            logger.log_video(step, f"eval/{log_prefix}{tag}/video", mp4_path)
+            logger.log_video(step, f"{eval_prefix}{tag}/video", mp4_path)
 
 
 # ---------------------------
@@ -1113,13 +1112,14 @@ def run_x0_visualization(
     img_array = np.array(pil_img)
 
     log_prefix = f"{name}/" if name else ""
+    eval_prefix = f"{log_prefix}eval/"
 
     # Save PNG
     out_dir = _ensure_dir(vis_dir / f"step_{step:06d}" / log_prefix)
     Image.fromarray(img_array).save(str(out_dir / "x0_vis.png"))
 
     # Log
-    logger.log_image(step, f"{log_prefix}x0_vis", img_array, caption=f"step {step}")
+    logger.log_image(step, f"{eval_prefix}x0_vis", img_array, caption=f"step {step}")
 
 
 def run_attention_visualization(
@@ -1265,6 +1265,7 @@ def run_attention_visualization(
         axes[1 + j].axis("off")
 
     log_prefix = f"{name}/" if name else ""
+    eval_prefix = f"{log_prefix}eval/"
 
     fig.suptitle(f"Attention weights [{log_prefix}step {step}]", fontsize=11)
     fig.tight_layout()
@@ -1280,4 +1281,4 @@ def run_attention_visualization(
     # --- 7. Save and log ---
     out_dir = _ensure_dir(vis_dir / f"step_{step:06d}" / log_prefix)
     Image.fromarray(img_array).save(str(out_dir / "attn_vis.png"))
-    logger.log_image(step, f"{log_prefix}attn_vis", img_array, caption=f"step {step}")
+    logger.log_image(step, f"{eval_prefix}attn_vis", img_array, caption=f"step {step}")
