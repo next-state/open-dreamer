@@ -1205,7 +1205,7 @@ def run_attention_visualization(
 
     # --- 4. Compute per-layer per-head mean entropy ---
     n_layers = len(all_weights)
-    layer_is_time = [layer.use_time for layer in dynamics.transformer.layers]
+    layer_is_time = [layer.is_time_layer for layer in dynamics.transformer.layers]
     n_heads = dynamics.cfg.n_heads
 
     entropies = np.zeros((n_layers, n_heads), dtype=np.float32)

@@ -3,7 +3,7 @@ import einops
 import jax.numpy as jnp
 from flax import nnx
 import jax
-from typing import Tuple, Any, Dict
+from typing import Tuple, Any, Dict, Sequence
 from einops import rearrange, repeat
 import math
 from .utils import (
@@ -124,22 +124,18 @@ KVCachesDict = Dict[int, KVCache]  # Type alias for KV cache dictionaries
 
 
 def create_transformer_caches(
-    depth: int,
-    time_every: int,
+    layer_is_time: Sequence[bool],
     flattened_batch_size: int,
     window_size: int,
     num_kv_heads: int,
     head_dim: int,
-    time_layer_offset: int = 1,
     dtype=jnp.float32,
 ) -> KVCachesDict:
     """
     Creates KV cache dictionary for transformer layers.
 
     Args:
-        depth: Total number of transformer layers
-        time_every: Create cache every N layers (for time attention)
-        time_layer_offset: Layer offset for time-attention selection schedule
+        layer_is_time: Boolean flags indicating which layers use temporal attention
         flattened_batch_size: Batch size after spatial flattening (B * S)
         window_size: Maximum temporal sequence length
         num_kv_heads: Number of key/value heads
@@ -151,8 +147,7 @@ def create_transformer_caches(
     """
     caches = {}
     time_index = 0
-    for layer_index in range(depth):
-        is_time_layer = (layer_index + time_layer_offset) % time_every == 0
+    for is_time_layer in layer_is_time:
         if is_time_layer:
             caches[time_index] = KVCache.init(
                 batch_size=flattened_batch_size,
@@ -603,8 +598,8 @@ class BlockCausalLayer(nnx.Module):
         self.norm = nnx.RMSNorm(dim, use_scale=use_rmsnorm_scale, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
 
         # Time or space attention
-        self.use_time = (self.layer_index + self.time_layer_offset) % self.time_every == 0
-        if self.use_time:
+        is_time_layer = (self.layer_index + self.time_layer_offset) % self.time_every == 0
+        if is_time_layer:
             self.attn = TimeSelfAttention(
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
@@ -627,6 +622,10 @@ class BlockCausalLayer(nnx.Module):
         # MLP
         self.mlp = MLP(dim, mlp_ratio, dropout_rate, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
 
+    @property
+    def is_time_layer(self) -> bool:
+        return isinstance(self.attn, TimeSelfAttention)
+
     def __call__(
         self,
         x,
@@ -641,7 +640,7 @@ class BlockCausalLayer(nnx.Module):
     ):
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
-        if self.use_time:
+        if self.is_time_layer:
             attn_mask = time_mask
             local_window_size = time_local_window_size
         else:
@@ -734,7 +733,8 @@ class BlockCausalTransformer(nnx.Module):
                 x0_lambda = self.x0_lambdas.value[i].astype(self.dtype)
                 x = resid_lambda * x + x0_lambda * x0
 
-            cache_i = caches.get(time_index) if caches is not None and layer.use_time else None
+            is_time_layer = layer.is_time_layer
+            cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
 
             x, new_cache_i, w_i = layer(x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs, return_weights=return_weights)
             if all_weights is not None:
@@ -742,7 +742,7 @@ class BlockCausalTransformer(nnx.Module):
 
             if new_caches is not None and new_cache_i is not None:
                 new_caches[time_index] = new_cache_i
-            if layer.use_time:
+            if is_time_layer:
                 time_index += 1
 
         return x, new_caches, all_weights
@@ -753,7 +753,7 @@ class BlockCausalTransformer(nnx.Module):
         Computes FLOPs for Q@K^T and attn@V operations only (not weight matrices).
         Factor of 12 = 2 matmuls × 2 ops × 3 (forward + backward).
         """
-        n_time = sum((i + self.time_layer_offset) % self.time_every == 0 for i in range(self.depth))
+        n_time = sum(layer.is_time_layer for layer in self.layers)
         n_space = self.depth - n_time
         space_attn = 12 * n_space * self.d_model * (seq_space ** 2) * batch_size * seq_time
         time_attn = 12 * n_time * self.d_model * (seq_time ** 2) * batch_size * seq_space
@@ -947,9 +947,7 @@ class Tokenizer(nnx.Module):
         layout = self.decoder.get_token_layout()
 
         return create_transformer_caches(
-            depth=self.cfg.decoder.depth,
-            time_every=self.cfg.decoder.time_every,
-            time_layer_offset=getattr(self.cfg.decoder, 'time_layer_offset', 1),
+            layer_is_time=[layer.is_time_layer for layer in self.decoder.transformer.layers],
             flattened_batch_size=batch_size * layout.S,
             window_size=window_size,
             num_kv_heads=self.cfg.decoder.n_kv_heads,
@@ -1257,9 +1255,7 @@ class Dynamics(nnx.Module):
         layout = self.get_token_layout(n_latents=n_latents, n_agent=n_agent)
 
         return create_transformer_caches(
-            depth=self.cfg.depth,
-            time_every=self.cfg.time_every,
-            time_layer_offset=self.cfg.time_layer_offset,
+            layer_is_time=[layer.is_time_layer for layer in self.transformer.layers],
             flattened_batch_size=batch_size * layout.S,
             window_size=window_size,
             num_kv_heads=self.cfg.n_kv_heads,
