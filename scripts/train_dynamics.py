@@ -1,3 +1,4 @@
+import os
 import logging
 
 import hydra
@@ -31,6 +32,8 @@ from dreamer.utils import (
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
+
 
 # Register OmegaConf resolver for arithmetic expressions
 OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
@@ -170,7 +173,7 @@ def run(cfg: DynamicsConfig):
         n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
         dl_cfg = cfg.dataset.dataloader_cfg
-        B, T = dl_cfg.B, dl_cfg.T  # FIXME: use actual T from the batch
+        B = dl_cfg.B
         avg_T = int(dl_cfg.long_ratio * dl_cfg.long_T + (1 - dl_cfg.long_ratio) * dl_cfg.short_T)
 
         # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
@@ -214,7 +217,7 @@ def run(cfg: DynamicsConfig):
             scaling.start_training()
 
 
-            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps)
+            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break

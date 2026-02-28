@@ -7,9 +7,8 @@ from typing import Literal
 @dataclass(frozen=True, unsafe_hash=True)
 class DataloaderConfig:
     """Configuration for dataloader parameters."""
-    # Batch and sequence dimensions
+    # Batch dimension
     B: int = 32  # batch size
-    T: int = 64  # sequence length
     
     # Common parameters
     num_workers: int = 16
@@ -51,6 +50,7 @@ class DatasetConfig:
 
     # For minecraft_vpt: number of shards to use (each shard = 1 episode)
     index_max: int = 0
+    num_max_samples: int = -1
 
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
