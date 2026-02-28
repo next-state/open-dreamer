@@ -1,3 +1,4 @@
+import os
 import logging
 
 import hydra
@@ -9,7 +10,7 @@ from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from dreamer.configs import DynamicsConfig
+from dreamer.configs import DynamicsConfig, OptimalTransportConfig
 from dreamer.data import make_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
@@ -31,6 +32,8 @@ from dreamer.utils import (
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
+
 
 # Register OmegaConf resolver for arithmetic expressions
 OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
@@ -49,7 +52,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_fraction", "use_latent_data"),
+    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -68,6 +71,7 @@ def train_step(
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
     bootstrap_fraction: float,
     use_latent_data: bool,    # True if data is already latents, False if data is videos
+    ot_cfg: OptimalTransportConfig,
 ):
     if use_latent_data:
         latents = data
@@ -111,6 +115,7 @@ def train_step(
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
             bootstrap_model=dynamics_ema,  # EMA as stable target network for half-steps
+            ot_cfg=ot_cfg,
         )
 
         return losses['total'], aux
@@ -169,6 +174,9 @@ def run(cfg: DynamicsConfig):
         key = jax.random.PRNGKey(cfg.seed)
         rng, init_key = jax.random.split(key)
 
+        # Build a plain dataclass OT config for JIT static args.
+        ot_cfg = OptimalTransportConfig(**cfg.ot)  # ty: ignore[invalid-argument-type]
+
         # Check if using latent data (pre-tokenized)
         use_latent_data = cfg.dataset.data_type == "latent"
 
@@ -186,7 +194,7 @@ def run(cfg: DynamicsConfig):
         n_latents = tokenizer_cfg.encoder.n_latents
         n_spatial = n_latents // cfg.dynamics.packing_factor
         dl_cfg = cfg.dataset.dataloader_cfg
-        B, T = dl_cfg.B, dl_cfg.T  # FIXME: use actual T from the batch
+        B = dl_cfg.B
         avg_T = int(dl_cfg.long_ratio * dl_cfg.long_T + (1 - dl_cfg.long_ratio) * dl_cfg.short_T)
 
         # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
@@ -234,7 +242,7 @@ def run(cfg: DynamicsConfig):
             scaling.start_training()
 
 
-            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps)
+            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
@@ -288,6 +296,7 @@ def run(cfg: DynamicsConfig):
                     context_length=cfg.dynamics.context_length,
                     bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                     use_latent_data=use_latent_data,
+                    ot_cfg=ot_cfg,
                 )
 
                 # EMA update

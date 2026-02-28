@@ -7,9 +7,8 @@ from typing import Literal
 @dataclass(frozen=True, unsafe_hash=True)
 class DataloaderConfig:
     """Configuration for dataloader parameters."""
-    # Batch and sequence dimensions
+    # Batch dimension
     B: int = 32  # batch size
-    T: int = 64  # sequence length
     
     # Common parameters
     num_workers: int = 16
@@ -51,6 +50,7 @@ class DatasetConfig:
 
     # For minecraft_vpt: number of shards to use (each shard = 1 episode)
     index_max: int = 0
+    num_max_samples: int = -1
 
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
@@ -154,15 +154,6 @@ class DynamicsModelConfig:
     # schedule
     k_max: int = 8
 
-    # optimal transport coupling (minibatch OT)
-    ot_enabled: bool = False
-    ot_epsilon: float | None = None
-    ot_max_iter: int = 50
-    ot_threshold: float = 1e-3
-    ot_lse_mode: bool = True
-    ot_pairing: str = "sample"  # "sample" | "argmax" | "barycentric"
-    ot_scale_cost: str = "mean"
-
     # attention window for sliding window attention (used when T > context_length)
     context_length: int = 192
 
@@ -242,6 +233,18 @@ class LRScheduleConfig:
     max_steps: int = 1_000_000_000
     warmup_ratio: float = 0.0  # e.g., 0.1 = 10% warmup
     decay_ratio: float = 0.0   # e.g., 0.2 = 20% decay (for wsd)
+
+
+@dataclass(frozen=True, unsafe_hash=True)
+class OptimalTransportConfig:
+    """Configuration for minibatch optimal transport coupling."""
+    enabled: bool = False
+    epsilon: float | None = None
+    max_iter: int = 50
+    threshold: float = 1e-3
+    lse_mode: bool = True
+    pairing: str = "sample"  # "sample" | "argmax" | "barycentric"
+    scale_cost: str = "mean"
 
 
 @dataclass(frozen=False)
@@ -348,6 +351,9 @@ class DynamicsConfig(BaseExperimentConfig):
     bootstrap_start: int = 5_000  # Number of start steps trained exclusively on flow-matching objective
     bootstrap_fraction: float = 0.25  # Fraction of batch used for bootstrap samples
     image_fraction: float = 0.3
+
+    # Optimal transport coupling (minibatch OT)
+    ot: OptimalTransportConfig = field(default_factory=OptimalTransportConfig)
 
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)

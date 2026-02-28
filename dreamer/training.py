@@ -20,7 +20,7 @@ from flax import nnx
 import optax
 import time
 
-from dreamer.configs import DynamicsConfig, HeadsConfig
+from dreamer.configs import DynamicsConfig, HeadsConfig, OptimalTransportConfig
 from dreamer.generation import DenoiseSchedule
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
@@ -192,13 +192,7 @@ def apply_ot_coupling(
     z1: jnp.ndarray,
     rng: jax.Array | None,
     *,
-    enabled: bool,
-    epsilon: float | None,
-    max_iterations: int,
-    threshold: float,
-    lse_mode: bool,
-    pairing: str,
-    scale_cost: str,
+    ot_cfg: OptimalTransportConfig,
 ) -> jnp.ndarray:
     """
     Apply minibatch OT coupling between noise (z0) and data (z1).
@@ -207,7 +201,7 @@ def apply_ot_coupling(
     sequence as one sample. The output is a reweighted/assigned z0 aligned to
     the ordering of z1.
     """
-    if (not enabled) or (z0.shape[0] < 2):
+    if (not ot_cfg.enabled) or (z0.shape[0] < 2):
         return z0
 
     B = z0.shape[0]
@@ -221,19 +215,19 @@ def apply_ot_coupling(
     from ott.geometry import pointcloud
     from ott.solvers import linear
 
-    geom = pointcloud.PointCloud(x, y, epsilon=epsilon, scale_cost=scale_cost)
+    geom = pointcloud.PointCloud(x, y, epsilon=ot_cfg.epsilon, scale_cost=ot_cfg.scale_cost)
     out = linear.solve(
         geom,
         a=a,
         b=b,
-        lse_mode=lse_mode,
-        threshold=threshold,
-        max_iterations=max_iterations,
+        lse_mode=ot_cfg.lse_mode,
+        threshold=ot_cfg.threshold,
+        max_iterations=ot_cfg.max_iter,
     )
 
     P = jax.lax.stop_gradient(out.matrix)
 
-    if pairing == "barycentric":
+    if ot_cfg.pairing == "barycentric":
         # Map y-indexed samples to x via column-normalized transport.
         col_sum = jnp.sum(P, axis=0, keepdims=True)
         col_sum = jnp.maximum(col_sum, 1e-8)
@@ -242,11 +236,11 @@ def apply_ot_coupling(
         mean = jnp.mean(x_coupled, axis=1, keepdims=True)
         var = jnp.mean((x_coupled - mean) ** 2, axis=1, keepdims=True)
         x_coupled = x_coupled / jnp.maximum(jnp.sqrt(var), 1e-8)
-    elif pairing == "argmax":
+    elif ot_cfg.pairing == "argmax":
         # Hard assignment per y sample (not necessarily a permutation).
         idx = jnp.argmax(P, axis=0)
         x_coupled = x[idx]
-    elif pairing == "sample":
+    elif ot_cfg.pairing == "sample":
         if rng is None:
             raise ValueError("apply_ot_coupling: rng is required for pairing='sample'.")
         keys = jax.random.split(rng, B)
@@ -254,7 +248,7 @@ def apply_ot_coupling(
         idx = jax.vmap(jax.random.categorical)(keys, logits)
         x_coupled = x[idx]
     else:
-        raise ValueError(f"apply_ot_coupling: unknown pairing mode '{pairing}'.")
+        raise ValueError(f"apply_ot_coupling: unknown pairing mode '{ot_cfg.pairing}'.")
 
     return x_coupled.reshape(z0.shape).astype(z0.dtype)
 
@@ -368,6 +362,7 @@ def shortcut_forcing_step(
     time_mask: jnp.ndarray | None = None,
     task_embeddings: jnp.ndarray | None = None,
     bootstrap_model: Dynamics | None = None,
+    ot_cfg: OptimalTransportConfig = OptimalTransportConfig(),
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
     Compute shortcut forcing losses (flow + bootstrap) for a batch.
@@ -388,6 +383,7 @@ def shortcut_forcing_step(
         bootstrap_model: Model used for the two stop-gradient half-steps that generate bootstrap
                         targets. Defaults to dynamics_model when None. Pass an EMA model here
                         for more stable bootstrap targets.
+        ot_cfg: OT coupling settings.
 
     Returns:
         losses: Dict with 'total', 'flow', 'bootstrap' keys
@@ -434,7 +430,7 @@ def shortcut_forcing_step(
 
     sigma_full = jnp.concatenate([sigma_emp, sigma_self], axis=0)
     sigma_idx_full = jnp.concatenate([sigma_idx_emp, sigma_idx_self], axis=0)
-    
+
     # --- Corrupt latents: z_tilde = (1 - (1-eps)*sigma) * z0 + sigma * z1 ---
     # The 1e-5 epsilon prevents the ODE from becoming singular at sigma=1
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
@@ -442,13 +438,7 @@ def shortcut_forcing_step(
         z0,
         latents,
         key_ot,
-        enabled=dynamics_model.cfg.ot_enabled,
-        epsilon=dynamics_model.cfg.ot_epsilon,
-        max_iterations=dynamics_model.cfg.ot_max_iter,
-        threshold=dynamics_model.cfg.ot_threshold,
-        lse_mode=dynamics_model.cfg.ot_lse_mode,
-        pairing=dynamics_model.cfg.ot_pairing,
-        scale_cost=dynamics_model.cfg.ot_scale_cost,
+        ot_cfg=ot_cfg,
     )
     z_tilde = (1.0 - (1.0 - 1e-5) * sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
     

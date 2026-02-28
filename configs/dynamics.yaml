@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics
+run_name: dynamics-abc
 tokenizer_ckpt: logs/tokenizer-window/checkpoints/
 
 ckpt:
@@ -47,20 +47,21 @@ dynamics:
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
 
-    # Optimal transport coupling (minibatch OT)
-    ot_enabled: true
-    ot_epsilon: null
-    ot_max_iter: 50
-    ot_threshold: 1e-3
-    ot_lse_mode: true
-    ot_pairing: barycentric
-    ot_scale_cost: mean
-
 ema_decay: 0.999
 
 bootstrap_start: 50_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
 image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
+
+# Optimal transport coupling (minibatch OT)
+ot:
+  enabled: true
+  epsilon: null
+  max_iter: 50
+  threshold: 1e-3
+  lse_mode: true
+  pairing: barycentric
+  scale_cost: mean
 
 max_steps: 100_000
 
