@@ -3,8 +3,8 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-abc
-tokenizer_ckpt: logs/tokenizer-window/checkpoints/
+run_name: dynamics-time-layer-start
+tokenizer_ckpt: logs/tokenizer-asymmetric-repro/checkpoints/
 
 ckpt:
   max_to_keep: 1
@@ -30,6 +30,7 @@ dynamics:
     qk_norm_type: qknorm
     rope_theta: 10000.0
     time_every: 4
+    time_layer_offset: 0
     mlp_ratio: 4
     dropout_rate: 0.00
     k_max: 128

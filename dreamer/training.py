@@ -1205,7 +1205,7 @@ def run_attention_visualization(
 
     # --- 4. Compute per-layer per-head mean entropy ---
     n_layers = len(all_weights)
-    time_every = dynamics.cfg.time_every
+    layer_is_time = [layer.is_time_layer for layer in dynamics.transformer.layers]
     n_heads = dynamics.cfg.n_heads
 
     entropies = np.zeros((n_layers, n_heads), dtype=np.float32)
@@ -1214,7 +1214,7 @@ def run_attention_visualization(
     for i, w in enumerate(all_weights):
         if w is None:
             continue
-        is_time = (i + 1) % time_every == 0
+        is_time = layer_is_time[i]
         if is_time:
             # w: (B, S, N, T, T) — causal temporal attention
             w_np = np.array(w)                   # (B, S, N, T, T)
@@ -1244,7 +1244,7 @@ def run_attention_visualization(
     ax_ent.set_title("attention entropy\n(lower = more collapsed)")
     ytick_labels = []
     for li in range(n_layers):
-        is_t = (li + 1) % time_every == 0
+        is_t = layer_is_time[li]
         ytick_labels.append(f"{li} {'[T]' if is_t else '[S]'}")
     ax_ent.set_yticks(range(n_layers))
     ax_ent.set_yticklabels(ytick_labels, fontsize=7)

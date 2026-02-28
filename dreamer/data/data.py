@@ -169,10 +169,13 @@ class AlternatingIterator(grain.IterDataset):
         self.long_iterator = iter(long_iterator)
         self.long_ratio = long_ratio
         self._rng_key = jax.random.key(seed)
+        self.step=0
 
     def __next__(self):
         self._rng_key, subkey = jax.random.split(self._rng_key)
-        use_long = bool(jax.random.bernoulli(subkey, p=self.long_ratio))
+        use_long = bool(jax.random.bernoulli(subkey, p=self.long_ratio)) or self.step%1000==0
+        self.step+=1
+        
         return next(self.long_iterator if use_long else self.short_iterator)
 
     def __iter__(self):
