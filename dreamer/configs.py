@@ -81,6 +81,9 @@ class EncoderModelConfig:
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
+    time_layer_offset: int = 1
+    # Optional sliding window attention for time layers; None means full causal.
+    context_length: int | None = None
     mae_p_min: float = 0.0
     mae_p_max: float = 0.9
     use_residual_lambdas: bool = False
@@ -109,6 +112,9 @@ class DecoderModelConfig:
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
+    time_layer_offset: int = 1
+    # Optional sliding window attention for time layers; None means full causal.
+    context_length: int | None = None
     use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
@@ -142,6 +148,7 @@ class DynamicsModelConfig:
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
+    time_layer_offset: int = 1
     mlp_ratio: float = 4.0
     dropout_rate: float = 0.0
     use_residual_lambdas: bool = False

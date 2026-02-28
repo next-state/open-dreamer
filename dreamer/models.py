@@ -130,6 +130,7 @@ def create_transformer_caches(
     window_size: int,
     num_kv_heads: int,
     head_dim: int,
+    time_layer_offset: int = 1,
     dtype=jnp.float32,
 ) -> KVCachesDict:
     """
@@ -138,6 +139,7 @@ def create_transformer_caches(
     Args:
         depth: Total number of transformer layers
         time_every: Create cache every N layers (for time attention)
+        time_layer_offset: Layer offset for time-attention selection schedule
         flattened_batch_size: Batch size after spatial flattening (B * S)
         window_size: Maximum temporal sequence length
         num_kv_heads: Number of key/value heads
@@ -148,9 +150,10 @@ def create_transformer_caches(
         Dictionary mapping time layer indices to KVCache objects
     """
     caches = {}
-    for i in range(depth):
-        time_index, time_offset = divmod(i, time_every)
-        if time_offset == 0:
+    time_index = 0
+    for layer_index in range(depth):
+        is_time_layer = (layer_index + time_layer_offset) % time_every == 0
+        if is_time_layer:
             caches[time_index] = KVCache.init(
                 batch_size=flattened_batch_size,
                 window_size=window_size,
@@ -158,6 +161,7 @@ def create_transformer_caches(
                 head_dim=head_dim,
                 dtype=dtype
             )
+            time_index += 1
     return caches
 
 
@@ -586,19 +590,20 @@ class BlockCausalLayer(nnx.Module):
 
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
-                 mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4,
+                 mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4, time_layer_offset: int = 1,
                  rope_theta: float = 10000.0, use_bias: bool = False,
                  use_rmsnorm_scale: bool = True, use_seq_parallel: bool = False,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  rngs: nnx.Rngs, mesh_rules: MeshRules):
         self.layer_index = layer_index
         self.time_every = time_every
+        self.time_layer_offset = time_layer_offset
         param_dtype = to_jnp_dtype(param_dtype)
 
         self.norm = nnx.RMSNorm(dim, use_scale=use_rmsnorm_scale, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
 
         # Time or space attention
-        self.use_time = (self.layer_index + 1) % self.time_every == 0
+        self.use_time = (self.layer_index + self.time_layer_offset) % self.time_every == 0
         if self.use_time:
             self.attn = TimeSelfAttention(
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
@@ -655,7 +660,7 @@ class BlockCausalTransformer(nnx.Module):
 
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, depth: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
-                 mlp_ratio: float = 4.0, time_every: int = 4, rope_theta: float = 10000.0,
+                 mlp_ratio: float = 4.0, time_every: int = 4, time_layer_offset: int = 1, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
                  use_seq_parallel: bool = False,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
@@ -664,6 +669,7 @@ class BlockCausalTransformer(nnx.Module):
         self.d_model = d_model
         self.depth = depth
         self.time_every = time_every
+        self.time_layer_offset = time_layer_offset
         self.use_residual_lambdas = use_residual_lambdas
         self.dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
@@ -683,7 +689,7 @@ class BlockCausalTransformer(nnx.Module):
             BlockCausalLayer(
                 dim=d_model, num_heads=n_heads, num_kv_heads=n_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
-                mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every,
+                mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every, time_layer_offset=time_layer_offset,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
                 use_seq_parallel=use_seq_parallel,
                 dtype=dtype, param_dtype=param_dtype,
@@ -720,6 +726,7 @@ class BlockCausalTransformer(nnx.Module):
         new_caches = {} if caches is not None else None
         all_weights: list | None = [] if return_weights else None
         x0 = x
+        time_index = 0
 
         for i, layer in enumerate(self.layers):
             if self.use_residual_lambdas:
@@ -727,8 +734,6 @@ class BlockCausalTransformer(nnx.Module):
                 x0_lambda = self.x0_lambdas.value[i].astype(self.dtype)
                 x = resid_lambda * x + x0_lambda * x0
 
-            time_index = i // self.time_every
-            is_time_layer = (i + 1) % self.time_every == 0
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
 
             x, new_cache_i, w_i = layer(x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs, return_weights=return_weights)
@@ -737,6 +742,8 @@ class BlockCausalTransformer(nnx.Module):
 
             if new_caches is not None and new_cache_i is not None:
                 new_caches[time_index] = new_cache_i
+            if layer.use_time:
+                time_index += 1
 
         return x, new_caches, all_weights
 
@@ -746,7 +753,7 @@ class BlockCausalTransformer(nnx.Module):
         Computes FLOPs for Q@K^T and attn@V operations only (not weight matrices).
         Factor of 12 = 2 matmuls × 2 ops × 3 (forward + backward).
         """
-        n_time = self.depth // self.time_every
+        n_time = sum((i + self.time_layer_offset) % self.time_every == 0 for i in range(self.depth))
         n_space = self.depth - n_time
         space_attn = 12 * n_space * self.d_model * (seq_space ** 2) * batch_size * seq_time
         time_attn = 12 * n_time * self.d_model * (seq_time ** 2) * batch_size * seq_space
@@ -769,6 +776,7 @@ class Encoder(nnx.Module):
     def __init__(self, cfg: EncoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
+        self.context_length = cfg.context_length
         self.dataset_mean = cfg.dataset_mean
         self.dataset_std = cfg.dataset_std
         self.context_length = cfg.context_length
@@ -781,7 +789,7 @@ class Encoder(nnx.Module):
         self.transformer = BlockCausalTransformer(
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
             dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
-            time_every=cfg.time_every, rope_theta=cfg.rope_theta,
+            time_every=cfg.time_every, time_layer_offset=getattr(cfg, 'time_layer_offset', 1), rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=dtype, param_dtype=param_dtype,
@@ -844,6 +852,7 @@ class Decoder(nnx.Module):
     def __init__(self, cfg: DecoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
+        self.context_length = cfg.context_length
         self.H = cfg.H
         self.W = cfg.W
         self.dataset_mean = cfg.dataset_mean
@@ -859,7 +868,7 @@ class Decoder(nnx.Module):
         self.transformer = BlockCausalTransformer(
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
             dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
-            time_every=cfg.time_every, rope_theta=cfg.rope_theta,
+            time_every=cfg.time_every, time_layer_offset=getattr(cfg, 'time_layer_offset', 1), rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=dtype, param_dtype=param_dtype,
@@ -940,6 +949,7 @@ class Tokenizer(nnx.Module):
         return create_transformer_caches(
             depth=self.cfg.decoder.depth,
             time_every=self.cfg.decoder.time_every,
+            time_layer_offset=getattr(self.cfg.decoder, 'time_layer_offset', 1),
             flattened_batch_size=batch_size * layout.S,
             window_size=window_size,
             num_kv_heads=self.cfg.decoder.n_kv_heads,
@@ -1184,7 +1194,7 @@ class Dynamics(nnx.Module):
         self.transformer = BlockCausalTransformer(
             d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads,
             depth=cfg.depth, dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type,
-            mlp_ratio=cfg.mlp_ratio, time_every=cfg.time_every, rope_theta=cfg.rope_theta,
+            mlp_ratio=cfg.mlp_ratio, time_every=cfg.time_every, time_layer_offset=cfg.time_layer_offset, rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             dtype=self.dtype, param_dtype=self.param_dtype,
@@ -1249,6 +1259,7 @@ class Dynamics(nnx.Module):
         return create_transformer_caches(
             depth=self.cfg.depth,
             time_every=self.cfg.time_every,
+            time_layer_offset=self.cfg.time_layer_offset,
             flattened_batch_size=batch_size * layout.S,
             window_size=window_size,
             num_kv_heads=self.cfg.n_kv_heads,

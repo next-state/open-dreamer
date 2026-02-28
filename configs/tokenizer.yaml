@@ -28,6 +28,7 @@ tokenizer:
     qk_norm_type: qknorm  # qknorm | quest | null
     rope_theta: 10000.0
     time_every: 4
+    time_layer_offset: 1
     mae_p_min: 0.0
     mae_p_max: 0.9
     patch_size: ${dataset.patch_size}
@@ -52,6 +53,7 @@ tokenizer:
     qk_norm_type: ${tokenizer.encoder.qk_norm_type}
     rope_theta: ${tokenizer.encoder.rope_theta}
     time_every: ${tokenizer.encoder.time_every}
+    time_layer_offset: ${tokenizer.encoder.time_layer_offset}
     H: ${sum:${dataset.padding_H[0]},${dataset.padding_H[1]},${dataset.H}}
     W: ${sum:${dataset.padding_W[0]},${dataset.padding_W[1]},${dataset.W}}
     patch_size: ${dataset.patch_size}
