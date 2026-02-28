@@ -187,16 +187,10 @@ def next_latent(
         jnp.arange(schedule.num_steps),
     )
 
-    # Aggregate per-step ODE diagnostics across τ-ladder steps.
-    # Scalar aggregates for cheap scalar logging; raw arrays for progression plots.
+    # ODE diagnostics
     diag_dict = {
-        'x0_norm_mean': jnp.mean(x0_norm_hist),
-        'x0_norm_max': jnp.max(x0_norm_hist),
-        'update_mag_mean': jnp.mean(update_mag_hist),
-        'update_mag_max': jnp.max(update_mag_hist),
-        # Per-τ-step arrays (shape: num_steps,) for plotting
-        'x0_norm_steps': x0_norm_hist,
-        'update_mag_steps': update_mag_hist,
+        'x0_norm': x0_norm_hist,
+        'update_mag': update_mag_hist,
     }
     
     if caches is not None:
@@ -368,8 +362,7 @@ def latent_rollout(
         # h_next has shape (B, 1, n_agent, d_model), so scan output is (t, B, 1, n_agent, d_model)
         rollout_hidden = einops.rearrange(rollout_hidden, 't b 1 n d -> b t n d') if isinstance(rollout_hidden, jax.Array) else None
 
-        # Aggregate ODE diagnostics: mean over autoregressive steps (axis 0).
-        # Scalar leaves (num_AR_steps,) → scalar; array leaves (num_AR_steps, num_tau_steps) → (num_tau_steps,).
+        # Leaves have shape (num_AR_steps, num_tau_steps) -> (num_tau_steps,)
         ode_diags = jax.tree.map(lambda x: jnp.mean(x, axis=0), rollout_diags)
 
         out_latents = jnp.concatenate((latents_ctx_orig, rollout_latents), axis=1)

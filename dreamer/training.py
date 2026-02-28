@@ -22,7 +22,7 @@ import time
 
 from dreamer.configs import DynamicsConfig, HeadsConfig, OptimalTransportConfig
 from dreamer.generation import DenoiseSchedule
-from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder
+from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
 from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents, unnormalize_latents
@@ -361,6 +361,7 @@ def shortcut_forcing_step(
     context_length: int | None = None,
     time_mask: jnp.ndarray | None = None,
     task_embeddings: jnp.ndarray | None = None,
+    bootstrap_model: Dynamics | None = None,
     ot_cfg: OptimalTransportConfig = OptimalTransportConfig(),
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
@@ -379,6 +380,9 @@ def shortcut_forcing_step(
         context_length: optional context length for sliding window attention. If provided,
                        creates local_window_size=(context_length - 1, 0) for causal sliding window.
         task_embeddings: Optional (B, T, n_agent, d_model) agent tokens
+        bootstrap_model: Model used for the two stop-gradient half-steps that generate bootstrap
+                        targets. Defaults to dynamics_model when None. Pass an EMA model here
+                        for more stable bootstrap targets.
         ot_cfg: OT coupling settings.
 
     Returns:
@@ -475,8 +479,10 @@ def shortcut_forcing_step(
         sigma_plus = sigma_self + d_half
         sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
 
+        _bootstrap = bootstrap_model if bootstrap_model is not None else dynamics_model
+
         # First half-step
-        z1_half1, *_ = dynamics_model(
+        z1_half1, *_ = _bootstrap(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
         )
@@ -486,7 +492,7 @@ def shortcut_forcing_step(
         z_prime = jnp.clip(z_prime, -4.0, 4.0)
 
         # Second half-step
-        z1_half2, *_ = dynamics_model(
+        z1_half2, *_ = _bootstrap(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
         )
@@ -841,8 +847,9 @@ def compute_policy_loss(
 def run_evaluation(
     cfg: DynamicsConfig | HeadsConfig,
     step: int,
-    tokenizer,
-    dynamics,
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
+    *,
     val_data: jnp.ndarray,
     val_actions: Actions,
     use_latent_data: bool,
@@ -851,6 +858,7 @@ def run_evaluation(
     logger,
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
+    name: str | None = None,
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
@@ -871,7 +879,11 @@ def run_evaluation(
         logger: Logger instance for logging metrics and videos
         policy: Optional policy model for action sampling
         task_embedder: Optional task embedder for agent tokens
+        name: Optional prefix for log keys (e.g. "online", "ema"). None for no prefix.
     """
+    log_prefix = f"{name}/" if name else ""
+    eval_prefix = f"{log_prefix}eval/"
+
     k_max = dynamics.cfg.k_max
     schedule_shortcut = DenoiseSchedule.init(4, k_max)
     schedule_diffusion = DenoiseSchedule.init(64, k_max)
@@ -913,7 +925,7 @@ def run_evaluation(
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
         psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames_for_metrics[:, -horizon:]/255))
 
-        print(f"[eval:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
+        print(f"[eval:{log_prefix}{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
 
         # Build visualization
         num_videos = min(4, pred_frames.shape[0])
@@ -931,7 +943,7 @@ def run_evaluation(
         videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
 
         # Save artifacts
-        tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+        tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}" / log_prefix)
         mp4_path = tag_dir / f"{tag}_grid.mp4"
 
         # Save video
@@ -939,21 +951,19 @@ def run_evaluation(
             videos = jax.device_get(videos)
             iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
         except Exception as e:
-            print(f"[eval:{tag}] MP4 write failed: {e}")
+            print(f"[eval:{log_prefix}{tag}] MP4 write failed: {e}")
 
         # Log metrics and video
         ode_diags_cpu = jax.device_get(ode_diags)
-        ode_scalars = {k: float(v) for k, v in ode_diags_cpu.items() if v.ndim == 0}
         logger.log_metrics(step, {
             f"{tag}/mse": mse,
             f"{tag}/psnr": psnr,
             f"{tag}/horizon": horizon,
             f"{tag}/eval_time": dt,
-            **{f"{tag}/ode/{k}": v for k, v in ode_scalars.items()},
-        }, prefix="eval/")
+        }, prefix=eval_prefix)
 
         # ODE progression plot: one curve per metric, x-axis = τ-ladder step
-        ode_curves = {k.replace('_steps', ''): v for k, v in ode_diags_cpu.items() if v.ndim == 1}
+        ode_curves = ode_diags_cpu.items()
         if ode_curves:
             import matplotlib
             matplotlib.use('Agg')
@@ -964,22 +974,22 @@ def run_evaluation(
 
             tau_xs = _np.array(schedule_config.tau_values[:-1])  # starting τ of each step
             fig, axes = plt.subplots(1, len(ode_curves), figsize=(4 * len(ode_curves), 2), squeeze=False)
-            for ax, (name, values) in zip(axes[0], ode_curves.items()):
+            for ax, (curve_name, values) in zip(axes[0], ode_curves):
                 ax.plot(tau_xs, values)
                 ax.set_xlabel('τ')
-                ax.set_title(name)
+                ax.set_title(curve_name)
                 ax.grid(True, alpha=0.4)
-            fig.suptitle(f'{tag} ODE step={step}', fontsize=9)
+            fig.suptitle(f'{log_prefix}{tag} ODE step={step}', fontsize=9)
             fig.tight_layout()
             buf = _io.BytesIO()
             fig.savefig(buf, format='png', dpi=100)
             buf.seek(0)
             ode_plot_img = _np.array(_Image.open(buf).convert('RGB'))
             plt.close(fig)
-            logger.log_image(step, f"eval/{tag}/ode_progression", ode_plot_img, caption=f"ODE step={step}")
+            logger.log_image(step, f"{eval_prefix}{tag}/ode_progression", ode_plot_img, caption=f"ODE step={step}")
 
         if videos is not None:
-            logger.log_video(step, f"eval/{tag}/video", mp4_path)
+            logger.log_video(step, f"{eval_prefix}{tag}/video", mp4_path)
 
 
 # ---------------------------
@@ -1037,8 +1047,8 @@ def vis_dynamics_step(
 def run_x0_visualization(
     cfg,
     step: int,
-    tokenizer,
-    dynamics,
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
     *,
     data: jnp.ndarray,
     actions,
@@ -1046,6 +1056,7 @@ def run_x0_visualization(
     use_latent_data: bool,
     vis_dir: Path,
     logger,
+    name: str | None = None,
 ):
     """Decode noisy input, x0 prediction, and ground-truth as a contact sheet.
 
@@ -1100,25 +1111,29 @@ def run_x0_visualization(
 
     img_array = np.array(pil_img)
 
+    log_prefix = f"{name}/" if name else ""
+    eval_prefix = f"{log_prefix}eval/"
+
     # Save PNG
-    out_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+    out_dir = _ensure_dir(vis_dir / f"step_{step:06d}" / log_prefix)
     Image.fromarray(img_array).save(str(out_dir / "x0_vis.png"))
 
     # Log
-    logger.log_image(step, "x0_vis", img_array, caption=f"step {step}")
+    logger.log_image(step, f"{eval_prefix}x0_vis", img_array, caption=f"step {step}")
 
 
 def run_attention_visualization(
     cfg,
     step: int,
-    tokenizer,
-    dynamics,
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
     *,
     data: jnp.ndarray,
     actions,
     use_latent_data: bool,
     vis_dir: Path,
     logger,
+    name: str | None = None,
 ):
     """Visualize per-layer attention weights to diagnose attention entropy collapse.
 
@@ -1249,7 +1264,10 @@ def run_attention_visualization(
     for j in range(n_time_layers, n_cols - 1):
         axes[1 + j].axis("off")
 
-    fig.suptitle(f"Attention weights — step {step}", fontsize=11)
+    log_prefix = f"{name}/" if name else ""
+    eval_prefix = f"{log_prefix}eval/"
+
+    fig.suptitle(f"Attention weights [{log_prefix}step {step}]", fontsize=11)
     fig.tight_layout()
 
     # --- 6. Convert figure to numpy array ---
@@ -1261,6 +1279,6 @@ def run_attention_visualization(
     plt.close(fig)
 
     # --- 7. Save and log ---
-    out_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+    out_dir = _ensure_dir(vis_dir / f"step_{step:06d}" / log_prefix)
     Image.fromarray(img_array).save(str(out_dir / "attn_vis.png"))
-    logger.log_image(step, "attn_vis", img_array, caption=f"step {step}")
+    logger.log_image(step, f"{eval_prefix}attn_vis", img_array, caption=f"step {step}")

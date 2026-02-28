@@ -297,7 +297,7 @@ def run(cfg: HeadsConfig):
 
         print(f"[setup] Loading pretrained dynamics and tokenizer from {cfg.dynamics_ckpt}")
         dynamics_bundle = DynamicsCheckpointBundle.from_pretrained(cfg.dynamics_ckpt, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
-        dynamics = dynamics_bundle.dynamics
+        dynamics = dynamics_bundle.dynamics_ema
         tokenizer = dynamics_bundle.tokenizer
         dynamics_cfg = dynamics.cfg
         tokenizer_cfg = tokenizer.cfg
@@ -410,10 +410,13 @@ def run(cfg: HeadsConfig):
                     val_videos = batch["videos"][:4]
                     val_actions = actions[:4]
                     run_evaluation(
-                        cfg, step,
-                        bundle.tokenizer, bundle.dynamics,
-                        val_videos, val_actions, vis_dir, rng, logger, bundle.policy_head,
-                        bundle.task_embedder
+                        cfg, step, bundle.tokenizer,
+                        dynamics=bundle.dynamics,
+                        val_data=val_videos, val_actions=val_actions,
+                        use_latent_data=False,
+                        vis_dir=vis_dir, rng=rng, logger=logger,
+                        policy=bundle.policy_head,
+                        task_embedder=bundle.task_embedder,
                     )
 
     print("[done] Agent finetuning complete!")

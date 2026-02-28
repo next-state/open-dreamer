@@ -6,11 +6,10 @@ Bundles have `from_pretrained` class methods for loading checkpoints for inferen
 (without optimizers).
 """
 from __future__ import annotations
-from aiohttp.abc import AbstractAccessLogger
 
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
-from typing import ClassVar, Optional, Self
+from typing import ClassVar, Self
 
 import jax
 import orbax.checkpoint as ocp
@@ -100,7 +99,8 @@ class CheckpointBundle:
         cls,
         checkpoint_path: str,
         mesh_rules: MeshRules,
-        rngs: Optional[nnx.Rngs] = None,
+        rngs: nnx.Rngs | None = None,
+        model_names: set[str] | None = None,
     ) -> Self:
         """Load bundle from checkpoint (without optimizers).
 
@@ -111,9 +111,10 @@ class CheckpointBundle:
             checkpoint_path: Path to checkpoint directory
             mesh_rules: Mesh sharding rules
             rngs: Random number generators (default: Rngs(0))
+            model_names: Optional subset of registry keys to load. If None, loads all.
 
         Returns:
-            Bundle with loaded models, optimizers set to None
+            Bundle with loaded models, unloaded/optimizer fields set to None
         """
         if not cls._model_registry:
             raise NotImplementedError(
@@ -123,6 +124,10 @@ class CheckpointBundle:
         if rngs is None:
             rngs = nnx.Rngs(0)
         checkpoint_path = str(Path(checkpoint_path).resolve())
+
+        registry = cls._model_registry
+        if model_names is not None:
+            registry = {k: v for k, v in registry.items() if k in model_names}
 
         with ocp.CheckpointManager(checkpoint_path) as checkpoint_manager:
             step = checkpoint_manager.latest_step()
@@ -137,7 +142,7 @@ class CheckpointBundle:
 
             # Initialize models from registry
             models = {}
-            for field_name, (config_cls, model_cls) in cls._model_registry.items():
+            for field_name, (config_cls, model_cls) in registry.items():
                 cfg = from_dict(config_cls, meta[field_name])
                 models[field_name] = model_cls(cfg, mesh_rules=mesh_rules, rngs=rngs)
 
@@ -243,7 +248,7 @@ class TokenizerCheckpointBundle(CheckpointBundle):
     }
 
     tokenizer: Tokenizer
-    tokenizer_optimizer: Optional[nnx.Optimizer] = None
+    tokenizer_optimizer: nnx.Optimizer | None = None
 
 
 @dataclass
@@ -256,12 +261,14 @@ class DynamicsCheckpointBundle(CheckpointBundle):
 
     _model_registry: ClassVar[dict[str, tuple[type, type]]] = {
         "dynamics": (DynamicsModelConfig, Dynamics),
+        "dynamics_ema": (DynamicsModelConfig, Dynamics),
         "tokenizer": (TokenizerModelConfig, Tokenizer),
     }
 
     dynamics: Dynamics
+    dynamics_ema: Dynamics
     tokenizer: Tokenizer
-    dynamics_optimizer: Optional[nnx.Optimizer] = None
+    dynamics_optimizer: nnx.Optimizer | None = None
 
 
 @dataclass
@@ -285,8 +292,8 @@ class HeadsCheckpointBundle(CheckpointBundle):
     task_embedder: TaskEmbedder
     policy_head: PolicyHeadMTP
     reward_head: RewardHeadMTP
-    dynamics_optimizer: Optional[nnx.Optimizer] = None
-    task_embedder_optimizer: Optional[nnx.Optimizer] = None
-    policy_optimizer: Optional[nnx.Optimizer] = None
-    reward_optimizer: Optional[nnx.Optimizer] = None
-    loss_normalizer: Optional[RMSLossNormalizer] = None
+    dynamics_optimizer: nnx.Optimizer | None = None
+    task_embedder_optimizer: nnx.Optimizer | None = None
+    policy_optimizer: nnx.Optimizer | None = None
+    reward_optimizer: nnx.Optimizer | None = None
+    loss_normalizer: RMSLossNormalizer | None = None
