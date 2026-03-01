@@ -367,8 +367,8 @@ class DynamicsConfig(BaseExperimentConfig):
     # Eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
-    # EMA model
-    ema_decay: float = 0.999
+    # Power function EMA (EDM2, Karras et al.)
+    ema_sigma_rel: float = 0.08  # Relative std dev controlling EMA lookback window width
 
 
 @dataclass(frozen=False)

@@ -1,5 +1,6 @@
 import os
 import logging
+from functools import lru_cache
 
 import hydra
 import jax
@@ -143,13 +144,30 @@ def build_ema_model(dynamics: Dynamics) -> Dynamics:
     return ema
 
 
-@nnx.jit(static_argnames=("ema_decay",))
-def ema_update_step(dynamics: Dynamics, dynamics_ema: Dynamics, *, ema_decay: float):
+@lru_cache(maxsize=None)
+def _sigma_rel_to_exponent(sigma_rel: float) -> float:
+    """Convert relative std dev to power function exponent (EDM2 Eq. 126 inverse)."""
+    t = sigma_rel ** -2
+    roots = np.roots([1, 7, 16 - t, 12 - t])
+    return float(np.real(roots[np.isreal(roots)]).max())
+
+
+def ema_update_step(dynamics: Dynamics, dynamics_ema: Dynamics, step: int, sigma_rel: float):
+    """Power function EMA update (EDM2 Eq. 127)."""
+    exponent = _sigma_rel_to_exponent(sigma_rel)
+
+    cur_step = step + 1  # 1-indexed to avoid division by zero
+    beta = jnp.float32((1 - 1.0 / cur_step) ** (exponent + 1))
+    _ema_update_params(dynamics, dynamics_ema, beta=beta)
+
+
+@nnx.jit
+def _ema_update_params(dynamics: Dynamics, dynamics_ema: Dynamics, *, beta: jax.Array):
     online_params = nnx.state(dynamics, nnx.Param)
     ema_params    = nnx.state(dynamics_ema, nnx.Param)
     # Keep EMA in float32 to avoid bf16 quantization (tiny EMA increments get rounded to 0)
     updated_ema = jax.tree.map(
-        lambda e, o: ema_decay * e + (1.0 - ema_decay) * o.astype(e.dtype),
+        lambda e, o: beta * e + (1.0 - beta) * o.astype(e.dtype),
         ema_params, online_params,
     )
     nnx.update(dynamics_ema, updated_ema)
@@ -244,7 +262,6 @@ def run(cfg: DynamicsConfig):
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
             scaling.start_training()
 
-
             pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
@@ -290,8 +307,8 @@ def run(cfg: DynamicsConfig):
                     ot_cfg=ot_cfg,
                 )
 
-                # EMA update
-                ema_update_step(bundle.dynamics, bundle.dynamics_ema, ema_decay=cfg.ema_decay)
+                # EMA update (power function EMA, EDM2 Eq. 127)
+                ema_update_step(bundle.dynamics, bundle.dynamics_ema, step, cfg.ema_sigma_rel)
 
                 # Logging
                 if logger.should_log(step):

@@ -48,7 +48,7 @@ dynamics:
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
 
-ema_decay: 0.999
+ema_sigma_rel: 0.05
 
 bootstrap_start: 50_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
