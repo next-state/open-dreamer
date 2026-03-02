@@ -1,18 +1,14 @@
-# Procgen CoinRun Reactor Configuration
-# ======================================
-# Configuration for running the Procgen environment with Reactor runtime.
+# MineRL Reactor Configuration
+# ==============================
+# Configuration for running the MineRL environment with Reactor runtime.
 
 # Environment settings
-env_name: coinrun
-num_levels: 0  # 0 = infinite procedural levels
-start_level: 0
-distribution_mode: easy  # Options: easy, hard, exploration
-
-# Rendering settings
-render_mode: rgb_array
-action_dim: 7  # CoinRun has 7 discrete actions
+env_name: MineRLBasaltFindCave-v0
 
 # Video output settings
-fps: 5
-height: 64
-width: 64
+fps: 20
+height: 360
+width: 640
+
+# Camera sensitivity (degrees per tick when mouse keys are held)
+camera_sensitivity: 5.0

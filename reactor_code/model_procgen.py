@@ -1,13 +1,13 @@
 """
-Procgen CoinRun Reactor Integration
-====================================
+MineRL Reactor Integration
+===========================
 
-This is a test version that uses the actual CoinRun environment instead of the Dreamer model.
+This is a test version that uses the actual MineRL Minecraft environment.
 Use this to verify that the Reactor integration works correctly before testing with the model.
 
-User Input → input_to_action() → Action Index
+User Input → input_to_action() → Action Dict
                                       ↓
-                            CoinRun Environment Step
+                            MineRL Environment Step
                                       ↓
                               Numpy Frame (H,W,C)
                                       ↓
@@ -15,13 +15,18 @@ User Input → input_to_action() → Action Index
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
+os.environ.setdefault("DISPLAY", ":0")
+
+import cv2
+import gym
+import minerl
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
-from procgen import ProcgenEnv
 from reactor_runtime import VideoModel, command, get_ctx
 from reactor_runtime.model_api import model
 
@@ -33,77 +38,97 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ProcgenReactorConfig:
-    """Configuration for Procgen reactor runtime."""
+class MineRLReactorConfig:
+    """Configuration for MineRL reactor runtime."""
 
     # Environment configuration
-    env_name: str = "coinrun"
-    num_levels: int = 0  # 0 = infinite procedural levels
-    start_level: int = 0
-    distribution_mode: str = "easy"  # "easy", "hard", or "exploration"
-
-    # Rendering
-    render_mode: str = "rgb_array"
-
-    # Action space configuration (CoinRun has 7 discrete actions)
-    action_dim: int = 7
+    env_name: str = "MineRLBasaltFindCave-v0"
 
     # Video settings
-    fps: int = 5
-    height: int = 64
-    width: int = 64
+    fps: int = 20
+    height: int = 360
+    width: int = 640
+
+    # Camera sensitivity (degrees per tick when mouse/arrow keys are held)
+    camera_sensitivity: float = 5.0
 
 
 def input_to_action(
-    mouse_pos: Tuple[int, int], controller_state: Dict[str, Any], action_dim: int = 7
-) -> int:
+    env, mouse_pos: Tuple[int, int], controller_state: Dict[str, Any], camera_sensitivity: float = 5.0
+) -> Dict[str, Any]:
     """
-    Convert keyboard input to CoinRun action.
-    Used https://github.com/openai/coinrun/blob/master/coinrun/coinrun.cpp for reference
+    Convert keyboard/mouse input to MineRL action dictionary.
 
-    CoinRun Action Space (NUM_ACTIONS = 7):
-        Action 0: No movement (dx=0, dy=0)
-        Action 1: Right → (dx=+1, dy=0) - mapped to D key
-        Action 2: Left ← (dx=-1, dy=0) - mapped to A key
-        Action 3: Jump/Up ↑ (dx=0, dy=+1) - mapped to W key
-        Action 4: Right-Jump ↗ (dx=+1, dy=+1) - mapped to E key
-        Action 5: Left-Jump ↖ (dx=-1, dy=+1) - mapped to Q key
-        Action 6: Down ↓ (dx=0, dy=-1) - mapped to S key
+    MineRL Action Space:
+        forward:  Discrete(2) - W key
+        back:     Discrete(2) - S key
+        left:     Discrete(2) - A key
+        right:    Discrete(2) - D key
+        jump:     Discrete(2) - Space key
+        sneak:    Discrete(2) - Shift key
+        sprint:   Discrete(2) - Ctrl key
+        attack:   Discrete(2) - Left click / F key
+        use:      Discrete(2) - Right click / G key
+        camera:   Box(-180, 180, shape=(2,)) - Mouse movement (pitch, yaw)
+        ESC:      Discrete(2) - Never sent (ends episode)
+
+    Camera is controlled via arrow keys or I/J/K/L:
+        Arrow Up / I:    Look up (negative pitch)
+        Arrow Down / K:  Look down (positive pitch)
+        Arrow Left / J:  Look left (negative yaw)
+        Arrow Right / L: Look right (positive yaw)
 
     Args:
-        mouse_pos: (mouse_x, mouse_y) position (unused for CoinRun)
-        controller_state: Dictionary with keyboard button states
-        action_dim: Dimension of action space (7 for CoinRun)
+        env: The MineRL gym environment (used for noop action)
+        mouse_pos: (mouse_x, mouse_y) position (unused currently)
+        controller_state: Dictionary with keyboard/mouse button states
+        camera_sensitivity: Degrees of camera rotation per tick
 
     Returns:
-        Integer action index
+        MineRL action dictionary
     """
-    # Key to action mapping (priority order: diagonals first, then cardinals)
-    # Uses indices from docstring: 0=none, 1=right, 2=left, 3=jump, 4=right-jump, 5=left-jump, 6=down
-    key_map = [
-        ("q", 5),  # Left-Jump ↖
-        ("e", 4),  # Right-Jump ↗
-        ("w", 3),  # Jump/Up ↑
-        ("s", 6),  # Down ↓
-        ("d", 1),  # Right →
-        ("a", 2),  # Left ←
-    ]
+    action = env.action_space.noop()
 
-    action_idx = 0  # Default: no movement
-    for key, action in key_map:
-        if controller_state.get(key, False):
-            action_idx = action
-            break
+    # Movement keys
+    action["forward"] = 1 if controller_state.get("w", False) else 0
+    action["back"] = 1 if controller_state.get("s", False) else 0
+    action["left"] = 1 if controller_state.get("a", False) else 0
+    action["right"] = 1 if controller_state.get("d", False) else 0
 
-    return action_idx
+    # Action keys
+    action["jump"] = 1 if controller_state.get(" ", False) else 0
+    action["sneak"] = 1 if controller_state.get("shift", False) else 0
+    action["sprint"] = 1 if controller_state.get("ctrl", False) else 0
+    action["attack"] = 1 if controller_state.get("f", False) else 0
+    action["use"] = 1 if controller_state.get("g", False) else 0
+
+    # Camera control via arrow keys or IJKL
+    pitch = 0.0  # vertical: negative = look up, positive = look down
+    yaw = 0.0    # horizontal: negative = look left, positive = look right
+
+    if controller_state.get("arrowup", False) or controller_state.get("i", False):
+        pitch -= camera_sensitivity
+    if controller_state.get("arrowdown", False) or controller_state.get("k", False):
+        pitch += camera_sensitivity
+    if controller_state.get("arrowleft", False) or controller_state.get("j", False):
+        yaw -= camera_sensitivity
+    if controller_state.get("arrowright", False) or controller_state.get("l", False):
+        yaw += camera_sensitivity
+
+    action["camera"] = np.array([pitch, yaw], dtype=np.float32)
+
+    # Never send ESC
+    action["ESC"] = 0
+
+    return action
 
 
-@model(name="procgen-coinrun", config="configs/procgen.yaml")
-class ProcgenVideoModel(VideoModel):
+@model(name="minerl", config="configs/procgen.yaml")
+class MineRLVideoModel(VideoModel):
     """
-    Procgen environment integration with Reactor VideoModel interface.
+    MineRL environment integration with Reactor VideoModel interface.
 
-    This version uses the actual CoinRun environment for testing the Reactor integration
+    This version uses the actual Minecraft environment for testing the Reactor integration
     before deploying the full Dreamer model.
 
     Demonstrates:
@@ -113,95 +138,108 @@ class ProcgenVideoModel(VideoModel):
     - Proper state reset between sessions
     """
 
-    @command("send_keyboard_state", description="Update keyboard state (WASD+QE keys)")
+    @command("send_keyboard_state", description="Update keyboard state (WASD + Space/Shift/Ctrl + IJKL camera + F attack + G use)")
     def send_keyboard_state(
         self,
         w: bool = False,
         a: bool = False,
         s: bool = False,
         d: bool = False,
-        q: bool = False,
-        e: bool = False,
+        f: bool = False,
+        g: bool = False,
+        i: bool = False,
+        j: bool = False,
+        k: bool = False,
+        l: bool = False,
+        space: bool = False,
+        shift: bool = False,
+        ctrl: bool = False,
     ):
         """
         Update keyboard state and compute action from current key presses.
 
         Args:
-            w: W key pressed (Jump/Up)
-            a: A key pressed (Left)
-            s: S key pressed (Down)
-            d: D key pressed (Right)
-            q: Q key pressed (Left-Jump)
-            e: E key pressed (Right-Jump)
+            w: W key pressed (Forward)
+            a: A key pressed (Strafe Left)
+            s: S key pressed (Back)
+            d: D key pressed (Strafe Right)
+            f: F key pressed (Attack/Mine)
+            g: G key pressed (Use/Place)
+            i: I key pressed (Look Up)
+            j: J key pressed (Look Left)
+            k: K key pressed (Look Down)
+            l: L key pressed (Look Right)
+            space: Space key pressed (Jump)
+            shift: Shift key pressed (Sneak)
+            ctrl: Ctrl key pressed (Sprint)
         """
-        self.controller_state = {"w": w, "a": a, "s": s, "d": d, "q": q, "e": e}
-        action = input_to_action((0, 0), self.controller_state, self.cfg.action_dim)
-        self.current_action = action
+        self.controller_state = {
+            "w": w, "a": a, "s": s, "d": d,
+            "f": f, "g": g,
+            "i": i, "j": j, "k": k, "l": l,
+            " ": space, "shift": shift, "ctrl": ctrl,
+        }
+        self.current_action = input_to_action(
+            self.env, (0, 0), self.controller_state, self.cfg.camera_sensitivity
+        )
 
-    @command("reset_env", description="Reset the environment to a new level")
+    @command("reset_env", description="Reset the environment to a new world")
     def reset_environment(self):
-        """Reset the environment to generate a new level."""
+        """Reset the environment to generate a new world."""
         if self.env is not None:
             obs = self.env.reset()
-            logger.debug("Environment reset to new level")
+            self.current_obs = obs["pov"]
+            logger.debug("Environment reset to new world")
 
     def __init__(self, config: DictConfig):
         """
-        Initialize Procgen environment.
+        Initialize MineRL environment.
 
         Args:
             config: DictConfig loaded from configs/procgen.yaml and merged by Reactor
         """
         super().__init__()
 
-        logger.info("Initializing Procgen CoinRun...")
-        print("DEBUG: Initializing Procgen CoinRun...", flush=True)
+        logger.info("Initializing MineRL...")
+        print("DEBUG: Initializing MineRL...", flush=True)
 
         # Merge config with defaults from dataclass
-        self.cfg = OmegaConf.structured(ProcgenReactorConfig)
+        self.cfg = OmegaConf.structured(MineRLReactorConfig)
         self.cfg = OmegaConf.merge(self.cfg, config)
 
         self.fps = self.cfg.fps
         self.size = (self.cfg.height, self.cfg.width)
 
-        # Create Procgen environment
-        # num_envs=1 for single environment
-        self.env = ProcgenEnv(
-            num_envs=1,
-            env_name=self.cfg.env_name,
-            num_levels=self.cfg.num_levels,
-            start_level=self.cfg.start_level,
-            distribution_mode=self.cfg.distribution_mode,
-            render_mode=self.cfg.render_mode,
-        )
+        # Create MineRL environment
+        self.env = gym.make(self.cfg.env_name)
 
         # State variables
-        self.current_action = 0  # Default to no movement (action 0)
+        self.current_action = None  # Will be set to noop on session start
         self.controller_state = {}
         self.current_obs = None
 
-        logger.info("Procgen CoinRun initialization complete")
-        print("DEBUG: Procgen CoinRun initialization complete", flush=True)
+        logger.info("MineRL initialization complete")
+        print("DEBUG: MineRL initialization complete", flush=True)
 
     def start_session(self) -> None:
         """
         Start the environment's main processing loop.
 
-        This method runs the CoinRun environment and emits frames to the Reactor runtime.
+        This method runs the MineRL environment and emits frames to the Reactor runtime.
         """
         self._running = True
 
-        logger.info("Starting Procgen session...")
-        print("DEBUG: Starting Procgen session...", flush=True)
+        logger.info("Starting MineRL session...")
+        print("DEBUG: Starting MineRL session...", flush=True)
 
-        # Reset environment and initialize state
-        self.current_action = 0  # Default to no movement (action 0)
+        # Reset state
         self.controller_state = {}
 
         # Reset environment to get initial observation
         obs = self.env.reset()
-        # obs is a dict with key 'rgb', shape: (1, 64, 64, 3)
-        self.current_obs = obs["rgb"][0]  # Extract first batch element: (64, 64, 3)
+        # obs is a dict with key 'pov', shape: (360, 640, 3)
+        self.current_obs = obs["pov"]
+        self.current_action = self.env.action_space.noop()
 
         logger.info(
             f"Environment initialized. Observation shape: {self.current_obs.shape}"
@@ -225,30 +263,37 @@ class ProcgenVideoModel(VideoModel):
                 current_action = self.current_action
 
                 # Step the environment
-                obs, reward, done, info = self.env.step(np.array([current_action]))
+                obs, reward, done, info = self.env.step(current_action)
 
                 # Extract frame from observation
-                # obs is a dict with key 'rgb', shape: (1, 64, 64, 3)
-                frame = obs["rgb"][0]  # Extract first batch element: (64, 64, 3)
+                # obs is a dict with key 'pov', shape: (360, 640, 3)
+                frame = obs["pov"]
 
                 # Ensure frame is uint8
                 if frame.dtype != np.uint8:
                     frame = np.clip(frame, 0, 255).astype(np.uint8)
 
+                # Resize if configured size differs from native resolution
+                if frame.shape[0] != self.cfg.height or frame.shape[1] != self.cfg.width:
+                    frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
+
                 # Check if episode ended
-                if done[0]:
-                    logger.info(f"Episode ended. Reward: {reward[0]}")
-                    print(f"DEBUG: Episode ended. Reward: {reward[0]}", flush=True)
+                if done:
+                    logger.info(f"Episode ended. Reward: {reward}")
+                    print(f"DEBUG: Episode ended. Reward: {reward}", flush=True)
                     # Reset environment
                     obs = self.env.reset()
-                    frame = obs["rgb"][0]
+                    frame = obs["pov"]
+                    if frame.shape[0] != self.cfg.height or frame.shape[1] != self.cfg.width:
+                        frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
+                    self.current_action = self.env.action_space.noop()
 
                 # Update current observation
                 self.current_obs = frame
 
                 # Emit frame to reactor runtime
                 get_ctx().emit_block(frame)
-                
+
                 # Sleep to maintain target FPS
                 current_time = time.time()
                 elapsed = current_time - last_frame_time
@@ -260,11 +305,9 @@ class ProcgenVideoModel(VideoModel):
         except Exception as e:
             logger.error(f"Error in session: {e}", exc_info=True)
             self._running = False
-            time.sleep(2)  # Fake machine resetting time
+            time.sleep(2)
             raise e
         finally:
             self._running = False
-            # Note: Don't close self.env here - it persists across sessions
-            # Environment cleanup happens when the runtime shuts down
-            logger.info("Procgen session ended.")
-            print("DEBUG: Procgen session ended.", flush=True)
+            logger.info("MineRL session ended.")
+            print("DEBUG: MineRL session ended.", flush=True)
