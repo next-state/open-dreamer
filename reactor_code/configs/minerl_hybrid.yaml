@@ -1,0 +1,20 @@
+# MineRL Hybrid Reactor Configuration
+
+# Checkpoints (bundle directories)
+dynamics_ckpt: logs/dynamics/checkpoints
+policy_ckpt: null
+
+# Agent settings
+task_id: 0
+
+# Denoising schedule
+num_steps: 4
+tau_ctx_target: 0.9
+
+# Environment
+env_name: MineRLBasaltFindCave-v0
+
+# Video output
+fps: 20
+height: 360
+width: 640

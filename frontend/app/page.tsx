@@ -4,7 +4,6 @@ import {
   ReactorProvider,
 } from "@reactor-team/js-sdk";
 import { ReactorStatus } from "@/components/ReactorStatus";
-import { GameView } from "@/components/GameView";
 import { KeyboardController } from "@/components/KeyboardController";
 import { AgentToggle } from "@/components/AgentToggle";
 import { ImaginationToggle } from "@/components/ImaginationToggle";
@@ -19,11 +18,10 @@ function GameInterface() {
 
   return (
     <div className="flex flex-col gap-3">
-      <GameView className="w-full aspect-video bg-gradient-to-br from-gray-800 to-gray-900 rounded-xl border border-gray-700/50 shadow-xl overflow-hidden" />
+      <KeyboardController enabled={isConnected && status === "ready"} />
       <ReactorStatus />
       <ImaginationToggle />
       <AgentToggle />
-      <KeyboardController enabled={isConnected && status === "ready"} />
     </div>
   );
 }
@@ -39,7 +37,7 @@ export default function Home() {
           </h1>
           <div className="flex flex-wrap items-center justify-center gap-3">
             <p className="text-gray-300 text-sm font-light tracking-wide">
-              Interactive coinrun world model with Reactor
+              Interactive Minecraft world model with Reactor
             </p>
             <a
               href="https://github.com/reactor-team/js-sdk"
@@ -55,7 +53,7 @@ export default function Home() {
           </div>
         </div>
         <ReactorProvider 
-          modelName="procgen-coinrun" 
+          modelName="minerl"
           local
         >
           <GameInterface />

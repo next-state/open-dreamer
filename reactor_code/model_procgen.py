@@ -12,13 +12,17 @@ User Input → input_to_action() → Action Dict
                               Numpy Frame (H,W,C)
                                       ↓
                             emit_frame() → User sees result
+
+Action space matches the VPT action space defined in dreamer/actions.py:
+  - 23 binary actions (keyboard keys + mouse buttons)
+  - 121 categorical camera classes (11x11 mu-law discretized mouse dx/dy)
 """
 
 import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 os.environ.setdefault("DISPLAY", ":0")
 
@@ -49,75 +53,103 @@ class MineRLReactorConfig:
     height: int = 360
     width: int = 640
 
-    # Camera sensitivity (degrees per tick when mouse/arrow keys are held)
-    camera_sensitivity: float = 5.0
+    # Camera mapping (raw mouse delta -> MineRL camera degrees)
+    camera_scaler: float = 360.0 / 2400.0
+    camera_maxval: float = 30.0
+    camera_deadzone_deg: float = 0.5
+    invert_y: bool = False
+
+
+def _camera_delta_to_degrees(
+    raw_delta: Any,
+    *,
+    scaler: float,
+    maxval: float,
+    deadzone_deg: float,
+) -> float:
+    """Convert raw mouse deltas to stable camera degrees for MineRL."""
+    try:
+        delta = float(raw_delta)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if not np.isfinite(delta):
+        return 0.0
+
+    delta_deg = float(np.clip(delta * scaler, -maxval, maxval))
+    if abs(delta_deg) < deadzone_deg:
+        return 0.0
+    return delta_deg
 
 
 def input_to_action(
-    env, mouse_pos: Tuple[int, int], controller_state: Dict[str, Any], camera_sensitivity: float = 5.0
+    env,
+    controller_state: Dict[str, Any],
+    mouse_state: Dict[str, Any],
+    cfg: MineRLReactorConfig,
 ) -> Dict[str, Any]:
     """
     Convert keyboard/mouse input to MineRL action dictionary.
 
-    MineRL Action Space:
-        forward:  Discrete(2) - W key
-        back:     Discrete(2) - S key
-        left:     Discrete(2) - A key
-        right:    Discrete(2) - D key
-        jump:     Discrete(2) - Space key
-        sneak:    Discrete(2) - Shift key
-        sprint:   Discrete(2) - Ctrl key
-        attack:   Discrete(2) - Left click / F key
-        use:      Discrete(2) - Right click / G key
-        camera:   Box(-180, 180, shape=(2,)) - Mouse movement (pitch, yaw)
-        ESC:      Discrete(2) - Never sent (ends episode)
+    Uses env.action_space.noop() as the base to ensure correct types and key
+    ordering, then overwrites every field with the current input state.
 
-    Camera is controlled via arrow keys or I/J/K/L:
-        Arrow Up / I:    Look up (negative pitch)
-        Arrow Down / K:  Look down (positive pitch)
-        Arrow Left / J:  Look left (negative yaw)
-        Arrow Right / L: Look right (positive yaw)
+    Mapping follows the VPT action space from dreamer/actions.py.
 
     Args:
-        env: The MineRL gym environment (used for noop action)
-        mouse_pos: (mouse_x, mouse_y) position (unused currently)
-        controller_state: Dictionary with keyboard/mouse button states
-        camera_sensitivity: Degrees of camera rotation per tick
+        env: The MineRL gym environment (used for noop action base)
+        controller_state: Dictionary with keyboard key states (bool values)
+        mouse_state: Dictionary with mouse buttons and dx/dy deltas
+        cfg: Runtime config containing camera scaling/filtering parameters
 
     Returns:
         MineRL action dictionary
     """
-    action = env.action_space.noop()
+    action = env.action_space.no_op()
 
-    # Movement keys
-    action["forward"] = 1 if controller_state.get("w", False) else 0
-    action["back"] = 1 if controller_state.get("s", False) else 0
-    action["left"] = 1 if controller_state.get("a", False) else 0
-    action["right"] = 1 if controller_state.get("d", False) else 0
+    # Movement keys (VPT indices 0-3)
+    action["forward"] = 1 if controller_state.get("w") else 0
+    action["left"] = 1 if controller_state.get("a") else 0
+    action["back"] = 1 if controller_state.get("s") else 0
+    action["right"] = 1 if controller_state.get("d") else 0
 
-    # Action keys
-    action["jump"] = 1 if controller_state.get(" ", False) else 0
-    action["sneak"] = 1 if controller_state.get("shift", False) else 0
-    action["sprint"] = 1 if controller_state.get("ctrl", False) else 0
-    action["attack"] = 1 if controller_state.get("f", False) else 0
-    action["use"] = 1 if controller_state.get("g", False) else 0
+    # Movement modifier keys (VPT indices 4-6)
+    action["jump"] = 1 if controller_state.get("space") else 0
+    action["sneak"] = 1 if controller_state.get("shift") else 0
+    action["sprint"] = 1 if controller_state.get("ctrl") else 0
 
-    # Camera control via arrow keys or IJKL
-    pitch = 0.0  # vertical: negative = look up, positive = look down
-    yaw = 0.0    # horizontal: negative = look left, positive = look right
+    # Inventory/item keys (VPT indices 7-8, 10)
+    action["inventory"] = 1 if controller_state.get("e") else 0
+    action["drop"] = 1 if controller_state.get("q") else 0
+    action["swapHands"] = 1 if controller_state.get("f") else 0
 
-    if controller_state.get("arrowup", False) or controller_state.get("i", False):
-        pitch -= camera_sensitivity
-    if controller_state.get("arrowdown", False) or controller_state.get("k", False):
-        pitch += camera_sensitivity
-    if controller_state.get("arrowleft", False) or controller_state.get("j", False):
-        yaw -= camera_sensitivity
-    if controller_state.get("arrowright", False) or controller_state.get("l", False):
-        yaw += camera_sensitivity
+    # Hotbar keys (VPT indices 11-19)
+    for slot in range(1, 10):
+        action[f"hotbar.{slot}"] = 1 if controller_state.get(str(slot)) else 0
 
-    action["camera"] = np.array([pitch, yaw], dtype=np.float32)
+    # Mouse buttons (VPT indices 20-22)
+    action["attack"] = 1 if mouse_state.get("left") else 0
+    action["use"] = 1 if mouse_state.get("right") else 0
+    action["pickItem"] = 1 if mouse_state.get("middle") else 0
 
-    # Never send ESC
+    # Camera from mouse deltas — convert raw deltas to MineRL camera degrees.
+    dx = _camera_delta_to_degrees(
+        mouse_state.get("dx", 0.0),
+        scaler=cfg.camera_scaler,
+        maxval=cfg.camera_maxval,
+        deadzone_deg=cfg.camera_deadzone_deg,
+    )
+    dy = _camera_delta_to_degrees(
+        mouse_state.get("dy", 0.0) + 6, # TODO: this -6 and + 6 is an abomination but it seems to be needed to avoid drift
+        scaler=cfg.camera_scaler,
+        maxval=cfg.camera_maxval,
+        deadzone_deg=cfg.camera_deadzone_deg,
+    )
+    if cfg.invert_y:
+        dy = -dy
+    action["camera"] = np.array([dy, dx], dtype=np.float32)
+
+    # Never send ESC (VPT index 9)
     action["ESC"] = 0
 
     return action
@@ -131,57 +163,90 @@ class MineRLVideoModel(VideoModel):
     This version uses the actual Minecraft environment for testing the Reactor integration
     before deploying the full Dreamer model.
 
-    Demonstrates:
-    - Method-based command system with automatic schema generation
-    - Environment integration pattern
-    - Async session management
-    - Proper state reset between sessions
+    The action space matches the VPT action space from dreamer/actions.py:
+    - 23 binary actions: 10 keyboard keys + 9 hotbar keys + 3 mouse buttons + ESC
+    - 121 categorical camera classes: 11x11 mu-law discretized mouse dx/dy
     """
 
-    @command("send_keyboard_state", description="Update keyboard state (WASD + Space/Shift/Ctrl + IJKL camera + F attack + G use)")
+    @command(
+        "send_keyboard_state",
+        description="Update keyboard state (WASD movement, Space/Shift/Ctrl modifiers, E/Q/F items, 1-9 hotbar)",
+    )
     def send_keyboard_state(
         self,
         w: bool = False,
         a: bool = False,
         s: bool = False,
         d: bool = False,
-        f: bool = False,
-        g: bool = False,
-        i: bool = False,
-        j: bool = False,
-        k: bool = False,
-        l: bool = False,
         space: bool = False,
         shift: bool = False,
         ctrl: bool = False,
+        e: bool = False,
+        q: bool = False,
+        f: bool = False,
+        n1: bool = False,
+        n2: bool = False,
+        n3: bool = False,
+        n4: bool = False,
+        n5: bool = False,
+        n6: bool = False,
+        n7: bool = False,
+        n8: bool = False,
+        n9: bool = False,
     ):
         """
-        Update keyboard state and compute action from current key presses.
+        Update keyboard state. Maps to VPT binary action indices from dreamer/actions.py.
 
         Args:
-            w: W key pressed (Forward)
-            a: A key pressed (Strafe Left)
-            s: S key pressed (Back)
-            d: D key pressed (Strafe Right)
-            f: F key pressed (Attack/Mine)
-            g: G key pressed (Use/Place)
-            i: I key pressed (Look Up)
-            j: J key pressed (Look Left)
-            k: K key pressed (Look Down)
-            l: L key pressed (Look Right)
-            space: Space key pressed (Jump)
-            shift: Shift key pressed (Sneak)
-            ctrl: Ctrl key pressed (Sprint)
+            w: W key (Forward) - VPT index 0
+            a: A key (Strafe Left) - VPT index 1
+            s: S key (Back) - VPT index 2
+            d: D key (Strafe Right) - VPT index 3
+            space: Space key (Jump) - VPT index 4
+            shift: Shift key (Sneak) - VPT index 5
+            ctrl: Ctrl key (Sprint) - VPT index 6
+            e: E key (Inventory) - VPT index 7
+            q: Q key (Drop) - VPT index 8
+            f: F key (Swap Hands) - VPT index 10
+            n1-n9: Number keys 1-9 (Hotbar slots) - VPT indices 11-19
         """
         self.controller_state = {
             "w": w, "a": a, "s": s, "d": d,
-            "f": f, "g": g,
-            "i": i, "j": j, "k": k, "l": l,
-            " ": space, "shift": shift, "ctrl": ctrl,
+            "space": space, "shift": shift, "ctrl": ctrl,
+            "e": e, "q": q, "f": f,
+            "1": n1, "2": n2, "3": n3, "4": n4, "5": n5,
+            "6": n6, "7": n7, "8": n8, "9": n9,
         }
-        self.current_action = input_to_action(
-            self.env, (0, 0), self.controller_state, self.cfg.camera_sensitivity
-        )
+
+    @command(
+        "send_mouse_state",
+        description="Update mouse state (buttons and camera movement)",
+    )
+    def send_mouse_state(
+        self,
+        left: bool = False,
+        right: bool = False,
+        middle: bool = False,
+        dx: float = 0.0,
+        dy: float = 0.0,
+    ):
+        """
+        Update mouse button and camera movement state.
+        Maps to VPT binary indices 20-22 and categorical camera action.
+
+        Args:
+            left: Left mouse button (Attack/Mine) - VPT index 20 (mouse.0)
+            right: Right mouse button (Use/Place) - VPT index 21 (mouse.1)
+            middle: Middle mouse button (Pick Item) - VPT index 22 (mouse.2)
+            dx: Mouse X delta for camera yaw (raw pixels, will be mu-law encoded)
+            dy: Mouse Y delta for camera pitch (raw pixels, will be mu-law encoded)
+        """
+        self.mouse_state["left"] = left
+        self.mouse_state["right"] = right
+        self.mouse_state["middle"] = middle
+        # Accumulate deltas — multiple messages may arrive between game steps
+        self.mouse_state["dx"] += dx
+        self.mouse_state["dy"] += dy
 
     @command("reset_env", description="Reset the environment to a new world")
     def reset_environment(self):
@@ -213,9 +278,9 @@ class MineRLVideoModel(VideoModel):
         # Create MineRL environment
         self.env = gym.make(self.cfg.env_name)
 
-        # State variables
-        self.current_action = None  # Will be set to noop on session start
+        # State variables — updated by command handlers, consumed by game loop
         self.controller_state = {}
+        self.mouse_state = {"left": False, "right": False, "middle": False, "dx": 0.0, "dy": 0.0}
         self.current_obs = None
 
         logger.info("MineRL initialization complete")
@@ -232,14 +297,14 @@ class MineRLVideoModel(VideoModel):
         logger.info("Starting MineRL session...")
         print("DEBUG: Starting MineRL session...", flush=True)
 
-        # Reset state
+        # Reset input state
         self.controller_state = {}
+        self.mouse_state = {"left": False, "right": False, "middle": False, "dx": 0.0, "dy": 0.0}
 
         # Reset environment to get initial observation
         obs = self.env.reset()
         # obs is a dict with key 'pov', shape: (360, 640, 3)
         self.current_obs = obs["pov"]
-        self.current_action = self.env.action_space.noop()
 
         logger.info(
             f"Environment initialized. Observation shape: {self.current_obs.shape}"
@@ -259,8 +324,21 @@ class MineRLVideoModel(VideoModel):
         try:
             last_frame_time = time.time()
             while not get_ctx().should_stop():
-                # Get current action from user input
-                current_action = self.current_action
+                # Consume accumulated mouse deltas and build action fresh
+                # This avoids race conditions between command handlers and the game loop
+                step_mouse = {
+                    "left": self.mouse_state["left"],
+                    "right": self.mouse_state["right"],
+                    "middle": self.mouse_state["middle"],
+                    "dx": self.mouse_state["dx"],
+                    "dy": self.mouse_state["dy"],
+                }
+                self.mouse_state["dx"] = 0.0
+                self.mouse_state["dy"] = 0.0
+
+                current_action = input_to_action(
+                    self.env, self.controller_state, step_mouse, self.cfg
+                )
 
                 # Step the environment
                 obs, reward, done, info = self.env.step(current_action)
@@ -281,12 +359,10 @@ class MineRLVideoModel(VideoModel):
                 if done:
                     logger.info(f"Episode ended. Reward: {reward}")
                     print(f"DEBUG: Episode ended. Reward: {reward}", flush=True)
-                    # Reset environment
                     obs = self.env.reset()
                     frame = obs["pov"]
                     if frame.shape[0] != self.cfg.height or frame.shape[1] != self.cfg.width:
                         frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
-                    self.current_action = self.env.action_space.noop()
 
                 # Update current observation
                 self.current_obs = frame

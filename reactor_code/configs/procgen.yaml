@@ -9,6 +9,3 @@ env_name: MineRLBasaltFindCave-v0
 fps: 20
 height: 360
 width: 640
-
-# Camera sensitivity (degrees per tick when mouse keys are held)
-camera_sensitivity: 5.0
