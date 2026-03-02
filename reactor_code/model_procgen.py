@@ -155,7 +155,7 @@ def input_to_action(
     return action
 
 
-@model(name="minerl", config="configs/procgen.yaml")
+# @model(name="minerl", config="configs/procgen.yaml")
 class MineRLVideoModel(VideoModel):
     """
     MineRL environment integration with Reactor VideoModel interface.

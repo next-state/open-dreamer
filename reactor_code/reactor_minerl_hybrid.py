@@ -6,6 +6,8 @@ This reactor combines real MineRL gameplay with Dreamer world model imagination.
 It starts in reality mode, keeps world model KV caches in sync from real frames,
 and can switch to imagination mode for autoregressive generation.
 """
+import prompt_toolkit
+from pycparser.ply.cpp import p
 
 import logging
 import os
@@ -32,7 +34,7 @@ from dreamer.actions import Actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES, mou
 from dreamer.checkpointing import DynamicsCheckpointBundle, HeadsCheckpointBundle
 from dreamer.generation import DenoiseSchedule, next_frame
 from dreamer.models import PolicyHeadMTP, TaskEmbedder
-from dreamer.parallel import MeshRules, create_data_model_parallel
+from dreamer.parallel import build_parallel
 
 
 logging.basicConfig(
@@ -77,7 +79,7 @@ def input_to_env_action(
     env, controller_state: Dict[str, Any], mouse_state: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Map user input state to MineRL environment action dict."""
-    action = env.action_space.noop()
+    action = env.action_space.no_op()
 
     action["forward"] = 1 if controller_state.get("w", False) else 0
     action["left"] = 1 if controller_state.get("a", False) else 0
@@ -286,9 +288,7 @@ class MineRLHybridVideoModel(VideoModel):
             logger.info("Switching to REALITY mode")
             self._reset_caches()
             obs = self.env.reset()
-            frame = obs["pov"]
-            if frame.shape[0] != self.cfg.height or frame.shape[1] != self.cfg.width:
-                frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
+            frame = self._to_display_frame(obs["pov"])
             self.current_obs = frame
             self._warmup_with_frame(frame)
             self.framegen_mode = FrameGenMode.REALITY
@@ -310,9 +310,7 @@ class MineRLHybridVideoModel(VideoModel):
         logger.info("Resetting environment and caches")
         self._reset_caches()
         obs = self.env.reset()
-        frame = obs["pov"]
-        if frame.shape[0] != self.cfg.height or frame.shape[1] != self.cfg.width:
-            frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
+        frame = self._to_display_frame(obs["pov"])
         self.current_obs = frame
         self._warmup_with_frame(frame)
         self.framegen_mode = FrameGenMode.REALITY
@@ -330,8 +328,7 @@ class MineRLHybridVideoModel(VideoModel):
         self.env = gym.make(self.cfg.env_name)
 
         logger.info("Loading world model bundle from: %s", self.cfg.dynamics_ckpt)
-        mesh, _ = create_data_model_parallel(1, 1)
-        mesh_rules = MeshRules(embed=None, mlp="model", attn="model", data="data")
+        mesh, _, mesh_rules = build_parallel("data")
         with jax.set_mesh(mesh):
             dyn_bundle = DynamicsCheckpointBundle.from_pretrained(
                 self.cfg.dynamics_ckpt,
@@ -357,12 +354,36 @@ class MineRLHybridVideoModel(VideoModel):
             n_latents = self.tokenizer_cfg.decoder.n_latents
             d_bottleneck = self.tokenizer_cfg.encoder.d_bottleneck
             self.latent_shape = (1, 1, n_latents, d_bottleneck)
-            self.window_size = self.tokenizer_cfg.dataset.T
+
+            # Prefer explicit model context lengths; keep compatibility with older checkpoint meta.
+            window_candidates = [
+                getattr(self.tokenizer_cfg.decoder, "context_length", None),
+                getattr(self.tokenizer_cfg.encoder, "context_length", None),
+                getattr(self.dynamics_cfg, "context_length", None),
+            ]
+            legacy_dataset_cfg = getattr(self.tokenizer_cfg, "dataset", None)
+            if legacy_dataset_cfg is not None:
+                window_candidates.append(getattr(legacy_dataset_cfg, "T", None))
+
+            valid_windows = [w for w in window_candidates if isinstance(w, int) and w > 0]
+            self.window_size = max(valid_windows) if valid_windows else 128
+
+            logger.info("Using cache window_size=%d", self.window_size)
             self.rng = jax.random.PRNGKey(0)
 
             self.task_embedder: TaskEmbedder | None = None
             self.policy_head: PolicyHeadMTP | None = None
             self.task_embedding = None
+
+            self.model_height = int(getattr(self.tokenizer_cfg.decoder, "H", self.cfg.height))
+            self.model_width = int(getattr(self.tokenizer_cfg.decoder, "W", self.cfg.width))
+            logger.info(
+                "Frame sizing: display=%dx%d, tokenizer_input=%dx%d",
+                self.cfg.height,
+                self.cfg.width,
+                self.model_height,
+                self.model_width,
+            )
 
             if self.cfg.policy_ckpt is not None:
                 logger.info("Loading policy bundle from: %s", self.cfg.policy_ckpt)
@@ -417,7 +438,7 @@ class MineRLHybridVideoModel(VideoModel):
         self.controller_state = {}
         self.mouse_state = {"left": False, "right": False, "middle": False, "dx": 0.0, "dy": 0.0}
         self.current_obs = None
-        self.current_env_action = self.env.action_space.noop()
+        self.current_env_action = self.env.action_space.no_op()
 
         logger.info("MineRL hybrid initialization complete")
 
@@ -426,8 +447,60 @@ class MineRLHybridVideoModel(VideoModel):
         self.tokenizer_cache = self.initial_tokenizer_cache
         self.h_last = None
 
+    @staticmethod
+    def _to_uint8(frame: np.ndarray) -> np.ndarray:
+        if frame.dtype == np.uint8:
+            return frame
+        return np.clip(frame, 0, 255).astype(np.uint8)
+
+    def _to_display_frame(self, frame: np.ndarray) -> np.ndarray:
+        frame = self._to_uint8(frame)
+        if frame.shape[0] == self.cfg.height and frame.shape[1] == self.cfg.width:
+            return frame
+
+        h, w = frame.shape[:2]
+        if h >= self.cfg.height and w >= self.cfg.width:
+            y0 = (h - self.cfg.height) // 2
+            x0 = (w - self.cfg.width) // 2
+            cropped = frame[y0:y0 + self.cfg.height, x0:x0 + self.cfg.width]
+            if cropped.shape[0] == self.cfg.height and cropped.shape[1] == self.cfg.width:
+                return cropped
+
+        return cv2.resize(frame, (self.cfg.width, self.cfg.height))
+
+    def _to_model_frame(self, frame: np.ndarray) -> np.ndarray:
+        frame = self._to_display_frame(frame)
+        if frame.shape[0] == self.model_height and frame.shape[1] == self.model_width:
+            return frame
+
+        h, w = frame.shape[:2]
+        dh = self.model_height - h
+        dw = self.model_width - w
+
+        if dh >= 0 and dw >= 0:
+            top = dh // 2
+            bottom = dh - top
+            left = dw // 2
+            right = dw - left
+            return np.pad(
+                frame,
+                ((top, bottom), (left, right), (0, 0)),
+                mode="constant",
+                constant_values=0,
+            )
+
+        if h >= self.model_height and w >= self.model_width:
+            y0 = (h - self.model_height) // 2
+            x0 = (w - self.model_width) // 2
+            cropped = frame[y0:y0 + self.model_height, x0:x0 + self.model_width]
+            if cropped.shape[0] == self.model_height and cropped.shape[1] == self.model_width:
+                return cropped
+
+        return cv2.resize(frame, (self.model_width, self.model_height))
+
     def _warmup_with_frame(self, frame: np.ndarray):
-        frame_jax = jnp.asarray(frame)[None, None]
+        frame_model = self._to_model_frame(frame)
+        frame_jax = jnp.asarray(frame_model)[None, None]
         noop_action = create_noop_wm_action(with_time_dim=True)
         self.rng, key = jax.random.split(self.rng)
         self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = self.update_caches_compiled(
@@ -450,17 +523,17 @@ class MineRLHybridVideoModel(VideoModel):
         self.actiongen_mode = ActionGenMode.USER_INPUT
         self.controller_state = {}
         self.mouse_state = {"left": False, "right": False, "middle": False, "dx": 0.0, "dy": 0.0}
-        self.current_env_action = self.env.action_space.noop()
+        self.current_env_action = self.env.action_space.no_op()
 
         self._reset_caches()
 
         obs = self.env.reset()
-        frame = obs["pov"]
-        if frame.shape[0] != self.cfg.height or frame.shape[1] != self.cfg.width:
-            frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
+        print("Environment reset")
+        frame = self._to_display_frame(obs["pov"])
         self.current_obs = frame
         self._warmup_with_frame(frame)
-
+        print("first frame warmup complete")
+        
         self.rng, compile_key = jax.random.split(self.rng)
         dummy_action = create_noop_wm_action(with_time_dim=False)
         _, _, self.dynamics_cache, self.tokenizer_cache, self.rng = self.next_frame_compiled(
@@ -471,6 +544,7 @@ class MineRLHybridVideoModel(VideoModel):
             task_embedding=self.task_embedding,
         )
 
+        print("Warmup complete")
         get_ctx().emit_block(frame)
         frame_time = 1.0 / self.fps
 
@@ -500,26 +574,19 @@ class MineRLHybridVideoModel(VideoModel):
                 if self.framegen_mode == FrameGenMode.REALITY:
                     env_action = self._current_env_action()
                     obs, reward, done, _ = self.env.step(env_action)
-                    frame = obs["pov"]
-
-                    if frame.dtype != np.uint8:
-                        frame = np.clip(frame, 0, 255).astype(np.uint8)
-                    if frame.shape[0] != self.cfg.height or frame.shape[1] != self.cfg.width:
-                        frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
+                    frame = self._to_display_frame(obs["pov"])
 
                     if done:
                         logger.info("Episode ended. Reward: %s", reward)
                         self._reset_caches()
                         obs = self.env.reset()
-                        frame = obs["pov"]
-                        if frame.shape[0] != self.cfg.height or frame.shape[1] != self.cfg.width:
-                            frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
+                        frame = self._to_display_frame(obs["pov"])
                         self._warmup_with_frame(frame)
 
                     self.current_obs = frame
                     get_ctx().emit_block(frame)
 
-                    frame_jax = jnp.asarray(frame)[None, None]
+                    frame_jax = jnp.asarray(self._to_model_frame(frame))[None, None]
                     wm_action_with_time = self._current_wm_action(with_time_dim=True)
                     self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = self.update_caches_compiled(
                         frame_jax,
@@ -536,7 +603,7 @@ class MineRLHybridVideoModel(VideoModel):
                         rng=key,
                         task_embedding=self.task_embedding,
                     )
-                    frame = np.asarray(frame_jax[0, 0])
+                    frame = self._to_display_frame(np.asarray(frame_jax[0, 0]))
                     get_ctx().emit_block(frame)
 
                 self.mouse_state["dx"] = 0.0

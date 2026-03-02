@@ -1,7 +1,7 @@
 # MineRL Hybrid Reactor Configuration
 
 # Checkpoints (bundle directories)
-dynamics_ckpt: logs/dynamics/checkpoints
+dynamics_ckpt: /root/dreamer4-jax-private/logs/dynamics-time-layer-start-bigg-ish/checkpoints
 policy_ckpt: null
 
 # Agent settings
