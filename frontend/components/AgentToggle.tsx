@@ -8,8 +8,8 @@ interface AgentToggleProps {
 }
 
 export function AgentToggle({ className }: AgentToggleProps) {
-  const { sendMessage, status } = useReactor((state) => ({
-    sendMessage: state.sendMessage,
+  const { sendCommand, status } = useReactor((state) => ({
+    sendCommand: state.sendCommand,
     status: state.status,
   }));
 
@@ -18,7 +18,7 @@ export function AgentToggle({ className }: AgentToggleProps) {
   const handleToggle = () => {
     const newValue = !useAgent;
     setUseAgent(newValue);
-    sendMessage({ type: "use_agent", data: { use_agent: newValue } });
+    sendCommand("switch_to_agent", { enable: newValue });
   };
 
   const isConnected = status === "ready" || status === "waiting";

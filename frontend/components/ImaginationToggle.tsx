@@ -8,8 +8,8 @@ interface ImaginationToggleProps {
 }
 
 export function ImaginationToggle({ className }: ImaginationToggleProps) {
-  const { sendMessage, status } = useReactor((state) => ({
-    sendMessage: state.sendMessage,
+  const { sendCommand, status } = useReactor((state) => ({
+    sendCommand: state.sendCommand,
     status: state.status,
   }));
 
@@ -18,7 +18,7 @@ export function ImaginationToggle({ className }: ImaginationToggleProps) {
   const handleToggle = () => {
     const newValue = !inImagination;
     setInImagination(newValue);
-    sendMessage({ type: "switch_to_imagination", data: { enable: newValue } });
+    sendCommand("switch_to_imagination", { enable: newValue });
   };
 
   const isConnected = status === "ready" || status === "waiting";

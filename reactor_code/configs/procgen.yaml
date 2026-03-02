@@ -1,0 +1,18 @@
+# Procgen CoinRun Reactor Configuration
+# ======================================
+# Configuration for running the Procgen environment with Reactor runtime.
+
+# Environment settings
+env_name: coinrun
+num_levels: 0  # 0 = infinite procedural levels
+start_level: 0
+distribution_mode: easy  # Options: easy, hard, exploration
+
+# Rendering settings
+render_mode: rgb_array
+action_dim: 7  # CoinRun has 7 discrete actions
+
+# Video output settings
+fps: 5
+height: 64
+width: 64
