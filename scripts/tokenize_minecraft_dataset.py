@@ -23,6 +23,7 @@ import decord
 import grain
 import hydra
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from grain._src.python.dataset import dataset as grain_dataset
@@ -41,7 +42,8 @@ from dreamer.parallel import build_parallel
 decord.bridge.set_bridge("native")
 
 logging.getLogger("absl").setLevel(logging.WARNING)
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
 
 
 # ==============================================================================
@@ -116,7 +118,7 @@ class AsyncShardWriter:
     def __init__(
         self,
         output_dir: Path | str,
-        records_per_shard: int = 1000,
+        records_per_shard: int = 5000,
         maxsize: int = 100,
     ):
         self._writer = ShardWriter(output_dir, records_per_shard)
@@ -165,7 +167,7 @@ def build_prefetch_pipeline(
     num_devices = len(devices)
 
     def transfer_to_devices(batch):
-        videos = batch["videos"]  # (B, T, H, W, C) numpy
+        videos = batch["videos"]  # (B, T, H, W, C) numpy float32
         batch_size = videos.shape[0]
         pad_size = (num_devices - batch_size % num_devices) % num_devices
 
@@ -173,13 +175,15 @@ def build_prefetch_pipeline(
             padding = np.zeros((pad_size,) + videos.shape[1:], dtype=videos.dtype)
             videos = np.concatenate([videos, padding], axis=0)
 
+        # Cast to bfloat16 on device to halve HBM usage
         per_device = videos.shape[0] // num_devices
         shards = [
-            jax.device_put(videos[i * per_device : (i + 1) * per_device], devices[i])
+            jax.device_put(videos[i * per_device : (i + 1) * per_device], devices[i]).astype(jnp.bfloat16)
             for i in range(num_devices)
         ]
+        shape = videos.shape
         sharded = jax.make_array_from_single_device_arrays(
-            videos.shape, sharding, shards
+            shape, sharding, shards
         )
 
         batch["videos"] = sharded
@@ -253,6 +257,7 @@ def run(cfg: DictConfig):
             mesh_rules=mesh_rules,
         )
         tokenizer = bundle.tokenizer
+        del tokenizer.decoder  # Free decoder params — only encoding
 
         print(f"[tokenize] Tokenizer loaded successfully")
         print(f"[tokenize] n_latents: {tokenizer.encoder.n_latents}")
@@ -277,8 +282,8 @@ def run(cfg: DictConfig):
         prefetched = build_prefetch_pipeline(
             base_dataloader,
             sharding=data_sharding,
-            cpu_buffer_size=10,
-            device_buffer_size=2,
+            cpu_buffer_size=cfg.dataset.dataloader_cfg.prefetch_buffer_size,
+            device_buffer_size=cfg.dataset.dataloader_cfg.device_prefetch_buffer_size,
         )
 
         # Create async shard writer (disk I/O on background thread)
@@ -312,7 +317,10 @@ def run(cfg: DictConfig):
 
         try:
             pbar = tqdm(prefetched, desc="Tokenizing")
+            t_iter_start = time.perf_counter()
             for batch in pbar:
+                t_iter = time.perf_counter() - t_iter_start
+
                 videos = batch["videos"]  # Already sharded JAX array
                 actions_batch = batch["actions"]
                 sources_batch = batch["source"]
@@ -333,7 +341,7 @@ def run(cfg: DictConfig):
 
                 # Queue records for async write
                 for i in range(batch_size):
-                    actions_i = { k: v[i] for k, v in actions_batch.items()}
+                    actions_i = { k: v[i] if v is not None else None for k, v in actions_batch.items()}
                     writer.write(
                         {
                             "latents": latents_np[i],  # (T, n_latents, d_bottleneck)
@@ -350,6 +358,7 @@ def run(cfg: DictConfig):
                 pbar.set_postfix(
                     mean=f"{welford.mean.mean():.4f}",
                     std=f"{welford.std.mean():.4f}",
+                    fetch=f"{t_iter:.3f}s",
                     encode=f"{t1-t0:.3f}s",
                     d2h=f"{t2-t1:.3f}s",
                     welford=f"{t3-t2:.3f}s",
@@ -357,6 +366,7 @@ def run(cfg: DictConfig):
                 )
 
                 total_videos += batch_size
+                t_iter_start = time.perf_counter()
 
                 # Periodically save stats (every 100 batches)
                 if total_videos % (100 * cfg.batch_size) < cfg.batch_size:

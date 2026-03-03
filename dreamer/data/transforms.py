@@ -9,6 +9,7 @@ Provides flexible, reusable transforms that handle:
 """
 
 import io
+import os
 import pickle
 from typing import Any
 import jax
@@ -277,8 +278,7 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
 
         # Decode MP4 bytes using decord
         mp4_bytes = io.BytesIO(data["video"])
-        cpu_idx = int(rng.integers(0, 2))
-        vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(cpu_idx), num_threads=1)
+        vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(0), num_threads=1)
 
         episode_len = len(vr)
 
@@ -290,7 +290,7 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             start = int(rng.integers(0, max_start + 1))
             frame_indices = list(range(start, start + self.seq_len))
             video = vr.get_batch(frame_indices).asnumpy()
-            Actions(binary=None, categorical=None, continuous=None) # TODO: might be better to pass None at this point, but i'm keeping it in not to beack any backward compatibility
+            actions = Actions(binary=None, categorical=None, continuous=None) # TODO: might be better to pass None at this point, but i'm keeping it in not to break any backward compatibility
 
         # Keep as float32 in [0, 255] range (consistent with CoinRun)
         video = video.astype(np.float32)
@@ -303,11 +303,14 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             constant_values=0
         )
 
-        return {
+        result = {
             "videos": video,
-            "actions": actions, 
+            "actions": actions,
             "rewards": None,
         }
+        if self.full_episode:
+            result["source"] = data.get("source")
+        return result
 
 
 # ==============================================================================
