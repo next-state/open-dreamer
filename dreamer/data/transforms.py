@@ -18,7 +18,7 @@ import decord
 import grain
 import numpy as np
 
-from ..actions import Actions
+from ..actions import Actions, parse_action_dicts
 from .serialization import deserialize_msgpack_record
 
 decord.bridge.set_bridge("native")
@@ -283,14 +283,14 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
         episode_len = len(vr)
 
         if self.full_episode:
-            # Return full episode for tokenization
             video = vr.get_batch(list(range(episode_len))).asnumpy()
+            actions = parse_action_dicts(data.get("actions")).to_dict()
         else:
-            # Random slice for training
             max_start = episode_len - self.seq_len
             start = int(rng.integers(0, max_start + 1))
             frame_indices = list(range(start, start + self.seq_len))
             video = vr.get_batch(frame_indices).asnumpy()
+            Actions(binary=None, categorical=None, continuous=None) # TODO: might be better to pass None at this point, but i'm keeping it in not to beack any backward compatibility
 
         # Keep as float32 in [0, 255] range (consistent with CoinRun)
         video = video.astype(np.float32)
@@ -305,7 +305,7 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
 
         return {
             "videos": video,
-            "actions": Actions(binary=None, categorical=None, continuous=None),  # FIXME: no actions returned!!
+            "actions": actions, 
             "rewards": None,
         }
 

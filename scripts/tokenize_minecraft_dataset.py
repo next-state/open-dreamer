@@ -15,7 +15,6 @@ Example usage:
 """
 import logging
 import os
-import pickle
 import queue
 from pathlib import Path
 from threading import Thread
@@ -33,7 +32,6 @@ from grain._src.python.dataset.transformations.prefetch import (
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from dreamer.actions import parse_action_dicts
 from dreamer.checkpointing import TokenizerCheckpointBundle
 from dreamer.data.data import DataLoaderIteratorWrapper
 from dreamer.data.shard_writer import ShardWriter
@@ -51,63 +49,18 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 # ==============================================================================
 
 
-class MinecraftVPTProcessFullEpisode(grain.transforms.Map):
-    """Decode full MP4 video for tokenization (no slicing).
-
-    Uses ProcessMinecraftEpisodeAndSlice with full_episode=True, then adds action parsing.
-    """
-
-    def __init__(self, patch_size: int = 16):
-        self.patch_size = patch_size
-        self.processor = ProcessMinecraftEpisodeAndSlice(
-            seq_len=0,
-            image_h=128,
-            image_w=128,
-            image_c=3,
-            full_episode=True,
-        )
-
-    def _calculate_padding(self, dimension: int) -> tuple[int, int]:
-        """Calculate (top/left, bottom/right) padding to make dimension divisible by patch_size."""
-        if dimension % self.patch_size == 0:
-            return (0, 0)
-        padding_needed = self.patch_size - (dimension % self.patch_size)
-        padding_start = padding_needed // 2
-        padding_end = padding_needed - padding_start
-        return (padding_start, padding_end)
-
-    def map(self, element: bytes) -> dict:
-        rng = np.random.default_rng(0)
-        result = self.processor.random_map(element, rng)
-
-        data = pickle.loads(element)
-
-        frames = result["videos"]  # (T, H, W, C) in [0, 255]
-        padding_h = self._calculate_padding(frames.shape[1])
-        padding_w = self._calculate_padding(frames.shape[2])
-        frames = np.pad(
-            frames,
-            ((0, 0), padding_h, padding_w, (0, 0)),
-            mode="constant",
-            constant_values=0,
-        )
-
-        actions = data.get("actions")
-        actions = parse_action_dicts(actions).to_dict()
-
-        return {
-            "videos": frames,  # (T, H_padded, W_padded, C) in [0, 255]
-            "actions": actions,
-            "source": data.get("source"),
-        }
-
-
 def make_tokenization_iterator(
     input_dir: str,
     num_shards: int | None,
     batch_size: int,
     num_workers: int,
-    patch_size: int = 16,
+    *,
+    image_h: int,
+    image_w: int,
+    image_c: int,
+    padding_h: tuple[int, int],
+    padding_w: tuple[int, int],
+    patch_size: int,
 ):
     """Create dataloader for tokenization (sequential, no shuffle, full episodes)."""
     all_shards = sorted(Path(input_dir).glob("shard-*.array_record"))
@@ -130,7 +83,16 @@ def make_tokenization_iterator(
     )
 
     operations = [
-        MinecraftVPTProcessFullEpisode(patch_size=patch_size),
+        ProcessMinecraftEpisodeAndSlice(
+            seq_len=0,
+            image_h=image_h,
+            image_w=image_w,
+            image_c=image_c,
+            padding_h=padding_h,
+            padding_w=padding_w,
+            patch_size=patch_size,
+            full_episode=True,
+        ),
         grain.transforms.Batch(batch_size=batch_size, drop_remainder=True),
     ]
 
@@ -155,10 +117,9 @@ class AsyncShardWriter:
         self,
         output_dir: Path | str,
         records_per_shard: int = 1000,
-        serialization_format: str = "msgpack",
         maxsize: int = 100,
     ):
-        self._writer = ShardWriter(output_dir, records_per_shard, serialization_format)
+        self._writer = ShardWriter(output_dir, records_per_shard)
         self._queue: queue.Queue = queue.Queue(maxsize=maxsize)
         self._thread = Thread(target=self._writer_loop, daemon=True)
         self._thread.start()
@@ -304,7 +265,12 @@ def run(cfg: DictConfig):
             num_shards=cfg.num_shards,
             batch_size=cfg.batch_size,
             num_workers=cfg.num_workers,
-            patch_size=tokenizer.cfg.encoder.patch_size,
+            image_h=cfg.dataset.H,
+            image_w=cfg.dataset.W,
+            image_c=cfg.dataset.C,
+            padding_h=cfg.dataset.padding_H,
+            padding_w=cfg.dataset.padding_W,
+            patch_size=cfg.dataset.patch_size,
         )
 
         # Build async prefetch pipeline: CPU buffer → device transfer → device buffer
@@ -320,7 +286,6 @@ def run(cfg: DictConfig):
         writer = AsyncShardWriter(
             output_dir,
             records_per_shard=cfg.records_per_shard,
-            serialization_format="msgpack",
         )
 
         # Create metadata directory for stats
@@ -343,6 +308,8 @@ def run(cfg: DictConfig):
         welford = WelfordAccumulator(n_channels)
         total_videos = 0
 
+        import time
+
         try:
             pbar = tqdm(prefetched, desc="Tokenizing")
             for batch in pbar:
@@ -352,32 +319,21 @@ def run(cfg: DictConfig):
                 batch_size = batch["_batch_size"]
                 pad_size = batch["_pad_size"]
 
+                t0 = time.perf_counter()
                 latents = encode_batch(videos)
+                latents.block_until_ready()
+                t1 = time.perf_counter()
 
-                # Gather latents from each device shard separately (avoids GPU 0 memory spike)
-                latents_np = np.concatenate(
-                    [np.asarray(shard.data) for shard in latents.addressable_shards],
-                    axis=0,
-                )
-
-                # Remove padding
-                if pad_size > 0:
-                    latents_np = latents_np[:batch_size]
+                latents_np = np.asarray(latents)[:batch_size]
+                t2 = time.perf_counter()
 
                 # Vectorized Welford update: flatten (B, T, n_latents) → (N, D)
                 welford.update(latents_np.reshape(-1, n_channels))
-
-                pbar.set_postfix(
-                    mean=f"{float(welford.mean.mean()):.4f}",
-                    std=f"{float(welford.std.mean()):.4f}",
-                )
+                t3 = time.perf_counter()
 
                 # Queue records for async write
                 for i in range(batch_size):
-                    actions_i = {
-                        k: v[i] if v is not None else None
-                        for k, v in actions_batch.items()
-                    }
+                    actions_i = { k: v[i] for k, v in actions_batch.items()}
                     writer.write(
                         {
                             "latents": latents_np[i],  # (T, n_latents, d_bottleneck)
@@ -389,6 +345,16 @@ def run(cfg: DictConfig):
                             ),
                         }
                     )
+                t4 = time.perf_counter()
+
+                pbar.set_postfix(
+                    mean=f"{welford.mean.mean():.4f}",
+                    std=f"{welford.std.mean():.4f}",
+                    encode=f"{t1-t0:.3f}s",
+                    d2h=f"{t2-t1:.3f}s",
+                    welford=f"{t3-t2:.3f}s",
+                    queue=f"{t4-t3:.3f}s",
+                )
 
                 total_videos += batch_size
 
