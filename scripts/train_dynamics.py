@@ -18,7 +18,10 @@ from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, shift_actions
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
-from dreamer.training import run_evaluation, run_x0_visualization, run_attention_visualization, shortcut_forcing_step
+from dreamer.training import (
+    run_evaluation,
+    shortcut_forcing_step,
+)
 from dreamer.checkpointing import (
     DynamicsCheckpointBundle,
     TokenizerCheckpointBundle,
@@ -273,29 +276,15 @@ def run(cfg: DynamicsConfig):
                 if do_eval and is_main_process:
                     val_data = input_tensor[:4]
                     val_actions = actions[:4]
-                    for eval_name, eval_dynamics in [("online", bundle.dynamics), ("ema", bundle.dynamics_ema)]:
-                        run_evaluation(
-                            cfg, step, bundle.tokenizer, eval_dynamics,
-                            val_data=val_data, val_actions=val_actions,
-                            use_latent_data=use_latent_data,
-                            vis_dir=vis_dir, rng=rng, logger=logger, name=eval_name,
-                        )
-                        run_x0_visualization(
-                            cfg, step, bundle.tokenizer, eval_dynamics,
-                            data=input_tensor[:1], actions=actions[:1],
-                            master_key=master_key,
-                            use_latent_data=use_latent_data,
-                            vis_dir=vis_dir, logger=logger, name=eval_name,
-                        )
-                        run_attention_visualization(
-                            cfg, step, bundle.tokenizer,
-                            dynamics=eval_dynamics,
-                            data=input_tensor[:1], actions=actions[:1],
-                            use_latent_data=use_latent_data,
-                            vis_dir=vis_dir, logger=logger, name=eval_name,
-                        )
-                if do_eval and is_multihost:
-                    multihost_utils.sync_global_devices(f"post_eval_{step}")
+                    run_evaluation(
+                        cfg, step, bundle.tokenizer,
+                        dynamics_online=bundle.dynamics,
+                        dynamics_ema=bundle.dynamics_ema,
+                        val_data=val_data,
+                        val_actions=val_actions,
+                        use_latent_data=use_latent_data,
+                        vis_dir=vis_dir, rng=rng, logger=logger,
+                    )
 
                 # Training step
                 B, T = input_tensor.shape[:2]
@@ -335,6 +324,7 @@ def run(cfg: DynamicsConfig):
                             **scaling.get_step_metrics(step),
                         },
                         pbar=pbar,
+                        pbar_filter=r"^(flow_mse|boot_mse|lr)$",
                     )
 
                 # Checkpointing
