@@ -4,6 +4,7 @@ import logging
 import hydra
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 import numpy as np
 import optax
 from flax import nnx
@@ -160,15 +161,17 @@ def run(cfg: DynamicsConfig):
     # Setup
     run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
+    # Parallelism
+    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
+    is_main_process = jax.process_index() == 0
+    is_multihost = jax.process_count() > 1
+
     # Logging
     logger = build_logger(
         logger_cfg=cfg.logger,
         config=OmegaConf.to_container(cfg, resolve=True),
         dir=str(run_dir),
     )
-
-    # Parallelism
-    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
     with logger, jax.set_mesh(mesh):
         key = jax.random.PRNGKey(cfg.seed)
@@ -242,7 +245,13 @@ def run(cfg: DynamicsConfig):
             scaling.start_training()
 
 
-            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True)
+            pbar = tqdm(
+                enumerate(dataloader, start_step),
+                initial=start_step,
+                total=cfg.max_steps,
+                dynamic_ncols=True,
+                disable=not is_main_process,
+            )
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
@@ -257,8 +266,11 @@ def run(cfg: DynamicsConfig):
 
                 actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
 
-                # Validation step before training (as input buffers might be donated)
-                if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
+                # Validation/visualization only on main process.
+                do_eval = ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1
+                if do_eval and is_multihost:
+                    multihost_utils.sync_global_devices(f"pre_eval_{step}")
+                if do_eval and is_main_process:
                     val_data = input_tensor[:4]
                     val_actions = actions[:4]
                     for eval_name, eval_dynamics in [("online", bundle.dynamics), ("ema", bundle.dynamics_ema)]:
@@ -282,6 +294,8 @@ def run(cfg: DynamicsConfig):
                             use_latent_data=use_latent_data,
                             vis_dir=vis_dir, logger=logger, name=eval_name,
                         )
+                if do_eval and is_multihost:
+                    multihost_utils.sync_global_devices(f"post_eval_{step}")
 
                 # Training step
                 B, T = input_tensor.shape[:2]
@@ -303,7 +317,7 @@ def run(cfg: DynamicsConfig):
                 ema_update_step(bundle.dynamics, bundle.dynamics_ema, ema_decay=cfg.ema_decay)
 
                 # Logging
-                if logger.should_log(step):
+                if is_main_process and logger.should_log(step):
                     metrics_cpu = jax.device_get(metrics)
                     scaling.on_step(step, metrics_cpu)
                     logger.log(
@@ -326,7 +340,8 @@ def run(cfg: DynamicsConfig):
                 # Checkpointing
                 bundle.maybe_save(checkpoint_manager, step, rng)
 
-            scaling.finalize()
+            if is_main_process:
+                scaling.finalize()
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")
