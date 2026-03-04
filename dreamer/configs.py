@@ -336,6 +336,12 @@ class TokenizerConfig(BaseExperimentConfig):
     visualize_every: int = 10_000
     tokenizer_loss_type: str = "mae" # "mse" | "mae"
 
+    # Finetuning: gradually reduce MAE masking while freezing encoder
+    freeze_encoder: bool = False
+    mae_finetune: bool = False
+    mae_finetune_p_max_start: float = 0.9
+    mae_finetune_p_max_end: float = 0.0
+
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
 

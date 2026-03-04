@@ -7,7 +7,7 @@ array_record_path: /mnt/data/big_tokenized_data
 index_max: 100
 num_max_samples: -1
 
-num_binary_actions: 23
+num_binary_actions: 25
 categorical_action_dim: 121
 continuous_action_dim: 0
 

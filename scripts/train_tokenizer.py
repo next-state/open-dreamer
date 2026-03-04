@@ -86,13 +86,14 @@ def lpips_on_mae_recon(lpips_model: LPIPS, pred, target, subsample_frac=1.0):
 # Train step
 # ------------------------
 
-@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type"))
-def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | None, videos, *, mae_key, dropout_key, step, 
-               lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str):
+@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type", "freeze_encoder"))
+def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | None, videos, *, mae_key, dropout_key, step,
+               lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str,
+               mae_p_max: jnp.ndarray | None = None, freeze_encoder: bool = False):
 
     def loss_fn(model: Tokenizer):
         rngs = nnx.Rngs(mae=mae_key, dropout=dropout_key)
-        pred, (mae_mask, keep_prob) = model(videos, deterministic=False, rngs=rngs)
+        pred, (mae_mask, keep_prob) = model(videos, deterministic=False, rngs=rngs, mae_p_max=mae_p_max)
 
         pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
         target_norm = normalize_with_dataset_stats(videos, mean=dataset_mean, std=dataset_std)
@@ -115,6 +116,11 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | 
         return total, aux
 
     (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+
+    if freeze_encoder:
+        encoder_grad_state = nnx.state(grads.encoder)
+        zeroed_state = jax.tree.map(jnp.zeros_like, encoder_grad_state)
+        nnx.update(grads.encoder, zeroed_state)
 
     if log_gradients:
         def _tree_std_mean(tree):
@@ -140,10 +146,10 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | 
 # ------------------------
 
 @partial(jax.jit, static_argnames=())
-def viz_step_jit(model: Tokenizer, videos, *, mae_key, drop_key):
+def viz_step_jit(model: Tokenizer, videos, *, mae_key, drop_key, mae_p_max=None):
     """Visualization step with NNX model."""
     rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
-    recon, (mask, _) = model(videos, deterministic=False, rngs=rngs)
+    recon, (mask, _) = model(videos, deterministic=False, rngs=rngs, mae_p_max=mae_p_max)
 
     masked = videos * (1.0 - mask)
     recon_masked = masked + recon * mask
@@ -152,11 +158,11 @@ def viz_step_jit(model: Tokenizer, videos, *, mae_key, drop_key):
     grid = einops.rearrange(grid, "b t h w c -> h (b t w) c")
     return grid.clip(0, 255).astype(jnp.uint8)
 
-def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger):
+def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger, mae_p_max=None):
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
-    grid = viz_step_jit(model, videos[:2,:256:256//4], mae_key=mae_key, drop_key=drop_key)
+    grid = viz_step_jit(model, videos[:2,:256:256//4], mae_key=mae_key, drop_key=drop_key, mae_p_max=mae_p_max)
     grid = jax.device_get(grid)
 
     imageio.imwrite(vis_dir / f"step_{step:06d}.png", grid)
@@ -252,6 +258,14 @@ def run(cfg: TokenizerConfig):
                 step_rng = jax.random.fold_in(rng, step)
                 mae_key, dropout_key = jax.random.split(step_rng)
 
+                # Compute dynamic mae_p_max if finetuning
+                current_mae_p_max = None
+                if cfg.mae_finetune:
+                    frac = min(step / max(cfg.max_steps - 1, 1), 1.0)
+                    current_mae_p_max = jnp.array(
+                        cfg.mae_finetune_p_max_start + (cfg.mae_finetune_p_max_end - cfg.mae_finetune_p_max_start) * frac
+                    )
+
                 # Shard batch data
                 aux = train_step(
                     bundle.tokenizer, bundle.tokenizer_optimizer, lpips_model, batch["videos"],
@@ -260,7 +274,9 @@ def run(cfg: TokenizerConfig):
                     dataset_mean=tuple(cfg.dataset.dataset_mean),
                     dataset_std=tuple(cfg.dataset.dataset_std),
                     log_gradients=cfg.logger.log_gradients,
-                    tokenizer_loss_type=cfg.tokenizer_loss_type
+                    tokenizer_loss_type=cfg.tokenizer_loss_type,
+                    mae_p_max=current_mae_p_max,
+                    freeze_encoder=cfg.freeze_encoder,
                 )
 
                 if logger.should_log(step):
@@ -276,6 +292,7 @@ def run(cfg: TokenizerConfig):
                             "lpips": metrics_cpu["loss_lpips"],
                             "psnr": metrics_cpu["psnr"],
                             "lr": lr_schedule(step),
+                            **({} if not cfg.mae_finetune else {"mae_p_max": float(current_mae_p_max)}),
                             **scaling.get_step_metrics(step),
                             **({} if not cfg.logger.log_gradients else {
                                 "grad/global_norm": metrics_cpu["grad/global_norm"],
@@ -295,12 +312,12 @@ def run(cfg: TokenizerConfig):
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
-                    viz_step(bundle.tokenizer, viz_videos, step_rng, step, vis_dir, logger)
+                    viz_step(bundle.tokenizer, viz_videos, step_rng, step, vis_dir, logger, mae_p_max=current_mae_p_max)
 
             scaling.finalize()
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
+@hydra.main(version_base=None, config_path="../configs", config_name="tokenizer_finetune")
 def main(cfg: TokenizerConfig):
     run(cfg)
 

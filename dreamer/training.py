@@ -882,13 +882,14 @@ def run_evaluation(
     k_max = dynamics_online.cfg.k_max
 
     rollout_specs = [
-        ("online_diffusion", dynamics_online, DenoiseSchedule.init(64, k_max)),
-        ("ema_diffusion", dynamics_ema, DenoiseSchedule.init(64, k_max)),
+        ("online_diffusion", dynamics_online, DenoiseSchedule.init(k_max, k_max)),
+        ("ema_diffusion", dynamics_ema, DenoiseSchedule.init(k_max, k_max)),
         ("online_shortcut", dynamics_online, DenoiseSchedule.init(4, k_max)),
         ("ema_shortcut", dynamics_ema, DenoiseSchedule.init(4, k_max)),
     ]
 
     dataset_std = cfg.dataset.dataset_std[0]
+    psnr_windows = (1, 3, 8)
     pred_columns: Dict[str, jnp.ndarray] = {}
     rollout_metrics: Dict[str, Dict[str, float]] = {}
     ground_truth_frames: jnp.ndarray | None = None
@@ -924,32 +925,39 @@ def run_evaluation(
             gt_frames_for_metrics[:, -horizon:], mean=0, std=dataset_std
         )
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
+        mse_values: Dict[int, float] = {
+            n: float(
+                jnp.mean(
+                    (normalized_pred[:, :min(n, horizon)] - normalized_gt[:, :min(n, horizon)]) ** 2
+                )
+            )
+            for n in psnr_windows
+        }
 
-        psnr_windows = (1, 3, 8)
-        psnr_values: Dict[int, float] = {}
-        for n in psnr_windows:
+        def _compute_window_psnr(n: int) -> float:
             n_eval = min(n, horizon)
-            psnr_values[n] = float(
+            return float(
                 compute_psnr(
                     pred_frames[:, ctx_length:ctx_length + n_eval] / 255,
                     gt_frames_for_metrics[:, ctx_length:ctx_length + n_eval] / 255,
                 )
             )
+
+        psnr_values: Dict[int, float] = {n: _compute_window_psnr(n) for n in psnr_windows}
         dt = time.time() - t0
+        psnr_log = " | ".join(f"PSNR@{n}={psnr_values[n]:.2f} dB" for n in psnr_windows)
 
         print(
             f"[eval:{tag}] step={step:06d} | horizon={horizon} | "
-            f"MSE={mse:.6g} | PSNR@1={psnr_values[1]:.2f} dB | "
-            f"PSNR@3={psnr_values[3]:.2f} dB | PSNR@8={psnr_values[8]:.2f} dB | {dt:.2f}s"
+            f"MSE={mse:.6g} | {psnr_log} | {dt:.2f}s"
         )
 
         pred_frames = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
         pred_columns[tag] = pred_frames
         rollout_metrics[tag] = {
             "mse": mse,
-            "psnr_1": psnr_values[1],
-            "psnr_3": psnr_values[3],
-            "psnr_8": psnr_values[8],
+            **{f"mse_{n}": mse_values[n] for n in psnr_windows},
+            **{f"psnr_{n}": psnr_values[n] for n in psnr_windows},
             "eval_time": dt,
         }
 
@@ -983,32 +991,14 @@ def run_evaluation(
         metrics_payload: Dict[str, float] = {"horizon": float(horizon)}
         for tag, _, _ in rollout_specs:
             metrics_payload[f"{tag}/mse"] = rollout_metrics[tag]["mse"]
-            metrics_payload[f"psnr/1_step/{tag}"] = rollout_metrics[tag]["psnr_1"]
-            metrics_payload[f"psnr/3_step/{tag}"] = rollout_metrics[tag]["psnr_3"]
-            metrics_payload[f"psnr/8_step/{tag}"] = rollout_metrics[tag]["psnr_8"]
+            for n in psnr_windows:
+                metrics_payload[f"mse/{n}_step/{tag}"] = rollout_metrics[tag][f"mse_{n}"]
+                metrics_payload[f"psnr/{n}_step/{tag}"] = rollout_metrics[tag][f"psnr_{n}"]
             metrics_payload[f"{tag}/eval_time"] = rollout_metrics[tag]["eval_time"]
         logger.log_metrics(step, metrics_payload, prefix="eval/")
 
         if video_written:
             logger.log_video(step, "eval/rollouts_grid/video", mp4_path)
-
-    # Keep auxiliary diagnostics (x0 / attention) under the same consolidated eval entrypoint.
-    for eval_name, eval_dynamics in [("online", dynamics_online), ("ema", dynamics_ema)]:
-        rng, x0_key = jax.random.split(rng)
-        run_x0_visualization(
-            cfg, step, tokenizer, eval_dynamics,
-            data=val_data[:1], actions=val_actions[:1],
-            master_key=x0_key,
-            use_latent_data=use_latent_data,
-            vis_dir=vis_dir, logger=logger, name=eval_name,
-        )
-        run_attention_visualization(
-            cfg, step, tokenizer,
-            dynamics=eval_dynamics,
-            data=val_data[:1], actions=val_actions[:1],
-            use_latent_data=use_latent_data,
-            vis_dir=vis_dir, logger=logger, name=eval_name,
-        )
 
 
 # ---------------------------
