@@ -844,11 +844,13 @@ def compute_policy_loss(
 # Evaluation and visualization
 # ---------------------------
 
+
 def run_evaluation(
-    cfg: DynamicsConfig | HeadsConfig,
+    cfg: DynamicsConfig,
     step: int,
     tokenizer: Tokenizer,
-    dynamics: Dynamics,
+    dynamics_online: Dynamics,
+    dynamics_ema: Dynamics,
     *,
     val_data: jnp.ndarray,
     val_actions: Actions,
@@ -856,140 +858,144 @@ def run_evaluation(
     vis_dir: Path,
     rng: jax.Array,
     logger,
-    policy: PolicyHeadMTP | None = None,
-    task_embedder: TaskEmbedder | None = None,
-    name: str | None = None,
 ):
     """
-    Run periodic evaluation: sample videos, compute metrics, and save visualization.
+    Run a consolidated periodic dynamics evaluation and save one grid video.
 
-    This function can be used in both dynamics pretraining and agent finetuning.
+    Grid layout:
+      - Rows: rollout samples
+      - Columns: [ground_truth, online_diffusion, ema_diffusion, online_shortcut, ema_shortcut]
 
-    Args:
-        cfg: Training config
-        step: Current training step
-        tokenizer: Tokenizer NNX model instance
-        dynamics: Dynamics NNX model instance
-        val_data: (B, T, H, W, C) Validation videos if use_latent_data=False,
-                  or (B, T, n_latents, d_bottleneck) pre-tokenized validation latents if use_latent_data=True
-        val_actions: (B, T) Validation actions
-        use_latent_data: Whether val_data contains latents (True) or videos (False)
-        vis_dir: Directory to save visualizations
-        rng: Random key
-        logger: Logger instance for logging metrics and videos
-        policy: Optional policy model for action sampling
-        task_embedder: Optional task embedder for agent tokens
-        name: Optional prefix for log keys (e.g. "online", "ema"). None for no prefix.
+    PSNR is computed on only the first generated frame (t = ctx_length).
+    Also runs x0 and attention visualizations for both online and EMA dynamics.
     """
-    log_prefix = f"{name}/" if name else ""
-    eval_prefix = f"{log_prefix}eval/"
+    if dynamics_online.cfg.k_max != dynamics_ema.cfg.k_max:
+        raise ValueError(
+            f"Expected matching k_max for online/ema dynamics, got "
+            f"{dynamics_online.cfg.k_max} and {dynamics_ema.cfg.k_max}."
+        )
 
-    k_max = dynamics.cfg.k_max
-    schedule_shortcut = DenoiseSchedule.init(4, k_max)
-    schedule_diffusion = DenoiseSchedule.init(64, k_max)
+    T = val_data.shape[1]
+    assert T > 5, f"Sequence length {T} must be > 5"
+    ctx_length = 4
+    horizon = T - ctx_length
+    k_max = dynamics_online.cfg.k_max
 
-    evaluation_schedules = {"shortcut": schedule_shortcut, "diffusion": schedule_diffusion}
+    rollout_specs = [
+        ("online_diffusion", dynamics_online, DenoiseSchedule.init(k_max, k_max)),
+        ("ema_diffusion", dynamics_ema, DenoiseSchedule.init(k_max, k_max)),
+        ("online_shortcut", dynamics_online, DenoiseSchedule.init(4, k_max)),
+        ("ema_shortcut", dynamics_ema, DenoiseSchedule.init(4, k_max)),
+    ]
 
-    for tag, schedule_config in evaluation_schedules.items():
+    dataset_std = cfg.dataset.dataset_std[0]
+    psnr_windows = (1, 3, 8)
+    pred_columns: Dict[str, jnp.ndarray] = {}
+    rollout_metrics: Dict[str, Dict[str, float]] = {}
+    ground_truth_frames: jnp.ndarray | None = None
+
+    for tag, dynamics_model, schedule_config in rollout_specs:
         t0 = time.time()
-        # Determine sequence length and horizon
-        T = val_data.shape[1]
-        assert T > 5, f"Sequence length {T} must be > 5"
-        ctx_length = 4
-        horizon = T - ctx_length
+        rng, eval_rng = jax.random.split(rng)
 
-        # Sample video predictions
         if use_latent_data:
-            pred_frames, gt_decoded_frames, _, ode_diags = sample_video(
-                tokenizer, dynamics, frames=None,
+            pred_frames, gt_decoded_frames, _, _ = sample_video(
+                tokenizer, dynamics_model, frames=None,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
-                rng=rng, policy=policy, task_embedder=task_embedder,
-                latents=val_data
+                rng=eval_rng, policy=None, task_embedder=None,
+                latents=val_data,
             )
-            # For metrics, compare pred vs gt_decoded (both from latents)
             gt_frames_for_metrics = gt_decoded_frames
         else:
-            pred_frames, gt_decoded_frames, original_frames, ode_diags = sample_video(
-                tokenizer, dynamics, frames=val_data,
+            pred_frames, _, original_frames, _ = sample_video(
+                tokenizer, dynamics_model, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
-                rng=rng, policy=policy, task_embedder=task_embedder
+                rng=eval_rng, policy=None, task_embedder=None,
             )
-            # For metrics, compare pred vs original frames
+            assert original_frames is not None
             gt_frames_for_metrics = original_frames
 
-        # Compute metrics
-        dt = time.time() - t0
-        dataset_std = cfg.dataset.dataset_std[0]
-        normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
-        normalized_gt = normalize_with_dataset_stats(gt_frames_for_metrics[:, -horizon:], mean=0, std=dataset_std)
+        if ground_truth_frames is None:
+            ground_truth_frames = gt_frames_for_metrics
+
+        normalized_pred = normalize_with_dataset_stats(
+            pred_frames[:, -horizon:], mean=0, std=dataset_std
+        )
+        normalized_gt = normalize_with_dataset_stats(
+            gt_frames_for_metrics[:, -horizon:], mean=0, std=dataset_std
+        )
         mse = float(jnp.mean((normalized_pred - normalized_gt) ** 2))
-        psnr = float(compute_psnr(pred_frames[:, -horizon:]/255, gt_frames_for_metrics[:, -horizon:]/255))
+        mse_values: Dict[int, float] = {
+            n: float(
+                jnp.mean(
+                    (normalized_pred[:, :min(n, horizon)] - normalized_gt[:, :min(n, horizon)]) ** 2
+                )
+            )
+            for n in psnr_windows
+        }
 
-        print(f"[eval:{log_prefix}{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
+        def _compute_window_psnr(n: int) -> float:
+            n_eval = min(n, horizon)
+            return float(
+                compute_psnr(
+                    pred_frames[:, ctx_length:ctx_length + n_eval] / 255,
+                    gt_frames_for_metrics[:, ctx_length:ctx_length + n_eval] / 255,
+                )
+            )
 
-        # Build visualization
-        num_videos = min(4, pred_frames.shape[0])
+        psnr_values: Dict[int, float] = {n: _compute_window_psnr(n) for n in psnr_windows}
+        dt = time.time() - t0
+        psnr_log = " | ".join(f"PSNR@{n}={psnr_values[n]:.2f} dB" for n in psnr_windows)
 
-        # Add red border to context frames in prediction
+        print(
+            f"[eval:{tag}] step={step:06d} | horizon={horizon} | "
+            f"MSE={mse:.6g} | {psnr_log} | {dt:.2f}s"
+        )
+
         pred_frames = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
+        pred_columns[tag] = pred_frames
+        rollout_metrics[tag] = {
+            "mse": mse,
+            **{f"mse_{n}": mse_values[n] for n in psnr_windows},
+            **{f"psnr_{n}": psnr_values[n] for n in psnr_windows},
+            "eval_time": dt,
+        }
 
-        if use_latent_data:
-            # 2-column grid: [gt_decoded, pred]
-            frames_list = [gt_decoded_frames, pred_frames]
-        else:
-            # 3-column grid: [floor (tokenizer reconstruction), gt, pred]
-            frames_list = [gt_decoded_frames, original_frames, pred_frames]
-        stacked_frames = jnp.stack(frames_list)[:, :num_videos]
-        videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
+    assert ground_truth_frames is not None
+    num_videos = min(4, ground_truth_frames.shape[0])
 
-        # Save artifacts
-        tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}" / log_prefix)
-        mp4_path = tag_dir / f"{tag}_grid.mp4"
+    grid_columns = [
+        ground_truth_frames,
+        pred_columns["online_diffusion"],
+        pred_columns["ema_diffusion"],
+        pred_columns["online_shortcut"],
+        pred_columns["ema_shortcut"],
+    ]
+    stacked_frames = jnp.stack(grid_columns)[:, :num_videos]
+    videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
 
-        # Save video
-        try:
-            videos = jax.device_get(videos)
-            iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
-        except Exception as e:
-            print(f"[eval:{log_prefix}{tag}] MP4 write failed: {e}")
+    tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+    mp4_path = tag_dir / "rollouts_grid.mp4"
 
-        # Log metrics and video
-        ode_diags_cpu = jax.device_get(ode_diags)
-        logger.log_metrics(step, {
-            f"{tag}/mse": mse,
-            f"{tag}/psnr": psnr,
-            f"{tag}/horizon": horizon,
-            f"{tag}/eval_time": dt,
-        }, prefix=eval_prefix)
+    video_written = False
+    try:
+        videos = jax.device_get(videos)
+        iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
+        video_written = True
+    except Exception as e:
+        print(f"[eval] consolidated MP4 write failed: {e}")
 
-        # ODE progression plot: one curve per metric, x-axis = τ-ladder step
-        ode_curves = ode_diags_cpu.items()
-        if ode_curves:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            import io as _io
-            import numpy as _np
-            from PIL import Image as _Image
+    metrics_payload: Dict[str, float] = {"horizon": float(horizon)}
+    for tag, _, _ in rollout_specs:
+        metrics_payload[f"{tag}/mse"] = rollout_metrics[tag]["mse"]
+        for n in psnr_windows:
+            metrics_payload[f"mse/{n}_step/{tag}"] = rollout_metrics[tag][f"mse_{n}"]
+            metrics_payload[f"psnr/{n}_step/{tag}"] = rollout_metrics[tag][f"psnr_{n}"]
+        metrics_payload[f"{tag}/eval_time"] = rollout_metrics[tag]["eval_time"]
+    logger.log_metrics(step, metrics_payload, prefix="eval/")
 
-            tau_xs = _np.array(schedule_config.tau_values[:-1])  # starting τ of each step
-            fig, axes = plt.subplots(1, len(ode_curves), figsize=(4 * len(ode_curves), 2), squeeze=False)
-            for ax, (curve_name, values) in zip(axes[0], ode_curves):
-                ax.plot(tau_xs, values)
-                ax.set_xlabel('τ')
-                ax.set_title(curve_name)
-                ax.grid(True, alpha=0.4)
-            fig.suptitle(f'{log_prefix}{tag} ODE step={step}', fontsize=9)
-            fig.tight_layout()
-            buf = _io.BytesIO()
-            fig.savefig(buf, format='png', dpi=100)
-            buf.seek(0)
-            ode_plot_img = _np.array(_Image.open(buf).convert('RGB'))
-            plt.close(fig)
-            logger.log_image(step, f"{eval_prefix}{tag}/ode_progression", ode_plot_img, caption=f"ODE step={step}")
-
-        if videos is not None:
-            logger.log_video(step, f"{eval_prefix}{tag}/video", mp4_path)
+    if video_written:
+        logger.log_video(step, "eval/rollouts_grid/video", mp4_path)
 
 
 # ---------------------------
