@@ -1,0 +1,23 @@
+defaults:
+  - tokenizer
+  - _self_
+
+run_name: tokenizer-big-finetune  # same as pretrained run to resume from its checkpoint
+
+max_steps: 30_000
+
+# Freeze encoder, linearly reduce masking from 0.9 → 0.0
+freeze_encoder: true
+mae_finetune: true
+mae_finetune_p_max_start: 0.9
+mae_finetune_p_max_end: 0.0
+
+# Lower LR for finetuning
+lr_schedule:
+  lr: 0.001
+  warmup_ratio: 0.05
+  decay_ratio: 0.5
+  max_steps: ${max_steps}
+
+ckpt:
+  save_interval_steps: 5000

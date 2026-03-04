@@ -244,15 +244,17 @@ class MAEReplacer(nnx.Module):
         # Learnable mask token
         self.mask_token = nnx.Param(jax.random.normal(rngs.params(), (D,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
-    def __call__(self, patches_btnd: jnp.ndarray, *, rngs: nnx.Rngs) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def __call__(self, patches_btnd: jnp.ndarray, *, rngs: nnx.Rngs, p_max_override: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         # patches_btnd: (B,T,Np,D)
         B, T, Np, D = patches_btnd.shape
         mask_token = self.mask_token.value.astype(self.dtype)
 
+        p_max = p_max_override if p_max_override is not None else self.p_max
+
         # Draw RNGs
         p_rng = rngs.mae()
         m_rng = rngs.mae()
-        p_bt = jax.random.uniform(p_rng, (B, T), minval=self.p_min, maxval=self.p_max)  # (B,T)
+        p_bt = jax.random.uniform(p_rng, (B, T), minval=self.p_min, maxval=p_max)  # (B,T)
         keep_prob_bt1 = 1.0 - p_bt[..., None]                                           # (B,T,1)
         keep = jax.random.bernoulli(m_rng, keep_prob_bt1, (B, T, Np))                   # (B,T,Np)
         keep = keep[..., None]                                                          # (B,T,Np,1)
@@ -800,7 +802,7 @@ class Encoder(nnx.Module):
         self.mask_and_replace = MAEReplacer(D=cfg.d_model, p_min=cfg.mae_p_min, p_max=cfg.mae_p_max, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
         self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_latents, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
-    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
         # Videos in the [0, 255] range
         B, T, H, W, C = videos.shape
 
@@ -815,7 +817,7 @@ class Encoder(nnx.Module):
             patch_mask = jnp.zeros((B, T, proj_patches.shape[2], 1), dtype=jnp.bool_)
             keep_prob = jnp.ones((B, T, 1))
         else:
-            proj_patches_masked, patch_mask, keep_prob = self.mask_and_replace(proj_patches, rngs=rngs)
+            proj_patches_masked, patch_mask, keep_prob = self.mask_and_replace(proj_patches, rngs=rngs, p_max_override=mae_p_max)
 
         # patch_mask is (B,T,Np,1), need to expand to pixels (B, T, Np, P*P)
         patch_mask_expanded = jnp.repeat(patch_mask, self.patch_size**2, axis=-1)
@@ -928,14 +930,14 @@ class Tokenizer(nnx.Module):
         self.encoder = Encoder(cfg.encoder, mesh_rules=mesh_rules, rngs=rngs)
         self.decoder = Decoder(cfg.decoder, mesh_rules=mesh_rules, rngs=rngs)
 
-    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None):
-        z, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs)
+    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
+        z, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs, mae_p_max=mae_p_max)
         recon, _ = self.decoder(z, deterministic=deterministic, rngs=rngs)
         return recon, aux
 
-    def encode(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None):
+    def encode(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
         # Always returns unpacked: (B, T, n_latents, d_bottleneck)
-        return self.encoder(videos, deterministic=deterministic, rngs=rngs)
+        return self.encoder(videos, deterministic=deterministic, rngs=rngs, mae_p_max=mae_p_max)
 
     def decode(self, z, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None):
         # Always expects unpacked: (B, T, n_latents, d_bottleneck)
