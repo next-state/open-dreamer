@@ -98,7 +98,6 @@ key_to_index: Final[dict[str, int]] = {
     "mouse.0": 20,                    # attack
     "mouse.1": 21,                    # use
     "mouse.2": 22,                    # pickItem
-    # Added wheel direction channels (binary event features)
     "mouse.wheel_neg": 23,            # scroll down
     "mouse.wheel_pos": 24,            # scroll up
 }
