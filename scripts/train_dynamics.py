@@ -269,11 +269,10 @@ def run(cfg: DynamicsConfig):
 
                 actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
 
-                # Validation/visualization only on main process.
+                # Validation/visualization — all hosts must participate in JAX
+                # compute (model is sharded), but only process 0 does I/O.
                 do_eval = ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1
-                if do_eval and is_multihost:
-                    multihost_utils.sync_global_devices(f"pre_eval_{step}")
-                if do_eval and is_main_process:
+                if do_eval:
                     val_data = input_tensor[:4]
                     val_actions = actions[:4]
                     run_evaluation(
@@ -283,7 +282,8 @@ def run(cfg: DynamicsConfig):
                         val_data=val_data,
                         val_actions=val_actions,
                         use_latent_data=use_latent_data,
-                        vis_dir=vis_dir, rng=rng, logger=logger,
+                        vis_dir=vis_dir, rng=rng,
+                        logger=logger if is_main_process else None,
                     )
 
                 # Training step
