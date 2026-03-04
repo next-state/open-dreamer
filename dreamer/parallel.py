@@ -1,3 +1,4 @@
+import os
 import jax
 from dataclasses import dataclass
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -16,8 +17,67 @@ class MeshRules:
     return tuple(getattr(self, key) for key in keys)
 
 
+def _int_env(*names: str, default: int | None = None) -> int | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value not in (None, ""):
+            return int(value)
+    return default
+
+
+def maybe_init_distributed() -> None:
+    """Initialize JAX multi-process runtime when launched across hosts."""
+    if jax.distributed.is_initialized():
+        return
+
+    coordinator = os.environ.get("JAX_COORDINATOR_ADDRESS")
+    world = _int_env(
+        "JAX_PROCESS_COUNT",
+        "WORLD_SIZE",
+        "SLURM_NTASKS",
+        "OMPI_COMM_WORLD_SIZE",
+        default=1,
+    )
+    rank = _int_env(
+        "JAX_PROCESS_INDEX",
+        "RANK",
+        "SLURM_PROCID",
+        "OMPI_COMM_WORLD_RANK",
+        default=0,
+    )
+
+    slurm_env = "SLURM_JOB_ID" in os.environ
+    ompi_env = "OMPI_MCA_orte_hnp_uri" in os.environ
+    should_init = bool(coordinator) or (world is not None and world > 1) or slurm_env or ompi_env
+    if not should_init:
+        return
+
+    if coordinator:
+        if world is None or world < 2:
+            raise ValueError(
+                "JAX_COORDINATOR_ADDRESS is set but process count is < 2. "
+                "Set JAX_PROCESS_COUNT (or WORLD_SIZE)."
+            )
+        if rank is None:
+            raise ValueError(
+                "JAX_COORDINATOR_ADDRESS is set but process id is missing. "
+                "Set JAX_PROCESS_INDEX (or RANK)."
+            )
+        jax.distributed.initialize(
+            coordinator_address=coordinator,
+            num_processes=world,
+            process_id=rank,
+        )
+    else:
+        # Use launcher-provided metadata (e.g., Slurm/OpenMPI).
+        jax.distributed.initialize()
+
+    print(f"[distributed] initialized process {jax.process_index()}/{jax.process_count()}")
+
+
 def build_parallel(strategy: Literal["data", "fsdp", "tp", "sp"]) -> tuple[Mesh, NamedSharding, MeshRules]:
     """Build parallelization setup based on strategy."""
+    maybe_init_distributed()
     n = len(jax.devices())
 
     if strategy == "data":
