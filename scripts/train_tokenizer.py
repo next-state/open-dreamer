@@ -146,10 +146,10 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | 
 # ------------------------
 
 @partial(jax.jit, static_argnames=())
-def viz_step_jit(model: Tokenizer, videos, *, mae_key, drop_key):
+def viz_step_jit(model: Tokenizer, videos, *, mae_key, drop_key, mae_p_max=None):
     """Visualization step with NNX model."""
     rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
-    recon, (mask, _) = model(videos, deterministic=False, rngs=rngs)
+    recon, (mask, _) = model(videos, deterministic=False, rngs=rngs, mae_p_max=mae_p_max)
 
     masked = videos * (1.0 - mask)
     recon_masked = masked + recon * mask
@@ -158,11 +158,11 @@ def viz_step_jit(model: Tokenizer, videos, *, mae_key, drop_key):
     grid = einops.rearrange(grid, "b t h w c -> h (b t w) c")
     return grid.clip(0, 255).astype(jnp.uint8)
 
-def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger):
+def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger, mae_p_max=None):
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
-    grid = viz_step_jit(model, videos[:2,:256:256//4], mae_key=mae_key, drop_key=drop_key)
+    grid = viz_step_jit(model, videos[:2,:256:256//4], mae_key=mae_key, drop_key=drop_key, mae_p_max=mae_p_max)
     grid = jax.device_get(grid)
 
     imageio.imwrite(vis_dir / f"step_{step:06d}.png", grid)
@@ -246,8 +246,6 @@ def run(cfg: TokenizerConfig):
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=TokenizerCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
-            if cfg.mae_finetune:
-                start_step = 0  # reset step counter for finetuning
             scaling.start_training()
 
             # Training loop
@@ -314,7 +312,7 @@ def run(cfg: TokenizerConfig):
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
-                    viz_step(bundle.tokenizer, viz_videos, step_rng, step, vis_dir, logger)
+                    viz_step(bundle.tokenizer, viz_videos, step_rng, step, vis_dir, logger, mae_p_max=current_mae_p_max)
 
             scaling.finalize()
 
