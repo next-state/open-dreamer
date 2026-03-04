@@ -98,6 +98,8 @@ key_to_index: Final[dict[str, int]] = {
     "mouse.0": 20,                    # attack
     "mouse.1": 21,                    # use
     "mouse.2": 22,                    # pickItem
+    "mouse.wheel_neg": 23,            # scroll down
+    "mouse.wheel_pos": 24,            # scroll up
 }
 
 
@@ -145,7 +147,7 @@ def mouse_movement_to_categorical(dx: Array, dy: Array) -> Array:
     return bins[..., 1] * NUM_CAMERA_BINS + bins[..., 0]
 
 
-NUM_BINARY_ACTIONS: Final[int] = 23  # keyboard (20) + mouse buttons (3)
+NUM_BINARY_ACTIONS: Final[int] = 25  # keyboard (20) + mouse buttons (3) + wheel dir (2)
 
 
 def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
@@ -160,7 +162,7 @@ def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
             
     Returns:
         Actions pytree with:
-            - binary: (T, 23) int32 array of keyboard/mouse button states
+            - binary: (T, 25) int32 array of keyboard/mouse button and wheel states
             - categorical: (T,) int32 array of camera action indices [0, 120]
     """
     T = len(action_dicts)
@@ -175,8 +177,9 @@ def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
         keyboard = action.get("keyboard", {})
         keys = keyboard.get("keys", [])
         for key in keys:
-            idx = key_to_index.get(key, 21)
-            binary[t, idx] = 1
+            idx = key_to_index.get(key)
+            if idx is not None:
+                binary[t, idx] = 1
         
         # Parse mouse buttons
         mouse = action.get("mouse", {})
@@ -188,6 +191,13 @@ def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
                 binary[t, key_to_index["mouse.1"]] = 1  # use
             elif btn == 2:
                 binary[t, key_to_index["mouse.2"]] = 1  # pickItem
+
+        # Parse mouse wheel as directional binary events
+        wheel = float(mouse.get("dwheel", 0.0) or 0.0)
+        if wheel < 0.0:
+            binary[t, key_to_index["mouse.wheel_neg"]] = 1
+        elif wheel > 0.0:
+            binary[t, key_to_index["mouse.wheel_pos"]] = 1
         
         # Parse camera movement
         camera_dx[t] = mouse.get("dx", 0.0)
