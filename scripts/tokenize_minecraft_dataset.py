@@ -20,13 +20,11 @@ from pathlib import Path
 from threading import Thread
 
 import decord
-import grain
 import hydra
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from grain._src.python.dataset import dataset as grain_dataset
 from grain._src.python.dataset.transformations.prefetch import (
     ThreadPrefetchIterDataset,
 )
@@ -34,9 +32,8 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 from dreamer.checkpointing import TokenizerCheckpointBundle
-from dreamer.data.data import DataLoaderIteratorWrapper
+from dreamer.data.data import DataLoaderIteratorWrapper, make_iterator
 from dreamer.data.shard_writer import ShardWriter
-from dreamer.data.transforms import ProcessMinecraftEpisodeAndSlice
 from dreamer.parallel import build_parallel
 
 decord.bridge.set_bridge("native")
@@ -44,67 +41,6 @@ decord.bridge.set_bridge("native")
 logging.getLogger("absl").setLevel(logging.WARNING)
 # os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
-
-
-# ==============================================================================
-# Data Loading
-# ==============================================================================
-
-
-def make_tokenization_iterator(
-    input_dir: str,
-    num_shards: int | None,
-    batch_size: int,
-    num_workers: int,
-    *,
-    image_h: int,
-    image_w: int,
-    image_c: int,
-    padding_h: tuple[int, int],
-    padding_w: tuple[int, int],
-    patch_size: int,
-):
-    """Create dataloader for tokenization (sequential, no shuffle, full episodes)."""
-    all_shards = sorted(Path(input_dir).glob("shard-*.array_record"))
-    if num_shards is not None:
-        all_shards = all_shards[:num_shards]
-    shard_paths = [str(p) for p in all_shards]
-
-    if not shard_paths:
-        raise ValueError(f"No shards found in {input_dir}")
-
-    print(f"[tokenize] Found {len(shard_paths)} shards")
-
-    source = grain.sources.ArrayRecordDataSource(shard_paths)
-
-    sampler = grain.samplers.IndexSampler(
-        num_records=len(source),
-        shard_options=grain.sharding.NoSharding(),
-        shuffle=False,
-        num_epochs=1,
-    )
-
-    operations = [
-        ProcessMinecraftEpisodeAndSlice(
-            seq_len=0,
-            image_h=image_h,
-            image_w=image_w,
-            image_c=image_c,
-            padding_h=padding_h,
-            padding_w=padding_w,
-            patch_size=patch_size,
-            full_episode=True,
-        ),
-        grain.transforms.Batch(batch_size=batch_size, drop_remainder=True),
-    ]
-
-    return grain.DataLoader(
-        data_source=source,
-        sampler=sampler,
-        operations=operations,
-        worker_count=num_workers,
-        worker_buffer_size=1,
-    )
 
 
 # ==============================================================================
@@ -153,7 +89,7 @@ class AsyncShardWriter:
 
 
 def build_prefetch_pipeline(
-    dataloader,
+    data_iter,
     sharding: jax.sharding.NamedSharding,
     cpu_buffer_size: int = 10,
     device_buffer_size: int = 2,
@@ -161,7 +97,7 @@ def build_prefetch_pipeline(
     """Build a 2-stage async prefetch pipeline: CPU buffer → device transfer + device buffer.
 
     Returns an iterable that yields batches with 'videos' already on device as sharded JAX arrays,
-    plus '_pad_size' and '_batch_size' metadata.
+    plus '_batch_size' metadata.
     """
     devices = list(sharding.mesh.devices.flat)
     num_devices = len(devices)
@@ -187,12 +123,11 @@ def build_prefetch_pipeline(
         )
 
         batch["videos"] = sharded
-        batch["_pad_size"] = pad_size
         batch["_batch_size"] = batch_size
         return batch
 
     # Stage 1: CPU-side prefetch buffer (decouples grain workers from main loop)
-    iter_ds = DataLoaderIteratorWrapper(dataloader)
+    iter_ds = DataLoaderIteratorWrapper(data_iter)
     iter_ds = ThreadPrefetchIterDataset(iter_ds, prefetch_buffer_size=cpu_buffer_size)
 
     # Stage 2: Device transfer + device-side buffer
@@ -264,23 +199,22 @@ def run(cfg: DictConfig):
         print(f"[tokenize] d_bottleneck: {tokenizer.cfg.encoder.d_bottleneck}")
         print(f"[tokenize] patch_size: {tokenizer.cfg.encoder.patch_size}")
 
-        # Create dataloader
-        base_dataloader = make_tokenization_iterator(
-            input_dir=cfg.dataset.array_record_path,
+        base_iterator = make_iterator(
+            cfg.dataset,
+            seed=cfg.seed,
+            dataloader_cfg=cfg.dataset.dataloader_cfg,
+            seq_len=0,
+            shuffle=False,
+            num_epochs=1,
+            shard_by_jax_process=False,
+            drop_remainder=True,
+            full_episode=True,
             num_shards=cfg.num_shards,
-            batch_size=cfg.batch_size,
-            num_workers=cfg.num_workers,
-            image_h=cfg.dataset.H,
-            image_w=cfg.dataset.W,
-            image_c=cfg.dataset.C,
-            padding_h=cfg.dataset.padding_H,
-            padding_w=cfg.dataset.padding_W,
-            patch_size=cfg.dataset.patch_size,
         )
 
         # Build async prefetch pipeline: CPU buffer → device transfer → device buffer
         prefetched = build_prefetch_pipeline(
-            base_dataloader,
+            base_iterator,
             sharding=data_sharding,
             cpu_buffer_size=cfg.dataset.dataloader_cfg.prefetch_buffer_size,
             device_buffer_size=cfg.dataset.dataloader_cfg.device_prefetch_buffer_size,
@@ -312,6 +246,7 @@ def run(cfg: DictConfig):
         n_channels = tokenizer.cfg.encoder.d_bottleneck
         welford = WelfordAccumulator(n_channels)
         total_videos = 0
+        save_interval_videos = 100 * cfg.dataset.dataloader_cfg.B
 
         import time
 
@@ -325,7 +260,6 @@ def run(cfg: DictConfig):
                 actions_batch = batch["actions"]
                 sources_batch = batch["source"]
                 batch_size = batch["_batch_size"]
-                pad_size = batch["_pad_size"]
 
                 t0 = time.perf_counter()
                 latents = encode_batch(videos)
@@ -369,7 +303,7 @@ def run(cfg: DictConfig):
                 t_iter_start = time.perf_counter()
 
                 # Periodically save stats (every 100 batches)
-                if total_videos % (100 * cfg.batch_size) < cfg.batch_size:
+                if total_videos % save_interval_videos < cfg.dataset.dataloader_cfg.B:
                     np.savez(
                         stats_path,
                         mean=welford.mean.astype(np.float32),

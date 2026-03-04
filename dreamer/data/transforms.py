@@ -65,6 +65,8 @@ class EpisodeLengthFilter(grain.transforms.Filter):
         Returns:
             True if episode is long enough, False otherwise
         """
+        if self.seq_len<0:
+            return True
         # Try to determine format and extract length
         if self.format_hint == "latent":
             data = deserialize_msgpack_record(element)

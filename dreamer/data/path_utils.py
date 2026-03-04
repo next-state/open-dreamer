@@ -1,7 +1,6 @@
 """Path utilities for ArrayRecord dataset discovery and generation."""
 
 import os
-from pathlib import Path
 from typing import Literal
 
 
@@ -27,25 +26,19 @@ def discover_array_record_paths(path: str | list[str]) -> list[str]:
         return [path]
 
 
-def generate_shard_paths(
-    base_dir: str,
-    num_shards: int,
-    prefix: str = "shard"
-) -> list[str]:
-    """Generate shard paths with consistent naming.
+def discover_shard_paths(path: str | list[str], prefix: str = "shard") -> list[str]:
+    """Discover shard files named like shard-XXXXX.array_record."""
+    if isinstance(path, list):
+        return sorted(path)
 
-    Args:
-        base_dir: Base directory containing shards
-        num_shards: Number of shards to generate paths for
-        prefix: Filename prefix (default: "shard")
+    if os.path.isdir(path):
+        return sorted(
+            os.path.join(path, f)
+            for f in os.listdir(path)
+            if f.startswith(f"{prefix}-") and f.endswith(".array_record")
+        )
 
-    Returns:
-        List of shard paths: base_dir/shard-00000.array_record, ...
-    """
-    return [
-        f"{base_dir}/{prefix}-{i:05d}.array_record"
-        for i in range(num_shards)
-    ]
+    return [path]
 
 
 def build_dataset_paths(
@@ -58,21 +51,21 @@ def build_dataset_paths(
     Args:
         array_record_path: Path or list of paths to ArrayRecord files/directories
         dataset_type: Type of dataset ("coinrun", "minecraft_vpt", "latent")
-        index_max: For minecraft_vpt/latent, number of shards to load
+        index_max: For minecraft_vpt/latent, max number of shards to load; None/<=0 means all
 
     Returns:
         List of paths to ArrayRecord files
 
-    Raises:
-        ValueError: If index_max is not provided for minecraft_vpt or latent datasets
     """
-    # Minecraft VPT and latent datasets use shard-based naming
+    # Minecraft VPT and latent datasets are shard-based.
     if dataset_type in ("minecraft_vpt", "latent"):
+        shard_paths = discover_shard_paths(array_record_path)
+        if not shard_paths:
+            raise ValueError(f"No shards found for {dataset_type} at {array_record_path}")
+        shard_paths = sorted(shard_paths)
         if index_max is None or index_max <= 0:
-            raise ValueError(
-                f"index_max must be > 0 for {dataset_type} dataset, got {index_max}"
-            )
-        return generate_shard_paths(array_record_path, index_max)
+            return shard_paths
+        return shard_paths[: min(index_max, len(shard_paths))]
 
     # CoinRun uses file discovery
     return discover_array_record_paths(array_record_path)

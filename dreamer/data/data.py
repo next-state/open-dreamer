@@ -1,18 +1,13 @@
-import io
 import logging
-import pickle
 
 import grain
 import jax
 from jax import numpy as jnp
-import numpy as np
 from grain._src.python.dataset import dataset as grain_dataset
 from grain.transforms import Batch
 
-from dreamer.actions import Actions
 from dreamer.configs import DatasetConfig, DataloaderConfig
 from dreamer.data.path_utils import build_dataset_paths
-from dreamer.data.serialization import deserialize_msgpack_record
 from dreamer.data.transforms import (
     CastDtype,
     EpisodeLengthFilter,
@@ -25,6 +20,9 @@ from dreamer.data.transforms import (
 # Factory
 # ==============================================================================
 
+_NUM_SHARDS_UNSET = object()
+
+
 def make_iterator(
     cfg: DatasetConfig,
     *,
@@ -34,6 +32,12 @@ def make_iterator(
     dtype = None,
     dataloader_cfg: DataloaderConfig | None = None,
     seq_len: int | None = None,
+    shuffle: bool = True,
+    num_epochs: int | None = None,
+    shard_by_jax_process: bool = True,
+    drop_remainder: bool = True,
+    full_episode: bool = False,
+    num_shards: int | None | object = _NUM_SHARDS_UNSET,
 ):
     """Creates a data loading pipeline using Grain from a DatasetConfig.
 
@@ -44,6 +48,12 @@ def make_iterator(
         seed: Random seed
         print_filter_warnings: Whether to print filter warnings
         device: Device for prefetching
+        shuffle: Whether to shuffle records
+        num_epochs: Number of epochs (None for infinite)
+        shard_by_jax_process: Whether to shard records across JAX processes
+        drop_remainder: Whether to drop remainder when sharding/batching
+        full_episode: For minecraft_vpt, return full episodes without random slicing
+        num_shards: Override for shard-based datasets; None means use all available shards
     """
     if dataloader_cfg is None:
         dataloader_cfg = cfg.dataloader_cfg
@@ -63,10 +73,14 @@ def make_iterator(
     use_latent_data = cfg.data_type == "latent"
     dataset_type = "latent" if use_latent_data else cfg.name
 
+    index_max = cfg.index_max if use_latent_data or cfg.name == "minecraft_vpt" else None
+    if num_shards is not _NUM_SHARDS_UNSET:
+        index_max = num_shards
+
     array_record_paths = build_dataset_paths(
         cfg.array_record_path,
         dataset_type=dataset_type,
-        index_max=cfg.index_max if use_latent_data or cfg.name == "minecraft_vpt" else None,
+        index_max=index_max,
     )
 
     num_processes = jax.process_count()
@@ -80,11 +94,13 @@ def make_iterator(
 
     source = grain.sources.ArrayRecordDataSource(array_record_paths)
 
+    shard_options = grain.sharding.ShardByJaxProcess(drop_remainder=drop_remainder) if shard_by_jax_process else grain.sharding.NoSharding()
+
     sampler = grain.samplers.IndexSampler(
         num_records = cfg.num_max_samples if cfg.num_max_samples>0 else len(source),
-        shard_options=grain.sharding.ShardByJaxProcess(drop_remainder=True),
-        shuffle=True,
-        num_epochs=None,
+        shard_options=shard_options,
+        shuffle=shuffle,
+        num_epochs=num_epochs,
         seed=seed,
     )
 
@@ -95,7 +111,7 @@ def make_iterator(
     elif cfg.name.startswith("minecraft_vpt"):
         operations = [
             EpisodeLengthFilter(
-                seq_len=seq_len,
+                seq_len=seq_len if not full_episode else -1,
                 format_hint="vpt",
                 print_filter_warnings=print_filter_warnings,
             ),
@@ -107,6 +123,7 @@ def make_iterator(
                 padding_h=cfg.padding_H,
                 padding_w=cfg.padding_W,
                 patch_size=cfg.patch_size,
+                full_episode=full_episode,
             )
         ]
     else:
@@ -128,7 +145,7 @@ def make_iterator(
             ),
         ]
             
-    common_ops = [Batch(batch_size=per_process_batch_size, drop_remainder=True), CastDtype(dataloader_cfg.dtype)]
+    common_ops = [Batch(batch_size=per_process_batch_size, drop_remainder=drop_remainder), CastDtype(dataloader_cfg.dtype)]
     operations = operations + common_ops
 
     dataloader = grain.DataLoader(
