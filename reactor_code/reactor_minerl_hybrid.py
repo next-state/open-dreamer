@@ -32,6 +32,7 @@ from dreamer.checkpointing import DynamicsCheckpointBundle, HeadsCheckpointBundl
 from dreamer.generation import DenoiseSchedule, next_frame
 from dreamer.models import PolicyHeadMTP, TaskEmbedder
 from dreamer.parallel import build_parallel
+from dreamer.utils import normalize_latents
 
 
 logging.basicConfig(
@@ -199,9 +200,8 @@ def create_noop_wm_action(with_time_dim: bool) -> Actions:
 
 def create_update_caches_fn(tokenizer, dynamics, schedule: DenoiseSchedule, task_embedding):
     """Update dynamics/tokenizer caches from a real observed frame and action."""
-    step_idx_ctx = schedule.step_idx_ctx
-    tau_idx_ctx = schedule.tau_idx_ctx
-    tau_ctx = schedule.tau_ctx
+    emax = schedule.emax
+    k_max = schedule.k_max
 
     def update_caches(
         frame: jax.Array,  # (1, 1, H, W, C)
@@ -210,7 +210,7 @@ def create_update_caches_fn(tokenizer, dynamics, schedule: DenoiseSchedule, task
         tokenizer_cache,
         rng: jax.Array,
     ):
-        rng, enc_key, noise_key = jax.random.split(rng, 3)
+        rng, enc_key = jax.random.split(rng)
 
         latent, _ = tokenizer.encode(
             frame,
@@ -218,17 +218,17 @@ def create_update_caches_fn(tokenizer, dynamics, schedule: DenoiseSchedule, task
             rngs=nnx.Rngs(mae=enc_key),
         )  # (1, 1, n_latents, D_s)
 
-        noise = jax.random.normal(noise_key, latent.shape, dtype=latent.dtype)
-        latent_noised = latent * tau_ctx + (1.0 - tau_ctx) * noise
+        latent_norm = normalize_latents(latent, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
-        step_indices = jnp.full((1, 1), step_idx_ctx, dtype=jnp.int32)
-        tau_indices = jnp.full((1, 1), tau_idx_ctx, dtype=jnp.int32)
+        # tau=1.0 (clean), step_idx=emax — matches training prefill for ground truth frames
+        step_indices = jnp.full((1, 1), emax, dtype=jnp.int32)
+        tau_indices = jnp.full((1, 1), k_max, dtype=jnp.int32)
 
         _, (h_new, dynamics_cache_new) = dynamics(
             action,
             step_indices,
             tau_indices,
-            latent_noised,
+            latent_norm,
             task_embeddings=task_embedding,
             deterministic=True,
             caches=dynamics_cache,
