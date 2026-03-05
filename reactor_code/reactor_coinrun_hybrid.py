@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from flax import nnx
 from dreamer.models import Dynamics, PolicyHeadMTP, TaskEmbedder, Tokenizer
 from dreamer.generation import DenoiseSchedule, next_frame
-from dreamer.parallel import create_data_model_parallel, MeshRules
+from dreamer.parallel import build_parallel
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
 from enum import Enum
@@ -270,8 +270,7 @@ class HybridVideoModel(VideoModel):
         
         # === Dreamer Model Setup ===
         logger.info(f"Loading dynamics model and tokenizer from {cfg.dynamics_ckpt}")
-        mesh, data_sharding = create_data_model_parallel(1, 1)
-        mesh_rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
+        mesh, _, mesh_rules = build_parallel("data")
         
         with jax.set_mesh(mesh):
             self.dynamics, self.tokenizer = Dynamics.from_pretrained(
