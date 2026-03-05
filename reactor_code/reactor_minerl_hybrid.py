@@ -567,7 +567,7 @@ class MineRLHybridVideoModel(VideoModel):
         )
 
         print("Warmup complete")
-        get_ctx()._push_to_framebuffer_fn(frame)
+        get_ctx().get_track().emit(frame)
         frame_time = 1.0 / self.fps
 
         try:
@@ -606,7 +606,7 @@ class MineRLHybridVideoModel(VideoModel):
                         self._warmup_with_frame(frame)
 
                     self.current_obs = frame
-                    get_ctx()._push_to_framebuffer_fn(frame)
+                    get_ctx().get_track().emit(frame)
 
                     frame_jax = jnp.asarray(self._to_model_frame(frame))[None, None]
                     wm_action_with_time = self._current_wm_action(with_time_dim=True)
@@ -626,7 +626,7 @@ class MineRLHybridVideoModel(VideoModel):
                         task_embedding=self.task_embedding,
                     )
                     frame = self._to_display_frame(np.asarray(frame_jax[0, 0]))
-                    get_ctx()._push_to_framebuffer_fn(frame)
+                    get_ctx().get_track().emit(frame)
 
                 self.mouse_state["dx"] = 0.0
                 self.mouse_state["dy"] = 0.0
