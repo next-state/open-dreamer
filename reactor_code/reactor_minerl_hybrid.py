@@ -11,12 +11,12 @@ from pycparser.ply.cpp import p
 
 import logging
 import os
+import shutil
+import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict
-
-os.environ.setdefault("DISPLAY", ":0")
 
 import cv2
 import gym
@@ -41,6 +41,30 @@ logging.basicConfig(
     level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def _ensure_display_with_xvfb() -> None:
+    """Restart under xvfb-run when running headless."""
+    if os.environ.get("DISPLAY"):
+        return
+
+    if os.environ.get("REACTOR_XVFB_WRAPPED") == "1":
+        raise RuntimeError(
+            "DISPLAY is still unset after restarting with xvfb-run."
+        )
+
+    xvfb_run = shutil.which("xvfb-run")
+    if xvfb_run is None:
+        raise RuntimeError(
+            "DISPLAY is unset and xvfb-run is not installed. "
+            "Install xvfb or launch manually with xvfb-run."
+        )
+
+    cmd = [xvfb_run, "-a", "-s", "-screen 0 1024x768x24", sys.executable, *sys.argv]
+    env = os.environ.copy()
+    env["REACTOR_XVFB_WRAPPED"] = "1"
+    logger.info("DISPLAY is unset; restarting process under xvfb-run")
+    os.execvpe(cmd[0], cmd, env)
 
 
 class FrameGenMode(Enum):
@@ -225,7 +249,7 @@ def create_update_caches_fn(tokenizer, dynamics, schedule: DenoiseSchedule, task
     return update_caches
 
 
-@model(name="minerl_hybrid", config="configs/minerl_hybrid.yaml")
+# @model(name="minerl_hybrid", config="configs/minerl_hybrid.yaml")
 class MineRLHybridVideoModel(VideoModel):
     @command(
         "send_keyboard_state",
@@ -317,6 +341,7 @@ class MineRLHybridVideoModel(VideoModel):
 
     def __init__(self, config: DictConfig):
         super().__init__()
+        _ensure_display_with_xvfb()
 
         self.cfg = OmegaConf.structured(MineRLHybridConfig)
         self.cfg = OmegaConf.merge(self.cfg, config)

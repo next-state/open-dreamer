@@ -20,11 +20,11 @@ Action space matches the VPT action space defined in dreamer/actions.py:
 
 import logging
 import os
+import shutil
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict
-
-os.environ.setdefault("DISPLAY", ":0")
 
 import cv2
 import gym
@@ -39,6 +39,30 @@ logging.basicConfig(
     level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def _ensure_display_with_xvfb() -> None:
+    """Restart under xvfb-run when running headless."""
+    if os.environ.get("DISPLAY"):
+        return
+
+    if os.environ.get("REACTOR_XVFB_WRAPPED") == "1":
+        raise RuntimeError(
+            "DISPLAY is still unset after restarting with xvfb-run."
+        )
+
+    xvfb_run = shutil.which("xvfb-run")
+    if xvfb_run is None:
+        raise RuntimeError(
+            "DISPLAY is unset and xvfb-run is not installed. "
+            "Install xvfb or launch manually with xvfb-run."
+        )
+
+    cmd = [xvfb_run, "-a", "-s", "-screen 0 1024x768x24", sys.executable, *sys.argv]
+    env = os.environ.copy()
+    env["REACTOR_XVFB_WRAPPED"] = "1"
+    logger.info("DISPLAY is unset; restarting process under xvfb-run")
+    os.execvpe(cmd[0], cmd, env)
 
 
 @dataclass
@@ -140,7 +164,7 @@ def input_to_action(
         deadzone_deg=cfg.camera_deadzone_deg,
     )
     dy = _camera_delta_to_degrees(
-        mouse_state.get("dy", 0.0) + 6, # TODO: this -6 and + 6 is an abomination but it seems to be needed to avoid drift
+        mouse_state.get("dy", 0.0), # TODO: this -6 and + 6 is an abomination but it seems to be needed to avoid drift
         scaler=cfg.camera_scaler,
         maxval=cfg.camera_maxval,
         deadzone_deg=cfg.camera_deadzone_deg,
@@ -155,7 +179,7 @@ def input_to_action(
     return action
 
 
-# @model(name="minerl", config="configs/procgen.yaml")
+@model(name="minerl", config="configs/procgen.yaml")
 class MineRLVideoModel(VideoModel):
     """
     MineRL environment integration with Reactor VideoModel interface.
@@ -264,6 +288,7 @@ class MineRLVideoModel(VideoModel):
             config: DictConfig loaded from configs/procgen.yaml and merged by Reactor
         """
         super().__init__()
+        _ensure_display_with_xvfb()
 
         logger.info("Initializing MineRL...")
         print("DEBUG: Initializing MineRL...", flush=True)
@@ -368,7 +393,7 @@ class MineRLVideoModel(VideoModel):
                 self.current_obs = frame
 
                 # Emit frame to reactor runtime
-                get_ctx().emit_block(frame)
+                get_ctx().get_track().emit(frame)
 
                 # Sleep to maintain target FPS
                 current_time = time.time()

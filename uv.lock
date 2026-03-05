@@ -811,6 +811,19 @@ wheels = [
 ]
 
 [[package]]
+name = "grpcio-health-checking"
+version = "1.76.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3e/96/5a52dcf21078b47ffa0c2ed613c3153a06f138edb6133792bace5f1ccc1d/grpcio_health_checking-1.76.0.tar.gz", hash = "sha256:b7a99d74096b3ab3a59987fc02374068e1c180a352e8d1f79f10e5a23727098d", size = 16784, upload-time = "2025-10-21T16:28:55.204Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/65/e6/746dffa51399827e38bb3f3f1ad656a3d8c1255039b256a6f76593368768/grpcio_health_checking-1.76.0-py3-none-any.whl", hash = "sha256:9743f345a855ba030cc7c381361606870b79d33bb71d7756efa47b6faa970f81", size = 18910, upload-time = "2025-10-21T16:27:26.332Z" },
+]
+
+[[package]]
 name = "gym"
 version = "0.23.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2381,7 +2394,7 @@ wheels = [
 
 [[package]]
 name = "reactor-runtime"
-version = "1.1.0"
+version = "1.6.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -2391,6 +2404,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "filelock" },
     { name = "grpcio" },
+    { name = "grpcio-health-checking" },
     { name = "numpy" },
     { name = "omegaconf" },
     { name = "opentelemetry-api" },
@@ -2404,9 +2418,9 @@ dependencies = [
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b1/5a/1690e450c569473a2dee9d0d51a4c3fa9d96f88872b4970f80be4b9f1322/reactor_runtime-1.1.0.tar.gz", hash = "sha256:6520d13ef3b3b531d8ca2d8b2403431fe1403cccf405d4962b70d178f321618f", size = 53769, upload-time = "2026-01-16T16:48:47.196Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4a/76/7b4a1078e02941e71be74a420f4e52ee3c797266afd79903b05d85947fe9/reactor_runtime-1.6.3.tar.gz", hash = "sha256:c05cd13efcb3f4cfcc2fb868097220b9bcf17817c66120e764bd9174b11dd55e", size = 158543, upload-time = "2026-02-28T09:20:47.941Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d5/7e/36b33bc84230d49c7235bf9a1e1dd95d39c4bee8ea01fc210c886708a598/reactor_runtime-1.1.0-py3-none-any.whl", hash = "sha256:b1deb443b87cd8cc0a32e3d27a38ee6e482270d684b5effecbbaad632adaafff", size = 66211, upload-time = "2026-01-16T16:48:45.874Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/7d/6644db212fbf74726c03d198aaba3aa85e892ee4eed508122ac2bb4e441d/reactor_runtime-1.6.3-py3-none-any.whl", hash = "sha256:8794e2ac5424db685c0036834903cfd39d446de2665e635322bdfac168e3270c", size = 200931, upload-time = "2026-02-28T09:20:46.567Z" },
 ]
 
 [[package]]
@@ -2803,7 +2817,7 @@ requires-dist = [
     { name = "nvidia-cusparse-cu12", specifier = ">=12.5.8.93" },
     { name = "optax", git = "https://github.com/google-deepmind/optax.git" },
     { name = "pandas", specifier = ">=2.3.3" },
-    { name = "reactor-runtime", specifier = ">=0.9" },
+    { name = "reactor-runtime", specifier = ">=1.4" },
     { name = "tqdm" },
     { name = "tyro", specifier = ">=1.0.0" },
     { name = "wandb" },
