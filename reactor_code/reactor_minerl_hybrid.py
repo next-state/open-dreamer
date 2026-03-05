@@ -573,23 +573,21 @@ class MineRLHybridVideoModel(VideoModel):
         try:
             last_frame_time = time.time()
             while not get_ctx().should_stop():
-                self.rng, key = jax.random.split(self.rng)
+                self.rng, key, policy_key = jax.random.split(self.rng, 3)
 
                 if (
                     self.actiongen_mode == ActionGenMode.POLICY
                     and isinstance(self.policy_head, PolicyHeadMTP)
                     and self.h_last is not None
                 ):
-                    logits = self.policy_head(self.h_last, deterministic=True)
                     sampled = self.policy_head.sample(
-                        self.h_last, deterministic=False, rng=key
+                        self.h_last, deterministic=False, rng=policy_key
                     )
                     wm_action_no_time = Actions(
                         binary=sampled.binary[:, 0, 0, :] if sampled.binary is not None else None,
                         categorical=sampled.categorical[:, 0, 0] if sampled.categorical is not None else None,
                         continuous=sampled.continuous[:, 0, 0, :] if sampled.continuous is not None else None,
                     )
-                    _ = logits  # Keep explicit policy forward for parity with old path.
                 else:
                     wm_action_no_time = self._current_wm_action(with_time_dim=False)
 
