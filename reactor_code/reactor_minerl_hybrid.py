@@ -558,7 +558,7 @@ class MineRLHybridVideoModel(VideoModel):
         
         self.rng, compile_key = jax.random.split(self.rng)
         dummy_action = create_noop_wm_action(with_time_dim=False)
-        _, _, self.dynamics_cache, self.tokenizer_cache, self.rng = self.next_frame_compiled(
+        self.next_frame_compiled(
             action=dummy_action,
             dynamics_cache=self.dynamics_cache,
             tokenizer_cache=self.tokenizer_cache,
