@@ -6,9 +6,6 @@ This reactor combines real MineRL gameplay with Dreamer world model imagination.
 It starts in reality mode, keeps world model KV caches in sync from real frames,
 and can switch to imagination mode for autoregressive generation.
 """
-import prompt_toolkit
-from pycparser.ply.cpp import p
-
 import logging
 import os
 import shutil
@@ -249,7 +246,7 @@ def create_update_caches_fn(tokenizer, dynamics, schedule: DenoiseSchedule, task
     return update_caches
 
 
-# @model(name="minerl_hybrid", config="configs/minerl_hybrid.yaml")
+@model(name="minerl_hybrid", config="configs/minerl_hybrid.yaml")
 class MineRLHybridVideoModel(VideoModel):
     @command(
         "send_keyboard_state",
