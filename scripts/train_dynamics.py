@@ -170,11 +170,7 @@ def run(cfg: DynamicsConfig):
     is_multihost = jax.process_count() > 1
 
     # Logging
-    logger = build_logger(
-        logger_cfg=cfg.logger,
-        config=OmegaConf.to_container(cfg, resolve=True),
-        dir=str(run_dir),
-    )
+    logger = build_logger(logger_cfg=cfg.logger, config=OmegaConf.to_container(cfg, resolve=True), dir=str(run_dir))
 
     with logger, jax.set_mesh(mesh):
         key = jax.random.PRNGKey(cfg.seed)
@@ -248,13 +244,7 @@ def run(cfg: DynamicsConfig):
             scaling.start_training()
 
 
-            pbar = tqdm(
-                enumerate(dataloader, start_step),
-                initial=start_step,
-                total=cfg.max_steps,
-                dynamic_ncols=True,
-                disable=not is_main_process,
-            )
+            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True, disable=not is_main_process)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
