@@ -336,7 +336,7 @@ def run(cfg: DictConfig):
                 t2 = time.perf_counter()
 
                 # Vectorized Welford update: flatten (B, T, n_latents) → (N, D)
-                welford.update(latents_np.reshape(-1, n_channels))
+                welford.update(latents_np.astype(np.float32).reshape(-1, n_channels)) # Cast to float32 first — bfloat16 var() has catastrophic cancellation
                 t3 = time.perf_counter()
 
                 # Queue records for async write
