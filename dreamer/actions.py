@@ -100,6 +100,8 @@ key_to_index: Final[dict[str, int]] = {
     "mouse.2": 22,                    # pickItem
     "mouse.wheel_neg": 23,            # scroll down
     "mouse.wheel_pos": 24,            # scroll up
+    "key.keyboard.f3": 25,            # debug screen toggle
+    "unknown": 26,                    # unknown key/mouse button
 }
 
 
@@ -147,7 +149,7 @@ def mouse_movement_to_categorical(dx: Array, dy: Array) -> Array:
     return bins[..., 1] * NUM_CAMERA_BINS + bins[..., 0]
 
 
-NUM_BINARY_ACTIONS: Final[int] = 25  # keyboard (20) + mouse buttons (3) + wheel dir (2)
+NUM_BINARY_ACTIONS: Final[int] = len(key_to_index)
 
 
 def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
@@ -162,7 +164,7 @@ def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
             
     Returns:
         Actions pytree with:
-            - binary: (T, 25) int32 array of keyboard/mouse button and wheel states
+            - binary: (T, NUM_BINARY_ACTIONS) int32 array of keyboard/mouse button and wheel states
             - categorical: (T,) int32 array of camera action indices [0, 120]
     """
     T = len(action_dicts)
@@ -171,26 +173,22 @@ def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
     binary = np.zeros((T, NUM_BINARY_ACTIONS), dtype=np.int32)
     camera_dx = np.zeros(T, dtype=np.float32)
     camera_dy = np.zeros(T, dtype=np.float32)
+    unknown_idx = key_to_index["unknown"]
     
     for t, action in enumerate(action_dicts):
         # Parse keyboard keys
         keyboard = action.get("keyboard", {})
         keys = keyboard.get("keys", [])
         for key in keys:
-            idx = key_to_index.get(key)
-            if idx is not None:
-                binary[t, idx] = 1
+            idx = key_to_index.get(key, unknown_idx)
+            binary[t, idx] = 1
         
         # Parse mouse buttons
         mouse = action.get("mouse", {})
         buttons = mouse.get("buttons", [])
         for btn in buttons:
-            if btn == 0:
-                binary[t, key_to_index["mouse.0"]] = 1  # attack
-            elif btn == 1:
-                binary[t, key_to_index["mouse.1"]] = 1  # use
-            elif btn == 2:
-                binary[t, key_to_index["mouse.2"]] = 1  # pickItem
+            idx = key_to_index.get(f"mouse.{btn}", unknown_idx)
+            binary[t, idx] = 1
 
         # Parse mouse wheel as directional binary events
         wheel = float(mouse.get("dwheel", 0.0) or 0.0)
