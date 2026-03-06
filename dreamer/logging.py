@@ -118,13 +118,7 @@ class WandbLogger(Logger):
 
     def __enter__(self):
         import wandb
-        self._run = wandb.init(
-            entity=self.entity,
-            project=self.project,
-            name=self.name,
-            config=self.config,
-            dir=self.dir,
-        )
+        self._run = wandb.init(entity=self.entity, project=self.project, name=self.name, config=self.config, dir=self.dir, save_code=True)
         self._initialized = True
         return self
 
