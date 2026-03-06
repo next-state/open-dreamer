@@ -46,8 +46,8 @@ def create_noop_action_like(template: Actions, categorical_action_dim: int) -> A
 
     return Actions(
         binary     = _create_action(template.binary, 0),
-        categorical = _create_action(template.categorical, categorical_action_dim // 2),
-        continuous  = _create_action(template.continuous, 0.0)
+        categorical = _create_action(template.categorical, categorical_action_dim//2), #verified that this is equal to mouse_movement_to_categorical(dx=0,dy=0)
+        continuous  = _create_action(template.continuous, 0.)
     )
 
 

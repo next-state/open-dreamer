@@ -4,7 +4,7 @@ defaults:
 name: minecraft_vpt
 data_type: video
 
-array_record_path: /home/data/arrayrecords-mp4
+array_record_path: /home/dreamer/data/arrayrecords-mp4
 index_max: 500
 num_max_samples: -1
 
@@ -27,7 +27,7 @@ padding_H: [4, 4]
 padding_W: [0, 0]
 patch_size: 16
 
-num_binary_actions: 25  # keyboard + mouse buttons + wheel direction
+num_binary_actions: 27  # keyboard + mouse buttons + wheel direction
 categorical_action_dim: 121  # mouse actions
 continuous_action_dim: 0
 
