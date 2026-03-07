@@ -511,20 +511,23 @@ class WorldModelVideoModel(VideoModel):
         data_iterator = make_iterator(self.dataset_cfg, device=self.data_sharding)
         batch = next(iter(data_iterator))
         logger.info("Prefilling %d frames...", self.cfg.num_prefill_frames)
-        self._prefill_from_batch(batch, emit=True)
+        self._prefill_from_batch(batch, emit=False)
         logger.info("Prefill complete")
 
         # Trigger JIT compilation
         self.rng, compile_key = jax.random.split(self.rng)
         dummy_action = create_noop_wm_action(with_time_dim=False)
-        self.next_frame_compiled(
-            action=dummy_action,
-            dynamics_cache=self.dynamics_cache,
-            tokenizer_cache=self.tokenizer_cache,
-            rng=compile_key,
-            task_embedding=self.task_embedding,
+        frame_jax, self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = (
+            self.next_frame_compiled(
+                action=dummy_action,
+                dynamics_cache=self.dynamics_cache,
+                tokenizer_cache=self.tokenizer_cache,
+                rng=compile_key,
+                task_embedding=self.task_embedding,
+            )
         )
         logger.info("Warmup compile complete")
+        get_ctx().get_track().emit(self._to_display_frame(np.asarray(frame_jax[0, 0])))
 
         frame_time = 1.0 / self.fps
 
