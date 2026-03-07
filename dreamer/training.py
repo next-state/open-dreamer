@@ -358,6 +358,7 @@ def shortcut_forcing_step(
     k_max: int,
     *,
     B_self: int = 0,
+    B_img_emp: int = 0,
     context_length: int | None = None,
     time_mask: jnp.ndarray | None = None,
     task_embeddings: jnp.ndarray | None = None,
@@ -377,6 +378,8 @@ def shortcut_forcing_step(
         rng: Random key
         k_max: Maximum noise resolution
         B_self: Number of bootstrap examples (last B_self rows of batch)
+        B_img_emp: Number of empirical rows treated as image-only (first rows in empirical slice).
+                  Used only to split flow MSE logging into image vs full-sequence subsets.
         context_length: optional context length for sliding window attention. If provided,
                        creates local_window_size=(context_length - 1, 0) for causal sliding window.
         task_embeddings: Optional (B, T, n_agent, d_model) agent tokens
@@ -453,6 +456,19 @@ def shortcut_forcing_step(
     z_pred_emp = z_pred_full[:B_emp]
     loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
 
+    # Split flow MSE by empirical sample type (image-only rows vs temporal sequence rows).
+    n_img_emp = min(max(B_img_emp, 0), B_emp)
+    n_seq_emp = B_emp - n_img_emp
+    if n_img_emp > 0:
+        flow_mse_image = jnp.mean(mse_per_step_emp[:n_img_emp])
+    else:
+        flow_mse_image = jnp.array(0.0, dtype=latents.dtype)
+
+    if n_seq_emp > 0:
+        flow_mse_sequence = jnp.mean(mse_per_step_emp[n_img_emp:])
+    else:
+        flow_mse_sequence = jnp.array(0.0, dtype=latents.dtype)
+
     # Per-σ-bin flow MSE: breaks down where failures occur on the noise schedule
     mask_low  = sigma_emp < 0.25
     mask_mid  = (sigma_emp >= 0.25) & (sigma_emp < 0.75)
@@ -513,6 +529,8 @@ def shortcut_forcing_step(
     losses = {'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
     aux = {
         'flow_mse': flow_mse_unweighted,
+        'flow_mse_sequence': flow_mse_sequence,
+        'flow_mse_image': flow_mse_image,
         'bootstrap_mse': boot_mse_unweighted,
         'flow_mse_low': flow_mse_low,
         'flow_mse_mid': flow_mse_mid,

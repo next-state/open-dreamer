@@ -442,8 +442,6 @@ def build_optimizer(
             weight_decay=optimizer_cfg.weight_decay,
         )
     elif optimizer_cfg.optimizer_type == "muon":
-        import optax.contrib
-
         muon_schedule = lr_schedule
         adam_ratio = optimizer_cfg.adam_lr_ratio
         if optimizer_cfg.mup_scaling:

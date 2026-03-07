@@ -114,6 +114,7 @@ def train_step(
             rng=step_key,
             k_max=k_max,
             B_self=B_self,
+            B_img_emp=B_img_emp,
             context_length=context_length, # Builds sliding window attention
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
@@ -303,6 +304,8 @@ def run(cfg: DynamicsConfig):
                         step,
                         metrics={
                             "flow_mse": metrics_cpu["flow_mse"],
+                            "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
+                            "flow_mse_image": metrics_cpu["flow_mse_image"],
                             "boot_mse": metrics_cpu["bootstrap_mse"],
                             "grad_norm": metrics_cpu["grad_norm"],
                             "flow_mse_low": metrics_cpu["flow_mse_low"],
