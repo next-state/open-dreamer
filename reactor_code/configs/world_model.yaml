@@ -1,4 +1,4 @@
-dynamics_ckpt: ???
+dynamics_ckpt: /root/dreamer4-jax-private/logs/dynamics-time-layer-start-bigg-ish/checkpoints
 
 num_prefill_frames: 4
 num_steps: 4
