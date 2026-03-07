@@ -1,7 +1,7 @@
 {
     "reactor-runtime": "1.4",
-    "class": "reactor_code.reactor_minerl_hybrid:MineRLHybridVideoModel",
-    "model_name": "minerl-hybrid",
+    "class": "reactor_code.world_model:WorldModelVideoModel",
+    "model_name": "world-model",
     "model_version": "1.0.0",
     "args": {},
     "weights": []
