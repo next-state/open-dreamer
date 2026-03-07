@@ -386,10 +386,7 @@ class WorldModelVideoModel(VideoModel):
             # Build DatasetConfig: data-loading fields from yaml, stats/dims from checkpoint.
             logger.info("Building dataset iterator for prefill")
             dataset_section = self.cfg.dataset or OmegaConf.create({})
-            dataset_dict = OmegaConf.to_container(
-                OmegaConf.merge(OmegaConf.structured(DatasetConfig), dataset_section),
-                resolve=True,
-            )
+            dataset_dict = OmegaConf.to_container(dataset_section, resolve=True)
             self.dataset_cfg: DatasetConfig = from_dict(DatasetConfig, dataset_dict)
             self.dataset_cfg.num_binary_actions = self.dynamics_cfg.num_binary_actions
             self.dataset_cfg.categorical_action_dim = self.dynamics_cfg.categorical_action_dim
