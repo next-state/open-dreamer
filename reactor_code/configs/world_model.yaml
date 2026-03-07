@@ -1,7 +1,3 @@
-defaults:
-  - dataset: minecraft_vpt_latent
-  - _self_
-
 dynamics_ckpt: ???
 
 # Number of ground-truth frames from dataset used to initialize KV caches
@@ -15,9 +11,3 @@ tau_ctx_target: 0.9
 fps: 20
 height: 360
 width: 640
-
-dataset:
-  dataloader_cfg:
-    B: 4
-    short_T: 32
-    long_T: 32
