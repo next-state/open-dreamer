@@ -28,11 +28,12 @@ from reactor_runtime.model_api import model
 
 from dreamer.actions import Actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES, mouse_movement_to_categorical
 from dreamer.checkpointing import DynamicsCheckpointBundle, HeadsCheckpointBundle
+from dreamer.configs import DatasetConfig
 from dreamer.data import make_iterator
+from dreamer.utils import from_dict, normalize_latents
 from dreamer.generation import DenoiseSchedule, next_frame
 from dreamer.models import PolicyHeadMTP, TaskEmbedder
 from dreamer.parallel import build_parallel
-from dreamer.utils import normalize_latents
 
 
 logging.basicConfig(
@@ -379,9 +380,19 @@ class WorldModelVideoModel(VideoModel):
                 dtype=self.tokenizer_cfg.decoder.dtype,
             )
 
-            # Dataset config is stored in the dynamics checkpoint — no need to duplicate it.
+            # Build DatasetConfig: data-loading fields from yaml, stats/dims from checkpoint.
             logger.info("Building dataset iterator for prefill")
-            self.dataset_cfg = self.dynamics_cfg.dataset  # type: ignore[attr-defined]
+            dataset_section = config.get("dataset", OmegaConf.create({}))
+            dataset_dict = OmegaConf.to_container(
+                OmegaConf.merge(OmegaConf.structured(DatasetConfig), dataset_section),
+                resolve=True,
+            )
+            self.dataset_cfg: DatasetConfig = from_dict(DatasetConfig, dataset_dict)
+            self.dataset_cfg.num_binary_actions = self.dynamics_cfg.num_binary_actions
+            self.dataset_cfg.categorical_action_dim = self.dynamics_cfg.categorical_action_dim
+            self.dataset_cfg.continuous_action_dim = self.dynamics_cfg.continuous_action_dim
+            self.dataset_cfg.latent_mean = self.dynamics_cfg.latent_mean
+            self.dataset_cfg.latent_std = self.dynamics_cfg.latent_std
             self.use_latent_data = self.dataset_cfg.data_type == "latent"
             self.data_iterator = make_iterator(self.dataset_cfg, device=data_sharding)
             logger.info("Dataset iterator ready (data_type=%s)", self.dataset_cfg.data_type)

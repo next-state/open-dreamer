@@ -1,13 +1,27 @@
 dynamics_ckpt: ???
 
-# Number of ground-truth frames from dataset used to initialize KV caches
 num_prefill_frames: 4
-
-# Denoising schedule
 num_steps: 4
 tau_ctx_target: 0.9
 
-# Video output
 fps: 20
 height: 360
 width: 640
+
+dataset:
+  name: minecraft_vpt
+  data_type: video
+  array_record_path: /home/data/arrayrecords-mp4
+  index_max: 500
+  H: 360
+  W: 640
+  C: 3
+  padding_H: [4, 4]
+  padding_W: [0, 0]
+  patch_size: 16
+  dataset_mean: [0.2241, 0.2348, 0.2086]
+  dataset_std: [0.1809, 0.1874, 0.2282]
+  dataloader_cfg:
+    B: 1
+    short_T: 32
+    long_T: 32
