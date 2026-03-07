@@ -255,7 +255,8 @@ class WorldModelVideoModel(VideoModel):
     def reprefill(self):
         logger.info("Reprefilling from dataset...")
         self._reset_caches()
-        batch = self._load_prefill_batch()
+        data_iterator = make_iterator(self.dataset_cfg, device=self.data_sharding)
+        batch = next(iter(data_iterator))
         self._prefill_from_batch(batch, emit=True)
         logger.info("Reprefill complete")
 
@@ -384,7 +385,8 @@ class WorldModelVideoModel(VideoModel):
             )
 
             # Build DatasetConfig: data-loading fields from yaml, stats/dims from checkpoint.
-            logger.info("Building dataset iterator for prefill")
+            # The iterator is created lazily in start_session to avoid holding worker
+            # processes between sessions
             dataset_section = self.cfg.dataset or OmegaConf.create({})
             dataset_dict = OmegaConf.to_container(dataset_section, resolve=True)
             self.dataset_cfg: DatasetConfig = from_dict(DatasetConfig, dataset_dict)
@@ -394,8 +396,7 @@ class WorldModelVideoModel(VideoModel):
             self.dataset_cfg.latent_mean = self.dynamics_cfg.latent_mean
             self.dataset_cfg.latent_std = self.dynamics_cfg.latent_std
             self.use_latent_data = self.dataset_cfg.data_type == "latent"
-            self.data_iterator = make_iterator(self.dataset_cfg, device=data_sharding)
-            logger.info("Dataset iterator ready (data_type=%s)", self.dataset_cfg.data_type)
+            self.data_sharding = data_sharding
 
         self.dynamics_cache = None
         self.tokenizer_cache = None
@@ -457,9 +458,6 @@ class WorldModelVideoModel(VideoModel):
                 return cropped
         return cv2.resize(frame, (self.model_width, self.model_height))
 
-    def _load_prefill_batch(self):
-        return next(iter(self.data_iterator))
-
     def _prefill_from_batch(self, batch, emit: bool = True):
         """Prefill KV caches from the first sequence in a dataset batch."""
         noop_action = create_noop_wm_action(with_time_dim=True)
@@ -510,7 +508,8 @@ class WorldModelVideoModel(VideoModel):
         self._reset_caches()
 
         logger.info("Loading prefill batch from dataset...")
-        batch = self._load_prefill_batch()
+        data_iterator = make_iterator(self.dataset_cfg, device=self.data_sharding)
+        batch = next(iter(data_iterator))
         logger.info("Prefilling %d frames...", self.cfg.num_prefill_frames)
         self._prefill_from_batch(batch, emit=True)
         logger.info("Prefill complete")
