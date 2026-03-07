@@ -378,7 +378,7 @@ class WorldModelVideoModel(VideoModel):
                 n_agent=n_agent,
                 dtype=self.dynamics_cfg.dtype,
             )
-            self.initial_tokenizer_cache = self.tokenizer.create_static_caches(
+            _, self.initial_tokenizer_cache = self.tokenizer.create_static_caches(
                 batch_size=1,
                 window_size=self.window_size,
                 dtype=self.tokenizer_cfg.decoder.dtype,
