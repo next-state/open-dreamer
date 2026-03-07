@@ -276,7 +276,7 @@ def run(cfg: TokenizerConfig):
                     log_gradients=cfg.logger.log_gradients,
                     tokenizer_loss_type=cfg.tokenizer_loss_type,
                     mae_p_max=current_mae_p_max,
-                    freeze_encoder=cfg.freeze_encoder,
+                    freeze_encoder=cfg.mae_finetune,
                 )
 
                 if logger.should_log(step):
@@ -317,7 +317,7 @@ def run(cfg: TokenizerConfig):
             scaling.finalize()
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="tokenizer_finetune")
+@hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
 def main(cfg: TokenizerConfig):
     run(cfg)
 

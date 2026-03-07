@@ -68,6 +68,7 @@ tokenizer:
     dataset_mean: ${dataset.dataset_mean}
     dataset_std: ${dataset.dataset_std}
 
+mae_finetune: false
 max_steps: 300_000
 tokenizer_loss_type: mse  # mse | mae
 
