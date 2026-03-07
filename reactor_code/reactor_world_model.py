@@ -68,6 +68,9 @@ class WorldModelConfig:
     height: int = 360
     width: int = 640
 
+    # Dataset config (passed through to make_iterator; not validated by this struct)
+    dataset: Any = None
+
 
 def input_to_wm_action(
     controller_state: Dict[str, Any], mouse_state: Dict[str, Any], with_time_dim: bool
@@ -272,7 +275,7 @@ class WorldModelVideoModel(VideoModel):
         super().__init__()
 
         self.cfg = OmegaConf.structured(WorldModelConfig)
-        self.cfg = OmegaConf.merge(self.cfg, {k: v for k, v in config.items() if k != "dataset"})
+        self.cfg = OmegaConf.merge(self.cfg, config)
 
         self.fps = self.cfg.fps
         self.size = (self.cfg.height, self.cfg.width)
@@ -382,7 +385,7 @@ class WorldModelVideoModel(VideoModel):
 
             # Build DatasetConfig: data-loading fields from yaml, stats/dims from checkpoint.
             logger.info("Building dataset iterator for prefill")
-            dataset_section = config.get("dataset", OmegaConf.create({}))
+            dataset_section = self.cfg.dataset or OmegaConf.create({})
             dataset_dict = OmegaConf.to_container(
                 OmegaConf.merge(OmegaConf.structured(DatasetConfig), dataset_section),
                 resolve=True,
