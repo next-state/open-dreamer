@@ -199,22 +199,25 @@ def create_noop_wm_action(with_time_dim: bool) -> Actions:
 
 
 def create_update_caches_fn(tokenizer, dynamics, schedule: DenoiseSchedule, task_embedding):
-    """Update dynamics/tokenizer caches from a real observed frame and action."""
+    """Update encoder/dynamics/decoder caches from a real observed frame and action."""
     emax = schedule.emax
     k_max = schedule.k_max
 
     def update_caches(
         frame: jax.Array,  # (1, 1, H, W, C)
         action: Actions,   # (1, 1, ...)
+        encoder_cache,
         dynamics_cache,
-        tokenizer_cache,
+        decoder_cache,
         rng: jax.Array,
     ):
         rng, enc_key = jax.random.split(rng)
 
-        latent, _ = tokenizer.encode(
+        latent, (_, _, encoder_cache_new) = tokenizer.encode(
             frame,
             deterministic=True,
+            caches=encoder_cache,
+            return_caches=True,
             rngs=nnx.Rngs(mae=enc_key),
         )  # (1, 1, n_latents, D_s)
 
@@ -234,14 +237,14 @@ def create_update_caches_fn(tokenizer, dynamics, schedule: DenoiseSchedule, task
             caches=dynamics_cache,
         )
 
-        _, tokenizer_cache_new = tokenizer.decode(
+        _, decoder_cache_new = tokenizer.decode(
             latent,
-            caches=tokenizer_cache,
+            caches=decoder_cache,
             deterministic=True,
             rngs=None,
         )
 
-        return h_new, dynamics_cache_new, tokenizer_cache_new, rng
+        return h_new, encoder_cache_new, dynamics_cache_new, decoder_cache_new, rng
 
     return update_caches
 
@@ -445,14 +448,15 @@ class MineRLHybridVideoModel(VideoModel):
                 n_agent=n_agent,
                 dtype=self.dynamics_cfg.dtype,
             )
-            self.initial_tokenizer_cache = self.tokenizer.create_static_caches(
+            self.initial_encoder_cache, self.initial_decoder_cache = self.tokenizer.create_static_caches(
                 batch_size=1,
                 window_size=self.window_size,
-                dtype=self.tokenizer_cfg.decoder.dtype,
+                dtype=self.tokenizer_cfg.encoder.dtype,
             )
 
+        self.encoder_cache = None
         self.dynamics_cache = None
-        self.tokenizer_cache = None
+        self.decoder_cache = None
         self.h_last = None
 
         self.framegen_mode = FrameGenMode.REALITY
@@ -465,8 +469,9 @@ class MineRLHybridVideoModel(VideoModel):
         logger.info("MineRL hybrid initialization complete")
 
     def _reset_caches(self):
+        self.encoder_cache = self.initial_encoder_cache
         self.dynamics_cache = self.initial_dynamics_cache
-        self.tokenizer_cache = self.initial_tokenizer_cache
+        self.decoder_cache = self.initial_decoder_cache
         self.h_last = None
 
     @staticmethod
@@ -525,11 +530,12 @@ class MineRLHybridVideoModel(VideoModel):
         frame_jax = jnp.asarray(frame_model)[None, None]
         noop_action = create_noop_wm_action(with_time_dim=True)
         self.rng, key = jax.random.split(self.rng)
-        self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = self.update_caches_compiled(
+        self.h_last, self.encoder_cache, self.dynamics_cache, self.decoder_cache, self.rng = self.update_caches_compiled(
             frame_jax,
             noop_action,
+            self.encoder_cache,
             self.dynamics_cache,
-            self.tokenizer_cache,
+            self.decoder_cache,
             key,
         )
 
@@ -561,7 +567,7 @@ class MineRLHybridVideoModel(VideoModel):
         self.next_frame_compiled(
             action=dummy_action,
             dynamics_cache=self.dynamics_cache,
-            tokenizer_cache=self.tokenizer_cache,
+            tokenizer_cache=self.decoder_cache,
             rng=compile_key,
             task_embedding=self.task_embedding,
         )
@@ -608,18 +614,19 @@ class MineRLHybridVideoModel(VideoModel):
 
                     frame_jax = jnp.asarray(self._to_model_frame(frame))[None, None]
                     wm_action_with_time = self._current_wm_action(with_time_dim=True)
-                    self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = self.update_caches_compiled(
+                    self.h_last, self.encoder_cache, self.dynamics_cache, self.decoder_cache, self.rng = self.update_caches_compiled(
                         frame_jax,
                         wm_action_with_time,
+                        self.encoder_cache,
                         self.dynamics_cache,
-                        self.tokenizer_cache,
+                        self.decoder_cache,
                         key,
                     )
                 else:
-                    frame_jax, self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = self.next_frame_compiled(
+                    frame_jax, self.h_last, self.dynamics_cache, self.decoder_cache, self.rng = self.next_frame_compiled(
                         action=wm_action_no_time,
                         dynamics_cache=self.dynamics_cache,
-                        tokenizer_cache=self.tokenizer_cache,
+                        tokenizer_cache=self.decoder_cache,
                         rng=key,
                         task_embedding=self.task_embedding,
                     )
@@ -642,8 +649,9 @@ class MineRLHybridVideoModel(VideoModel):
             raise
         finally:
             self._running = False
+            self.encoder_cache = None
             self.dynamics_cache = None
-            self.tokenizer_cache = None
+            self.decoder_cache = None
             if self.env is not None:
                 self.env.close()
             logger.info("MineRL hybrid session ended")

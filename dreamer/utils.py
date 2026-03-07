@@ -99,6 +99,13 @@ class TokenLayout:
             idx += n
         return out
 
+    def segment_size(self, modality: Modality) -> int:
+        """Number of tokens for the requested modality."""
+        for current_modality, count in self.segments:
+            if current_modality == modality:
+                return count
+        raise ValueError(f"Modality {modality!r} not found in token layout: {self.segments!r}")
+
     def build_space_mask(self, mode: str):
         """
         Returns a (1, 1, S, S) boolean mask indicating allowed key for each query index, per mode.
