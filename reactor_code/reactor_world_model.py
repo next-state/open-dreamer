@@ -272,7 +272,7 @@ class WorldModelVideoModel(VideoModel):
         super().__init__()
 
         self.cfg = OmegaConf.structured(WorldModelConfig)
-        self.cfg = OmegaConf.merge(self.cfg, config)
+        self.cfg = OmegaConf.merge(self.cfg, {k: v for k, v in config.items() if k != "dataset"})
 
         self.fps = self.cfg.fps
         self.size = (self.cfg.height, self.cfg.width)
