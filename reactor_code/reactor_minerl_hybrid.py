@@ -246,7 +246,7 @@ def create_update_caches_fn(tokenizer, dynamics, schedule: DenoiseSchedule, task
     return update_caches
 
 
-@model(name="minerl_hybrid", config="configs/minerl_hybrid.yaml")
+# @model(name="minerl_hybrid", config="configs/minerl_hybrid.yaml")
 class MineRLHybridVideoModel(VideoModel):
     @command(
         "send_keyboard_state",

@@ -11,8 +11,8 @@ width: 640
 dataset:
   name: minecraft_vpt
   data_type: video
-  array_record_path: /home/data/arrayrecords-mp4
-  index_max: 500
+  array_record_path: /root/data
+  index_max: 1
   H: 360
   W: 640
   C: 3
