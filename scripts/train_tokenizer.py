@@ -260,7 +260,7 @@ def run(cfg: TokenizerConfig):
 
                 # Compute dynamic mae_p_max if finetuning
                 current_mae_p_max = None
-                if cfg.mae_finetune:
+                if cfg.mae_finetune_p_max_start != cfg.mae_finetune_p_max_end:
                     frac = min(step / max(cfg.max_steps - 1, 1), 1.0)
                     current_mae_p_max = jnp.array(
                         cfg.mae_finetune_p_max_start + (cfg.mae_finetune_p_max_end - cfg.mae_finetune_p_max_start) * frac
@@ -317,7 +317,7 @@ def run(cfg: TokenizerConfig):
             scaling.finalize()
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="tokenizer_finetune")
+@hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
 def main(cfg: TokenizerConfig):
     run(cfg)
 

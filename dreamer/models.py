@@ -839,7 +839,7 @@ class Encoder(nnx.Module):
 
         # Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
-        proj_tokens = self.bottleneck_proj(latent_tokens)
+        proj_tokens = nnx.tanh(self.bottleneck_proj(latent_tokens))
 
         # Always return unpacked: (B, T, n_latents, d_bottleneck)
         return proj_tokens, (frame_mask, keep_prob)
@@ -878,7 +878,7 @@ class Decoder(nnx.Module):
             mesh_rules=mesh_rules, rngs=rngs
         )
 
-        self.patch_query = nnx.Param(jax.random.normal(rngs.params(), (cfg.d_model,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
+        self.patch_queries = nnx.Param(jax.random.normal(rngs.params(), (self.n_patches, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
     def get_token_layout(self) -> TokenLayout:
         return TokenLayout((
@@ -900,8 +900,8 @@ class Decoder(nnx.Module):
         # Up-project latent bottleneck to d_model (per latent token)
         latents = self.up_proj(z)  # (B, T, N_l, D)
 
-        # Single shared mask token broadcast to all patch positions
-        patches = repeat(self.patch_query.value.astype(latents.dtype), "d -> b t n d", b=B, t=T, n=self.n_patches)
+        # Learned per-patch query tokens (owned by the decoder)
+        patches = repeat(self.patch_queries.value.astype(latents.dtype), " ... -> b t ...", b=B, t=T)  # (B, T, Np, D)
 
         # Concat: [latents, patch queries]  ->  (B, T, S=N_l+N_p, D)
         tokens = jnp.concatenate([latents, patches], axis=-2)
@@ -969,7 +969,7 @@ class Tokenizer(nnx.Module):
         # Learned tokens (embedding-like)
         excluded += self.encoder.latents_enc.value.size
         excluded += self.encoder.mask_and_replace.mask_token.value.size
-        excluded += self.decoder.patch_query.value.size
+        excluded += self.decoder.patch_queries.value.size
         # Per-layer scalars
         excluded += self.encoder.transformer.count_excluded_params()
         excluded += self.decoder.transformer.count_excluded_params()

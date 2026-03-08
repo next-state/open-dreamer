@@ -2341,6 +2341,16 @@ wheels = [
 ]
 
 [[package]]
+name = "ripgrep"
+version = "15.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1b/4c/9308d061c46f3ef1bfed45a0054f4b4fef27cbb15834ec6194152822ec5f/ripgrep-15.0.0.tar.gz", hash = "sha256:51ee063a756cb13cb0d72333e57b736e678a6a3c99c3feaa0669331382cf88ad", size = 488148, upload-time = "2025-10-20T08:44:37.879Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f6/ba/820becc3a88cca9baa6feaf6d616210481645f7c48101296b6602b4de839/ripgrep-15.0.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:ba377ff6f9fbc10e0ca0a0cc6cd19849380bdbd3cce6ca1c94c2e3fd24b9819c", size = 2026061, upload-time = "2025-10-20T08:44:34.447Z" },
+    { url = "https://files.pythonhosted.org/packages/72/59/95e261860ec2182b5c32022b65cf34de2757db6d4b0f5f14fc9699d31e1a/ripgrep-15.0.0-py3-none-manylinux_2_39_x86_64.whl", hash = "sha256:33b72e58758652ef22e8df95e8790874a114872f548b9cb0c65c8dba533e7d73", size = 7774889, upload-time = "2025-10-20T08:44:36.233Z" },
+]
+
+[[package]]
 name = "rsa"
 version = "4.7.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2636,6 +2646,7 @@ dependencies = [
     { name = "pandas" },
     { name = "procgen-mirror" },
     { name = "reactor-runtime" },
+    { name = "ripgrep" },
     { name = "tqdm" },
     { name = "tyro" },
     { name = "wandb" },
@@ -2665,6 +2676,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "procgen-mirror" },
     { name = "reactor-runtime", specifier = ">=0.0.4" },
+    { name = "ripgrep" },
     { name = "tqdm" },
     { name = "tyro", specifier = ">=1.0.0" },
     { name = "wandb" },
