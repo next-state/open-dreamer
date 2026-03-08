@@ -48,10 +48,14 @@ def build_checkpoint_manager(
         item_names=("model_state", "optimizer_state", "rngs", "meta"),
     ) -> ocp.CheckpointManager:
 
+    is_multihost = jax.process_count() > 1
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=ckpt_cfg.max_to_keep,
         save_interval_steps=ckpt_cfg.save_interval_steps,
         save_on_steps=[ckpt_cfg.max_steps - 1],  # always save at the end
+        single_host_load_and_broadcast=is_multihost,
+        enable_async_checkpointing=not is_multihost,
+        multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=0),
     )
 
     if ckpt_cfg.max_to_keep == 0:

@@ -5,6 +5,7 @@ import pickle
 import grain
 import jax
 from jax import numpy as jnp
+from jax.experimental import multihost_utils
 import numpy as np
 from grain._src.python.dataset import dataset as grain_dataset
 from grain.transforms import Batch
@@ -299,14 +300,24 @@ def device_put(
     """Adapt sharding to leaf rank by truncating the partition spec."""
     if not isinstance(device, jax.sharding.NamedSharding):
       return device
-    if not hasattr(leaf, 'ndim') or leaf.ndim >= len(device.spec):
+    if not hasattr(leaf, 'ndim'):
+      return None
+    if leaf.ndim >= len(device.spec):
       return device
     truncated = jax.sharding.PartitionSpec(*device.spec[:leaf.ndim])
     return jax.sharding.NamedSharding(device.mesh, truncated)
 
   def _transfer(x):
-    shardings = jax.tree.map(_make_sharding, x)
-    x = jax.device_put(x, shardings)
+    def _put_leaf(leaf):
+      sharding = _make_sharding(leaf)
+      if sharding is None:
+        return leaf
+      if isinstance(sharding, jax.sharding.NamedSharding) and not sharding.is_fully_addressable:
+        # Multi-host input path: convert process-local batches to global arrays.
+        return multihost_utils.host_local_array_to_global_array(leaf, sharding.mesh, sharding.spec)
+      return jax.device_put(leaf, sharding)
+
+    x = jax.tree.map(_put_leaf, x)
     if jax_dtype is not None:
       x = jax.tree.map(lambda a: a.astype(jax_dtype) if a is not None and jnp.issubdtype(a.dtype, jnp.floating) else a, x)
     return x
