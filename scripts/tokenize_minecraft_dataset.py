@@ -53,7 +53,7 @@ os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
 
 def make_tokenization_iterator(
     input_dir: str,
-    num_shards: int | None,
+    index_max: int | None,
     batch_size: int,
     num_workers: int,
     *,
@@ -66,8 +66,8 @@ def make_tokenization_iterator(
 ):
     """Create dataloader for tokenization (sequential, no shuffle, full episodes)."""
     all_shards = sorted(Path(input_dir).glob("shard-*.array_record"))
-    if num_shards is not None:
-        all_shards = all_shards[:num_shards]
+    if index_max is not None:
+        all_shards = all_shards[:index_max]
     shard_paths = [str(p) for p in all_shards]
 
     if not shard_paths:
@@ -247,6 +247,7 @@ def run(cfg: DictConfig):
     print(f"[tokenize] Loading tokenizer from: {cfg.tokenizer_ckpt}")
     print(f"[tokenize] Input directory: {cfg.dataset.array_record_path}")
     print(f"[tokenize] Output directory: {cfg.output_dir}")
+    dataloader_cfg = cfg.dataset.dataloader_cfg
 
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
@@ -267,9 +268,9 @@ def run(cfg: DictConfig):
         # Create dataloader
         base_dataloader = make_tokenization_iterator(
             input_dir=cfg.dataset.array_record_path,
-            num_shards=cfg.num_shards,
-            batch_size=cfg.batch_size,
-            num_workers=cfg.num_workers,
+            index_max=cfg.dataset.index_max,
+            batch_size=dataloader_cfg.B,
+            num_workers=dataloader_cfg.num_workers,
             image_h=cfg.dataset.H,
             image_w=cfg.dataset.W,
             image_c=cfg.dataset.C,
@@ -282,8 +283,8 @@ def run(cfg: DictConfig):
         prefetched = build_prefetch_pipeline(
             base_dataloader,
             sharding=data_sharding,
-            cpu_buffer_size=cfg.dataset.dataloader_cfg.prefetch_buffer_size,
-            device_buffer_size=cfg.dataset.dataloader_cfg.device_prefetch_buffer_size,
+            cpu_buffer_size=dataloader_cfg.prefetch_buffer_size,
+            device_buffer_size=dataloader_cfg.device_prefetch_buffer_size,
         )
 
         # Create async shard writer (disk I/O on background thread)
@@ -369,7 +370,7 @@ def run(cfg: DictConfig):
                 t_iter_start = time.perf_counter()
 
                 # Periodically save stats (every 100 batches)
-                if total_videos % (100 * cfg.batch_size) < cfg.batch_size:
+                if total_videos % (100 * dataloader_cfg.B) < dataloader_cfg.B:
                     np.savez(
                         stats_path,
                         mean=welford.mean.astype(np.float32),

@@ -15,7 +15,7 @@ from dreamer.configs import DynamicsConfig, OptimalTransportConfig
 from dreamer.data import make_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.actions import Actions, shift_actions
+from dreamer.actions import Actions, shift_actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import (
@@ -115,6 +115,7 @@ def train_step(
             rng=step_key,
             k_max=k_max,
             B_self=B_self,
+            B_img_emp=B_img_emp,
             context_length=context_length, # Builds sliding window attention
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
@@ -181,6 +182,8 @@ def run(cfg: DynamicsConfig):
 
         # Check if using latent data (pre-tokenized)
         use_latent_data = cfg.dataset.data_type == "latent"
+        assert cfg.dataset.num_binary_actions == NUM_BINARY_ACTIONS
+        assert cfg.dataset.categorical_action_dim == NUM_CAMERA_CLASSES
 
         # Load pretrained tokenizer (required for video data, optional for latent data checkpoints)
         tokenizer_bundle = TokenizerCheckpointBundle.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
@@ -303,6 +306,8 @@ def run(cfg: DynamicsConfig):
                         step,
                         metrics={
                             "flow_mse": metrics_cpu["flow_mse"],
+                            "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
+                            "flow_mse_image": metrics_cpu["flow_mse_image"],
                             "boot_mse": metrics_cpu["bootstrap_mse"],
                             "grad_norm": metrics_cpu["grad_norm"],
                             "flow_mse_low": metrics_cpu["flow_mse_low"],
