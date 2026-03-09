@@ -36,4 +36,4 @@ seed: 0
 # Hydra
 hydra:
   run:
-    dir: logs/${run_name}
+    dir: /mnt/data/logs/${run_name}
