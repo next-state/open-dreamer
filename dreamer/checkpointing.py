@@ -56,7 +56,7 @@ def build_checkpoint_manager(
         save_interval_steps=ckpt_cfg.save_interval_steps,
         save_on_steps=[ckpt_cfg.max_steps - 1],  # always save at the end
         single_host_load_and_broadcast=is_multihost,
-        enable_async_checkpointing=not is_multihost,
+        enable_async_checkpointing=True,
         multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=0),
     )
 
@@ -228,11 +228,6 @@ class CheckpointBundle:
         """
         if not checkpoint_manager.should_save(step):
             return
-
-        # Barrier: all hosts must enter save() together. Without this,
-        # async JAX dispatch can leave hosts at different points, causing
-        # the collective save to deadlock.
-        multihost_utils.sync_global_devices(f"pre_checkpoint_{step}")
 
         # Build save args dynamically by introspecting bundle fields
         save_kwargs, meta = {}, {}
