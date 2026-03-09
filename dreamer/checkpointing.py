@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import ClassVar, Self
 
 import jax
+import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
+from jax.experimental import multihost_utils
 from omegaconf import OmegaConf
 
 from dreamer.configs import (
@@ -82,6 +84,17 @@ class CheckpointBundle:
 
     _model_registry: ClassVar[dict[str, tuple[type, type]]] = {}
 
+    @staticmethod
+    def _broadcast_from_primary(value, *, dtype):
+        """Broadcast scalar value from process 0 to all hosts."""
+        if jax.process_count() <= 1:
+            return value
+        payload = np.asarray(value, dtype=dtype)
+        if jax.process_index() != 0:
+            payload = np.zeros_like(payload)
+        out = multihost_utils.broadcast_one_to_all(payload)
+        return np.asarray(out).item()
+
     @classmethod
     def get_item_names(cls) -> tuple[str, ...]:
         """Get checkpoint item names for this bundle.
@@ -128,13 +141,28 @@ class CheckpointBundle:
         if rngs is None:
             rngs = nnx.Rngs(0)
         checkpoint_path = str(Path(checkpoint_path).resolve())
+        is_multihost = jax.process_count() > 1
 
         registry = cls._model_registry
         if model_names is not None:
             registry = {k: v for k, v in registry.items() if k in model_names}
 
-        with ocp.CheckpointManager(checkpoint_path) as checkpoint_manager:
-            step = checkpoint_manager.latest_step()
+        manager_options = ocp.CheckpointManagerOptions(
+            single_host_load_and_broadcast=is_multihost,
+            multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=0),
+        )
+        with ocp.CheckpointManager(checkpoint_path, options=manager_options) as checkpoint_manager:
+            if is_multihost:
+                step_on_primary = (
+                    checkpoint_manager.latest_step() if jax.process_index() == 0 else None
+                )
+                step = cls._broadcast_from_primary(
+                    -1 if step_on_primary is None else int(step_on_primary),
+                    dtype=np.int64,
+                )
+                step = None if step < 0 else int(step)
+            else:
+                step = checkpoint_manager.latest_step()
             if step is None:
                 raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
 
@@ -184,7 +212,17 @@ class CheckpointBundle:
         Returns:
             Tuple of (start_step, self, rng)
         """
-        step = checkpoint_manager.latest_step()
+        if jax.process_count() > 1:
+            step_on_primary = (
+                checkpoint_manager.latest_step() if jax.process_index() == 0 else None
+            )
+            step = self._broadcast_from_primary(
+                -1 if step_on_primary is None else int(step_on_primary),
+                dtype=np.int64,
+            )
+            step = None if step < 0 else int(step)
+        else:
+            step = checkpoint_manager.latest_step()
         if step is None:
             print("No checkpoint found, starting from scratch.")
             return 0, self, rng
@@ -224,7 +262,15 @@ class CheckpointBundle:
             step: Current training step
             rngs: Random number generator state
         """
-        if not checkpoint_manager.should_save(step):
+        if jax.process_count() > 1:
+            should_save = self._broadcast_from_primary(
+                checkpoint_manager.should_save(step) if jax.process_index() == 0 else False,
+                dtype=np.bool_,
+            )
+        else:
+            should_save = checkpoint_manager.should_save(step)
+
+        if not should_save:
             return
 
         # Build save args dynamically by introspecting bundle fields
@@ -241,7 +287,11 @@ class CheckpointBundle:
         save_kwargs["meta"] = ocp.args.JsonSave(meta)
 
         save_args = ocp.args.Composite(**save_kwargs)
-        checkpoint_manager.save(step, args=save_args)
+        checkpoint_manager.save(
+            step,
+            args=save_args,
+            force=(jax.process_count() > 1),
+        )
 
 @dataclass
 class TokenizerCheckpointBundle(CheckpointBundle):
