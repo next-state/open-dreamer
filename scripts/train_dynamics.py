@@ -298,29 +298,30 @@ def run(cfg: DynamicsConfig):
                 # EMA update
                 ema_update_step(bundle.dynamics, bundle.dynamics_ema, ema_decay=cfg.ema_decay)
 
-                # Logging
-                if is_main_process and logger.should_log(step):
+                # Logging — device_get on all hosts to stay in sync, only host 0 logs
+                if logger.should_log(step):
                     metrics_cpu = jax.device_get(metrics)
-                    scaling.on_step(step, metrics_cpu)
-                    logger.log(
-                        step,
-                        metrics={
-                            "flow_mse": metrics_cpu["flow_mse"],
-                            "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
-                            "flow_mse_image": metrics_cpu["flow_mse_image"],
-                            "boot_mse": metrics_cpu["bootstrap_mse"],
-                            "grad_norm": metrics_cpu["grad_norm"],
-                            "flow_mse_low": metrics_cpu["flow_mse_low"],
-                            "flow_mse_mid": metrics_cpu["flow_mse_mid"],
-                            "flow_mse_high": metrics_cpu["flow_mse_high"],
-                            "boot_target_norm": metrics_cpu["boot_target_norm"],
-                            "lr": lr_schedule(step),
-                            "T": T,
-                            **scaling.get_step_metrics(step),
-                        },
-                        pbar=pbar,
-                        pbar_filter=r"^(flow_mse|boot_mse|lr)$",
-                    )
+                    if is_main_process:
+                        scaling.on_step(step, metrics_cpu)
+                        logger.log(
+                            step,
+                            metrics={
+                                "flow_mse": metrics_cpu["flow_mse"],
+                                "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
+                                "flow_mse_image": metrics_cpu["flow_mse_image"],
+                                "boot_mse": metrics_cpu["bootstrap_mse"],
+                                "grad_norm": metrics_cpu["grad_norm"],
+                                "flow_mse_low": metrics_cpu["flow_mse_low"],
+                                "flow_mse_mid": metrics_cpu["flow_mse_mid"],
+                                "flow_mse_high": metrics_cpu["flow_mse_high"],
+                                "boot_target_norm": metrics_cpu["boot_target_norm"],
+                                "lr": lr_schedule(step),
+                                "T": T,
+                                **scaling.get_step_metrics(step),
+                            },
+                            pbar=pbar,
+                            pbar_filter=r"^(flow_mse|boot_mse|lr)$",
+                        )
 
                 # Checkpointing
                 bundle.maybe_save(checkpoint_manager, step, rng)

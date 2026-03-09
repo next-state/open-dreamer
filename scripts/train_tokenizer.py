@@ -162,7 +162,8 @@ def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger, mae_p_max=Non
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
-    grid = viz_step_jit(model, videos[:2,:256:256//4], mae_key=mae_key, drop_key=drop_key, mae_p_max=mae_p_max)
+    T = min(videos.shape[1],256)
+    grid = viz_step_jit(model, videos[:2,:T:T//4], mae_key=mae_key, drop_key=drop_key, mae_p_max=mae_p_max)
     grid = jax.device_get(grid)
 
     imageio.imwrite(vis_dir / f"step_{step:06d}.png", grid)

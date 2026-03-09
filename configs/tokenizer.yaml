@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt
   - _self_
 
-run_name: tokenizer-asymmetric
+run_name: tokenizer-asymmetric-small-normal-latent-space
 
 dataset:
   dataloader_cfg:

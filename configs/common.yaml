@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 run_name: ???
-use_wandb: True
+use_wandb: true
 dataset: ???
 scaling_tokens_per_param: 0.0
 scaling_flops_budget: 0.0
@@ -25,7 +25,7 @@ logger:
 
 # Precision
 dtype: bfloat16
-param_dtype: float32
+param_dtype: bfloat16
 
 # Parallel
 parallel_strategy: data  # data | fsdp | tp | sp
