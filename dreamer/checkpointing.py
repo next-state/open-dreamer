@@ -33,6 +33,8 @@ from dreamer.models import (
 )
 from dreamer.training import RMSLossNormalizer
 from dreamer.parallel import MeshRules
+from jax.experimental import multihost_utils
+
 from dreamer.utils import from_dict
 
 
@@ -226,6 +228,11 @@ class CheckpointBundle:
         """
         if not checkpoint_manager.should_save(step):
             return
+
+        # Barrier: all hosts must enter save() together. Without this,
+        # async JAX dispatch can leave hosts at different points, causing
+        # the collective save to deadlock.
+        multihost_utils.sync_global_devices(f"pre_checkpoint_{step}")
 
         # Build save args dynamically by introspecting bundle fields
         save_kwargs, meta = {}, {}
