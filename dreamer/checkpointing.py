@@ -257,20 +257,16 @@ class CheckpointBundle:
     ) -> None:
         """Save checkpoint if checkpoint_manager.should_save(step).
 
+        All hosts must call this on every step so orbax's internal multi-host
+        synchronization stays consistent.  We rely on orbax to coordinate
+        which host actually writes to disk (via ``primary_host``).
+
         Args:
             checkpoint_manager: Checkpoint manager
             step: Current training step
             rngs: Random number generator state
         """
-        if jax.process_count() > 1:
-            should_save = self._broadcast_from_primary(
-                checkpoint_manager.should_save(step) if jax.process_index() == 0 else False,
-                dtype=np.bool_,
-            )
-        else:
-            should_save = checkpoint_manager.should_save(step)
-
-        if not should_save:
+        if not checkpoint_manager.should_save(step):
             return
 
         # Build save args dynamically by introspecting bundle fields
@@ -287,11 +283,7 @@ class CheckpointBundle:
         save_kwargs["meta"] = ocp.args.JsonSave(meta)
 
         save_args = ocp.args.Composite(**save_kwargs)
-        checkpoint_manager.save(
-            step,
-            args=save_args,
-            force=(jax.process_count() > 1),
-        )
+        checkpoint_manager.save(step, args=save_args)
 
 @dataclass
 class TokenizerCheckpointBundle(CheckpointBundle):
