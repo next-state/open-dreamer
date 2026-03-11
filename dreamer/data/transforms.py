@@ -239,6 +239,8 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
         padding_w: tuple[int, int] = (0, 0),
         patch_size: int | None = None,
         full_episode: bool = False,
+        decoder_threads: int = 1,
+        cast_to_float32: bool = True,
     ):
         """Initialize Minecraft VPT processor.
 
@@ -251,11 +253,15 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             padding_w: Padding for width (left, right)
             patch_size: Patch size for padding validation (required if padding used)
             full_episode: If True, return full episode without slicing (for tokenization)
+            decoder_threads: Number of decoding threads per worker process
+            cast_to_float32: Whether to cast decoded video to float32
         """
         self.seq_len = seq_len
         self.padding_h = tuple(padding_h) if isinstance(padding_h, list) else padding_h
         self.padding_w = tuple(padding_w) if isinstance(padding_w, list) else padding_w
         self.full_episode = full_episode
+        self.decoder_threads = max(1, int(decoder_threads))
+        self.cast_to_float32 = bool(cast_to_float32)
 
         # Validate padding alignment with patch_size
         if patch_size is not None:
@@ -278,7 +284,9 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
 
         # Decode MP4 bytes using decord
         mp4_bytes = io.BytesIO(data["video"])
-        vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(0), num_threads=1)
+        vr = decord.VideoReader(
+            mp4_bytes, ctx=decord.cpu(0), num_threads=self.decoder_threads
+        )
 
         episode_len = len(vr)
 
@@ -292,8 +300,10 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             video = vr.get_batch(frame_indices).asnumpy()
             actions = Actions(binary=None, categorical=None, continuous=None) # TODO: might be better to pass None at this point, but i'm keeping it in not to break any backward compatibility
 
-        # Keep as float32 in [0, 255] range (consistent with CoinRun)
-        video = video.astype(np.float32)
+        # For tokenization pipelines, keeping uint8 here dramatically reduces
+        # multiprocessing/shared-memory pressure; cast later on-device.
+        if self.cast_to_float32:
+            video = video.astype(np.float32, copy=False)
 
         # Apply padding
         video = np.pad(

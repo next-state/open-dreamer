@@ -186,10 +186,10 @@ def run(cfg: TokenizerConfig):
     )
 
     # Parallelism
-    mesh, data_sharding, mesh_rules = build_parallel("data") # simple data parallel, if you finetune on longer sequences comment this line and uncomment the three below
-    # mesh = jax.make_mesh((2, jax.local_device_count()//2), ('data', 'seq'))
-    # data_sharding = NamedSharding(mesh, P('data', 'seq', None, None, None))
-    # mesh_rules = MeshRules(data='data', seq='seq')
+    # mesh, data_sharding, mesh_rules = build_parallel("data") # simple data parallel, if you finetune on longer sequences comment this line and uncomment the three below
+    mesh = jax.make_mesh((2, jax.local_device_count()//2), ('data', 'seq'))
+    data_sharding = NamedSharding(mesh, P('data', 'seq', None, None, None))
+    mesh_rules = MeshRules(data='data', seq='seq')
     
 
     with logger, jax.set_mesh(mesh):
@@ -318,7 +318,7 @@ def run(cfg: TokenizerConfig):
             scaling.finalize()
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
+@hydra.main(version_base=None, config_path="../configs", config_name="tokenizer_finetune")
 def main(cfg: TokenizerConfig):
     run(cfg)
 
