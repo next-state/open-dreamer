@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import DynamicsConfig, OptimalTransportConfig
-from dreamer.data import make_dual_iterator
+from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, shift_actions
@@ -55,7 +55,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
+    static_argnames=("k_max", "B_img", "T", "n_splits", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -70,6 +70,7 @@ def train_step(
     step: int,
     B_img: int,               # Number of samples to treat as images
     T: int,
+    n_splits: int,            # Number of block-causal chunks (1 = full causal, >1 = split into independent chunks)
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
     bootstrap_fraction: float,
@@ -96,7 +97,13 @@ def train_step(
 
     # Build time mask for full batch
     mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
-    mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))  # causal tokens
+    # Block-causal mask: n_splits independent causal chunks
+    chunk_size = T // n_splits
+    row_idx = jnp.arange(T)
+    col_idx = jnp.arange(T)
+    same_chunk = (row_idx[:, None] // chunk_size) == (col_idx[None, :] // chunk_size)
+    causal = row_idx[:, None] >= col_idx[None, :]
+    mask_vid = (same_chunk & causal)                         # block-causal tokens
     time_mask = jnp.where(
         is_img[:, None, None, None],
         mask_img[None, None, :, :],
@@ -198,7 +205,7 @@ def run(cfg: DynamicsConfig):
         n_spatial = n_latents // cfg.dynamics.packing_factor
         dl_cfg = cfg.dataset.dataloader_cfg
         B = dl_cfg.B
-        avg_T = int(dl_cfg.long_ratio * dl_cfg.long_T + (1 - dl_cfg.long_ratio) * dl_cfg.short_T)
+        avg_T = dl_cfg.long_T
 
         # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
         dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
@@ -238,7 +245,7 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        dataloader = make_dual_iterator(cfg.dataset, device=data_sharding)
+        dataloader = make_iterator(cfg.dataset, device=data_sharding, seq_len=dl_cfg.long_T)
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
@@ -250,7 +257,10 @@ def run(cfg: DynamicsConfig):
                 if step >= cfg.max_steps:
                     break
 
-                rng, master_key = jax.random.split(rng, num=2)
+                rng, master_key, split_key = jax.random.split(rng, num=3)
+
+                use_long = bool(jax.random.bernoulli(split_key, p=dl_cfg.long_ratio)) or step % cfg.write_video_every == 0
+                n_splits = 1 if use_long else dl_cfg.long_T // dl_cfg.short_T
 
                 # Use pre-allocated batch
                 actions = batch["actions"]
@@ -283,6 +293,7 @@ def run(cfg: DynamicsConfig):
                     step=step,
                     B_img=int(B * cfg.image_fraction),
                     T=T,
+                    n_splits=n_splits,
                     k_max=cfg.dynamics.k_max,
                     context_length=cfg.dynamics.context_length,
                     bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
@@ -308,7 +319,7 @@ def run(cfg: DynamicsConfig):
                             "flow_mse_high": metrics_cpu["flow_mse_high"],
                             "boot_target_norm": metrics_cpu["boot_target_norm"],
                             "lr": lr_schedule(step),
-                            "T": T,
+                            "T": T // n_splits,
                             **scaling.get_step_metrics(step),
                         },
                         pbar=pbar,

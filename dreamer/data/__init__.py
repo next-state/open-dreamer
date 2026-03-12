@@ -5,7 +5,7 @@ and pre-tokenized latent datasets.
 """
 
 # Public API - core functions
-from .data import make_iterator, make_dual_iterator
+from .data import make_iterator
 
 # Transforms (for advanced usage)
 from .transforms import (
@@ -23,7 +23,6 @@ from . import path_utils
 __all__ = [
     # Core API
     "make_iterator",
-    "make_dual_iterator",
     # Transforms
     "EpisodeLengthFilter",
     "ProcessEpisodeAndSlice",
