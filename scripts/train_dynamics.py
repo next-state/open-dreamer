@@ -276,7 +276,7 @@ def run(cfg: DynamicsConfig):
 
                 # Validation/visualization — all hosts must participate in JAX
                 # compute (model is sharded), but only process 0 does I/O.
-                do_eval = ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1
+                do_eval = (cfg.write_video_every>0 and step>0 and (step % cfg.write_video_every == 0)) or step == cfg.max_steps - 1
                 if do_eval:
                     val_data = input_tensor[:4]
                     val_actions = actions[:4]
