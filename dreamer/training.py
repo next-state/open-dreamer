@@ -358,6 +358,7 @@ def shortcut_forcing_step(
     k_max: int,
     *,
     B_self: int = 0,
+    B_img_emp: int = 0,
     context_length: int | None = None,
     time_mask: jnp.ndarray | None = None,
     task_embeddings: jnp.ndarray | None = None,
@@ -377,6 +378,8 @@ def shortcut_forcing_step(
         rng: Random key
         k_max: Maximum noise resolution
         B_self: Number of bootstrap examples (last B_self rows of batch)
+        B_img_emp: Number of empirical rows treated as image-only (first rows in empirical slice).
+                  Used only to split flow MSE logging into image vs full-sequence subsets.
         context_length: optional context length for sliding window attention. If provided,
                        creates local_window_size=(context_length - 1, 0) for causal sliding window.
         task_embeddings: Optional (B, T, n_agent, d_model) agent tokens
@@ -453,6 +456,19 @@ def shortcut_forcing_step(
     z_pred_emp = z_pred_full[:B_emp]
     loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
 
+    # Split flow MSE by empirical sample type (image-only rows vs temporal sequence rows).
+    n_img_emp = min(max(B_img_emp, 0), B_emp)
+    n_seq_emp = B_emp - n_img_emp
+    if n_img_emp > 0:
+        flow_mse_image = jnp.mean(mse_per_step_emp[:n_img_emp])
+    else:
+        flow_mse_image = jnp.array(0.0, dtype=latents.dtype)
+
+    if n_seq_emp > 0:
+        flow_mse_sequence = jnp.mean(mse_per_step_emp[n_img_emp:])
+    else:
+        flow_mse_sequence = jnp.array(0.0, dtype=latents.dtype)
+
     # Per-σ-bin flow MSE: breaks down where failures occur on the noise schedule
     mask_low  = sigma_emp < 0.25
     mask_mid  = (sigma_emp >= 0.25) & (sigma_emp < 0.75)
@@ -513,6 +529,8 @@ def shortcut_forcing_step(
     losses = {'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
     aux = {
         'flow_mse': flow_mse_unweighted,
+        'flow_mse_sequence': flow_mse_sequence,
+        'flow_mse_image': flow_mse_image,
         'bootstrap_mse': boot_mse_unweighted,
         'flow_mse_low': flow_mse_low,
         'flow_mse_mid': flow_mse_mid,
@@ -962,40 +980,43 @@ def run_evaluation(
         }
 
     assert ground_truth_frames is not None
-    num_videos = min(4, ground_truth_frames.shape[0])
 
-    grid_columns = [
-        ground_truth_frames,
-        pred_columns["online_diffusion"],
-        pred_columns["ema_diffusion"],
-        pred_columns["online_shortcut"],
-        pred_columns["ema_shortcut"],
-    ]
-    stacked_frames = jnp.stack(grid_columns)[:, :num_videos]
-    videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
+    # Save video and log metrics (only on main process in multi-host)
+    if logger is not None:
+        num_videos = min(4, ground_truth_frames.shape[0])
 
-    tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
-    mp4_path = tag_dir / "rollouts_grid.mp4"
+        grid_columns = [
+            ground_truth_frames,
+            pred_columns["online_diffusion"],
+            pred_columns["ema_diffusion"],
+            pred_columns["online_shortcut"],
+            pred_columns["ema_shortcut"],
+        ]
+        stacked_frames = jnp.stack(grid_columns)[:, :num_videos]
+        videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
 
-    video_written = False
-    try:
-        videos = jax.device_get(videos)
-        iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
-        video_written = True
-    except Exception as e:
-        print(f"[eval] consolidated MP4 write failed: {e}")
+        tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+        mp4_path = tag_dir / "rollouts_grid.mp4"
 
-    metrics_payload: Dict[str, float] = {"horizon": float(horizon)}
-    for tag, _, _ in rollout_specs:
-        metrics_payload[f"{tag}/mse"] = rollout_metrics[tag]["mse"]
-        for n in psnr_windows:
-            metrics_payload[f"mse/{n}_step/{tag}"] = rollout_metrics[tag][f"mse_{n}"]
-            metrics_payload[f"psnr/{n}_step/{tag}"] = rollout_metrics[tag][f"psnr_{n}"]
-        metrics_payload[f"{tag}/eval_time"] = rollout_metrics[tag]["eval_time"]
-    logger.log_metrics(step, metrics_payload, prefix="eval/")
+        video_written = False
+        try:
+            videos = jax.device_get(videos)
+            iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
+            video_written = True
+        except Exception as e:
+            print(f"[eval] consolidated MP4 write failed: {e}")
 
-    if video_written:
-        logger.log_video(step, "eval/rollouts_grid/video", mp4_path)
+        metrics_payload: Dict[str, float] = {"horizon": float(horizon)}
+        for tag, _, _ in rollout_specs:
+            metrics_payload[f"{tag}/mse"] = rollout_metrics[tag]["mse"]
+            for n in psnr_windows:
+                metrics_payload[f"mse/{n}_step/{tag}"] = rollout_metrics[tag][f"mse_{n}"]
+                metrics_payload[f"psnr/{n}_step/{tag}"] = rollout_metrics[tag][f"psnr_{n}"]
+            metrics_payload[f"{tag}/eval_time"] = rollout_metrics[tag]["eval_time"]
+        logger.log_metrics(step, metrics_payload, prefix="eval/")
+
+        if video_written:
+            logger.log_video(step, "eval/rollouts_grid/video", mp4_path)
 
 
 # ---------------------------
@@ -1117,15 +1138,16 @@ def run_x0_visualization(
 
     img_array = np.array(pil_img)
 
-    log_prefix = f"{name}/" if name else ""
-    eval_prefix = f"{log_prefix}eval/"
+    if logger is not None:
+        log_prefix = f"{name}/" if name else ""
+        eval_prefix = f"{log_prefix}eval/"
 
-    # Save PNG
-    out_dir = _ensure_dir(vis_dir / f"step_{step:06d}" / log_prefix)
-    Image.fromarray(img_array).save(str(out_dir / "x0_vis.png"))
+        # Save PNG
+        out_dir = _ensure_dir(vis_dir / f"step_{step:06d}" / log_prefix)
+        Image.fromarray(img_array).save(str(out_dir / "x0_vis.png"))
 
-    # Log
-    logger.log_image(step, f"{eval_prefix}x0_vis", img_array, caption=f"step {step}")
+        # Log
+        logger.log_image(step, f"{eval_prefix}x0_vis", img_array, caption=f"step {step}")
 
 
 def run_attention_visualization(
@@ -1285,6 +1307,7 @@ def run_attention_visualization(
     plt.close(fig)
 
     # --- 7. Save and log ---
-    out_dir = _ensure_dir(vis_dir / f"step_{step:06d}" / log_prefix)
-    Image.fromarray(img_array).save(str(out_dir / "attn_vis.png"))
-    logger.log_image(step, f"{eval_prefix}attn_vis", img_array, caption=f"step {step}")
+    if logger is not None:
+        out_dir = _ensure_dir(vis_dir / f"step_{step:06d}" / log_prefix)
+        Image.fromarray(img_array).save(str(out_dir / "attn_vis.png"))
+        logger.log_image(step, f"{eval_prefix}attn_vis", img_array, caption=f"step {step}")

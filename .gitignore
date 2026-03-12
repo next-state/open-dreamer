@@ -232,3 +232,4 @@ datasets/
 migration/
 .claude/
 CLAUDE.md
+.hydra/

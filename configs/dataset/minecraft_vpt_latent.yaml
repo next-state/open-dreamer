@@ -3,11 +3,11 @@ defaults:
 
 name: minecraft_vpt_latent
 data_type: latent
-array_record_path: /mnt/data/tokenized_data_new
+array_record_path: /mnt/data/big_tokenized_data
 index_max: 20
 num_max_samples: -1
 
-num_binary_actions: 25
+num_binary_actions: 27
 categorical_action_dim: 121
 continuous_action_dim: 0
 

@@ -4,6 +4,7 @@ import logging
 import hydra
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 import numpy as np
 import optax
 from flax import nnx
@@ -14,7 +15,7 @@ from dreamer.configs import DynamicsConfig, OptimalTransportConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.actions import Actions, shift_actions
+from dreamer.actions import Actions, shift_actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES
 from dreamer.parallel import build_parallel
 from dreamer.scaling import ScalingContext
 from dreamer.training import (
@@ -121,6 +122,7 @@ def train_step(
             rng=step_key,
             k_max=k_max,
             B_self=B_self,
+            B_img_emp=B_img_emp,
             context_length=context_length, # Builds sliding window attention
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
@@ -170,15 +172,13 @@ def run(cfg: DynamicsConfig):
     # Setup
     run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
-    # Logging
-    logger = build_logger(
-        logger_cfg=cfg.logger,
-        config=OmegaConf.to_container(cfg, resolve=True),
-        dir=str(run_dir),
-    )
-
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
+    is_main_process = jax.process_index() == 0
+    is_multihost = jax.process_count() > 1
+
+    # Logging
+    logger = build_logger(logger_cfg=cfg.logger, config=OmegaConf.to_container(cfg, resolve=True), dir=str(run_dir))
 
     with logger, jax.set_mesh(mesh):
         key = jax.random.PRNGKey(cfg.seed)
@@ -189,6 +189,8 @@ def run(cfg: DynamicsConfig):
 
         # Check if using latent data (pre-tokenized)
         use_latent_data = cfg.dataset.data_type == "latent"
+        assert cfg.dataset.num_binary_actions == NUM_BINARY_ACTIONS
+        assert cfg.dataset.categorical_action_dim == NUM_CAMERA_CLASSES
 
         # Load pretrained tokenizer (required for video data, optional for latent data checkpoints)
         tokenizer_bundle = TokenizerCheckpointBundle.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
@@ -252,7 +254,7 @@ def run(cfg: DynamicsConfig):
             scaling.start_training()
 
 
-            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True)
+            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True, disable=not is_main_process)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
@@ -270,8 +272,10 @@ def run(cfg: DynamicsConfig):
 
                 actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
 
-                # Validation step before training (as input buffers might be donated)
-                if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
+                # Validation/visualization — all hosts must participate in JAX
+                # compute (model is sharded), but only process 0 does I/O.
+                do_eval = ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1
+                if do_eval:
                     val_data = input_tensor[:4]
                     val_actions = actions[:4]
                     run_evaluation(
@@ -281,7 +285,8 @@ def run(cfg: DynamicsConfig):
                         val_data=val_data,
                         val_actions=val_actions,
                         use_latent_data=use_latent_data,
-                        vis_dir=vis_dir, rng=rng, logger=logger,
+                        vis_dir=vis_dir, rng=rng,
+                        logger=logger if is_main_process else None,
                     )
 
                 # Training step
@@ -305,13 +310,15 @@ def run(cfg: DynamicsConfig):
                 ema_update_step(bundle.dynamics, bundle.dynamics_ema, ema_decay=cfg.ema_decay)
 
                 # Logging
-                if logger.should_log(step):
+                if is_main_process and logger.should_log(step):
                     metrics_cpu = jax.device_get(metrics)
                     scaling.on_step(step, metrics_cpu)
                     logger.log(
                         step,
                         metrics={
                             "flow_mse": metrics_cpu["flow_mse"],
+                            "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
+                            "flow_mse_image": metrics_cpu["flow_mse_image"],
                             "boot_mse": metrics_cpu["bootstrap_mse"],
                             "grad_norm": metrics_cpu["grad_norm"],
                             "flow_mse_low": metrics_cpu["flow_mse_low"],
@@ -329,7 +336,8 @@ def run(cfg: DynamicsConfig):
                 # Checkpointing
                 bundle.maybe_save(checkpoint_manager, step, rng)
 
-            scaling.finalize()
+            if is_main_process:
+                scaling.finalize()
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")

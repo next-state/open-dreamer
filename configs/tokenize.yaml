@@ -2,12 +2,9 @@ defaults:
   - dataset: minecraft_vpt
   - _self_
 
-tokenizer_ckpt: logs/tokenizer-asymmetric-repro        # Required: path to pretrained tokenizer checkpoint
-output_dir: /mnt/data/big_tokenized_data            # Required: output directory for latent shards
-batch_size: 8
-num_workers: 16
-records_per_shard: 1000
-num_shards: 500           # null = all shards
+tokenizer_ckpt: /mnt/data/logs/tokenizer-big/checkpoints       # Required: path to pretrained tokenizer checkpoint
+output_dir: /mnt/data/tokenized_data_last            # Required: output directory for latent shards
+records_per_shard: 5000
 seed: 0
 parallel_strategy: data
 
