@@ -5,6 +5,7 @@ defaults:
 tokenizer_ckpt: /mnt/data/logs/tokenizer-asymmetric-small-normal-latent-space/checkpoints       # Required: path to pretrained tokenizer checkpoint
 output_dir: minecraft-vpt/latents-final            # Required: output directory for latent shards
 records_per_shard: 5000
+start_shard_idx: 0
 seed: 0
 parallel_strategy: data
 

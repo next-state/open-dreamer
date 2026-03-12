@@ -5,7 +5,8 @@ name: minecraft_vpt
 data_type: video
 
 array_record_path: /home/dreamer/data/arrayrecords-mp4
-index_max: 500
+index_min: 0
+index_max: 1649
 num_max_samples: -1
 
 dataloader_cfg:

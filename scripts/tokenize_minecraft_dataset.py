@@ -5,18 +5,29 @@ Reads existing ArrayRecord shards containing MP4-encoded Minecraft VPT videos,
 decodes them, encodes them into latents using a pretrained tokenizer, and writes
 new ArrayRecord shards with latents (using msgpack serialization).
 
-3-stage async pipeline:
-  [Grain DataLoader] → [CPU Prefetch] → [Device Transfer + Prefetch] → [Main Loop] → [Async Writer]
+Pipeline per input shard:
+  [GCS Download] → [Grain DataLoader] → [CPU Prefetch] → [Device Transfer + Prefetch]
+                 → [Main Loop] → [Async Writer] → [GCS Upload]
+
+Input shards are downloaded one at a time to /tmp (with 1 shard pre-fetched ahead),
+processed, then deleted. Output shards are written locally to a staging dir and
+uploaded to GCS as soon as each output shard is finalized.
 
 Example usage:
     python scripts/tokenize_minecraft_dataset.py \
         tokenizer_ckpt=/path/to/tokenizer/ckpt \
-        output_dir=/home/ubuntu/minecraft-vpt/arrayrecords-latents
+        dataset.array_record_path=gs://bucket/arrayrecords-mp4 \
+        output_dir=gs://bucket/latents-out
 """
 import logging
 import os
 import pickle
 import queue
+import shutil
+import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Thread
 
@@ -27,15 +38,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from grain._src.python.dataset import dataset as grain_dataset
-from grain._src.python.dataset.transformations.prefetch import (
-    ThreadPrefetchIterDataset,
-)
 from omegaconf import DictConfig
 from tqdm import tqdm
 
 from dreamer.checkpointing import TokenizerCheckpointBundle
-from dreamer.data.data import DataLoaderIteratorWrapper
 from dreamer.data.shard_writer import ShardWriter
 from dreamer.data.transforms import ProcessMinecraftEpisodeAndSlice
 from dreamer.parallel import build_parallel
@@ -43,147 +49,155 @@ from dreamer.parallel import build_parallel
 decord.bridge.set_bridge("native")
 
 logging.getLogger("absl").setLevel(logging.WARNING)
-# os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
 
 
 # ==============================================================================
-# Data Loading
+# Shard listing
 # ==============================================================================
 
 
-def make_tokenization_iterator(
-    input_dir: str,
-    index_max: int | None,
-    batch_size: int,
-    num_workers: int,
-    *,
-    image_h: int,
-    image_w: int,
-    image_c: int,
-    padding_h: tuple[int, int],
-    padding_w: tuple[int, int],
-    patch_size: int,
-    worker_buffer_size: int = 1,
-    decoder_threads: int | None = None,
-    read_prefetch_buffer_size: int | None = None,
-    read_num_threads: int | None = None,
-    cast_to_float32: bool = False,
-    shm_safety_margin: float = 0.6,
-):
-    """Create dataloader for tokenization (sequential, no shuffle, full episodes)."""
-    all_shards = sorted(Path(input_dir).glob("shard-*.array_record"))
+def list_shards(input_dir: str, index_max: int | None, index_min: int = 0) -> list[str]:
+    """List shard paths from a local directory or GCS prefix."""
+    if input_dir.startswith("gs://"):
+        result = subprocess.run(
+            ["gsutil", "ls", f"{input_dir.rstrip('/')}/shard-*.array_record"],
+            capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+        )
+        all_shards = sorted(result.stdout.strip().splitlines())
+    else:
+        all_shards = sorted(str(p) for p in Path(input_dir).glob("shard-*.array_record"))
     if index_max is not None:
         all_shards = all_shards[:index_max]
-    shard_paths = [str(p) for p in all_shards]
-
-    if not shard_paths:
+    if index_min:
+        all_shards = all_shards[index_min:]
+    if not all_shards:
         raise ValueError(f"No shards found in {input_dir}")
+    return all_shards
 
-    print(f"[tokenize] Found {len(shard_paths)} shards")
 
-    source = grain.sources.ArrayRecordDataSource(shard_paths)
-    effective_num_workers = max(1, int(num_workers))
-    effective_worker_buffer_size = max(1, int(worker_buffer_size))
+# ==============================================================================
+# Download-ahead pipeline
+# ==============================================================================
 
-    auto_decoder_threads = decoder_threads is None
-    if decoder_threads is None:
-        host_cpus = os.cpu_count() or effective_num_workers
-        decoder_threads = max(1, min(4, host_cpus // max(1, effective_num_workers * 2)))
 
-    auto_read_threads = read_num_threads is None
-    if read_num_threads is None:
-        read_num_threads = max(1, min(8, effective_num_workers // 2))
-    if read_prefetch_buffer_size is None:
-        read_prefetch_buffer_size = read_num_threads
-    read_prefetch_buffer_size = max(1, int(read_prefetch_buffer_size))
+class DownloadAheadPipeline:
+    """Downloads GCS shards to local tmp ahead of processing.
 
-    estimated_batch_bytes = None
-    try:
-        sample = pickle.loads(source[0])
-        video_shape = sample.get("video_shape")
-        if isinstance(video_shape, (tuple, list)) and len(video_shape) == 4:
-            t, h, w, c = map(int, video_shape)
-            h += sum(padding_h)
-            w += sum(padding_w)
-            dtype_bytes = 4 if cast_to_float32 else 1
-            estimated_batch_bytes = batch_size * t * h * w * c * dtype_bytes
-    except Exception:
-        estimated_batch_bytes = None
+    Keeps `lookahead` shards pre-downloaded on disk. Deletes each shard
+    after the caller has finished with it (on iterator advance).
+    Works transparently for local paths too (yields path directly, no copy).
+    """
 
-    try:
-        shm_stats = os.statvfs("/dev/shm")
-        shm_free_bytes = shm_stats.f_bavail * shm_stats.f_frsize
-    except OSError:
-        shm_free_bytes = None
+    def __init__(self, shard_paths: list[str], tmp_dir: str, lookahead: int = 1):
+        self._paths = shard_paths
+        self._tmp_dir = Path(tmp_dir)
+        self._tmp_dir.mkdir(parents=True, exist_ok=True)
+        self._is_gcs = any(p.startswith("gs://") for p in shard_paths[:1])
+        # Queue holds (local_path, is_tmp) — is_tmp=True means we should delete after use
+        self._ready: queue.Queue = queue.Queue(maxsize=lookahead)
+        self._thread = Thread(target=self._download_loop, daemon=True)
+        self._thread.start()
 
-    if estimated_batch_bytes is not None and shm_free_bytes is not None:
-        max_workers_by_shm = int(
-            (shm_free_bytes * float(shm_safety_margin))
-            // max(1, estimated_batch_bytes * effective_worker_buffer_size)
-        )
-        max_workers_by_shm = max(1, max_workers_by_shm)
-        if max_workers_by_shm < effective_num_workers:
-            print(
-                f"[tokenize] Capping num_workers from {effective_num_workers} to "
-                f"{max_workers_by_shm} to stay within /dev/shm budget "
-                f"(free={shm_free_bytes / 1024**3:.1f} GiB, "
-                f"est_batch={estimated_batch_bytes / 1024**3:.2f} GiB, "
-                f"safety_margin={shm_safety_margin:.2f})"
-            )
-            effective_num_workers = max_workers_by_shm
-            if auto_decoder_threads:
-                host_cpus = os.cpu_count() or effective_num_workers
-                decoder_threads = max(
-                    1, min(4, host_cpus // max(1, effective_num_workers * 2))
+    def _download_one(self, gcs_path: str) -> str:
+        local = str(self._tmp_dir / Path(gcs_path).name)
+        for attempt in range(3):
+            try:
+                subprocess.run(
+                    ["gsutil", "-q", "cp", gcs_path, local],
+                    check=True, capture_output=True, stdin=subprocess.DEVNULL,
                 )
-            if auto_read_threads:
-                read_num_threads = max(1, min(8, effective_num_workers // 2))
+                return local
+            except subprocess.CalledProcessError:
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
 
-    sampler = grain.samplers.IndexSampler(
-        num_records=len(source),
-        shard_options=grain.sharding.NoSharding(),
-        shuffle=False,
-        num_epochs=1,
-    )
+    def _download_loop(self):
+        try:
+            for path in self._paths:
+                if self._is_gcs:
+                    local = self._download_one(path)
+                    self._ready.put((local, True))
+                else:
+                    self._ready.put((path, False))
+        except Exception as e:
+            self._ready.put((e, False))
+        finally:
+            self._ready.put((None, False))  # sentinel
 
-    operations = [
-        ProcessMinecraftEpisodeAndSlice(
-            seq_len=0,
-            image_h=image_h,
-            image_w=image_w,
-            image_c=image_c,
-            padding_h=padding_h,
-            padding_w=padding_w,
-            patch_size=patch_size,
-            full_episode=True,
-            decoder_threads=decoder_threads,
-            cast_to_float32=cast_to_float32,
-        ),
-        grain.transforms.Batch(batch_size=batch_size, drop_remainder=True),
-    ]
+    def __iter__(self):
+        while True:
+            local_path, is_tmp = self._ready.get()
+            if local_path is None:
+                break
+            if isinstance(local_path, Exception):
+                raise local_path
+            try:
+                yield local_path
+            finally:
+                if is_tmp:
+                    Path(local_path).unlink(missing_ok=True)
 
-    print(
-        "[tokenize] DataLoader config: "
-        f"workers={effective_num_workers}, "
-        f"worker_buffer_size={effective_worker_buffer_size}, "
-        f"decoder_threads={decoder_threads}, "
-        f"read_threads={read_num_threads}, "
-        f"read_prefetch={read_prefetch_buffer_size}, "
-        f"cast_to_float32={cast_to_float32}"
-    )
 
-    return grain.DataLoader(
-        data_source=source,
-        sampler=sampler,
-        operations=operations,
-        worker_count=effective_num_workers,
-        worker_buffer_size=effective_worker_buffer_size,
-        read_options=grain.ReadOptions(
-            prefetch_buffer_size=read_prefetch_buffer_size,
-            num_threads=max(1, int(read_num_threads)),
-        ),
-    )
+# ==============================================================================
+# Async GCS uploader
+# ==============================================================================
+
+
+class AsyncGCSUploader:
+    """Uploads local shard files to GCS in a background thread, deletes after success."""
+
+    def __init__(self, gcs_dir: str):
+        self._gcs_dir = gcs_dir.rstrip("/")
+        self._queue: queue.Queue = queue.Queue()
+        self._errors: list[str] = []
+        self._thread = Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _upload_one(self, local_path: str):
+        gcs_path = f"{self._gcs_dir}/{Path(local_path).name}"
+        for attempt in range(3):
+            try:
+                subprocess.run(
+                    ["gsutil", "-q", "-o", "GSUtil:parallel_composite_upload_threshold=100M",
+                     "cp", local_path, gcs_path],
+                    check=True, capture_output=True, stdin=subprocess.DEVNULL,
+                )
+                size_mb = Path(local_path).stat().st_size / 1024**2
+                Path(local_path).unlink(missing_ok=True)
+                print(f"[tokenize] Uploaded {Path(local_path).name} ({size_mb:.0f} MB) → {self._gcs_dir}")
+                return
+            except subprocess.CalledProcessError as e:
+                if attempt == 2:
+                    self._errors.append(f"Failed to upload {local_path}: {e.stderr.decode()[:200]}")
+                    return
+                time.sleep(2 ** attempt)
+
+    def _loop(self):
+        for item in iter(self._queue.get, None):
+            if isinstance(item, threading.Event):
+                item.set()
+            else:
+                self._upload_one(item)
+
+    def upload(self, local_path: str):
+        self._queue.put(local_path)
+
+    def flush(self):
+        """Block until all currently queued uploads are complete."""
+        event = threading.Event()
+        self._queue.put(event)
+        event.wait()
+        if self._errors:
+            raise RuntimeError(f"Upload errors: {self._errors}")
+
+    def close(self):
+        self.flush()
+        self._queue.put(None)
+        self._thread.join()
+        if self._errors:
+            raise RuntimeError(f"Upload errors: {self._errors}")
 
 
 # ==============================================================================
@@ -198,19 +212,33 @@ class AsyncShardWriter:
         self,
         output_dir: Path | str,
         records_per_shard: int = 5000,
-        maxsize: int = 100,
+        maxsize: int = 200,
+        start_shard_idx: int = 0,
     ):
-        self._writer = ShardWriter(output_dir, records_per_shard)
+        self._writer = ShardWriter(output_dir, records_per_shard, start_shard_idx=start_shard_idx)
         self._queue: queue.Queue = queue.Queue(maxsize=maxsize)
         self._thread = Thread(target=self._writer_loop, daemon=True)
         self._thread.start()
 
     def _writer_loop(self):
         for item in iter(self._queue.get, None):
-            self._writer.write(item)
+            if isinstance(item, threading.Event):
+                item.set()
+            else:
+                self._writer.write(item)
 
     def write(self, record: dict):
         self._queue.put(record)
+
+    def sync(self):
+        """Block until all queued writes have been processed by the background thread."""
+        event = threading.Event()
+        self._queue.put(event)
+        event.wait()
+
+    def drain_completed(self) -> list[str]:
+        """Return completed (fully closed) shard file paths. Call after sync()."""
+        return self._writer.drain_completed()
 
     def close(self):
         self._queue.put(None)
@@ -227,60 +255,92 @@ class AsyncShardWriter:
 
 
 # ==============================================================================
-# Device-sharded prefetch pipeline
+# Pre-decode pipeline (thread-pool, no /dev/shm)
 # ==============================================================================
 
 
-def build_prefetch_pipeline(
-    dataloader,
-    sharding: jax.sharding.NamedSharding,
-    cpu_buffer_size: int = 10,
-    device_buffer_size: int = 2,
-):
-    """Build a 2-stage async prefetch pipeline: CPU buffer → device transfer + device buffer.
+def predecode_shard(
+    local_path: str,
+    transform: ProcessMinecraftEpisodeAndSlice,
+    num_threads: int,
+) -> list[dict]:
+    """Pre-decode all episodes in a local ArrayRecord shard using a thread pool.
 
-    Returns an iterable that yields batches with 'videos' already on device as sharded JAX arrays,
-    plus '_pad_size' and '_batch_size' metadata.
+    Uses threads (not processes) so there is no /dev/shm constraint. decord releases
+    the GIL during MP4 decoding, enabling true parallelism across threads.
+    Returns a list of decoded episode dicts, all in regular RAM.
+    """
+    source = grain.sources.ArrayRecordDataSource([local_path])
+    n = len(source)
+
+    # Read raw bytes sequentially (fast, ArrayRecord is optimised for sequential I/O)
+    raw_records = [source[i] for i in range(n)]
+
+    dummy_rng = np.random.default_rng(0)
+
+    def decode_one(raw: bytes) -> dict:
+        return transform.random_map(raw, dummy_rng)
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=num_threads) as ex:
+        episodes = list(ex.map(decode_one, raw_records))
+    dt = time.perf_counter() - t0
+    print(f"[tokenize] Pre-decoded {n} episodes in {dt:.1f}s  ({dt/n:.2f}s/ep, {num_threads} threads)")
+    return episodes
+
+
+def make_device_prefetcher(
+    episodes: list[dict],
+    batch_size: int,
+    sharding: jax.sharding.NamedSharding,
+    prefetch: int = 2,
+):
+    """Batch episodes, transfer to device in a background thread, yield ready batches.
+
+    Overlaps H2D transfer of batch N+1 with GPU encoding of batch N.
+    Episodes with drop_remainder (same as grain Batch default).
     """
     devices = list(sharding.mesh.devices.flat)
     num_devices = len(devices)
 
-    def transfer_to_devices(batch):
-        videos = batch["videos"]  # (B, T, H, W, C) numpy uint8 or float32
-        batch_size = videos.shape[0]
-        pad_size = (num_devices - batch_size % num_devices) % num_devices
+    # Build batches (drop remainder)
+    n_full = (len(episodes) // batch_size) * batch_size
+    batches_raw = [episodes[i:i + batch_size] for i in range(0, n_full, batch_size)]
 
+    def stack_and_transfer(group: list[dict]) -> dict:
+        videos = np.stack([ep["videos"] for ep in group])  # (B, T, H, W, C)
+        B = videos.shape[0]
+        pad_size = (num_devices - B % num_devices) % num_devices
         if pad_size > 0:
-            padding = np.zeros((pad_size,) + videos.shape[1:], dtype=videos.dtype)
-            videos = np.concatenate([videos, padding], axis=0)
-
-        # Cast to bfloat16 on device to halve HBM usage
+            videos = np.concatenate(
+                [videos, np.zeros((pad_size,) + videos.shape[1:], dtype=videos.dtype)], axis=0
+            )
         per_device = videos.shape[0] // num_devices
         shards = [
-            jax.device_put(videos[i * per_device : (i + 1) * per_device], devices[i]).astype(jnp.bfloat16)
+            jax.device_put(videos[i * per_device:(i + 1) * per_device], devices[i]).astype(jnp.bfloat16)
             for i in range(num_devices)
         ]
-        shape = videos.shape
-        sharded = jax.make_array_from_single_device_arrays(
-            shape, sharding, shards
-        )
+        sharded = jax.make_array_from_single_device_arrays(videos.shape, sharding, shards)
+        return {
+            "videos": sharded,
+            "actions": {k: np.stack([ep["actions"][k] for ep in group])
+                        if group[0]["actions"].get(k) is not None else None
+                        for k in group[0]["actions"]},
+            "source": [ep.get("source") for ep in group],
+            "_batch_size": B,
+            "_pad_size": pad_size,
+        }
 
-        batch["videos"] = sharded
-        batch["_pad_size"] = pad_size
-        batch["_batch_size"] = batch_size
-        return batch
+    ready: queue.Queue = queue.Queue(maxsize=prefetch)
 
-    # Stage 1: CPU-side prefetch buffer (decouples grain workers from main loop)
-    iter_ds = DataLoaderIteratorWrapper(dataloader)
-    iter_ds = ThreadPrefetchIterDataset(iter_ds, prefetch_buffer_size=cpu_buffer_size)
+    def _transfer_loop():
+        for group in batches_raw:
+            ready.put(stack_and_transfer(group))
+        ready.put(None)
 
-    # Stage 2: Device transfer + device-side buffer
-    iter_ds = iter_ds.map(transfer_to_devices)
-    iter_ds = ThreadPrefetchIterDataset(
-        iter_ds, prefetch_buffer_size=device_buffer_size
-    )
-
-    return iter_ds
+    t = Thread(target=_transfer_loop, daemon=True)
+    t.start()
+    return ready
 
 
 # ==============================================================================
@@ -323,165 +383,208 @@ class WelfordAccumulator:
 
 
 def run(cfg: DictConfig):
-    print(f"[tokenize] Loading tokenizer from: {cfg.tokenizer_ckpt}")
-    print(f"[tokenize] Input directory: {cfg.dataset.array_record_path}")
-    print(f"[tokenize] Output directory: {cfg.output_dir}")
-    dataloader_cfg = cfg.dataset.dataloader_cfg
+    output_dir_str = str(cfg.output_dir).rstrip("/")
+    is_gcs_output = output_dir_str.startswith("gs://")
 
+    # Always write locally to a staging dir; upload to GCS from there
+    staging_dir = Path("/tmp/tokenize_output") if is_gcs_output else Path(output_dir_str)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    (staging_dir / "metadata").mkdir(exist_ok=True)
+    stats_path = str(staging_dir / "metadata" / "latent_stats.npz")
+
+    print(f"[tokenize] Loading tokenizer from: {cfg.tokenizer_ckpt}")
+    print(f"[tokenize] Input: {cfg.dataset.array_record_path}")
+    print(f"[tokenize] Output: {output_dir_str}  (staging: {staging_dir})")
+
+    dataloader_cfg = cfg.dataset.dataloader_cfg
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
 
+    # List all input shards upfront
+    shard_paths = list_shards(
+        cfg.dataset.array_record_path,
+        cfg.dataset.index_max,
+        index_min=int(getattr(cfg.dataset, "index_min", 0)),
+    )
+    print(f"[tokenize] Found {len(shard_paths)} input shards")
+
     with jax.set_mesh(mesh):
-        # Load pretrained tokenizer
         bundle = TokenizerCheckpointBundle.from_pretrained(
             cfg.tokenizer_ckpt,
             mesh_rules=mesh_rules,
         )
         tokenizer = bundle.tokenizer
-        del tokenizer.decoder  # Free decoder params — only encoding
+        del tokenizer.decoder
 
-        print(f"[tokenize] Tokenizer loaded successfully")
-        print(f"[tokenize] n_latents: {tokenizer.encoder.n_latents}")
-        print(f"[tokenize] d_bottleneck: {tokenizer.cfg.encoder.d_bottleneck}")
-        print(f"[tokenize] patch_size: {tokenizer.cfg.encoder.patch_size}")
+        print(f"[tokenize] Tokenizer loaded. "
+              f"n_latents={tokenizer.encoder.n_latents}, "
+              f"d_bottleneck={tokenizer.cfg.encoder.d_bottleneck}, "
+              f"patch_size={tokenizer.cfg.encoder.patch_size}")
 
-        # Create dataloader
-        base_dataloader = make_tokenization_iterator(
-            input_dir=cfg.dataset.array_record_path,
-            index_max=cfg.dataset.index_max,
-            batch_size=dataloader_cfg.B,
-            num_workers=dataloader_cfg.num_workers,
+        start_shard_idx = int(getattr(cfg, "start_shard_idx", 0))
+        writer = AsyncShardWriter(staging_dir, records_per_shard=cfg.records_per_shard, start_shard_idx=start_shard_idx)
+        uploader = AsyncGCSUploader(output_dir_str) if is_gcs_output else None
+
+        @nnx.jit
+        def encode_batch(videos):
+            latents, _ = tokenizer.encode(videos, deterministic=True, rngs=nnx.Rngs(0))
+            return latents
+
+        n_channels = tokenizer.cfg.encoder.d_bottleneck
+        welford = WelfordAccumulator(n_channels)
+        total_videos = 0
+        total_batches = 0
+
+        # How many threads to use for parallel MP4 decoding.
+        # Each thread decodes one episode independently; decord releases the GIL.
+        host_cpus = os.cpu_count() or 8
+        predecode_threads = max(1, min(host_cpus - 4, 64))
+        decoder_threads_per_worker = max(1, min(4, host_cpus // max(1, predecode_threads)))
+        print(f"[tokenize] Pre-decode: {predecode_threads} threads, "
+              f"{decoder_threads_per_worker} decord threads/ep")
+
+        transform = ProcessMinecraftEpisodeAndSlice(
+            seq_len=0,
             image_h=cfg.dataset.H,
             image_w=cfg.dataset.W,
             image_c=cfg.dataset.C,
             padding_h=cfg.dataset.padding_H,
             padding_w=cfg.dataset.padding_W,
             patch_size=cfg.dataset.patch_size,
-            worker_buffer_size=int(getattr(dataloader_cfg, "worker_buffer_size", 1)),
-            decoder_threads=getattr(dataloader_cfg, "decoder_threads", None),
-            read_prefetch_buffer_size=getattr(
-                dataloader_cfg, "read_prefetch_buffer_size", None
-            ),
-            read_num_threads=getattr(dataloader_cfg, "read_num_threads", None),
+            full_episode=True,
+            decoder_threads=decoder_threads_per_worker,
             cast_to_float32=bool(getattr(dataloader_cfg, "cast_to_float32", False)),
-            shm_safety_margin=float(getattr(dataloader_cfg, "shm_safety_margin", 0.6)),
         )
 
-        # Build async prefetch pipeline: CPU buffer → device transfer → device buffer
-        prefetched = build_prefetch_pipeline(
-            base_dataloader,
-            sharding=data_sharding,
-            cpu_buffer_size=dataloader_cfg.prefetch_buffer_size,
-            device_buffer_size=dataloader_cfg.device_prefetch_buffer_size,
-        )
+        def _drain_and_upload():
+            if uploader is not None:
+                for p in writer.drain_completed():
+                    uploader.upload(p)
 
-        # Create async shard writer (disk I/O on background thread)
-        output_dir = Path(cfg.output_dir)
-        writer = AsyncShardWriter(
-            output_dir,
-            records_per_shard=cfg.records_per_shard,
-        )
-
-        # Create metadata directory for stats
-        metadata_dir = output_dir / "metadata"
-        metadata_dir.mkdir(parents=True, exist_ok=True)
-        stats_path = metadata_dir / "latent_stats.npz"
-
-        # JIT-compile encode function
-        @nnx.jit
-        def encode_batch(videos):
-            latents, _ = tokenizer.encode(
-                videos,
-                deterministic=True,
-                rngs=nnx.Rngs(0),
+        def _save_stats():
+            np.savez(
+                stats_path,
+                mean=welford.mean.astype(np.float32),
+                std=welford.std.astype(np.float32),
+                num_samples=welford.count,
+                num_videos=total_videos,
             )
-            return latents
-
-        # Vectorized Welford accumulator
-        n_channels = tokenizer.cfg.encoder.d_bottleneck
-        welford = WelfordAccumulator(n_channels)
-        total_videos = 0
-
-        import time
-
-        try:
-            pbar = tqdm(prefetched, desc="Tokenizing")
-            t_iter_start = time.perf_counter()
-            for batch in pbar:
-                t_iter = time.perf_counter() - t_iter_start
-
-                videos = batch["videos"]  # Already sharded JAX array
-                actions_batch = batch["actions"]
-                sources_batch = batch["source"]
-                batch_size = batch["_batch_size"]
-                pad_size = batch["_pad_size"]
-
-                t0 = time.perf_counter()
-                latents = encode_batch(videos)
-                latents.block_until_ready()
-                t1 = time.perf_counter()
-
-                latents_np = np.asarray(latents)[:batch_size]
-                t2 = time.perf_counter()
-
-                # Vectorized Welford update: flatten (B, T, n_latents) → (N, D)
-                welford.update(latents_np.astype(np.float32).reshape(-1, n_channels)) # Cast to float32 first — bfloat16 var() has catastrophic cancellation
-                t3 = time.perf_counter()
-
-                # Queue records for async write
-                for i in range(batch_size):
-                    actions_i = { k: v[i] if v is not None else None for k, v in actions_batch.items()}
-                    writer.write(
-                        {
-                            "latents": latents_np[i],  # (T, n_latents, d_bottleneck)
-                            "actions": actions_i,
-                            "source": (
-                                sources_batch[i]
-                                if sources_batch is not None
-                                else None
-                            ),
-                        }
-                    )
-                t4 = time.perf_counter()
-
-                pbar.set_postfix(
-                    mean=f"{welford.mean.mean():.4f}",
-                    std=f"{welford.std.mean():.4f}",
-                    fetch=f"{t_iter:.3f}s",
-                    encode=f"{t1-t0:.3f}s",
-                    d2h=f"{t2-t1:.3f}s",
-                    welford=f"{t3-t2:.3f}s",
-                    queue=f"{t4-t3:.3f}s",
+            if is_gcs_output:
+                subprocess.run(
+                    ["gsutil", "-q", "cp", stats_path,
+                     f"{output_dir_str}/metadata/latent_stats.npz"],
+                    check=False, stdin=subprocess.DEVNULL,
                 )
 
-                total_videos += batch_size
+        try:
+            downloader = DownloadAheadPipeline(
+                shard_paths,
+                tmp_dir="/tmp/tokenize_shards",
+                lookahead=2,  # 2 shards pre-downloaded (~1.3 GB on disk)
+            )
+            for shard_num, local_shard_path in enumerate(downloader):
+                shard_name = Path(local_shard_path).name
+                print(f"\n[tokenize] Shard {shard_num + 1}/{len(shard_paths)}: {shard_name}")
+
+                # Pre-decode all episodes in the shard in parallel (threads, no /dev/shm)
+                episodes = predecode_shard(local_shard_path, transform, predecode_threads)
+
+                # Batch + H2D transfer in background thread, overlapping with GPU encode
+                ready_queue = make_device_prefetcher(
+                    episodes,
+                    batch_size=dataloader_cfg.B,
+                    sharding=data_sharding,
+                    prefetch=2,
+                )
+
+                pbar = tqdm(total=len(episodes) // dataloader_cfg.B, desc="  Encoding")
                 t_iter_start = time.perf_counter()
 
-                # Periodically save stats (every 100 batches)
-                if total_videos % (100 * dataloader_cfg.B) < dataloader_cfg.B:
-                    np.savez(
-                        stats_path,
-                        mean=welford.mean.astype(np.float32),
-                        std=welford.std.astype(np.float32),
-                        num_samples=welford.count,
-                        num_videos=total_videos,
+                while True:
+                    batch = ready_queue.get()
+                    if batch is None:
+                        break
+                    t_iter = time.perf_counter() - t_iter_start
+
+                    videos = batch["videos"]
+                    actions_batch = batch["actions"]
+                    sources_batch = batch["source"]
+                    batch_size = batch["_batch_size"]
+
+                    t0 = time.perf_counter()
+                    latents = encode_batch(videos)
+                    latents.block_until_ready()
+                    t1 = time.perf_counter()
+
+                    latents_np = np.asarray(latents)[:batch_size]
+                    t2 = time.perf_counter()
+
+                    welford.update(latents_np.astype(np.float32).reshape(-1, n_channels))
+                    t3 = time.perf_counter()
+
+                    for i in range(batch_size):
+                        actions_i = {k: v[i] if v is not None else None for k, v in actions_batch.items()}
+                        writer.write({
+                            "latents": latents_np[i],
+                            "actions": actions_i,
+                            "source": sources_batch[i] if sources_batch is not None else None,
+                        })
+                    t4 = time.perf_counter()
+
+                    pbar.set_postfix(
+                        mean=f"{welford.mean.mean():.4f}",
+                        std=f"{welford.std.mean():.4f}",
+                        fetch=f"{t_iter:.3f}s",
+                        encode=f"{t1 - t0:.3f}s",
+                        d2h=f"{t2 - t1:.3f}s",
+                        queue=f"{t4 - t3:.3f}s",
                     )
+
+                    total_videos += batch_size
+                    total_batches += 1
+                    pbar.update(1)
+                    t_iter_start = time.perf_counter()
+
+                    # Save stats every 100 batches
+                    if total_batches % 100 == 0:
+                        _save_stats()
+
+                pbar.close()
+                del episodes  # free ~10-70 GB of decoded frames
+
+                # After each input shard: flush writer, upload any completed output shards
+                writer.sync()
+                _drain_and_upload()
+
+                # Log local disk usage
+                staging_gb = sum(f.stat().st_size for f in staging_dir.rglob("*") if f.is_file()) / 1024**3
+                total_gb = shutil.disk_usage("/").used / 1024**3
+                free_gb = shutil.disk_usage("/").free / 1024**3
+                print(f"[tokenize] Disk: staging={staging_gb:.1f} GB used, "
+                      f"total_used={total_gb:.1f} GB, free={free_gb:.1f} GB")
 
         finally:
             writer.close()
-            # Save final stats
+            _drain_and_upload()
+            if uploader is not None:
+                uploader.flush()  # wait for all uploads to finish
+
             if welford.count > 0:
-                np.savez(
-                    stats_path,
-                    mean=welford.mean.astype(np.float32),
-                    std=welford.std.astype(np.float32),
-                    num_samples=welford.count,
-                    num_videos=total_videos,
-                )
+                _save_stats()
+                # Ensure final stats are uploaded
+                if is_gcs_output:
+                    subprocess.run(
+                        ["gsutil", "-q", "cp", stats_path,
+                         f"{output_dir_str}/metadata/latent_stats.npz"],
+                        check=True, stdin=subprocess.DEVNULL,
+                    )
+
+            if uploader is not None:
+                uploader.close()
 
         print(f"[tokenize] Done! Processed {total_videos} videos")
-        print(f"[tokenize] Wrote {writer.shard_idx} shards to {cfg.output_dir}")
+        print(f"[tokenize] Wrote {writer.shard_idx} output shards to {output_dir_str}")
         print(f"[tokenize] Total records: {writer.total_records}")
-        print(f"[tokenize] Latent stats saved to: {stats_path}")
+        print(f"[tokenize] Latent stats: mean={welford.mean.mean():.4f}, std={welford.std.mean():.4f}")
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="tokenize")

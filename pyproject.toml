@@ -27,6 +27,7 @@ dependencies = [
     "awscli>=1.27.0",
     "decord>=0.6.0",
     "ripgrep",
+    "google-cloud-storage>=3.9.0",
 ]
 
 [dependency-groups]
