@@ -92,6 +92,6 @@ optimizer:
   muon_ns_steps: 5
   muon_nesterov: true
 
-write_video_every: 5000
+write_video_every: 0
 dtype: ${dataset.dataloader_cfg.dtype}
 param_dtype: bfloat16

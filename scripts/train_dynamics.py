@@ -1,4 +1,16 @@
 import os
+
+
+def _append_xla_flag(flag: str) -> None:
+    current = os.environ.get("XLA_FLAGS", "")
+    if flag not in current.split():
+        os.environ["XLA_FLAGS"] = f"{current} {flag}".strip()
+
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95")
+_append_xla_flag("--xla_gpu_triton_gemm_any=True")
+_append_xla_flag("--xla_gpu_enable_latency_hiding_scheduler=true")
+
 import logging
 
 import hydra
