@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import DynamicsConfig, OptimalTransportConfig
-from dreamer.data import make_iterator
+from dreamer.data import make_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, shift_actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES
@@ -247,7 +247,7 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        dataloader = make_iterator(cfg.dataset, device=data_sharding, seq_len=dl_cfg.long_T)
+        dataloader = make_dual_iterator(cfg.dataset, device=data_sharding)
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
@@ -259,10 +259,9 @@ def run(cfg: DynamicsConfig):
                 if step >= cfg.max_steps:
                     break
 
-                rng, master_key, split_key = jax.random.split(rng, num=3)
+                rng, master_key = jax.random.split(rng, num=2)
 
-                use_long = bool(jax.random.bernoulli(split_key, p=dl_cfg.long_ratio)) or step % cfg.write_video_every == 0
-                n_splits = 1 if use_long else dl_cfg.long_T // dl_cfg.short_T
+                n_splits = int(batch.pop("n_splits"))
 
                 # Use pre-allocated batch
                 actions = batch["actions"]

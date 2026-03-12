@@ -1,5 +1,4 @@
-import io
-import pickle
+import logging
 
 import grain
 import jax
@@ -34,6 +33,7 @@ def make_iterator(
     dtype = None,
     dataloader_cfg: DataloaderConfig | None = None,
     seq_len: int | None = None,
+    pack_factor: int = 1,
 ):
     """Creates a data loading pipeline using Grain from a DatasetConfig.
 
@@ -44,6 +44,9 @@ def make_iterator(
         seed: Random seed
         print_filter_warnings: Whether to print filter warnings
         device: Device for prefetching
+        pack_factor: Number of episodes to pack into one sequence. When >1, batches
+            pack_factor * B episodes of length seq_len and reshapes to B sequences
+            of length seq_len * pack_factor.
     """
     if dataloader_cfg is None:
         dataloader_cfg = cfg.dataloader_cfg
@@ -123,7 +126,11 @@ def make_iterator(
             ),
         ]
             
-    common_ops = [Batch(batch_size=per_process_batch_size, drop_remainder=True), CastDtype(dataloader_cfg.dtype)]
+    batch_size = per_process_batch_size * pack_factor
+    common_ops = [Batch(batch_size=batch_size, drop_remainder=True)]
+    if pack_factor > 1:
+        common_ops.append(PackEpisodes(pack_factor))
+    common_ops.append(CastDtype(dataloader_cfg.dtype))
     operations = operations + common_ops
 
     dataloader = grain.DataLoader(
@@ -152,6 +159,114 @@ def make_iterator(
     )
     
     return iter_dataset
+
+
+# ==============================================================================
+# Episode Packing
+# ==============================================================================
+
+class PackEpisodes(grain.transforms.Map):
+    """Reshape a batch of short episodes into packed long sequences.
+
+    Transforms (B * n_splits, short_T, ...) → (B, n_splits * short_T, ...)
+    so that each packed sequence contains n_splits independent episodes.
+    """
+
+    def __init__(self, n_splits: int):
+        self.n_splits = n_splits
+
+    def map(self, batch):
+        def _reshape(x):
+            if x is None:
+                return None
+            shape = x.shape
+            B_packed = shape[0] // self.n_splits
+            new_shape = (B_packed, self.n_splits * shape[1], *shape[2:])
+            return x.reshape(new_shape)
+        return jax.tree.map(_reshape, batch)
+
+
+# ==============================================================================
+# Dual Iterator (uniform output shapes)
+# ==============================================================================
+
+class AlternatingIterator:
+    """Alternates between short (packed) and long iterators with uniform output shapes.
+
+    Both iterators must produce batches of the same shape (B, long_T, ...).
+    Adds 'n_splits' to each batch dict to indicate block-causal chunk count.
+    """
+
+    def __init__(self, short_iterator, long_iterator, n_splits: int, long_ratio: float, seed: int) -> None:
+        self.short_iterator = iter(short_iterator)
+        self.long_iterator = iter(long_iterator)
+        self.n_splits = n_splits
+        self.long_ratio = long_ratio
+        self._rng_key = jax.random.key(seed)
+        self.step = 0
+
+    def __next__(self):
+        self._rng_key, subkey = jax.random.split(self._rng_key)
+        use_long = bool(jax.random.bernoulli(subkey, p=self.long_ratio)) or self.step % 1000 == 0
+        self.step += 1
+
+        if use_long:
+            batch = next(self.long_iterator)
+            batch["n_splits"] = 1
+        else:
+            batch = next(self.short_iterator)
+            batch["n_splits"] = self.n_splits
+        return batch
+
+    def __iter__(self):
+        return self
+
+
+def make_dual_iterator(
+    cfg: DatasetConfig,
+    *,
+    seed: int = 42,
+    print_filter_warnings: bool = False,
+    device=None,
+    dtype=None,
+) -> AlternatingIterator:
+    """Create alternating iterator over short (packed) and long sequences.
+
+    Both pipelines output the same shape (B, long_T, ...) for uniform GPU utilization.
+    Short sequences are packed from n_splits independent episodes with a block-causal mask.
+
+    Args:
+        cfg: Dataset configuration
+        seed: Random seed
+        print_filter_warnings: Whether to print filter warnings
+        device: Device for prefetching
+        dtype: Optional dtype override
+    """
+    dataloader_cfg = cfg.dataloader_cfg
+
+    short_T = dataloader_cfg.short_T
+    long_T = dataloader_cfg.long_T
+    assert long_T % short_T == 0, f"long_T ({long_T}) must be a multiple of short_T ({short_T})"
+    n_splits = long_T // short_T
+    long_ratio = dataloader_cfg.long_ratio
+
+    if short_T == long_T:
+        logging.warning("short_T == long_T, using just one iterator")
+        return make_iterator(cfg, seed=seed, print_filter_warnings=print_filter_warnings, device=device, dtype=dtype, seq_len=long_T)
+
+    # Long pipeline: single episodes of length long_T, batch B → (B, long_T, ...)
+    long_iter = make_iterator(
+        cfg, seed=seed, print_filter_warnings=print_filter_warnings,
+        device=device, dtype=dtype, seq_len=long_T,
+    )
+
+    # Short pipeline: short_T episodes, batch B*n_splits, pack → (B, long_T, ...)
+    short_iter = make_iterator(
+        cfg, seed=seed + short_T, print_filter_warnings=print_filter_warnings,
+        device=device, dtype=dtype, seq_len=short_T, pack_factor=n_splits,
+    )
+
+    return AlternatingIterator(short_iter, long_iter, n_splits, long_ratio, seed)
 
 
 # ==============================================================================
