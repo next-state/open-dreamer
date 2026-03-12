@@ -15,11 +15,11 @@ Example usage:
 """
 import logging
 import os
-import pickle
 import queue
 from pathlib import Path
 from threading import Thread
 
+import decord
 import grain
 import hydra
 import jax
@@ -38,13 +38,6 @@ from dreamer.data.data import DataLoaderIteratorWrapper
 from dreamer.data.shard_writer import ShardWriter
 from dreamer.data.transforms import ProcessMinecraftEpisodeAndSlice
 from dreamer.parallel import build_parallel
-
-try:
-    import decord
-except ImportError as exc:
-    raise ImportError(
-        "scripts/tokenize_minecraft_dataset.py requires decord for MP4 decoding."
-    ) from exc
 
 decord.bridge.set_bridge("native")
 
@@ -70,12 +63,6 @@ def make_tokenization_iterator(
     padding_h: tuple[int, int],
     padding_w: tuple[int, int],
     patch_size: int,
-    worker_buffer_size: int = 1,
-    decoder_threads: int | None = None,
-    read_prefetch_buffer_size: int | None = None,
-    read_num_threads: int | None = None,
-    cast_to_float32: bool = False,
-    shm_safety_margin: float = 0.6,
 ):
     """Create dataloader for tokenization (sequential, no shuffle, full episodes)."""
     all_shards = sorted(Path(input_dir).glob("shard-*.array_record"))
@@ -89,62 +76,6 @@ def make_tokenization_iterator(
     print(f"[tokenize] Found {len(shard_paths)} shards")
 
     source = grain.sources.ArrayRecordDataSource(shard_paths)
-    effective_num_workers = max(1, int(num_workers))
-    effective_worker_buffer_size = max(1, int(worker_buffer_size))
-
-    auto_decoder_threads = decoder_threads is None
-    if decoder_threads is None:
-        host_cpus = os.cpu_count() or effective_num_workers
-        decoder_threads = max(1, min(4, host_cpus // max(1, effective_num_workers * 2)))
-
-    auto_read_threads = read_num_threads is None
-    if read_num_threads is None:
-        read_num_threads = max(1, min(8, effective_num_workers // 2))
-    if read_prefetch_buffer_size is None:
-        read_prefetch_buffer_size = read_num_threads
-    read_prefetch_buffer_size = max(1, int(read_prefetch_buffer_size))
-
-    estimated_batch_bytes = None
-    try:
-        sample = pickle.loads(source[0])
-        video_shape = sample.get("video_shape")
-        if isinstance(video_shape, (tuple, list)) and len(video_shape) == 4:
-            t, h, w, c = map(int, video_shape)
-            h += sum(padding_h)
-            w += sum(padding_w)
-            dtype_bytes = 4 if cast_to_float32 else 1
-            estimated_batch_bytes = batch_size * t * h * w * c * dtype_bytes
-    except Exception:
-        estimated_batch_bytes = None
-
-    try:
-        shm_stats = os.statvfs("/dev/shm")
-        shm_free_bytes = shm_stats.f_bavail * shm_stats.f_frsize
-    except OSError:
-        shm_free_bytes = None
-
-    if estimated_batch_bytes is not None and shm_free_bytes is not None:
-        max_workers_by_shm = int(
-            (shm_free_bytes * float(shm_safety_margin))
-            // max(1, estimated_batch_bytes * effective_worker_buffer_size)
-        )
-        max_workers_by_shm = max(1, max_workers_by_shm)
-        if max_workers_by_shm < effective_num_workers:
-            print(
-                f"[tokenize] Capping num_workers from {effective_num_workers} to "
-                f"{max_workers_by_shm} to stay within /dev/shm budget "
-                f"(free={shm_free_bytes / 1024**3:.1f} GiB, "
-                f"est_batch={estimated_batch_bytes / 1024**3:.2f} GiB, "
-                f"safety_margin={shm_safety_margin:.2f})"
-            )
-            effective_num_workers = max_workers_by_shm
-            if auto_decoder_threads:
-                host_cpus = os.cpu_count() or effective_num_workers
-                decoder_threads = max(
-                    1, min(4, host_cpus // max(1, effective_num_workers * 2))
-                )
-            if auto_read_threads:
-                read_num_threads = max(1, min(8, effective_num_workers // 2))
 
     sampler = grain.samplers.IndexSampler(
         num_records=len(source),
@@ -163,32 +94,16 @@ def make_tokenization_iterator(
             padding_w=padding_w,
             patch_size=patch_size,
             full_episode=True,
-            decoder_threads=decoder_threads,
-            cast_to_float32=cast_to_float32,
         ),
         grain.transforms.Batch(batch_size=batch_size, drop_remainder=True),
     ]
-
-    print(
-        "[tokenize] DataLoader config: "
-        f"workers={effective_num_workers}, "
-        f"worker_buffer_size={effective_worker_buffer_size}, "
-        f"decoder_threads={decoder_threads}, "
-        f"read_threads={read_num_threads}, "
-        f"read_prefetch={read_prefetch_buffer_size}, "
-        f"cast_to_float32={cast_to_float32}"
-    )
 
     return grain.DataLoader(
         data_source=source,
         sampler=sampler,
         operations=operations,
-        worker_count=effective_num_workers,
-        worker_buffer_size=effective_worker_buffer_size,
-        read_options=grain.ReadOptions(
-            prefetch_buffer_size=read_prefetch_buffer_size,
-            num_threads=max(1, int(read_num_threads)),
-        ),
+        worker_count=num_workers,
+        worker_buffer_size=1,
     )
 
 
@@ -252,7 +167,7 @@ def build_prefetch_pipeline(
     num_devices = len(devices)
 
     def transfer_to_devices(batch):
-        videos = batch["videos"]  # (B, T, H, W, C) numpy uint8 or float32
+        videos = batch["videos"]  # (B, T, H, W, C) numpy float32
         batch_size = videos.shape[0]
         pad_size = (num_devices - batch_size % num_devices) % num_devices
 
@@ -362,14 +277,6 @@ def run(cfg: DictConfig):
             padding_h=cfg.dataset.padding_H,
             padding_w=cfg.dataset.padding_W,
             patch_size=cfg.dataset.patch_size,
-            worker_buffer_size=int(getattr(dataloader_cfg, "worker_buffer_size", 1)),
-            decoder_threads=getattr(dataloader_cfg, "decoder_threads", None),
-            read_prefetch_buffer_size=getattr(
-                dataloader_cfg, "read_prefetch_buffer_size", None
-            ),
-            read_num_threads=getattr(dataloader_cfg, "read_num_threads", None),
-            cast_to_float32=bool(getattr(dataloader_cfg, "cast_to_float32", False)),
-            shm_safety_margin=float(getattr(dataloader_cfg, "shm_safety_margin", 0.6)),
         )
 
         # Build async prefetch pipeline: CPU buffer → device transfer → device buffer

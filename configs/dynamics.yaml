@@ -3,18 +3,18 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: ehhsivede-3
+run_name: dynamics
 use_wandb: true
 tokenizer_ckpt: /data/minecraft-vpt/models/tokenizer-asymmetric-small-normal-latent-space/checkpoints/
 
 ckpt:
-  max_to_keep: 1
-  save_interval_steps: 1_000
+  max_to_keep: 99999
+  save_interval_steps: 5_000
 
 dataset:
   array_record_path: /data/minecraft-vpt/latents-final/
   dataloader_cfg:
-    B: 12
+    B: ???
     num_workers: 0
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
@@ -51,7 +51,7 @@ dynamics:
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
 
-ema_decay: 0.999
+ema_decay: 0.9997
 
 bootstrap_start: 50_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
@@ -67,7 +67,7 @@ ot:
   pairing: barycentric
   scale_cost: mean
 
-max_steps: 100_000
+max_steps: 500_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
