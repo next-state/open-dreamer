@@ -33,6 +33,8 @@ from dreamer.models import (
 )
 from dreamer.training import RMSLossNormalizer
 from dreamer.parallel import MeshRules
+from jax.experimental import multihost_utils
+
 from dreamer.utils import from_dict
 
 
@@ -54,7 +56,7 @@ def build_checkpoint_manager(
         save_interval_steps=ckpt_cfg.save_interval_steps,
         save_on_steps=[ckpt_cfg.max_steps - 1],  # always save at the end
         single_host_load_and_broadcast=is_multihost,
-        enable_async_checkpointing=not is_multihost,
+        enable_async_checkpointing=True,
         multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=0),
     )
 

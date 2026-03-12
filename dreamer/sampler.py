@@ -12,6 +12,12 @@ from dreamer.actions import Actions
 from .generation import DenoiseSchedule, video_rollout, latent_rollout
 
 
+@nnx.jit
+def decode_jit(tokenizer: Tokenizer, z: jax.Array) -> jax.Array:
+    frames, _ = tokenizer.decode(z, deterministic=True)
+    return frames
+
+
 # ---------------------------
 # Multi-frame rollout wrapper
 # ---------------------------
@@ -86,12 +92,7 @@ def sample_video(
 
     # Decode GT latents for visualization
     # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
-    @nnx.jit
-    def decode_jit(z):
-        frames, _ = tokenizer.decode(z, deterministic=True)
-        return frames
-
-    gt_decoded_frames = decode_jit(latents)
+    gt_decoded_frames = decode_jit(tokenizer, latents)
     gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
@@ -120,7 +121,7 @@ def sample_video(
 
     # Decode predicted latents to frames
     # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
-    pred_frames = decode_jit(rollout_result['latents'])
+    pred_frames = decode_jit(tokenizer, rollout_result['latents'])
     pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
     ode_diags = rollout_result.get('ode_diags', {})

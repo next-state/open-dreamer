@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: train-tokenizer-single-node-interactive
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: p02-r01-cp04
+  initContainers:
+  - name: unpack-source
+    image: python:3.11-bookworm
+    command: ["/bin/bash", "-lc"]
+    args:
+    - |
+      set -euo pipefail
+      mkdir -p /workspace
+      tar -xzf /src/dreamer4-k8s-src.tgz -C /workspace
+    volumeMounts:
+    - name: workspace
+      mountPath: /workspace
+    - name: source-bundle
+      mountPath: /src
+  containers:
+  - name: trainer
+    image: python:3.11-bookworm
+    workingDir: /workspace
+    env:
+    - name: WANDB_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: wandb-credentials
+          key: WANDB_API_KEY
+    command: ["/bin/bash", "-lc"]
+    args:
+    - |
+      set -euo pipefail
+      apt-get update
+      python -m pip install --upgrade pip uv
+      uv sync
+      uv pip install -e .
+      trap : TERM INT
+      sleep infinity & wait
+    stdin: true
+    tty: true
+    resources:
+      requests:
+        cpu: "16"
+        memory: "192Gi"
+        nvidia.com/gpu: "4"
+      limits:
+        cpu: "16"
+        memory: "192Gi"
+        nvidia.com/gpu: "4"
+    volumeMounts:
+    - name: workspace
+      mountPath: /workspace
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: workspace
+    emptyDir: {}
+  - name: source-bundle
+    configMap:
+      name: dreamer4-src
+  - name: data
+    hostPath:
+      path: /data
+      type: Directory

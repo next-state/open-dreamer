@@ -17,7 +17,7 @@ dependencies = [
     "ott-jax",
     "tqdm",
     "wandb",
-    "procgen-mirror",
+    "procgen-mirror; sys_platform != 'linux' or platform_machine != 'aarch64'",
     "tyro>=1.0.0",
     "array-record>=0.8.3",
     "grain>=0.2.15",
@@ -25,7 +25,7 @@ dependencies = [
     "reactor-runtime>=0.0.4",
     "pandas>=2.3.3",
     "awscli>=1.27.0",
-    "decord>=0.6.0",
+    "decord>=0.6.0; sys_platform != 'linux' or platform_machine != 'aarch64'",
     "ripgrep",
 ]
 
