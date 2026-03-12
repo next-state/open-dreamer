@@ -1,0 +1,78 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train-tokenizer-single-node
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: p02-r01-cp04
+      initContainers:
+      - name: unpack-source
+        image: python:3.11-bookworm
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          mkdir -p /workspace
+          tar -xzf /src/dreamer4-k8s-src.tgz -C /workspace
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: source-bundle
+          mountPath: /src
+      containers:
+      - name: trainer
+        image: python:3.11-bookworm
+        workingDir: /workspace
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y ffmpeg
+          python -m pip install --upgrade pip uv
+          uv sync
+          uv pip install -e .
+          uv run python scripts/train_tokenizer.py \
+            run_name=train-tokenizer-single-node \
+            use_wandb=false \
+            hydra.run.dir=/data/minecraft-vpt/models/train-tokenizer-single-node \
+            dataset.array_record_path=/data/minecraft-vpt/arrayrecords-mp4 \
+            dataset.index_max=500 \
+            dataset.dataloader_cfg.B=8 \
+            dataset.dataloader_cfg.num_workers=1 \
+            dataset.dataloader_cfg.prefetch_buffer_size=2 \
+            dataset.dataloader_cfg.device_prefetch_buffer_size=1
+        resources:
+          requests:
+            cpu: "16"
+            memory: "192Gi"
+            nvidia.com/gpu: "4"
+          limits:
+            cpu: "16"
+            memory: "192Gi"
+            nvidia.com/gpu: "4"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: data
+          mountPath: /data
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: workspace
+        emptyDir: {}
+      - name: source-bundle
+        configMap:
+          name: dreamer4-src
+      - name: data
+        hostPath:
+          path: /data
+          type: Directory
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 500Gi

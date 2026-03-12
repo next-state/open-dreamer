@@ -1,4 +1,16 @@
 import os
+
+
+def _append_xla_flag(flag: str) -> None:
+    current = os.environ.get("XLA_FLAGS", "")
+    if flag not in current.split():
+        os.environ["XLA_FLAGS"] = f"{current} {flag}".strip()
+
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95")
+_append_xla_flag("--xla_gpu_triton_gemm_any=True")
+_append_xla_flag("--xla_gpu_enable_latency_hiding_scheduler=true")
+
 import logging
 
 import hydra
@@ -308,29 +320,30 @@ def run(cfg: DynamicsConfig):
                 # EMA update
                 ema_update_step(bundle.dynamics, bundle.dynamics_ema, ema_decay=cfg.ema_decay)
 
-                # Logging
-                if is_main_process and logger.should_log(step):
+                # Logging — device_get on all hosts to stay in sync, only host 0 logs
+                if logger.should_log(step):
                     metrics_cpu = jax.device_get(metrics)
-                    scaling.on_step(step, metrics_cpu)
-                    logger.log(
-                        step,
-                        metrics={
-                            "flow_mse": metrics_cpu["flow_mse"],
-                            "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
-                            "flow_mse_image": metrics_cpu["flow_mse_image"],
-                            "boot_mse": metrics_cpu["bootstrap_mse"],
-                            "grad_norm": metrics_cpu["grad_norm"],
-                            "flow_mse_low": metrics_cpu["flow_mse_low"],
-                            "flow_mse_mid": metrics_cpu["flow_mse_mid"],
-                            "flow_mse_high": metrics_cpu["flow_mse_high"],
-                            "boot_target_norm": metrics_cpu["boot_target_norm"],
-                            "lr": lr_schedule(step),
-                            "T": T // n_splits,
-                            **scaling.get_step_metrics(step),
-                        },
-                        pbar=pbar,
-                        pbar_filter=r"^(flow_mse|boot_mse|lr)$",
-                    )
+                    if is_main_process:
+                        scaling.on_step(step, metrics_cpu)
+                        logger.log(
+                            step,
+                            metrics={
+                                "flow_mse": metrics_cpu["flow_mse"],
+                                "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
+                                "flow_mse_image": metrics_cpu["flow_mse_image"],
+                                "boot_mse": metrics_cpu["bootstrap_mse"],
+                                "grad_norm": metrics_cpu["grad_norm"],
+                                "flow_mse_low": metrics_cpu["flow_mse_low"],
+                                "flow_mse_mid": metrics_cpu["flow_mse_mid"],
+                                "flow_mse_high": metrics_cpu["flow_mse_high"],
+                                "boot_target_norm": metrics_cpu["boot_target_norm"],
+                                "lr": lr_schedule(step),
+                                "T": T // n_splits,
+                                **scaling.get_step_metrics(step),
+                            },
+                            pbar=pbar,
+                            pbar_filter=r"^(flow_mse|boot_mse|lr)$",
+                        )
 
                 # Checkpointing
                 bundle.maybe_save(checkpoint_manager, step, rng)

@@ -3,25 +3,28 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-time-layer-start
-tokenizer_ckpt: logs/tokenizer-asymmetric-repro/checkpoints/
+run_name: dynamics
+use_wandb: true
+tokenizer_ckpt: /data/minecraft-vpt/models/tokenizer-asymmetric-small-normal-latent-space/checkpoints/
 
 ckpt:
-  max_to_keep: 1
-  save_interval_steps: 1_000
+  max_to_keep: 99999
+  save_interval_steps: 5_000
 
 dataset:
+  array_record_path: /data/minecraft-vpt/latents-final/
   dataloader_cfg:
-    B: 64
+    B: ???
+    num_workers: 0
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
-    short_T: 32
-    long_T: 32
+    short_T: 64
+    long_T: 64
     long_ratio: 0.1  # Fraction of batches that use long_T
 
 dynamics:
     d_bottleneck: 16
-    depth: 20
+    depth: 30
     d_model: ${mul:64,${dynamics.depth}}
     n_heads: ${floordiv:${dynamics.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${dynamics.n_heads},8}}
@@ -48,11 +51,11 @@ dynamics:
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
 
-ema_decay: 0.999
+ema_decay: 0.9997
 
 bootstrap_start: 50_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
-image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
+image_fraction: 0.0  # Fraction of batch to train as images (no temporal attention)
 
 # Optimal transport coupling (minibatch OT)
 ot:
@@ -64,7 +67,7 @@ ot:
   pairing: barycentric
   scale_cost: mean
 
-max_steps: 100_000
+max_steps: 500_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
@@ -89,6 +92,6 @@ optimizer:
   muon_ns_steps: 5
   muon_nesterov: true
 
-write_video_every: 5000
+write_video_every: 0
 dtype: ${dataset.dataloader_cfg.dtype}
 param_dtype: bfloat16

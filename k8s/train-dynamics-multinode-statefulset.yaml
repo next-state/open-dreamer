@@ -1,0 +1,128 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: train-dynamics-multinode
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: train-dynamics-multinode
+  ports:
+  - name: coordinator
+    port: 12345
+    targetPort: 12345
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: train-dynamics-multinode
+spec:
+  serviceName: train-dynamics-multinode
+  replicas: 14
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: train-dynamics-multinode
+  template:
+    metadata:
+      labels:
+        app: train-dynamics-multinode
+    spec:
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: train-dynamics-multinode
+            topologyKey: kubernetes.io/hostname
+      initContainers:
+      - name: unpack-source
+        image: python:3.11-bookworm
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          mkdir -p /workspace
+          tar -xzf /src/dreamer4-k8s-src.tgz -C /workspace
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: source-bundle
+          mountPath: /src
+      containers:
+      - name: trainer
+        image: python:3.11-bookworm
+        workingDir: /workspace
+        env:
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-credentials
+              key: WANDB_API_KEY
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          apt-get update
+          python -m pip install --upgrade pip uv
+          uv sync
+          uv pip install -e .
+
+          COORDINATOR_HOST="train-dynamics-multinode-0.train-dynamics-multinode"
+          export JAX_COORDINATOR_ADDRESS="${COORDINATOR_HOST}:12345"
+          export JAX_PROCESS_COUNT=14
+          export JAX_PROCESS_INDEX="${HOSTNAME##*-}"
+          GLOBAL_BATCH_SIZE="$((12 * JAX_PROCESS_COUNT))"
+
+          if [ "${JAX_PROCESS_INDEX}" = "0" ]; then
+            USE_WANDB=true
+          else
+            USE_WANDB=false
+            until getent hosts "${COORDINATOR_HOST}" >/dev/null 2>&1; do sleep 2; done
+            until (echo >"/dev/tcp/${COORDINATOR_HOST}/12345") >/dev/null 2>&1; do sleep 2; done
+          fi
+
+          uv run scripts/train_dynamics.py \
+            run_name=train-dynamics-latents-multinode \
+            use_wandb=${USE_WANDB} \
+            hydra.run.dir=/data/minecraft-vpt/models/train-dynamics-latents-multinode \
+            hydra.output_subdir=null \
+            dataset.array_record_path=/data/minecraft-vpt/latents-final/ \
+            dataset.dataloader_cfg.B=${GLOBAL_BATCH_SIZE} \
+            ckpt.max_to_keep=0 \
+            dataset.dataloader_cfg.num_workers=0 \
+            tokenizer_ckpt=/data/minecraft-vpt/models/tokenizer-asymmetric-small-normal-latent-space/checkpoints/
+        ports:
+        - name: coordinator
+          containerPort: 12345
+        resources:
+          requests:
+            cpu: "16"
+            memory: "192Gi"
+            nvidia.com/gpu: "4"
+          limits:
+            cpu: "16"
+            memory: "192Gi"
+            nvidia.com/gpu: "4"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: data
+          mountPath: /data
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: workspace
+        emptyDir: {}
+      - name: source-bundle
+        configMap:
+          name: dreamer4-src
+      - name: data
+        hostPath:
+          path: /data
+          type: Directory
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 500Gi
