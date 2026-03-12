@@ -4,15 +4,18 @@ defaults:
   - _self_
 
 run_name: ehhsivede-3
-tokenizer_ckpt: /mnt/data/logs/tokenizer-asymmetric-small-normal-latent-space/checkpoints/
+use_wandb: true
+tokenizer_ckpt: /data/minecraft-vpt/models/tokenizer-asymmetric-small-normal-latent-space/checkpoints/
 
 ckpt:
   max_to_keep: 1
   save_interval_steps: 1_000
 
 dataset:
+  array_record_path: /data/minecraft-vpt/latents-final/
   dataloader_cfg:
-    B: 40
+    B: 12
+    num_workers: 0
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
     short_T: 64

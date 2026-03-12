@@ -14,15 +14,26 @@ import pickle
 from typing import Any
 import jax
 import jax.numpy as jnp
-
-import decord
 import grain
 import numpy as np
 
 from ..actions import Actions, parse_action_dicts
 from .serialization import deserialize_msgpack_record
 
-decord.bridge.set_bridge("native")
+try:
+    import decord
+except ImportError:
+    decord = None
+
+
+def _require_decord():
+    if decord is None:
+        raise ImportError(
+            "decord is required for Minecraft VPT video decoding but is not installed "
+            "for this platform."
+        )
+    decord.bridge.set_bridge("native")
+    return decord
 
 
 # ==============================================================================
@@ -281,11 +292,12 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             Dictionary with videos and actions
         """
         data = pickle.loads(element)
+        decord_module = _require_decord()
 
         # Decode MP4 bytes using decord
         mp4_bytes = io.BytesIO(data["video"])
-        vr = decord.VideoReader(
-            mp4_bytes, ctx=decord.cpu(0), num_threads=self.decoder_threads
+        vr = decord_module.VideoReader(
+            mp4_bytes, ctx=decord_module.cpu(0), num_threads=self.decoder_threads
         )
 
         episode_len = len(vr)

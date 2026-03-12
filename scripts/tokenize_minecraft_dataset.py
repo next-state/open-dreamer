@@ -20,7 +20,6 @@ import queue
 from pathlib import Path
 from threading import Thread
 
-import decord
 import grain
 import hydra
 import jax
@@ -39,6 +38,13 @@ from dreamer.data.data import DataLoaderIteratorWrapper
 from dreamer.data.shard_writer import ShardWriter
 from dreamer.data.transforms import ProcessMinecraftEpisodeAndSlice
 from dreamer.parallel import build_parallel
+
+try:
+    import decord
+except ImportError as exc:
+    raise ImportError(
+        "scripts/tokenize_minecraft_dataset.py requires decord for MP4 decoding."
+    ) from exc
 
 decord.bridge.set_bridge("native")
 

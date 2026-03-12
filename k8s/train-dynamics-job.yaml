@@ -1,0 +1,82 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train-dynamics-latents-single-node
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: p02-r01-cp05
+      initContainers:
+      - name: unpack-source
+        image: python:3.11-bookworm
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          mkdir -p /workspace
+          tar -xzf /src/dreamer4-k8s-src.tgz -C /workspace
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: source-bundle
+          mountPath: /src
+      containers:
+      - name: trainer
+        image: python:3.11-bookworm
+        workingDir: /workspace
+        env:
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-credentials
+              key: WANDB_API_KEY
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          apt-get update
+          python -m pip install --upgrade pip uv
+          uv sync
+          uv pip install -e .
+          uv run scripts/train_dynamics.py \
+            run_name=train-dynamics-latents-single-node \
+            use_wandb=true \
+            hydra.run.dir=/data/minecraft-vpt/models/train-dynamics-latents-single-node \
+            dataset.array_record_path=/data/minecraft-vpt/latents-final/ \
+            dataset.dataloader_cfg.B=12 \
+            ckpt.max_to_keep=0 \
+            dataset.dataloader_cfg.num_workers=0 \
+            tokenizer_ckpt=/data/minecraft-vpt/models/tokenizer-asymmetric-small-normal-latent-space/checkpoints/
+        resources:
+          requests:
+            cpu: "16"
+            memory: "192Gi"
+            nvidia.com/gpu: "4"
+          limits:
+            cpu: "16"
+            memory: "192Gi"
+            nvidia.com/gpu: "4"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: data
+          mountPath: /data
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: workspace
+        emptyDir: {}
+      - name: source-bundle
+        configMap:
+          name: dreamer4-src
+      - name: data
+        hostPath:
+          path: /data
+          type: Directory
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 500Gi
