@@ -9,6 +9,11 @@ dynamics_ckpt: ""
 # "evaluate" only computes FVD from previously saved videos
 mode: "both"
 
+# Rollout type: one of ema_shortcut, ema_diffusion, online_shortcut, online_diffusion
+# - ema/online: which model weights to use
+# - shortcut (4 steps) vs diffusion (k_max steps)
+rollout_type: ema_shortcut
+
 # Generation settings
 num_videos: 256
 batch_size: 8

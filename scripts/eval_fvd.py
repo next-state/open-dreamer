@@ -75,7 +75,13 @@ def generate_videos(cfg):
             ckpt_path, mesh_rules=mesh_rules,
         )
         tokenizer = bundle.tokenizer
-        dynamics = bundle.dynamics_ema
+
+        rollout_type = cfg.get("rollout_type", "ema_shortcut")
+        valid_types = ("ema_shortcut", "ema_diffusion", "online_shortcut", "online_diffusion")
+        assert rollout_type in valid_types, f"rollout_type must be one of {valid_types}, got {rollout_type!r}"
+        use_ema = rollout_type.startswith("ema")
+        use_shortcut = rollout_type.endswith("shortcut")
+        dynamics = bundle.dynamics_ema if use_ema else bundle.dynamics
 
         use_latent_data = cfg.dataset.data_type == "latent"
         T = cfg.dataset.dataloader_cfg.long_T
@@ -86,7 +92,9 @@ def generate_videos(cfg):
             f"ctx_length({ctx_length}) + horizon({horizon}) > T({T})")
 
         k_max = dynamics.cfg.k_max
-        schedule_config = DenoiseSchedule.init(4, k_max)
+        num_steps = 4 if use_shortcut else k_max
+        schedule_config = DenoiseSchedule.init(num_steps, k_max)
+        print(f"Rollout type: {rollout_type} (num_steps={num_steps}, k_max={k_max})")
 
         # Override dataloader batch size
         cfg.dataset.dataloader_cfg.B = batch_size
@@ -94,7 +102,7 @@ def generate_videos(cfg):
         dataloader = make_iterator(cfg.dataset, seed=cfg.seed, device=data_sharding)
         rng = jax.random.PRNGKey(cfg.seed)
 
-        out_dir = video_dir / "step_000000"
+        out_dir = video_dir / rollout_type
         out_dir.mkdir(parents=True, exist_ok=True)
 
         collected = 0
@@ -145,7 +153,8 @@ def generate_videos(cfg):
 
 def evaluate_fvd(cfg):
     """Stage 2: Load saved MP4s and compute FVD."""
-    video_dir = Path(cfg.video_dir) / "step_000000"
+    rollout_type = cfg.get("rollout_type", "ema_shortcut")
+    video_dir = Path(cfg.video_dir) / rollout_type
     i3d_bs = cfg.i3d_bs
     pred_frames_only = cfg.pred_frames_only
     ctx_length = cfg.ctx_length
