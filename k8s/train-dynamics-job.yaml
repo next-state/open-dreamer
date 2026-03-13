@@ -8,7 +8,7 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        kubernetes.io/hostname: p02-r01-cp05
+        kubernetes.io/hostname: p02-r01-cp02
       initContainers:
       - name: unpack-source
         image: python:3.11-bookworm
@@ -46,8 +46,13 @@ spec:
             use_wandb=true \
             hydra.run.dir=/data/minecraft-vpt/models/train-dynamics-latents-single-node \
             dataset.array_record_path=/data/minecraft-vpt/latents-final/ \
-            dataset.dataloader_cfg.B=12 \
+            dataset.dataloader_cfg.B=4 \
+            dataset.dataloader_cfg.short_T=64 \
+            dataset.dataloader_cfg.long_T=192 \
+            dataset.dataloader_cfg.long_ratio=0.1 \
+            dynamics.context_length=128 \
             ckpt.max_to_keep=0 \
+            write_video_every=5000 \
             dataset.dataloader_cfg.num_workers=0 \
             tokenizer_ckpt=/data/minecraft-vpt/models/tokenizer-asymmetric-small-normal-latent-space/checkpoints/
         resources:
