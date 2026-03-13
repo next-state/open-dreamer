@@ -863,6 +863,31 @@ def compute_policy_loss(
 # ---------------------------
 
 
+@nnx.jit(static_argnames=("schedule_config", "horizon", "use_latent_data"))
+def compute_eval(tokenizer, dynamics, val_data, val_actions, rng,
+                 schedule_config, horizon, use_latent_data,
+                 policy=None, task_embedder=None):
+    """JIT-compiled core: sample_video + metrics. Returns raw frames for saving."""
+    sample_kwargs = dict(tokenizer=tokenizer, dynamics=dynamics, actions=val_actions,
+                         horizon=horizon, schedule_config=schedule_config, rng=rng,
+                         policy=policy, task_embedder=task_embedder)
+    if use_latent_data:
+        sample_kwargs["frames"] = None
+        sample_kwargs["latents"] = val_data
+    else:
+        sample_kwargs["frames"] = val_data
+
+    pred_frames, gt_decoded_frames, original_frames = sample_video(**sample_kwargs)
+    gt_frames_for_metrics = original_frames if original_frames is not None else gt_decoded_frames
+
+    pred_f = pred_frames[:, -horizon:] / 255.0
+    gt_f   = gt_frames_for_metrics[:, -horizon:] / 255.0
+    mse = jnp.mean((pred_f - gt_f) ** 2)
+    psnr = compute_psnr(pred_f, gt_f)
+
+    return mse, psnr, pred_frames, gt_decoded_frames, original_frames
+
+
 def run_evaluation(
     cfg: DynamicsConfig,
     step: int,
@@ -917,7 +942,7 @@ def run_evaluation(
         rng, eval_rng = jax.random.split(rng)
 
         if use_latent_data:
-            pred_frames, gt_decoded_frames, _, _ = sample_video(
+            pred_frames, gt_decoded_frames, _ = sample_video(
                 tokenizer, dynamics_model, frames=None,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=eval_rng, policy=None, task_embedder=None,
@@ -925,7 +950,7 @@ def run_evaluation(
             )
             gt_frames_for_metrics = gt_decoded_frames
         else:
-            pred_frames, _, original_frames, _ = sample_video(
+            pred_frames, _, original_frames = sample_video(
                 tokenizer, dynamics_model, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=eval_rng, policy=None, task_embedder=None,

@@ -1,6 +1,6 @@
 defaults:
   - common
-  - dataset: minecraft_vpt_latent
+  - dataset: minecraft_vpt
   - _self_
 
 run_name: dynamics
@@ -12,7 +12,7 @@ ckpt:
   save_interval_steps: 5_000
 
 dataset:
-  array_record_path: /data/minecraft-vpt/latents-0312-h200
+  array_record_path: /home/ubuntu/workspace/arrayrecords-mp4
   dataloader_cfg:
     B: ???
     num_workers: 0

@@ -1,3 +1,4 @@
+import dataclasses
 import math
 import einops
 import jax
@@ -6,11 +7,10 @@ from typing import Any, Tuple
 from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 from .actions import Actions
 from .utils import normalize_latents, unnormalize_latents
-from flax.struct import dataclass
 from tqdm import tqdm
 
 
-@dataclass
+@dataclasses.dataclass(frozen=True)
 class DenoiseSchedule:
     """
     Precomputed, JAX-friendly schedule for the τ-ladder.
@@ -78,7 +78,15 @@ class DenoiseSchedule:
         tau_idx_ctx = j_ctx * (k_max // K_ctx)
 
         return cls(num_steps, k_max, d, step_idx, emax, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
-    
+
+    def __hash__(self):
+        return hash((self.num_steps, self.k_max, float(self.tau_ctx)))
+
+    def __eq__(self, other):
+        if not isinstance(other, DenoiseSchedule):
+            return NotImplemented
+        return (self.num_steps, self.k_max, float(self.tau_ctx)) == (other.num_steps, other.k_max, float(other.tau_ctx))
+
 # ---------------------------
 # Single-step τ-ladder denoiser
 # ---------------------------

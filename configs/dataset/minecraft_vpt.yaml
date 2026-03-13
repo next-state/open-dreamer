@@ -4,8 +4,8 @@ defaults:
 name: minecraft_vpt
 data_type: video
 
-array_record_path: /home/dreamer/data/arrayrecords-mp4
-index_max: 500
+array_record_path: /home/ubuntu/workspace/arrayrecords-mp4
+index_max: 5
 num_max_samples: -1
 
 dataloader_cfg:
