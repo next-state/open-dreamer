@@ -17,7 +17,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dreamer.configs import TokenizerConfig
 from dreamer.training import compute_psnr
-from dreamer.data import make_dual_iterator
+from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
 from dreamer.parallel import build_parallel, MeshRules
@@ -205,21 +205,10 @@ def run(cfg: TokenizerConfig):
         # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
         n_patches = (cfg.dataset.H // cfg.tokenizer.encoder.patch_size) * (cfg.dataset.W // cfg.tokenizer.encoder.patch_size)
         dl_cfg = cfg.dataset.dataloader_cfg
-        short_T = dl_cfg.short_T
         long_T = dl_cfg.long_T
-        long_ratio = dl_cfg.long_ratio
-
-        # make_dual_iterator rescales batch size as B(T)=B_long * long_T // T.
-        # This keeps B*T constant across short/long steps.
-        # TODO: make the ScalingContext estimate the flops instead of passing it externally
-        B_long = dl_cfg.B
-        B_short = B_long * long_T // short_T
-        tokens_per_step_bt = B_long * long_T
-
-        # Expected FLOPs per step under alternating short/long batches.
-        flops_short = tokenizer.estimate_flops(batch_size=B_short, seq_length=short_T)
-        flops_long = tokenizer.estimate_flops(batch_size=B_long, seq_length=long_T)
-        expected_flops_per_step = (1.0 - long_ratio) * flops_short + long_ratio * flops_long
+        B = dl_cfg.B
+        tokens_per_step_bt = B * long_T
+        expected_flops_per_step = tokenizer.estimate_flops(batch_size=B, seq_length=long_T)
 
         scaling = ScalingContext.create(
             cfg=cfg,
@@ -242,7 +231,7 @@ def run(cfg: TokenizerConfig):
         bundle = TokenizerCheckpointBundle(tokenizer=tokenizer, tokenizer_optimizer=optimizer)
 
         # Data iterator
-        train_dataloader = make_dual_iterator(cfg.dataset, device=data_sharding)
+        train_dataloader = make_iterator(cfg.dataset, device=data_sharding, seq_len=dl_cfg.long_T)
 
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=TokenizerCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
@@ -277,7 +266,7 @@ def run(cfg: TokenizerConfig):
                     log_gradients=cfg.logger.log_gradients,
                     tokenizer_loss_type=cfg.tokenizer_loss_type,
                     mae_p_max=current_mae_p_max,
-                    freeze_encoder=cfg.freeze_encoder,
+                    freeze_encoder=cfg.mae_finetune,
                 )
 
                 if logger.should_log(step):

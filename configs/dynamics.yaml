@@ -12,7 +12,7 @@ ckpt:
   save_interval_steps: 5_000
 
 dataset:
-  array_record_path: /data/minecraft-vpt/latents-final/
+  array_record_path: /data/minecraft-vpt/latents-0312-h200
   dataloader_cfg:
     B: ???
     num_workers: 0

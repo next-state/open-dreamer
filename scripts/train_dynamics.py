@@ -68,7 +68,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
+    static_argnames=("k_max", "B_img", "T", "n_splits", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -83,6 +83,7 @@ def train_step(
     step: int,
     B_img: int,               # Number of samples to treat as images
     T: int,
+    n_splits: int,            # Number of block-causal chunks (1 = full causal, >1 = split into independent chunks)
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
     bootstrap_fraction: float,
@@ -109,7 +110,13 @@ def train_step(
 
     # Build time mask for full batch
     mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
-    mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))  # causal tokens
+    # Block-causal mask: n_splits independent causal chunks
+    chunk_size = T // n_splits
+    row_idx = jnp.arange(T)
+    col_idx = jnp.arange(T)
+    same_chunk = (row_idx[:, None] // chunk_size) == (col_idx[None, :] // chunk_size)
+    causal = row_idx[:, None] >= col_idx[None, :]
+    mask_vid = (same_chunk & causal)                         # block-causal tokens
     time_mask = jnp.where(
         is_img[:, None, None, None],
         mask_img[None, None, :, :],
@@ -212,7 +219,7 @@ def run(cfg: DynamicsConfig):
         n_spatial = n_latents // cfg.dynamics.packing_factor
         dl_cfg = cfg.dataset.dataloader_cfg
         B = dl_cfg.B
-        avg_T = int(dl_cfg.long_ratio * dl_cfg.long_T + (1 - dl_cfg.long_ratio) * dl_cfg.short_T)
+        avg_T = dl_cfg.long_T
 
         # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
         dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
@@ -266,6 +273,8 @@ def run(cfg: DynamicsConfig):
 
                 rng, master_key = jax.random.split(rng, num=2)
 
+                n_splits = int(batch.pop("n_splits"))
+
                 # Use pre-allocated batch
                 actions = batch["actions"]
                 videos = batch.get("videos")
@@ -300,6 +309,7 @@ def run(cfg: DynamicsConfig):
                     step=step,
                     B_img=int(B * cfg.image_fraction),
                     T=T,
+                    n_splits=n_splits,
                     k_max=cfg.dynamics.k_max,
                     context_length=cfg.dynamics.context_length,
                     bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
@@ -328,7 +338,7 @@ def run(cfg: DynamicsConfig):
                                 "flow_mse_high": metrics_cpu["flow_mse_high"],
                                 "boot_target_norm": metrics_cpu["boot_target_norm"],
                                 "lr": lr_schedule(step),
-                                "T": T,
+                                "T": T // n_splits,
                                 **scaling.get_step_metrics(step),
                             },
                             pbar=pbar,

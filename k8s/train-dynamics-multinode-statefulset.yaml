@@ -88,7 +88,7 @@ spec:
             use_wandb=${USE_WANDB} \
             hydra.run.dir=/data/minecraft-vpt/models/train-dynamics-latents-multinode \
             hydra.output_subdir=null \
-            dataset.array_record_path=/data/minecraft-vpt/latents-final/ \
+            dataset.array_record_path=/data/minecraft-vpt/latents-final \
             dataset.dataloader_cfg.B=${GLOBAL_BATCH_SIZE} \
             ckpt.max_to_keep=0 \
             dataset.dataloader_cfg.num_workers=0 \
