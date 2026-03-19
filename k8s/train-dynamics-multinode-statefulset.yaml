@@ -18,7 +18,7 @@ metadata:
   name: train-dynamics-multinode
 spec:
   serviceName: train-dynamics-multinode
-  replicas: 14
+  replicas: 18
   podManagementPolicy: Parallel
   selector:
     matchLabels:
@@ -71,9 +71,9 @@ spec:
 
           COORDINATOR_HOST="train-dynamics-multinode-0.train-dynamics-multinode"
           export JAX_COORDINATOR_ADDRESS="${COORDINATOR_HOST}:12345"
-          export JAX_PROCESS_COUNT=14
+          export JAX_PROCESS_COUNT=18
           export JAX_PROCESS_INDEX="${HOSTNAME##*-}"
-          GLOBAL_BATCH_SIZE="$((12 * JAX_PROCESS_COUNT))"
+          GLOBAL_BATCH_SIZE="$((4 * JAX_PROCESS_COUNT))"
 
           if [ "${JAX_PROCESS_INDEX}" = "0" ]; then
             USE_WANDB=true
@@ -84,13 +84,22 @@ spec:
           fi
 
           uv run scripts/train_dynamics.py \
-            run_name=train-dynamics-latents-multinode \
+            run_name=re-warmup \
             use_wandb=${USE_WANDB} \
-            hydra.run.dir=/data/minecraft-vpt/models/train-dynamics-latents-multinode \
-            hydra.output_subdir=null \
-            dataset.array_record_path=/data/minecraft-vpt/latents-final \
+            bootstrap_fraction=0.3334 \
+            bootstrap_start=150000 \
+            hydra.run.dir=/data/minecraft-vpt/models/re-warmup \
             dataset.dataloader_cfg.B=${GLOBAL_BATCH_SIZE} \
-            ckpt.max_to_keep=0 \
+            dataset.dataloader_cfg.short_T=64 \
+            dataset.dataloader_cfg.long_T=192 \
+            dataset.dataloader_cfg.long_ratio=0.1 \
+            dataset.array_record_path=/data/minecraft-vpt/latents-final \
+            dataset.index_max=26 \
+            dynamics.context_length=128 \
+            lr_schedule.warmup_ratio=0.01 \
+            lr_schedule.decay_ratio=0.99 \
+            write_video_every=0 \
+            max_steps=300000 \
             dataset.dataloader_cfg.num_workers=0 \
             tokenizer_ckpt=/data/minecraft-vpt/models/tokenizer-asymmetric-small-normal-latent-space/checkpoints/
         ports:

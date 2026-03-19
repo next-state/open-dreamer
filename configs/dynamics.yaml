@@ -12,7 +12,7 @@ ckpt:
   save_interval_steps: 5_000
 
 dataset:
-  array_record_path: /data/minecraft-vpt/latents-0312-h200
+  array_record_path: /data/minecraft-vpt/latents-final
   dataloader_cfg:
     B: ???
     num_workers: 0
@@ -53,7 +53,7 @@ dynamics:
 
 ema_decay: 0.9997
 
-bootstrap_start: 50_000  # Number of start steps trained exclusively on flow-matching objective
+bootstrap_start: 100_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
 image_fraction: 0.0  # Fraction of batch to train as images (no temporal attention)
 
@@ -67,7 +67,7 @@ ot:
   pairing: barycentric
   scale_cost: mean
 
-max_steps: 500_000
+max_steps: 300_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
