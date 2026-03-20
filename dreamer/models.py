@@ -120,7 +120,8 @@ class KVCache:
         return k_ordered, v_ordered, final_mask
 
 
-KVCachesDict = Dict[int, KVCache]  # Type alias for KV cache dictionaries
+KVCachesDict = Dict[int, KVCache]  # Type alias for per-transformer KV cache dictionaries
+TokenizerKVCaches = Dict[str, KVCachesDict]
 
 
 def create_transformer_caches(
@@ -802,7 +803,7 @@ class Encoder(nnx.Module):
         self.mask_and_replace = MAEReplacer(D=cfg.d_model, p_min=cfg.mae_p_min, p_max=cfg.mae_p_max, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
         self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_latents, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
-    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+    def __call__(self, videos, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray], KVCachesDict | None]:
         # Videos in the [0, 255] range
         B, T, H, W, C = videos.shape
 
@@ -835,14 +836,14 @@ class Encoder(nnx.Module):
 
         # Feed tokens into transformer
         time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
-        encoded_tokens, _, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, rngs=rngs)
+        encoded_tokens, new_caches, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, caches=caches, rngs=rngs)
 
         # Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
         proj_tokens = nnx.tanh(self.bottleneck_proj(latent_tokens))
 
         # Always return unpacked: (B, T, n_latents, d_bottleneck)
-        return proj_tokens, (frame_mask, keep_prob)
+        return proj_tokens, (frame_mask, keep_prob), new_caches
 
 
 class Decoder(nnx.Module):
@@ -886,14 +887,7 @@ class Decoder(nnx.Module):
             (Modality.IMAGE, self.n_patches)
         ))
 
-    def __call__(
-            self,
-            z: jnp.ndarray,
-            *,
-            deterministic: bool = True,
-            caches: KVCachesDict | None = None,
-            rngs: nnx.Rngs | None = None
-        ):
+    def __call__(self, z: jnp.ndarray, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None):
         # Always expect unpacked input: (B, T, n_latents, d_bottleneck)
         B, T, N_l, d_bottleneck = z.shape
 
@@ -931,31 +925,44 @@ class Tokenizer(nnx.Module):
         self.decoder = Decoder(cfg.decoder, mesh_rules=mesh_rules, rngs=rngs)
 
     def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
-        z, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs, mae_p_max=mae_p_max)
+        z, aux, _ = self.encoder(videos, deterministic=deterministic, rngs=rngs, mae_p_max=mae_p_max)
         recon, _ = self.decoder(z, deterministic=deterministic, rngs=rngs)
         return recon, aux
 
-    def encode(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
+    def encode(self, videos, *, deterministic: bool = True, caches: TokenizerKVCaches | None = None, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None,):
         # Always returns unpacked: (B, T, n_latents, d_bottleneck)
-        return self.encoder(videos, deterministic=deterministic, rngs=rngs, mae_p_max=mae_p_max)
+        z, aux, encoder_caches = self.encoder(videos, deterministic=deterministic, caches=None if caches is None else caches["encoder"], rngs=rngs, mae_p_max=mae_p_max)
+        new_caches = None if caches is None else {"encoder": encoder_caches, "decoder": caches["decoder"]}
+        return z, aux, new_caches
 
-    def decode(self, z, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None):
+    def decode(self, z, *, deterministic: bool = True, caches: TokenizerKVCaches | None = None, rngs: nnx.Rngs | None = None):
         # Always expects unpacked: (B, T, n_latents, d_bottleneck)
-        frames, caches = self.decoder(z, deterministic=deterministic, caches=caches, rngs=rngs)
-        return frames, caches
+        frames, decoder_caches = self.decoder(z, deterministic=deterministic, caches=None if caches is None else caches["decoder"], rngs=rngs)
+        new_caches = None if caches is None else {"encoder": caches["encoder"],"decoder": decoder_caches}
+        return frames, new_caches
 
-    def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
-        """Creates concrete, zero-filled KV cache buffers for JIT compilation."""
+    def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> TokenizerKVCaches:
+        """Creates concrete, zero-filled encoder and decoder KV cache buffers for JIT compilation."""
         layout = self.decoder.get_token_layout()
 
-        return create_transformer_caches(
-            layer_is_time=[layer.is_time_layer for layer in self.decoder.transformer.layers],
-            flattened_batch_size=batch_size * layout.S,
-            window_size=window_size,
-            num_kv_heads=self.cfg.decoder.n_kv_heads,
-            head_dim=self.cfg.decoder.d_model // self.cfg.decoder.n_heads,
-            dtype=dtype
-        )
+        return {
+            "encoder": create_transformer_caches(
+                layer_is_time=[layer.is_time_layer for layer in self.encoder.transformer.layers],
+                flattened_batch_size=batch_size * layout.S,
+                window_size=window_size,
+                num_kv_heads=self.cfg.encoder.n_kv_heads,
+                head_dim=self.cfg.encoder.d_model // self.cfg.encoder.n_heads,
+                dtype=dtype,
+            ),
+            "decoder": create_transformer_caches(
+                layer_is_time=[layer.is_time_layer for layer in self.decoder.transformer.layers],
+                flattened_batch_size=batch_size * layout.S,
+                window_size=window_size,
+                num_kv_heads=self.cfg.decoder.n_kv_heads,
+                head_dim=self.cfg.decoder.d_model // self.cfg.decoder.n_heads,
+                dtype=dtype,
+            ),
+        }
 
     def num_scaling_params(self) -> int:
         """Total params for scaling law analysis (Chinchilla-style, includes all)."""

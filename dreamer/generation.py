@@ -2,8 +2,8 @@ import math
 import einops
 import jax
 import jax.numpy as jnp
-from typing import Any, Tuple
-from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
+from typing import Tuple
+from .models import KVCachesDict, TokenizerKVCaches, Dynamics, PolicyHeadMTP, Tokenizer
 from .actions import Actions
 from .utils import normalize_latents, unnormalize_latents
 from flax.struct import dataclass
@@ -82,6 +82,30 @@ class DenoiseSchedule:
 # ---------------------------
 # Single-step τ-ladder denoiser
 # ---------------------------
+
+
+def update_KV_caches(
+    dynamics: Dynamics,
+    schedule: DenoiseSchedule,
+    action: Actions,
+    latent: jax.Array,
+    rng: jax.Array,
+    dynamics_caches: KVCachesDict,
+    task_embedding: jax.Array | None = None,
+) -> Tuple[jax.Array | None, KVCachesDict, jax.Array]:
+    """Advance dynamics KV caches with the finalized latent at tau_ctx."""
+    B = latent.shape[0]
+    action = action[:, None, ...]
+    step_indices = jnp.full((B, 1), schedule.step_idx_ctx, dtype=jnp.int32)
+    tau_indices = jnp.full((B, 1), schedule.tau_idx_ctx, dtype=jnp.int32)
+
+    rng, noise_key = jax.random.split(rng)
+    latent_noised = latent * schedule.tau_ctx + (1 - schedule.tau_ctx) * jax.random.normal(noise_key, shape=latent.shape, dtype=latent.dtype)
+
+    _, (h_seq, caches_new) = dynamics(action, step_indices, tau_indices, latent_noised, task_embeddings=task_embedding, deterministic=True, caches=dynamics_caches)
+    assert caches_new is not None
+    h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq
+    return h_last, caches_new, rng
 
 def next_latent(
     dynamics: Dynamics,
@@ -194,19 +218,7 @@ def next_latent(
     }
     
     if caches is not None:
-        # Update caches by doing one more forward pass with tau_ctx
-        step_indices = jnp.full((B, 1), schedule.step_idx_ctx, dtype=jnp.int32)
-        tau_indices = jnp.full((B, 1), schedule.tau_idx_ctx, dtype=jnp.int32)
-        
-        rng, new_random_key = jax.random.split(rng)
-        latent_noised_caching = latent_t_final * schedule.tau_ctx + (1 - schedule.tau_ctx) * jax.random.normal(new_random_key, shape=latent_t_final.shape, dtype=latent_t_final.dtype)
-
-        # Dynamics call
-        _, (h_seq_final, caches_new) = dynamics(
-            action, step_indices, tau_indices, latent_noised_caching,
-            task_embeddings=task_embedding, deterministic=True, caches=caches
-        )
-        h_last = h_seq_final[:, -1:, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
+        h_last, caches_new, rng = update_KV_caches(dynamics=dynamics, schedule=schedule, action=action, latent=latent_t_final, rng=rng, dynamics_caches=caches, task_embedding=task_embedding)
     else:
         h_last = h_history[-1] if h_history is not None else None  # (B, n_agent, d_model)
         caches_new = None
@@ -223,11 +235,11 @@ def next_frame(
     schedule: DenoiseSchedule,
     action: Actions,
     latent_shape: Tuple,
-    dynamics_cache: Any,
-    tokenizer_cache: Any,
+    dynamics_cache: KVCachesDict | None,
+    tokenizer_cache: TokenizerKVCaches | None,
     rng: jax.Array,
     task_embedding: jax.Array | None = None,
-) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, Any, jax.Array]:
+) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, TokenizerKVCaches | None, jax.Array]:
     """
     Generate next frame using dynamics model and decode to pixels.
 
@@ -238,7 +250,7 @@ def next_frame(
         action: Single action to condition on where the time dimension is squeezed (B, ...)
         latent_shape: Shape of latent (B, 1, n_spatial, D_s)
         dynamics_cache: KV cache for dynamics model from previous steps
-        tokenizer_cache: KV cache for tokenizer decoder from previous steps
+        tokenizer_cache: Structured tokenizer KV cache with encoder and decoder entries
         rng: Random key
         task_embedding: Optional task embedding (currently unused)
         
@@ -435,7 +447,7 @@ def video_rollout(
     rng, mae_key = jax.random.split(rng)
     rngs = nnx.Rngs(mae=mae_key)
 
-    latents_ctx, _ = tokenizer.encode(
+    latents_ctx, _, _ = tokenizer.encode(
         frames_ctx,
         deterministic=True,
         rngs=rngs

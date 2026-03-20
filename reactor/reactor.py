@@ -235,7 +235,7 @@ class DreamerVideoModel(VideoModel):
         
         # Encode frames to latents
         logger.info("Encoding frames to latents...")
-        init_latents, _ = self.tokenizer.encode(
+        init_latents, _, _ = self.tokenizer.encode(
             init_frames_jax,
             deterministic=True,
             rngs=nnx.Rngs(mae=rng_encoder),
@@ -334,4 +334,3 @@ class DreamerVideoModel(VideoModel):
             self.tokenizer_cache = None  # Clean up cache
             logger.info("Dreamer session ended.")
             print("DEBUG: Dreamer session ended.", flush=True)
-

@@ -125,9 +125,10 @@ def create_update_caches_fn(tokenizer:Tokenizer, dynamics: Dynamics, schedule:De
         rng, enc_key, noise_key = jax.random.split(rng, 3)
 
         # 1. Encode frame to latent (returns unpacked)
-        latent, _ = tokenizer.encode(
+        latent, _, tokenizer_cache = tokenizer.encode(
             frame,
             deterministic=True,
+            caches=tokenizer_cache,
             rngs=nnx.Rngs(mae=enc_key),
         )  # Shape: (1, 1, n_latents, D_s)
 

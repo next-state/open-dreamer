@@ -72,7 +72,7 @@ def sample_video(
         rngs = nnx.Rngs(mae=mae_key)
 
         # Encode frames to clean latents (returns unpacked)
-        latents, _ = tokenizer.encode(
+        latents, _, _ = tokenizer.encode(
             frames,
             deterministic=True,
             rngs=rngs
