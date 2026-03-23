@@ -893,6 +893,7 @@ def run_evaluation(
             f"{dynamics_online.cfg.k_max} and {dynamics_ema.cfg.k_max}."
         )
 
+    # val_data = val_data[:,:64]
     T = val_data.shape[1]
     assert T > 5, f"Sequence length {T} must be > 5"
     ctx_length = 4
@@ -970,6 +971,8 @@ def run_evaluation(
             f"MSE={mse:.6g} | {psnr_log} | {dt:.2f}s"
         )
 
+        # Visualization should show the true context frames; metrics already ignore them.
+        pred_frames = pred_frames.at[:, :ctx_length].set(gt_frames_for_metrics[:, :ctx_length])
         pred_frames = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
         pred_columns[tag] = pred_frames
         rollout_metrics[tag] = {

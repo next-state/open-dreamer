@@ -9,13 +9,84 @@ from flax import nnx
 
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
-from .generation import DenoiseSchedule, video_rollout, latent_rollout
+from .generation import DenoiseSchedule, video_rollout, latent_rollout, next_frame
+from .utils import normalize_latents
 
 
 @nnx.jit
 def decode_jit(tokenizer: Tokenizer, z: jax.Array) -> jax.Array:
     frames, _ = tokenizer.decode(z, deterministic=True)
     return frames
+
+
+@nnx.jit
+def warmup_tokenizer_cache_jit(
+    tokenizer: Tokenizer,
+    unnormalized_latents: jax.Array,
+    tokenizer_cache,
+):
+    frames, tokenizer_cache = tokenizer.decode(
+        unnormalized_latents,
+        caches=tokenizer_cache,
+        deterministic=True,
+    )
+    _, _, tokenizer_cache = tokenizer.encode(
+        frames,
+        deterministic=True,
+        caches=tokenizer_cache,
+    )
+    return frames, tokenizer_cache
+
+
+@nnx.jit
+def prefill_dynamics_cache_jit(
+    dynamics: Dynamics,
+    schedule: DenoiseSchedule,
+    actions: Actions,
+    unnormalized_latents: jax.Array,
+    dynamics_cache,
+):
+    normalized_latents = normalize_latents(
+        unnormalized_latents,
+        dynamics.cfg.latent_mean,
+        dynamics.cfg.latent_std,
+    )
+    B, T = normalized_latents.shape[:2]
+    step_indices = jnp.full((B, T), schedule.emax, dtype=jnp.int32)
+    tau_indices = jnp.full((B, T), schedule.k_max, dtype=jnp.int32)
+
+    _, (_, dynamics_cache) = dynamics(
+        actions,
+        step_indices,
+        tau_indices,
+        normalized_latents,
+        deterministic=True,
+        caches=dynamics_cache,
+    )
+    return dynamics_cache
+
+
+@nnx.jit(static_argnames=("latent_shape",))
+def next_frame_jit(
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
+    schedule: DenoiseSchedule,
+    action: Actions,
+    latent_shape: Tuple,
+    dynamics_cache,
+    tokenizer_cache,
+    rng: jax.Array,
+):
+    return next_frame(
+        tokenizer=tokenizer,
+        dynamics=dynamics,
+        schedule=schedule,
+        action=action,
+        latent_shape=latent_shape,
+        dynamics_cache=dynamics_cache,
+        tokenizer_cache=tokenizer_cache,
+        rng=rng,
+    )
 
 
 # ---------------------------
@@ -106,24 +177,74 @@ def sample_video(
     else:
         initial_agent_tokens = None
 
-    # Use latent_rollout for both paths (frames already encoded to latents above)
-    rollout_result = latent_rollout(
-        dynamics,
-        policy=actions_future if policy is None else policy,
-        schedule=schedule_config,
-        latents_ctx=latents_ctx,
-        actions_ctx=actions_ctx,
-        num_steps=horizon,
-        rng=rng,
-        initial_task_embedding=initial_agent_tokens,
-        deterministic=True,
-    )
+    if policy is None:
+        window_size = T
+        latent_shape = (B, 1, latents.shape[2], latents.shape[3])
+        dynamics_cache = dynamics.create_static_caches(
+            batch_size=B,
+            n_latents=latents.shape[2],
+            window_size=window_size,
+            dtype=latents.dtype,
+        )
+        tokenizer_cache = tokenizer.create_static_caches(
+            batch_size=B,
+            window_size=window_size,
+            dtype=latents.dtype,
+        )
 
-    # Decode predicted latents to frames
-    # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
-    pred_frames = decode_jit(tokenizer, rollout_result['latents'])
-    pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
+        cached_frames = []
+        dynamics_cache = prefill_dynamics_cache_jit(
+            dynamics=dynamics,
+            schedule=schedule_config,
+            actions=actions_ctx,
+            unnormalized_latents=latents_ctx,
+            dynamics_cache=dynamics_cache,
+        )
+
+        for t in range(T_ctx):
+            frame_t, tokenizer_cache = warmup_tokenizer_cache_jit(
+                tokenizer=tokenizer,
+                unnormalized_latents=latents_ctx[:, t:t + 1],
+                tokenizer_cache=tokenizer_cache,
+            )
+            assert frame_t is not None
+            cached_frames.append(frame_t)
+
+        for t in range(horizon):
+            frame_t, _, dynamics_cache, tokenizer_cache, rng = next_frame_jit(
+                tokenizer=tokenizer,
+                dynamics=dynamics,
+                schedule=schedule_config,
+                action=actions_future[:, t],
+                latent_shape=latent_shape,
+                dynamics_cache=dynamics_cache,
+                tokenizer_cache=tokenizer_cache,
+                rng=rng,
+            )
+            cached_frames.append(frame_t)
+
+        pred_frames = jnp.concatenate(cached_frames, axis=1)
+        pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
+        ode_diags = {}
+    else:
+        rollout_result = latent_rollout(
+            dynamics,
+            policy=policy,
+            schedule=schedule_config,
+            latents_ctx=latents_ctx,
+            actions_ctx=actions_ctx,
+            num_steps=horizon,
+            rng=rng,
+            initial_task_embedding=initial_agent_tokens,
+            deterministic=True,
+        )
+
+        # Decode predicted latents to frames
+        # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
+        pred_frames = decode_jit(tokenizer, rollout_result['latents'])
+        pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
+        ode_diags = rollout_result.get('ode_diags', {})
+
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
-    ode_diags = rollout_result.get('ode_diags', {})
 
     return pred_frames, gt_decoded_frames, original_frames, ode_diags

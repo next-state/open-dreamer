@@ -37,7 +37,7 @@ def run(cfg):
         # Load checkpoint (includes both dynamics and tokenizer)
         print(f"Loading checkpoint from: {cfg.dynamics_ckpt}")
         bundle = DynamicsCheckpointBundle.from_pretrained(
-            cfg.dynamics_ckpt, mesh_rules=mesh_rules, model_names={"dynamics_ema", "tokenizer"}
+            cfg.dynamics_ckpt, mesh_rules=mesh_rules, model_names={"dynamics", "dynamics_ema", "tokenizer"}
         )
         print(f"Loaded dynamics model (k_max={bundle.dynamics_ema.cfg.k_max}, depth={bundle.dynamics_ema.cfg.depth})")
 
@@ -78,7 +78,8 @@ def run(cfg):
                 eval_cfg,  # type: ignore[arg-type]
                 step=cfg.step,
                 tokenizer=bundle.tokenizer,
-                dynamics=bundle.dynamics_ema,
+                dynamics_online=bundle.dynamics,
+                dynamics_ema=bundle.dynamics_ema,
                 val_data=input_tensor,
                 val_actions=actions,
                 use_latent_data=use_latent_data,

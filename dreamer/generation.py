@@ -88,24 +88,37 @@ def update_KV_caches(
     dynamics: Dynamics,
     schedule: DenoiseSchedule,
     action: Actions,
-    latent: jax.Array,
+    unnormalized_latents: jax.Array,
     rng: jax.Array,
     dynamics_caches: KVCachesDict,
     task_embedding: jax.Array | None = None,
-) -> Tuple[jax.Array | None, KVCachesDict, jax.Array]:
+    tokenizer: Tokenizer | None = None,
+    tokenizer_caches: TokenizerKVCaches | None = None,
+) -> Tuple[jax.Array | None, jax.Array | None, KVCachesDict, TokenizerKVCaches | None, jax.Array]:
     """Advance dynamics KV caches with the finalized latent at tau_ctx."""
-    B = latent.shape[0]
-    action = action[:, None, ...]
+    frame = None # TODO: add frame as argument, if it exist skip the latent decoding.
+    tokenizer_caches_new = tokenizer_caches
+
+    if tokenizer is not None:
+        assert tokenizer_caches is not None
+        frame, tokenizer_caches_new = tokenizer.decode(unnormalized_latents, caches=tokenizer_caches, deterministic=True)
+        unnormalized_latents, _, tokenizer_caches_new = tokenizer.encode(frame, deterministic=True, caches=tokenizer_caches_new)
+
+    normalized_latents = normalize_latents(unnormalized_latents, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+
+    B = normalized_latents.shape[0]
     step_indices = jnp.full((B, 1), schedule.step_idx_ctx, dtype=jnp.int32)
     tau_indices = jnp.full((B, 1), schedule.tau_idx_ctx, dtype=jnp.int32)
 
     rng, noise_key = jax.random.split(rng)
-    latent_noised = latent * schedule.tau_ctx + (1 - schedule.tau_ctx) * jax.random.normal(noise_key, shape=latent.shape, dtype=latent.dtype)
+    noise = jax.random.normal(noise_key, shape=normalized_latents.shape, dtype=normalized_latents.dtype)
+    noised_normalized_latents = normalized_latents * schedule.tau_ctx + (1 - schedule.tau_ctx) * noise
 
-    _, (h_seq, caches_new) = dynamics(action, step_indices, tau_indices, latent_noised, task_embeddings=task_embedding, deterministic=True, caches=dynamics_caches)
+    action = action[:, None, ...]
+    _, (h_seq, caches_new) = dynamics(action, step_indices, tau_indices, noised_normalized_latents, task_embeddings=task_embedding, deterministic=True, caches=dynamics_caches)
     assert caches_new is not None
     h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq
-    return h_last, caches_new, rng
+    return frame, h_last, caches_new, tokenizer_caches_new, rng
 
 def next_latent(
     dynamics: Dynamics,
@@ -118,6 +131,7 @@ def next_latent(
     caches: KVCachesDict | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: Actions | None = None,
+    finalize_caches: bool = True,
 ) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array, dict]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
@@ -141,27 +155,27 @@ def next_latent(
         - caches_new: The updated KV cache
     """
     rng, rng_latent, rng_ctx = jax.random.split(rng, 3)
-    noisy_latent = jax.random.normal(rng_latent, latent_shape)
+    noisy_normalized_latents = jax.random.normal(rng_latent, latent_shape)
     B = latent_shape[0]
 
-    latents_ctx_noised = None
+    noised_context_normalized_latents = None
     if latents_ctx is not None and caches is None:
-        latents_prefill = latents_ctx[:, :prefill_length]
-        latents_decode = latents_ctx[:, prefill_length:]
-        noise_decode = jax.random.normal(rng_ctx, latents_decode.shape)
-        latents_decode_noised = latents_decode * schedule.tau_ctx + (1 - schedule.tau_ctx) * noise_decode
-        latents_ctx_noised = jnp.concatenate([latents_prefill, latents_decode_noised], axis=1)
+        normalized_latents_prefill = latents_ctx[:, :prefill_length]
+        normalized_latents_decode = latents_ctx[:, prefill_length:]
+        decode_noise = jax.random.normal(rng_ctx, normalized_latents_decode.shape)
+        noised_normalized_latents_decode = normalized_latents_decode * schedule.tau_ctx + (1 - schedule.tau_ctx) * decode_noise
+        noised_context_normalized_latents = jnp.concatenate([normalized_latents_prefill, noised_normalized_latents_decode], axis=1)
 
+    cache_action = action
     action = action[:, None, ...]  # expand squeezed-out time dimension
 
-    def refinement_step(latent_t, s):
-        beta = schedule.beta_values[s]
+    def refinement_step(normalized_latents_t, step_inputs):
+        beta, tau_idx_val = step_inputs
 
         step_idx = schedule.step_idx
-        tau_idx_val = schedule.tau_indices[s]
 
         if caches is not None:
-            latent_input, actions_input = latent_t, action
+            normalized_latents_input, actions_input = normalized_latents_t, action
 
             step_indices= jnp.full((B, 1), step_idx,    dtype=jnp.int32)
             tau_indices = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
@@ -170,11 +184,11 @@ def next_latent(
         
         else:
             # Used only for debugging.
-            assert latents_ctx_noised is not None and actions_ctx is not None and prefill_length is not None
-            latent_input  = jnp.concatenate([latents_ctx_noised, latent_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
+            assert noised_context_normalized_latents is not None and actions_ctx is not None and prefill_length is not None
+            normalized_latents_input = jnp.concatenate([noised_context_normalized_latents, normalized_latents_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
             actions_input = jax.tree.map(lambda x, y: jnp.concatenate([x, y], axis=1), actions_ctx, action)  # (B, T_ctx+1)
 
-            decode_length = latents_ctx_noised.shape[1] - prefill_length
+            decode_length = noised_context_normalized_latents.shape[1] - prefill_length
             step_idx_prefill= jnp.full((B, prefill_length), schedule.emax, dtype=jnp.int32)
             step_idx_decode = jnp.full((B, decode_length),  schedule.step_idx_ctx, dtype=jnp.int32)
             step_idx_curr   = jnp.full((B, 1), step_idx, dtype=jnp.int32)
@@ -186,29 +200,29 @@ def next_latent(
             tau_indices    = jnp.concatenate([tau_idx_prefill, tau_idx_decode, tau_idx_curr], axis=1)  # (B, T_ctx+1)
 
         # Dynamics call
-        latent_clean_pred_seq, (h_seq, _) = dynamics(
-            actions_input, step_indices, tau_indices, latent_input,
+        predicted_normalized_latents_seq, (h_seq, _) = dynamics(
+            actions_input, step_indices, tau_indices, normalized_latents_input,
             task_embeddings=task_embedding, deterministic=True, caches=caches
         )
 
-        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
+        predicted_normalized_latents = predicted_normalized_latents_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
 
         # Per-step ODE diagnostics
-        x0_norm = jnp.mean(jnp.abs(latent_clean_pred))
-        update_mag = jnp.mean(jnp.abs((1.0 - beta) * (latent_clean_pred - latent_t)))
+        x0_norm = jnp.mean(jnp.abs(predicted_normalized_latents))
+        update_mag = jnp.mean(jnp.abs((1.0 - beta) * (predicted_normalized_latents - normalized_latents_t)))
 
         # Per-step mixing toward clean latent
-        latent_t_new = beta * latent_t + (1.0 - beta) * latent_clean_pred
+        updated_normalized_latents = beta * normalized_latents_t + (1.0 - beta) * predicted_normalized_latents
 
-        return latent_t_new, (h_last, x0_norm, update_mag)
+        return updated_normalized_latents, (h_last, x0_norm, update_mag)
 
     # Run τ-ladder with JAX control flow using scan to keep carry/output structure consistent.
     # Only run steps where tau index <= TAU_IDX_MAX (schedule.num_steps_capped is a concrete int for tracing).
-    latent_t_final, (h_history, x0_norm_hist, update_mag_hist) = jax.lax.scan(
+    final_normalized_latents, (h_history, x0_norm_hist, update_mag_hist) = jax.lax.scan(
         refinement_step,
-        noisy_latent,
-        jnp.arange(schedule.num_steps),
+        noisy_normalized_latents,
+        (schedule.beta_values, schedule.tau_indices[:-1]),
     )
 
     # ODE diagnostics
@@ -216,18 +230,19 @@ def next_latent(
         'x0_norm': x0_norm_hist,
         'update_mag': update_mag_hist,
     }
-    
-    if caches is not None:
-        h_last, caches_new, rng = update_KV_caches(dynamics=dynamics, schedule=schedule, action=action, latent=latent_t_final, rng=rng, dynamics_caches=caches, task_embedding=task_embedding)
+
+    if caches is not None and finalize_caches:
+        unnormalized_latents = unnormalize_latents(final_normalized_latents, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+        _, h_last, caches_new, _, rng = update_KV_caches(dynamics, schedule, cache_action, unnormalized_latents, rng, caches, task_embedding)
     else:
         h_last = h_history[-1] if h_history is not None else None  # (B, n_agent, d_model)
         caches_new = None
 
     assert isinstance(h_last, jax.Array) or h_last is None
 
-    latent_t_final = unnormalize_latents(latent_t_final, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+    final_unnormalized_latents = unnormalize_latents(final_normalized_latents, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
-    return latent_t_final, h_last, caches_new, rng, diag_dict
+    return final_unnormalized_latents, h_last, caches_new, rng, diag_dict
 
 def next_frame(
     tokenizer: Tokenizer,
@@ -267,15 +282,15 @@ def next_frame(
         prefill_length=None,  # No prefill for interactive generation
         task_embedding=task_embedding,
         caches=dynamics_cache,
+        finalize_caches=False,
     )
-    
-    # Decoder call
-    frame, tokenizer_cache_updated = tokenizer.decode(
-        latent,
-        caches=tokenizer_cache,
-        deterministic=True,
-    )
-    
+
+    if dynamics_cache is not None:
+        frame, h_last, dynamics_cache_updated, tokenizer_cache_updated, rng = update_KV_caches(dynamics, schedule, action, latent, rng, dynamics_cache, task_embedding, tokenizer, tokenizer_cache)
+        assert frame is not None
+    else:
+        frame, tokenizer_cache_updated = tokenizer.decode(latent, caches=tokenizer_cache, deterministic=True)
+
     # Clip to valid range (keep as JAX array)
     # frame shape: (B, 1, H, W, C)
     frame = jnp.clip(frame, 0, 255).astype(jnp.uint8)

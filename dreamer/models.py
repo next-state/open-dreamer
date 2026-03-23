@@ -464,12 +464,17 @@ class GroupedQueryAttention(nnx.Module):
                     mask_attn = jnp.logical_and(mask, cache_mask)
                 else:
                     mask_attn = cache_mask
+                # JAX local_window_size is query-relative, so it does not align with
+                # absolute positions once we switch to KV-cache decoding with T=1.
+                # The cache mask already enforces causality here.
+                attn_local_window_size = None
             else:
                 # TRAINING or NON-CAUSAL (SPACE) ATTENTION
                 new_cache = None
                 k_attn, v_attn = k, v
                 mask_attn = mask
                 attn_is_causal = self.is_causal and (mask is None)
+                attn_local_window_size = local_window_size
 
             # SDPA
             attn = jax.nn.dot_product_attention(
@@ -477,7 +482,7 @@ class GroupedQueryAttention(nnx.Module):
                 mask=mask_attn,
                 scale=scale,
                 is_causal=attn_is_causal,
-                local_window_size=local_window_size
+                local_window_size=attn_local_window_size
             )  # TODO: try setting implementation="cudnn"
 
             if return_weights:
