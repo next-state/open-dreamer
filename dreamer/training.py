@@ -900,8 +900,8 @@ def run_evaluation(
     k_max = dynamics_online.cfg.k_max
 
     rollout_specs = [
-        ("online_diffusion", dynamics_online, DenoiseSchedule.init(k_max, k_max)),
-        ("ema_diffusion", dynamics_ema, DenoiseSchedule.init(k_max, k_max)),
+        # ("online_diffusion", dynamics_online, DenoiseSchedule.init(k_max, k_max)),
+        # ("ema_diffusion", dynamics_ema, DenoiseSchedule.init(k_max, k_max)),
         ("online_shortcut", dynamics_online, DenoiseSchedule.init(4, k_max)),
         ("ema_shortcut", dynamics_ema, DenoiseSchedule.init(4, k_max)),
     ]
@@ -987,8 +987,8 @@ def run_evaluation(
 
         grid_columns = [
             ground_truth_frames,
-            pred_columns["online_diffusion"],
-            pred_columns["ema_diffusion"],
+            #pred_columns["online_diffusion"],
+            #pred_columns["ema_diffusion"],
             pred_columns["online_shortcut"],
             pred_columns["ema_shortcut"],
         ]
@@ -1001,7 +1001,7 @@ def run_evaluation(
         video_written = False
         try:
             videos = jax.device_get(videos)
-            iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
+            iio.imwrite(str(mp4_path), videos, fps=20, plugin='pyav', codec='libx264')
             video_written = True
         except Exception as e:
             print(f"[eval] consolidated MP4 write failed: {e}")
@@ -1017,6 +1017,173 @@ def run_evaluation(
 
         if video_written:
             logger.log_video(step, "eval/rollouts_grid/video", mp4_path)
+
+
+# ---------------------------
+# JIT-compiled evaluation
+# ---------------------------
+
+@nnx.jit(static_argnames=("schedule_config", "horizon", "ctx_length", "use_latent_data"))
+def compute_eval_jit(
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
+    val_data: jnp.ndarray,
+    val_actions: Actions,
+    rng: jax.Array,
+    *,
+    schedule_config: DenoiseSchedule,
+    horizon: int,
+    ctx_length: int,
+    use_latent_data: bool,
+    dataset_std: float,
+):
+    """JIT-compiled core of one evaluation rollout: sample + metrics + border.
+
+    Returns pred_frames (bordered), gt_frames, and scalar metrics.
+    All ops stay on device; only scalars need device_get before logging.
+    """
+    pred_frames, gt_decoded_frames, original_frames, _ = sample_video(
+        tokenizer, dynamics,
+        frames=None if use_latent_data else val_data,
+        latents=val_data if use_latent_data else None,
+        actions=val_actions,
+        horizon=horizon,
+        schedule_config=schedule_config,
+        rng=rng,
+    )
+    gt_frames_for_metrics = gt_decoded_frames if use_latent_data else original_frames
+
+    normalized_pred = normalize_with_dataset_stats(pred_frames[:, -horizon:], mean=0, std=dataset_std)
+    normalized_gt   = normalize_with_dataset_stats(gt_frames_for_metrics[:, -horizon:], mean=0, std=dataset_std)
+
+    def _mse(n):
+        n_eval = min(n, horizon)
+        return jnp.mean((normalized_pred[:, :n_eval] - normalized_gt[:, :n_eval]) ** 2)
+
+    def _psnr(n):
+        n_eval = min(n, horizon)
+        return compute_psnr(
+            pred_frames[:, ctx_length:ctx_length + n_eval] / 255,
+            gt_frames_for_metrics[:, ctx_length:ctx_length + n_eval] / 255,
+        )
+
+    mse    = jnp.mean((normalized_pred - normalized_gt) ** 2)
+    mse_1  = _mse(1);  mse_3  = _mse(3);  mse_8  = _mse(8)
+    psnr_1 = _psnr(1); psnr_3 = _psnr(3); psnr_8 = _psnr(8)
+
+    pred_frames_bordered = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
+
+    return pred_frames_bordered, gt_frames_for_metrics, mse, mse_1, mse_3, mse_8, psnr_1, psnr_3, psnr_8
+
+
+def run_evaluation_jit(
+    cfg: DynamicsConfig,
+    step: int,
+    tokenizer: Tokenizer,
+    dynamics_online: Dynamics,
+    dynamics_ema: Dynamics,
+    *,
+    val_data: jnp.ndarray,
+    val_actions: Actions,
+    use_latent_data: bool,
+    vis_dir: Path,
+    rng: jax.Array,
+    logger,
+):
+    """JIT-compiled version of run_evaluation. Same interface; uses compute_eval_jit per rollout."""
+    if dynamics_online.cfg.k_max != dynamics_ema.cfg.k_max:
+        raise ValueError(
+            f"Expected matching k_max for online/ema dynamics, got "
+            f"{dynamics_online.cfg.k_max} and {dynamics_ema.cfg.k_max}."
+        )
+
+    T = val_data.shape[1]
+    assert T > 5, f"Sequence length {T} must be > 5"
+    ctx_length = 4
+    horizon = T - ctx_length
+    k_max = dynamics_online.cfg.k_max
+
+    rollout_specs = [
+        #("online_diffusion", dynamics_online, DenoiseSchedule.init(k_max, k_max)),
+        #("ema_diffusion",    dynamics_ema,    DenoiseSchedule.init(k_max, k_max)),
+        ("online_shortcut",  dynamics_online, DenoiseSchedule.init(4, k_max)),
+        ("ema_shortcut",     dynamics_ema,    DenoiseSchedule.init(4, k_max)),
+    ]
+
+    dataset_std = cfg.dataset.dataset_std[0]
+    psnr_windows = (1, 3, 8)
+    pred_columns: Dict[str, jnp.ndarray] = {}
+    rollout_metrics: Dict[str, Dict[str, float]] = {}
+    ground_truth_frames: jnp.ndarray | None = None
+
+    for tag, dynamics_model, schedule_config in rollout_specs:
+        t0 = time.time()
+        rng, eval_rng = jax.random.split(rng)
+
+        pred_frames, gt_frames, mse, mse_1, mse_3, mse_8, psnr_1, psnr_3, psnr_8 = compute_eval_jit(
+            tokenizer, dynamics_model, val_data, val_actions, eval_rng,
+            schedule_config=schedule_config,
+            horizon=horizon,
+            ctx_length=ctx_length,
+            use_latent_data=use_latent_data,
+            dataset_std=dataset_std,
+        )
+        dt = time.time() - t0
+
+        mse   = float(mse)
+        mse_1 = float(mse_1); mse_3 = float(mse_3); mse_8 = float(mse_8)
+        psnr_1 = float(psnr_1); psnr_3 = float(psnr_3); psnr_8 = float(psnr_8)
+
+        psnr_log = f"PSNR@1={psnr_1:.2f} | PSNR@3={psnr_3:.2f} | PSNR@8={psnr_8:.2f} dB"
+        print(f"[eval_jit:{tag}] step={step:06d} | horizon={horizon} | MSE={mse:.6g} | {psnr_log} | {dt:.2f}s")
+
+        if ground_truth_frames is None:
+            ground_truth_frames = gt_frames
+
+        pred_columns[tag] = pred_frames
+        rollout_metrics[tag] = {
+            "mse": mse,
+            "mse_1": mse_1, "mse_3": mse_3, "mse_8": mse_8,
+            "psnr_1": psnr_1, "psnr_3": psnr_3, "psnr_8": psnr_8,
+            "eval_time": dt,
+        }
+
+    assert ground_truth_frames is not None
+
+    if logger is not None:
+        num_videos = min(4, ground_truth_frames.shape[0])
+        grid_columns = [
+            ground_truth_frames,
+            #pred_columns["online_diffusion"],
+            #pred_columns["ema_diffusion"],
+            pred_columns["online_shortcut"],
+            pred_columns["ema_shortcut"],
+        ]
+        stacked_frames = jnp.stack(grid_columns)[:, :num_videos]
+        videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
+
+        tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+        mp4_path = tag_dir / "rollouts_grid_jit.mp4"
+
+        video_written = False
+        try:
+            videos = jax.device_get(videos)
+            iio.imwrite(str(mp4_path), videos, fps=20, plugin='pyav', codec='libx264')
+            video_written = True
+        except Exception as e:
+            print(f"[eval_jit] MP4 write failed: {e}")
+
+        metrics_payload: Dict[str, float] = {"horizon": float(horizon)}
+        for tag, _, _ in rollout_specs:
+            metrics_payload[f"{tag}/mse"] = rollout_metrics[tag]["mse"]
+            for n in psnr_windows:
+                metrics_payload[f"mse/{n}_step/{tag}"] = rollout_metrics[tag][f"mse_{n}"]
+                metrics_payload[f"psnr/{n}_step/{tag}"] = rollout_metrics[tag][f"psnr_{n}"]
+            metrics_payload[f"{tag}/eval_time"] = rollout_metrics[tag]["eval_time"]
+        logger.log_metrics(step, metrics_payload, prefix="eval_jit/")
+
+        if video_written:
+            logger.log_video(step, "eval_jit/rollouts_grid/video", mp4_path)
 
 
 # ---------------------------

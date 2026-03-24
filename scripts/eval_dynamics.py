@@ -10,7 +10,8 @@ from dreamer.configs import LoggerConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
 from dreamer.parallel import build_parallel
-from dreamer.training import run_evaluation, run_x0_visualization
+from dreamer.training import run_evaluation, run_evaluation_jit, run_x0_visualization
+from dreamer.actions import shift_actions
 from dreamer.checkpointing import DynamicsCheckpointBundle
 
 # Suppress absl info logs
@@ -37,18 +38,21 @@ def run(cfg):
         # Load checkpoint (includes both dynamics and tokenizer)
         print(f"Loading checkpoint from: {cfg.dynamics_ckpt}")
         bundle = DynamicsCheckpointBundle.from_pretrained(
-            cfg.dynamics_ckpt, mesh_rules=mesh_rules, model_names={"dynamics_ema", "tokenizer"}
+            cfg.dynamics_ckpt, mesh_rules=mesh_rules, model_names={"dynamics", "dynamics_ema", "tokenizer"}
         )
-        print(f"Loaded dynamics model (k_max={bundle.dynamics_ema.cfg.k_max}, depth={bundle.dynamics_ema.cfg.depth})")
+        print(f"Loaded dynamics models (k_max={bundle.dynamics_ema.cfg.k_max}, depth={bundle.dynamics_ema.cfg.depth})")
 
         use_latent_data = cfg.dataset.data_type == "latent"
 
         # Load one batch of data
+        cfg.dataset.dataloader_cfg.short_T = 128
+        cfg.dataset.dataloader_cfg.long_T = 128
         print(f"Loading data from: {cfg.dataset.array_record_path}")
         iterator = make_iterator(cfg.dataset, device=data_sharding)
         batch = next(iter(iterator))
 
         actions = batch["actions"]
+        actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
         input_tensor = batch.get("latents") if use_latent_data else batch.get("videos")
         print(f"Batch loaded: shape={input_tensor.shape}, use_latent_data={use_latent_data}")
 
@@ -74,11 +78,13 @@ def run(cfg):
         with logger:
             rng, eval_key = jax.random.split(rng)
 
+            print("\n--- non-JIT evaluation ---")
             run_evaluation(
                 eval_cfg,  # type: ignore[arg-type]
                 step=cfg.step,
                 tokenizer=bundle.tokenizer,
-                dynamics=bundle.dynamics_ema,
+                dynamics_online=bundle.dynamics,
+                dynamics_ema=bundle.dynamics_ema,
                 val_data=input_tensor,
                 val_actions=actions,
                 use_latent_data=use_latent_data,
@@ -86,6 +92,40 @@ def run(cfg):
                 rng=eval_key,
                 logger=logger,
             )
+
+            # rng, jit_key = jax.random.split(rng)
+
+            # print("\n--- JIT evaluation (first call includes compile time) ---")
+            # run_evaluation_jit(
+            #     eval_cfg,  # type: ignore[arg-type]
+            #     step=cfg.step,
+            #     tokenizer=bundle.tokenizer,
+            #     dynamics_online=bundle.dynamics_ema,
+            #     dynamics_ema=bundle.dynamics_ema,
+            #     val_data=input_tensor,
+            #     val_actions=actions,
+            #     use_latent_data=use_latent_data,
+            #     vis_dir=vis_dir,
+            #     rng=jit_key,
+            #     logger=logger,
+            # )
+
+            # rng, jit_key2 = jax.random.split(rng)
+
+            # print("\n--- JIT evaluation (second call, compiled) ---")
+            # run_evaluation_jit(
+            #     eval_cfg,  # type: ignore[arg-type]
+            #     step=cfg.step,
+            #     tokenizer=bundle.tokenizer,
+            #     dynamics_online=bundle.dynamics_ema,
+            #     dynamics_ema=bundle.dynamics_ema,
+            #     val_data=input_tensor,
+            #     val_actions=actions,
+            #     use_latent_data=use_latent_data,
+            #     vis_dir=vis_dir,
+            #     rng=jit_key2,
+            #     logger=logger,
+            # )
 
             rng, x0_key = jax.random.split(rng)
 

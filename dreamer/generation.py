@@ -336,12 +336,17 @@ def latent_rollout(
         caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
 
         # Run dynamics on context to prefill caches and get last hidden state
-        # Use clean signal for ground truth context
-        step_idx_prefill = jnp.full((B, T_ctx), schedule.emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
-        tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)  # tau=1.0
-        
+        # Noise the ground truth prefill frames with context noise (tau_ctx), matching
+        # how autoregressively-generated context frames are cached in next_latent.
+        rng, rng_prefill = jax.random.split(rng)
+        noise_prefill = jax.random.normal(rng_prefill, latents_ctx.shape, dtype=latents_ctx.dtype)
+        latents_ctx_noised = latents_ctx * schedule.tau_ctx + (1 - schedule.tau_ctx) * noise_prefill
+
+        step_idx_prefill = jnp.full((B, T_ctx), schedule.step_idx_ctx, dtype=jnp.int32)
+        tau_idx_prefill = jnp.full((B, T_ctx), schedule.tau_idx_ctx, dtype=jnp.int32)
+
         _, (h_seq, caches) = dynamics(
-            actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
+            actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx_noised,
             task_embeddings=initial_task_embedding, caches=caches, deterministic=True
         )
 
