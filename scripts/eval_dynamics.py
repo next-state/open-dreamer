@@ -6,6 +6,7 @@ import hydra
 import jax
 from omegaconf import OmegaConf
 
+from dreamer.actions import shift_actions
 from dreamer.configs import LoggerConfig
 from dreamer.data import make_iterator
 from dreamer.logging import build_logger
@@ -37,9 +38,9 @@ def run(cfg):
         # Load checkpoint (includes both dynamics and tokenizer)
         print(f"Loading checkpoint from: {cfg.dynamics_ckpt}")
         bundle = DynamicsCheckpointBundle.from_pretrained(
-            cfg.dynamics_ckpt, mesh_rules=mesh_rules, model_names={"dynamics_ema", "tokenizer"}
+            cfg.dynamics_ckpt, mesh_rules=mesh_rules, model_names={"dynamics", "dynamics_ema", "tokenizer"}
         )
-        print(f"Loaded dynamics model (k_max={bundle.dynamics_ema.cfg.k_max}, depth={bundle.dynamics_ema.cfg.depth})")
+        print(f"Loaded dynamics models (k_max={bundle.dynamics_ema.cfg.k_max}, depth={bundle.dynamics_ema.cfg.depth})")
 
         use_latent_data = cfg.dataset.data_type == "latent"
 
@@ -49,6 +50,7 @@ def run(cfg):
         batch = next(iter(iterator))
 
         actions = batch["actions"]
+        actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
         input_tensor = batch.get("latents") if use_latent_data else batch.get("videos")
         print(f"Batch loaded: shape={input_tensor.shape}, use_latent_data={use_latent_data}")
 
@@ -78,7 +80,8 @@ def run(cfg):
                 eval_cfg,  # type: ignore[arg-type]
                 step=cfg.step,
                 tokenizer=bundle.tokenizer,
-                dynamics=bundle.dynamics_ema,
+                dynamics_online=bundle.dynamics,
+                dynamics_ema=bundle.dynamics_ema,
                 val_data=input_tensor,
                 val_actions=actions,
                 use_latent_data=use_latent_data,

@@ -303,6 +303,7 @@ def latent_rollout(
     """
     B, T_ctx, n_spatial, D_s = latents_ctx.shape
     latent_shape = (B, 1, n_spatial, D_s)
+    effective_context_length = dynamics.cfg.context_length
 
     # Normalize context latents for dynamics (keep original for output)
     latents_ctx_orig = latents_ctx
@@ -331,7 +332,7 @@ def latent_rollout(
 
     if use_kv_cache:
         # Initialize caches and process context
-        window_size = T_ctx + num_steps
+        window_size = effective_context_length if effective_context_length is not None else T_ctx + num_steps
         n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
         caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
 
