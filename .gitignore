@@ -233,3 +233,4 @@ migration/
 .claude/
 CLAUDE.md
 .hydra/
+tmp/

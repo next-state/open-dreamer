@@ -45,8 +45,8 @@ def run(cfg):
         use_latent_data = cfg.dataset.data_type == "latent"
 
         # Load one batch of data
-        cfg.dataset.dataloader_cfg.short_T = 128
-        cfg.dataset.dataloader_cfg.long_T = 128
+        # cfg.dataset.dataloader_cfg.short_T = 128
+        # cfg.dataset.dataloader_cfg.long_T = 128
         print(f"Loading data from: {cfg.dataset.array_record_path}")
         iterator = make_iterator(cfg.dataset, device=data_sharding)
         batch = next(iter(iterator))

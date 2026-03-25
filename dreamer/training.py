@@ -895,7 +895,8 @@ def run_evaluation(
 
     T = val_data.shape[1]
     assert T > 5, f"Sequence length {T} must be > 5"
-    ctx_length = 4
+    attention_context_length = dynamics_online.cfg.context_length
+    ctx_length = min(4, T - 1)
     horizon = T - ctx_length
     k_max = dynamics_online.cfg.k_max
 
@@ -922,6 +923,7 @@ def run_evaluation(
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=eval_rng, policy=None, task_embedder=None,
                 latents=val_data,
+                context_length=attention_context_length,
             )
             gt_frames_for_metrics = gt_decoded_frames
         else:
@@ -929,6 +931,7 @@ def run_evaluation(
                 tokenizer, dynamics_model, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=eval_rng, policy=None, task_embedder=None,
+                context_length=attention_context_length,
             )
             assert original_frames is not None
             gt_frames_for_metrics = original_frames
@@ -1023,7 +1026,7 @@ def run_evaluation(
 # JIT-compiled evaluation
 # ---------------------------
 
-@nnx.jit(static_argnames=("schedule_config", "horizon", "ctx_length", "use_latent_data"))
+@nnx.jit(static_argnames=("schedule_config", "horizon", "ctx_length", "use_latent_data", "attention_context_length"))
 def compute_eval_jit(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -1036,6 +1039,7 @@ def compute_eval_jit(
     ctx_length: int,
     use_latent_data: bool,
     dataset_std: float,
+    attention_context_length: int | None,
 ):
     """JIT-compiled core of one evaluation rollout: sample + metrics + border.
 
@@ -1050,6 +1054,7 @@ def compute_eval_jit(
         horizon=horizon,
         schedule_config=schedule_config,
         rng=rng,
+        context_length=attention_context_length,
     )
     gt_frames_for_metrics = gt_decoded_frames if use_latent_data else original_frames
 
@@ -1099,7 +1104,8 @@ def run_evaluation_jit(
 
     T = val_data.shape[1]
     assert T > 5, f"Sequence length {T} must be > 5"
-    ctx_length = 4
+    attention_context_length = dynamics_online.cfg.context_length
+    ctx_length = min(4, T - 1)
     horizon = T - ctx_length
     k_max = dynamics_online.cfg.k_max
 
@@ -1127,6 +1133,7 @@ def run_evaluation_jit(
             ctx_length=ctx_length,
             use_latent_data=use_latent_data,
             dataset_std=dataset_std,
+            attention_context_length=attention_context_length,
         )
         dt = time.time() - t0
 
