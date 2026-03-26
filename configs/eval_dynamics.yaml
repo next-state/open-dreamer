@@ -18,6 +18,7 @@ dataset:
 # Evaluation settings
 output_dir: eval_outputs    # Where to save videos / PNGs
 step: 0                     # Step label stamped on output filenames
+eval_ctx_length: null       # null -> use model context length when available
 
 hydra:
   run:

@@ -77,18 +77,8 @@ class KVCache:
 
         fits_contiguous = (write_idx + T) <= self.window_size
 
-        k_updated = jax.lax.cond(
-            fits_contiguous,
-            _update_contiguous,
-            _update_wrap,
-            self.k, k_new, write_idx
-        )
-        v_updated = jax.lax.cond(
-            fits_contiguous,
-            _update_contiguous,
-            _update_wrap,
-            self.v, v_new, write_idx
-        )
+        k_updated = jax.lax.cond(fits_contiguous, _update_contiguous, _update_wrap, self.k, k_new, write_idx)
+        v_updated = jax.lax.cond(fits_contiguous, _update_contiguous, _update_wrap, self.v, v_new, write_idx)
 
         return KVCache(k=k_updated, v=v_updated, index=self.index + T, window_size=self.window_size)
 

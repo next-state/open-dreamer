@@ -282,6 +282,7 @@ def latent_rollout(
     initial_task_embedding: jax.Array | None = None,
     deterministic: bool = False,
     use_kv_cache: bool = True,
+    prefill_context_mode: str = "clean",
 ):
     """
     Autoregressive rollout in latent space.
@@ -297,6 +298,9 @@ def latent_rollout(
         initial_task_embedding: Optional (B, T_ctx, n_agent, D) agent tokens for context.
         deterministic: Whether to sample deterministic actions from the policy.
         use_kv_cache: Whether to use KV caching in dynamics for faster rollout.
+        prefill_context_mode: How to seed observed prompt frames into the KV cache.
+            `clean` keeps prompt frames at tau=1.0.
+            `ctx_noised` corrupts prompt frames to schedule.tau_ctx before prefill.
         
     Returns:
         Dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
@@ -334,15 +338,30 @@ def latent_rollout(
         # Initialize caches and process context
         window_size = effective_context_length if effective_context_length is not None else T_ctx + num_steps
         n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
-        caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
+        caches = dynamics.create_static_caches(
+            batch_size=B,
+            n_latents=n_spatial,
+            window_size=window_size,
+            n_agent=n_agents,
+            dtype=dynamics.dtype,
+        )
 
-        # Run dynamics on context to prefill caches and get last hidden state
-        # Use clean signal for ground truth context
-        step_idx_prefill = jnp.full((B, T_ctx), schedule.emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
-        tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)  # tau=1.0
+        # Run dynamics on context to prefill caches and get last hidden state.
+        if prefill_context_mode == "clean":
+            prefill_latents = latents_ctx
+            step_idx_prefill = jnp.full((B, T_ctx), schedule.emax, dtype=jnp.int32)
+            tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)
+        elif prefill_context_mode == "ctx_noised":
+            rng, prefill_key = jax.random.split(rng)
+            prefill_noise = jax.random.normal(prefill_key, latents_ctx.shape, dtype=latents_ctx.dtype)
+            prefill_latents = latents_ctx * schedule.tau_ctx + (1 - schedule.tau_ctx) * prefill_noise
+            step_idx_prefill = jnp.full((B, T_ctx), schedule.step_idx_ctx, dtype=jnp.int32)
+            tau_idx_prefill = jnp.full((B, T_ctx), schedule.tau_idx_ctx, dtype=jnp.int32)
+        else:
+            raise ValueError(f"Unsupported prefill_context_mode={prefill_context_mode}")
         
         _, (h_seq, caches) = dynamics(
-            actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
+            actions_ctx, step_idx_prefill, tau_idx_prefill, prefill_latents,
             task_embeddings=initial_task_embedding, caches=caches, deterministic=True
         )
 

@@ -895,7 +895,10 @@ def run_evaluation(
 
     T = val_data.shape[1]
     assert T > 5, f"Sequence length {T} must be > 5"
-    ctx_length = 4
+    eval_ctx_length = getattr(cfg, "eval_ctx_length", None)
+    default_ctx_length = dynamics_online.cfg.context_length if dynamics_online.cfg.context_length is not None else 4
+    requested_ctx_length = default_ctx_length if eval_ctx_length is None else int(eval_ctx_length)
+    ctx_length = max(1, min(requested_ctx_length, T - 1))
     horizon = T - ctx_length
     k_max = dynamics_online.cfg.k_max
 

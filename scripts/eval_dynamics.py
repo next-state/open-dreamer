@@ -60,6 +60,7 @@ def run(cfg):
         eval_cfg = types.SimpleNamespace(
             dynamics=bundle.dynamics_ema.cfg,
             dataset=types.SimpleNamespace(dataset_std=tuple(cfg.dataset.dataset_std)),
+            eval_ctx_length=cfg.eval_ctx_length,
         )
 
         # Output directory and logger
