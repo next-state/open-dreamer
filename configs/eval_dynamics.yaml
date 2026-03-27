@@ -8,6 +8,7 @@ run_name: eval_dynamics
 use_wandb: false
 parallel_strategy: data
 seed: 0
+dataset_seed: null         # null -> reuse seed for dataset sampling
 
 dataset:
   dataloader_cfg:
@@ -18,7 +19,12 @@ dataset:
 # Evaluation settings
 output_dir: eval_outputs    # Where to save videos / PNGs
 step: 0                     # Step label stamped on output filenames
-eval_ctx_length: null       # null -> use model context length when available
+eval_prompt_length: 4       # Number of observed prompt frames for eval; null/128 uses the model attention window as the default
+eval_rollout_tags: [ema_shortcut]
+eval_shortcut_steps: 4
+history_guidance_mode: off
+history_guidance_scale: 0.0
+history_guidance_tau_target: 0.5
 
 hydra:
   run:

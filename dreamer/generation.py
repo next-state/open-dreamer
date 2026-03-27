@@ -11,6 +11,38 @@ from tqdm import tqdm
 
 
 @dataclass
+class HistoryGuidanceConfig:
+    mode: str = "off"
+    scale: float = 0.0
+    tau_target: float = 0.5
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode in {"vanilla", "fractional"} and self.scale != 0.0
+
+
+def snap_context_noise_target(
+    *,
+    num_steps: int,
+    k_max: int,
+    tau_target: float,
+    dtype: Any = jnp.float32,
+) -> tuple[int, int, jax.Array]:
+    step_idx = int(math.log2(num_steps))
+    emax = int(math.log2(k_max))
+    if step_idx == emax:
+        step_idx_ctx = step_idx
+        K_ctx = num_steps
+    else:
+        step_idx_ctx = emax - 1
+        K_ctx = k_max // 2
+    j_ctx = int(tau_target * K_ctx)
+    tau_ctx = jnp.array(j_ctx / K_ctx, dtype=dtype)
+    tau_idx_ctx = j_ctx * (k_max // K_ctx)
+    return step_idx_ctx, tau_idx_ctx, tau_ctx
+
+
+@dataclass
 class DenoiseSchedule:
     """
     Precomputed, JAX-friendly schedule for the τ-ladder.
@@ -62,20 +94,13 @@ class DenoiseSchedule:
         tau_values = jnp.linspace(0.0, 1.0, num_steps + 1, dtype=dtype)
         tau_indices = jnp.arange(num_steps + 1) * (k_max // num_steps)
         beta_values = (1.0 - tau_values[1:]) / jnp.maximum(1.0 - tau_values[:-1], 1e-8)
-
-        # Snap tau_ctx to an appropriate ladder:
         emax = int(math.log2(k_max))
-        if step_idx == emax:
-            # Use the same ladder for consistency with empirical training
-            step_idx_ctx = step_idx
-            K_ctx = num_steps
-        else:
-            # Use emax-1 ladder for finer control (bootstrap training uses mixed ladders excluding emax)
-            step_idx_ctx = emax - 1
-            K_ctx = k_max // 2  # emax - 1 ladder has K = k_max / 2
-        j_ctx = int(tau_ctx_target * K_ctx)  # floor to ensure some noise
-        tau_ctx = jnp.array(j_ctx / K_ctx, dtype=dtype)
-        tau_idx_ctx = j_ctx * (k_max // K_ctx)
+        step_idx_ctx, tau_idx_ctx, tau_ctx = snap_context_noise_target(
+            num_steps=num_steps,
+            k_max=k_max,
+            tau_target=tau_ctx_target,
+            dtype=dtype,
+        )
 
         return cls(num_steps, k_max, d, step_idx, emax, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
     
@@ -92,9 +117,11 @@ def next_latent(
     prefill_length: int | None = None,
     task_embedding: jax.Array | None = None,  # (B, T_ctx+1, n_agent, d_model)
     caches: KVCachesDict | None = None,
+    masked_caches: KVCachesDict | None = None,
     latents_ctx: jax.Array| None = None,                     # (B, T_ctx, n_spatial, D_s)
     actions_ctx: Actions | None = None,
-) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, jax.Array, dict]:
+    history_guidance: HistoryGuidanceConfig | None = None,
+) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, KVCachesDict | None, jax.Array, dict]:
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
 
@@ -119,6 +146,18 @@ def next_latent(
     rng, rng_latent, rng_ctx = jax.random.split(rng, 3)
     noisy_latent = jax.random.normal(rng_latent, latent_shape)
     B = latent_shape[0]
+    guidance_enabled = history_guidance is not None and history_guidance.enabled
+    guidance_is_fractional = guidance_enabled and history_guidance.mode == "fractional"
+    frac_step_idx_ctx = None
+    frac_tau_idx_ctx = None
+    frac_tau_ctx = None
+    if guidance_is_fractional:
+        frac_step_idx_ctx, frac_tau_idx_ctx, frac_tau_ctx = snap_context_noise_target(
+            num_steps=schedule.num_steps,
+            k_max=schedule.k_max,
+            tau_target=history_guidance.tau_target,
+            dtype=noisy_latent.dtype,
+        )
 
     latents_ctx_noised = None
     if latents_ctx is not None and caches is None:
@@ -139,7 +178,7 @@ def next_latent(
         if caches is not None:
             latent_input, actions_input = latent_t, action
 
-            step_indices= jnp.full((B, 1), step_idx,    dtype=jnp.int32)
+            step_indices = jnp.full((B, 1), step_idx, dtype=jnp.int32)
             tau_indices = jnp.full((B, 1), tau_idx_val, dtype=jnp.int32)
 
             assert task_embedding is None or task_embedding.shape[1] == noisy_latent.shape[1], f"task_embedding.shape = {task_embedding.shape}, noisy_latent.shape = {noisy_latent.shape}"
@@ -168,6 +207,16 @@ def next_latent(
         )
 
         latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
+        if guidance_enabled:
+            if masked_caches is None:
+                raise ValueError("masked_caches must be provided when history guidance is enabled.")
+            latent_clean_masked_seq, _ = dynamics(
+                actions_input, step_indices, tau_indices, latent_input,
+                task_embeddings=task_embedding, deterministic=True, caches=masked_caches
+            )
+            latent_clean_masked = latent_clean_masked_seq[:, -1:, :, :]
+            latent_clean_pred = latent_clean_pred + history_guidance.scale * (latent_clean_pred - latent_clean_masked)
+
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
 
         # Per-step ODE diagnostics
@@ -197,9 +246,13 @@ def next_latent(
         # Update caches by doing one more forward pass with tau_ctx
         step_indices = jnp.full((B, 1), schedule.step_idx_ctx, dtype=jnp.int32)
         tau_indices = jnp.full((B, 1), schedule.tau_idx_ctx, dtype=jnp.int32)
-        
-        rng, new_random_key = jax.random.split(rng)
-        latent_noised_caching = latent_t_final * schedule.tau_ctx + (1 - schedule.tau_ctx) * jax.random.normal(new_random_key, shape=latent_t_final.shape, dtype=latent_t_final.dtype)
+
+        rng, cond_cache_key = jax.random.split(rng)
+        latent_noised_caching = latent_t_final * schedule.tau_ctx + (1 - schedule.tau_ctx) * jax.random.normal(
+            cond_cache_key,
+            shape=latent_t_final.shape,
+            dtype=latent_t_final.dtype,
+        )
 
         # Dynamics call
         _, (h_seq_final, caches_new) = dynamics(
@@ -207,15 +260,39 @@ def next_latent(
             task_embeddings=task_embedding, deterministic=True, caches=caches
         )
         h_last = h_seq_final[:, -1:, :, :] if isinstance(h_seq_final, jax.Array) else h_seq_final
+        masked_caches_new = None
+        if guidance_enabled:
+            if masked_caches is None:
+                raise ValueError("masked_caches must be provided when history guidance is enabled.")
+            rng, masked_cache_key = jax.random.split(rng)
+            if guidance_is_fractional:
+                assert frac_step_idx_ctx is not None and frac_tau_idx_ctx is not None and frac_tau_ctx is not None
+                masked_step_indices = jnp.full((B, 1), frac_step_idx_ctx, dtype=jnp.int32)
+                masked_tau_indices = jnp.full((B, 1), frac_tau_idx_ctx, dtype=jnp.int32)
+                masked_noise = jax.random.normal(masked_cache_key, shape=latent_t_final.shape, dtype=latent_t_final.dtype)
+                masked_history = latent_t_final * frac_tau_ctx + (1 - frac_tau_ctx) * masked_noise
+            else:
+                masked_step_indices = jnp.full((B, 1), schedule.emax, dtype=jnp.int32)
+                masked_tau_indices = jnp.zeros((B, 1), dtype=jnp.int32)
+                masked_history = jax.random.normal(
+                    masked_cache_key,
+                    shape=latent_t_final.shape,
+                    dtype=latent_t_final.dtype,
+                )
+            _, (_, masked_caches_new) = dynamics(
+                action, masked_step_indices, masked_tau_indices, masked_history,
+                task_embeddings=task_embedding, deterministic=True, caches=masked_caches
+            )
     else:
         h_last = h_history[-1] if h_history is not None else None  # (B, n_agent, d_model)
         caches_new = None
+        masked_caches_new = None
 
     assert isinstance(h_last, jax.Array) or h_last is None
 
     latent_t_final = unnormalize_latents(latent_t_final, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
-    return latent_t_final, h_last, caches_new, rng, diag_dict
+    return latent_t_final, h_last, caches_new, masked_caches_new, rng, diag_dict
 
 def next_frame(
     tokenizer: Tokenizer,
@@ -246,7 +323,7 @@ def next_frame(
         Tuple of (frame as jax.Array, h_last, updated dynamics cache, updated tokenizer cache, updated rng)
     """
     # Generate next latent using τ-ladder denoising
-    latent, h_last, dynamics_cache_updated, rng, _ = next_latent(
+    latent, h_last, dynamics_cache_updated, _, rng, _ = next_latent(
         dynamics=dynamics,
         schedule=schedule,
         action=action,
@@ -283,6 +360,8 @@ def latent_rollout(
     deterministic: bool = False,
     use_kv_cache: bool = True,
     prefill_context_mode: str = "clean",
+    rollout_context_length: int | None = None,
+    history_guidance: HistoryGuidanceConfig | None = None,
 ):
     """
     Autoregressive rollout in latent space.
@@ -301,13 +380,23 @@ def latent_rollout(
         prefill_context_mode: How to seed observed prompt frames into the KV cache.
             `clean` keeps prompt frames at tau=1.0.
             `ctx_noised` corrupts prompt frames to schedule.tau_ctx before prefill.
+        rollout_context_length: Optional KV cache window override for rollout.
+            When None, uses dynamics.cfg.context_length.
+        history_guidance: Optional history guidance config for sampling-time score composition.
         
     Returns:
         Dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
     """
     B, T_ctx, n_spatial, D_s = latents_ctx.shape
     latent_shape = (B, 1, n_spatial, D_s)
-    effective_context_length = dynamics.cfg.context_length
+    effective_context_length = (
+        dynamics.cfg.context_length if rollout_context_length is None else rollout_context_length
+    )
+    history_guidance = HistoryGuidanceConfig() if history_guidance is None else history_guidance
+    guidance_enabled = history_guidance.enabled
+
+    if guidance_enabled and not use_kv_cache:
+        raise ValueError("History guidance requires use_kv_cache=True.")
 
     # Normalize context latents for dynamics (keep original for output)
     latents_ctx_orig = latents_ctx
@@ -315,7 +404,7 @@ def latent_rollout(
 
     # Scan loop for rollout
     def scan_step(carry, step_idx):
-        h_t, caches_t, rng = carry
+        h_t, caches_t, masked_caches_t, rng = carry
 
         # Sample action
         rng, rng_policy = jax.random.split(rng)
@@ -327,18 +416,27 @@ def latent_rollout(
             action = all_actions[:, 0, 0, ...]  # (B, ...) - use first predicted action
         
         # Predict next latent (denoising)
-        latent_next, h_next, caches_next, rng, diag = next_latent(
-            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
+        latent_next, h_next, caches_next, masked_caches_next, rng, diag = next_latent(
+            dynamics,
+            schedule,
+            action,
+            latent_shape,
+            rng,
+            caches=caches_t,
+            masked_caches=masked_caches_t,
+            task_embedding=task_embedding,
+            history_guidance=history_guidance,
         )
         
-        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next, diag) # latent_next[:, 0] to remove time dimension
+        return (h_next, caches_next, masked_caches_next, rng), (latent_next[:, 0], action, h_next, diag) # latent_next[:, 0] to remove time dimension
 
 
     if use_kv_cache:
         # Initialize caches and process context
         window_size = effective_context_length if effective_context_length is not None else T_ctx + num_steps
         n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
-        caches = dynamics.create_static_caches(
+        caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=dynamics.dtype)
+        masked_caches = None if not guidance_enabled else dynamics.create_static_caches(
             batch_size=B,
             n_latents=n_spatial,
             window_size=window_size,
@@ -364,6 +462,33 @@ def latent_rollout(
             actions_ctx, step_idx_prefill, tau_idx_prefill, prefill_latents,
             task_embeddings=initial_task_embedding, caches=caches, deterministic=True
         )
+        if guidance_enabled:
+            rng, masked_prefill_key = jax.random.split(rng)
+            if history_guidance.mode == "fractional":
+                masked_step_idx_val, masked_tau_idx_val, masked_tau = snap_context_noise_target(
+                    num_steps=schedule.num_steps,
+                    k_max=schedule.k_max,
+                    tau_target=history_guidance.tau_target,
+                    dtype=latents_ctx.dtype,
+                )
+                masked_noise = jax.random.normal(masked_prefill_key, latents_ctx.shape, dtype=latents_ctx.dtype)
+                masked_prefill = latents_ctx * masked_tau + (1 - masked_tau) * masked_noise
+                masked_step_idx = jnp.full((B, T_ctx), masked_step_idx_val, dtype=jnp.int32)
+                masked_tau_idx = jnp.full((B, T_ctx), masked_tau_idx_val, dtype=jnp.int32)
+            else:
+                masked_prefill = jax.random.normal(masked_prefill_key, latents_ctx.shape, dtype=latents_ctx.dtype)
+                masked_step_idx = jnp.full((B, T_ctx), schedule.emax, dtype=jnp.int32)
+                masked_tau_idx = jnp.zeros((B, T_ctx), dtype=jnp.int32)
+                
+            _, (_, masked_caches) = dynamics(
+                actions_ctx,
+                masked_step_idx,
+                masked_tau_idx,
+                masked_prefill,
+                task_embeddings=initial_task_embedding,
+                caches=masked_caches,
+                deterministic=True,
+            )
 
         # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
         task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
@@ -372,7 +497,7 @@ def latent_rollout(
         # Run scan
         _, (rollout_latents, rollout_actions, rollout_hidden, rollout_diags) = jax.lax.scan(
             scan_step,
-            (h_last, caches, rng),
+            (h_last, caches, masked_caches, rng),
             jnp.arange(num_steps)
         )
 
@@ -388,6 +513,8 @@ def latent_rollout(
         out_latents = jnp.concatenate((latents_ctx_orig, rollout_latents), axis=1)
     else:
         # Run scan without KV caching in Python for-loop to support debugging
+        if guidance_enabled:
+            raise ValueError("History guidance is only implemented for use_kv_cache=True.")
         
         # Not Implemented:
         h_seq, rollout_hidden = None, None
@@ -399,9 +526,18 @@ def latent_rollout(
             action = policy[:, step_idx]
 
             # Predict next latent
-            latent_next, _, _, rng, diag = next_latent(
-                dynamics, schedule, action, latent_shape, rng, caches=None, task_embedding=None,
-                latents_ctx=latents_ctx, actions_ctx=actions_ctx, prefill_length=T_ctx
+            latent_next, _, _, _, rng, diag = next_latent(
+                dynamics,
+                schedule,
+                action,
+                latent_shape,
+                rng,
+                caches=None,
+                masked_caches=None,
+                task_embedding=None,
+                latents_ctx=latents_ctx,
+                actions_ctx=actions_ctx,
+                prefill_length=T_ctx,
             )
 
             pred_latents.append(latent_next[:, 0])  # Remove time dimension

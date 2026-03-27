@@ -9,7 +9,7 @@ from flax import nnx
 
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
-from .generation import DenoiseSchedule, video_rollout, latent_rollout
+from .generation import DenoiseSchedule, HistoryGuidanceConfig, video_rollout, latent_rollout
 
 
 @nnx.jit
@@ -43,6 +43,7 @@ def sample_video(
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
     latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
+    history_guidance: HistoryGuidanceConfig | None = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array | None, jax.Array]:
     """
     Sample video predictions using Tokenizer and Dynamics.
@@ -127,6 +128,7 @@ def sample_video(
         rng=rng,
         initial_task_embedding=initial_agent_tokens,
         deterministic=True,
+        history_guidance=history_guidance,
     )
 
     # Decode predicted latents to frames

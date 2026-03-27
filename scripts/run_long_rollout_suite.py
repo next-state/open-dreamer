@@ -15,7 +15,7 @@ from omegaconf import OmegaConf
 from dreamer.actions import shift_actions
 from dreamer.checkpointing import DynamicsCheckpointBundle
 from dreamer.data import make_iterator
-from dreamer.generation import DenoiseSchedule, latent_rollout
+from dreamer.generation import DenoiseSchedule, HistoryGuidanceConfig, latent_rollout
 from dreamer.parallel import build_parallel
 from dreamer.sampler import decode_latents
 from dreamer.utils import apply_border
@@ -48,12 +48,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=10)
-    parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument("--data-seed", type=int, default=None)
+    parser.add_argument("--sample-index", type=int, default=None)
     parser.add_argument("--prompt-lengths", default="4")
     parser.add_argument("--schedule-steps-list", default="4")
     parser.add_argument("--parallel-strategy", default="data")
     parser.add_argument("--use-online", action="store_true")
     parser.add_argument("--title", default="")
+    parser.add_argument("--rollout-context-length", type=int, default=None)
+    parser.add_argument("--prefill-context-mode", choices=["clean", "ctx_noised"], default="clean")
+    parser.add_argument("--tau-ctx-target", type=float, default=0.9)
+    parser.add_argument("--history-guidance-mode", choices=["off", "vanilla", "fractional"], default="off")
+    parser.add_argument("--history-guidance-scale", type=float, default=0.0)
+    parser.add_argument("--history-guidance-tau-target", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -81,7 +88,11 @@ def build_cases(prompt_lengths: list[int], schedule_steps: list[int], seq_len: i
 
 
 def framewise_mse(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
-    return np.mean((pred.astype(np.float32) - gt.astype(np.float32)) ** 2, axis=(1, 2, 3))
+    if pred.ndim == 4:
+        return np.mean((pred.astype(np.float32) - gt.astype(np.float32)) ** 2, axis=(1, 2, 3))
+    if pred.ndim == 5:
+        return np.mean((pred.astype(np.float32) - gt.astype(np.float32)) ** 2, axis=(2, 3, 4))
+    raise ValueError(f"Unsupported frame tensor rank {pred.ndim}")
 
 
 def decorate_prediction_frames(frames: np.ndarray, *, context_start: int, prompt_length: int) -> np.ndarray:
@@ -102,16 +113,24 @@ def selected_frames(total_frames: int) -> list[int]:
 
 
 def save_contact(path: Path, *, gt_frames: np.ndarray, case_frames: list[np.ndarray], labels: list[str]) -> None:
-    frame_ids = selected_frames(gt_frames.shape[0])
-    fig, axes = plt.subplots(1 + len(case_frames), len(frame_ids), figsize=(2.2 * len(frame_ids), 2.0 * (1 + len(case_frames))))
-    rows = [(gt_frames, "GT")] + list(zip(case_frames, labels, strict=True))
-    for row_idx, (frames, row_label) in enumerate(rows):
-        for col_idx, frame_idx in enumerate(frame_ids):
-            axes[row_idx, col_idx].imshow(frames[frame_idx])
-            axes[row_idx, col_idx].axis("off")
-            if row_idx == 0:
-                axes[row_idx, col_idx].set_title(str(frame_idx))
-        axes[row_idx, 0].set_ylabel(row_label)
+    num_samples, total_frames = gt_frames.shape[:2]
+    frame_ids = selected_frames(total_frames)
+    n_rows = num_samples * (1 + len(case_frames))
+    fig, axes = plt.subplots(n_rows, len(frame_ids), figsize=(2.2 * len(frame_ids), 2.0 * n_rows))
+    axes = np.asarray(axes).reshape(n_rows, len(frame_ids))
+    row_idx = 0
+    for sample_idx in range(num_samples):
+        rows = [(gt_frames[sample_idx], f"s{sample_idx} GT")] + [
+            (frames[sample_idx], f"s{sample_idx} {label}") for frames, label in zip(case_frames, labels, strict=True)
+        ]
+        for frames, row_label in rows:
+            for col_idx, frame_idx in enumerate(frame_ids):
+                axes[row_idx, col_idx].imshow(frames[frame_idx])
+                axes[row_idx, col_idx].axis("off")
+                if row_idx == 0:
+                    axes[row_idx, col_idx].set_title(str(frame_idx))
+            axes[row_idx, 0].set_ylabel(row_label)
+            row_idx += 1
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     plt.close(fig)
@@ -122,8 +141,15 @@ def save_mse_plot(path: Path, *, total_frames: int, curves: list[np.ndarray], ca
     xs = np.arange(total_frames)
     for case, mse in zip(cases, curves, strict=True):
         display = np.full((total_frames,), np.nan, dtype=np.float32)
-        display[case.prompt_length:] = mse[case.prompt_length:]
+        mean_curve = mse.mean(axis=0) if mse.ndim == 2 else mse
+        display[case.prompt_length:] = mean_curve[case.prompt_length:]
         ax.plot(xs, display, label=case.label, linewidth=2.0)
+        if mse.ndim == 2 and mse.shape[0] > 1:
+            low = np.full((total_frames,), np.nan, dtype=np.float32)
+            high = np.full((total_frames,), np.nan, dtype=np.float32)
+            low[case.prompt_length:] = mse[:, case.prompt_length:].min(axis=0)
+            high[case.prompt_length:] = mse[:, case.prompt_length:].max(axis=0)
+            ax.fill_between(xs, low, high, alpha=0.15)
     ax.axvline(128, color="gray", linestyle="--", alpha=0.5)
     ax.set_xlabel("Absolute frame")
     ax.set_ylabel("Pixel MSE")
@@ -150,20 +176,24 @@ def save_dashboard(path: Path, *, contact_path: Path, mse_path: Path, title: str
 
 
 def save_video(path: Path, *, gt_frames: np.ndarray, case_frames: list[np.ndarray]) -> None:
-    video = np.concatenate([gt_frames] + case_frames, axis=2)
+    stacked = np.stack([gt_frames] + case_frames, axis=1)  # (S, C, T, H, W, 3)
+    num_samples, num_columns, total_frames, height, width, channels = stacked.shape
+    video = stacked.transpose(2, 0, 3, 1, 4, 5).reshape(total_frames, num_samples * height, num_columns * width, channels)
     iio.imwrite(str(path), video, fps=5, plugin="pyav", codec="libx264")
 
 
 def metrics_for_case(case: CaseSpec, mse: np.ndarray) -> dict[str, float | int]:
+    mean_curve = mse.mean(axis=0) if mse.ndim == 2 else mse
     metrics: dict[str, float | int] = {
         "prompt_length": case.prompt_length,
-        "generated_horizon": int(len(mse) - case.prompt_length),
+        "generated_horizon": int(len(mean_curve) - case.prompt_length),
         "schedule_steps": case.schedule_steps,
-        "mean_generated_mse": float(np.mean(mse[case.prompt_length:])),
+        "num_samples": int(mse.shape[0]) if mse.ndim == 2 else 1,
+        "mean_generated_mse": float(np.mean(mse[..., case.prompt_length:])),
     }
-    for frame_idx in [128, 160, 192, 224, len(mse) - 1]:
-        if frame_idx < len(mse):
-            metrics[f"mse_{frame_idx}"] = float(mse[frame_idx])
+    for frame_idx in [128, 160, 192, 224, len(mean_curve) - 1]:
+        if frame_idx < len(mean_curve):
+            metrics[f"mse_{frame_idx}"] = float(mean_curve[frame_idx])
     return metrics
 
 
@@ -173,7 +203,13 @@ def save_summary(
     title: str,
     model_name: str,
     dataset_path: str,
-    sample_index: int,
+    sample_selection: str,
+    rollout_context_length: int | None,
+    prefill_context_mode: str,
+    tau_ctx_target: float,
+    history_guidance_mode: str,
+    history_guidance_scale: float,
+    history_guidance_tau_target: float,
     cases: list[CaseSpec],
     metrics: dict[str, dict[str, float | int]],
     video_path: Path,
@@ -183,8 +219,14 @@ def save_summary(
         "",
         f"- model: `{model_name}`",
         f"- dataset: `{dataset_path}`",
-        f"- sample_index: `{sample_index}`",
+        f"- sample_selection: `{sample_selection}`",
         f"- video: `{video_path}`",
+        f"- rollout_context_length: `{rollout_context_length}`",
+        f"- prefill_context_mode: `{prefill_context_mode}`",
+        f"- tau_ctx_target: `{tau_ctx_target}`",
+        f"- history_guidance_mode: `{history_guidance_mode}`",
+        f"- history_guidance_scale: `{history_guidance_scale}`",
+        f"- history_guidance_tau_target: `{history_guidance_tau_target}`",
         "",
         "Border semantics:",
         "- GT column: no border",
@@ -209,7 +251,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    if args.sample_index < 0 or args.sample_index >= args.batch_size:
+    if args.sample_index is not None and (args.sample_index < 0 or args.sample_index >= args.batch_size):
         raise ValueError(f"sample_index must be in [0, {args.batch_size - 1}]")
 
     for case in cases:
@@ -217,6 +259,7 @@ def main() -> None:
             raise ValueError(f"Invalid prompt length {case.prompt_length} for seq_len={args.seq_len}")
 
     dataset_cfg = build_dataset_cfg(args)
+    data_seed = args.seed if args.data_seed is None else args.data_seed
     mesh, data_sharding, mesh_rules = build_parallel(args.parallel_strategy)
 
     with jax.set_mesh(mesh):
@@ -228,23 +271,33 @@ def main() -> None:
         dynamics = bundle.dynamics if args.use_online else bundle.dynamics_ema
         tokenizer = bundle.tokenizer
 
-        iterator = make_iterator(dataset_cfg, device=data_sharding)
+        iterator = make_iterator(dataset_cfg, seed=data_seed, device=data_sharding)
         batch = next(iter(iterator))
         latents = batch["latents"]
         actions = shift_actions(batch["actions"], dataset_cfg.categorical_action_dim)
 
-        sample_index = args.sample_index
         gt_frames = decode_latents(tokenizer, latents)
         gt_frames = jnp.clip(gt_frames, 0, 255).astype(jnp.uint8)
-        gt_frames = np.asarray(jax.device_get(gt_frames[sample_index]))
+        gt_frames = np.asarray(jax.device_get(gt_frames))
+        sample_indices = [args.sample_index] if args.sample_index is not None else list(range(gt_frames.shape[0]))
+        gt_frames = gt_frames[sample_indices]
 
         case_frames: list[np.ndarray] = []
         mse_curves: list[np.ndarray] = []
         metrics: dict[str, dict[str, float | int]] = {}
+        history_guidance = HistoryGuidanceConfig(
+            mode=args.history_guidance_mode,
+            scale=args.history_guidance_scale,
+            tau_target=args.history_guidance_tau_target,
+        )
 
         for case in cases:
             rng = jax.random.PRNGKey(args.seed)
-            schedule = DenoiseSchedule.init(case.schedule_steps, dynamics.cfg.k_max)
+            schedule = DenoiseSchedule.init(
+                case.schedule_steps,
+                dynamics.cfg.k_max,
+                tau_ctx_target=args.tau_ctx_target,
+            )
             rollout = latent_rollout(
                 dynamics=dynamics,
                 policy=actions[:, case.prompt_length:],
@@ -255,12 +308,21 @@ def main() -> None:
                 rng=rng,
                 deterministic=True,
                 use_kv_cache=True,
+                prefill_context_mode=args.prefill_context_mode,
+                rollout_context_length=args.rollout_context_length,
+                history_guidance=history_guidance,
             )
             pred_frames = decode_latents(tokenizer, rollout["latents"])
             pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
-            pred_frames = np.asarray(jax.device_get(pred_frames[sample_index]))
+            pred_frames = np.asarray(jax.device_get(pred_frames))[sample_indices]
 
-            decorated = decorate_prediction_frames(pred_frames, context_start=case.context_start, prompt_length=case.prompt_length)
+            decorated = np.stack(
+                [
+                    decorate_prediction_frames(sample_frames, context_start=case.context_start, prompt_length=case.prompt_length)
+                    for sample_frames in pred_frames
+                ],
+                axis=0,
+            )
             case_frames.append(decorated)
 
             mse = framewise_mse(pred_frames, gt_frames)
@@ -277,7 +339,13 @@ def main() -> None:
         title=title,
         model_name="online" if args.use_online else "ema",
         dataset_path=args.array_record_path,
-        sample_index=args.sample_index,
+        sample_selection="all" if args.sample_index is None else str(args.sample_index),
+        rollout_context_length=args.rollout_context_length,
+        prefill_context_mode=args.prefill_context_mode,
+        tau_ctx_target=args.tau_ctx_target,
+        history_guidance_mode=args.history_guidance_mode,
+        history_guidance_scale=args.history_guidance_scale,
+        history_guidance_tau_target=args.history_guidance_tau_target,
         cases=cases,
         metrics=metrics,
         video_path=output_dir / "rollouts.mp4",

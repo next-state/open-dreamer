@@ -30,6 +30,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 
 def run(cfg):
     rng = jax.random.PRNGKey(cfg.seed)
+    data_seed = cfg.seed if cfg.dataset_seed is None else int(cfg.dataset_seed)
 
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
@@ -46,7 +47,7 @@ def run(cfg):
 
         # Load one batch of data
         print(f"Loading data from: {cfg.dataset.array_record_path}")
-        iterator = make_iterator(cfg.dataset, device=data_sharding)
+        iterator = make_iterator(cfg.dataset, seed=data_seed, device=data_sharding)
         batch = next(iter(iterator))
 
         actions = batch["actions"]
@@ -57,10 +58,17 @@ def run(cfg):
         # run_evaluation needs cfg.dataset.dataset_std
         # run_x0_visualization needs cfg.dynamics.k_max and cfg.dynamics.context_length
         # Both are available directly: dataset_std from cfg.dataset, dynamics fields from the loaded model
+        eval_prompt_length = getattr(cfg, "eval_prompt_length", getattr(cfg, "eval_ctx_length", None))
         eval_cfg = types.SimpleNamespace(
             dynamics=bundle.dynamics_ema.cfg,
             dataset=types.SimpleNamespace(dataset_std=tuple(cfg.dataset.dataset_std)),
-            eval_ctx_length=cfg.eval_ctx_length,
+            eval_prompt_length=eval_prompt_length,
+            eval_ctx_length=eval_prompt_length,
+            eval_rollout_tags=cfg.eval_rollout_tags,
+            eval_shortcut_steps=cfg.eval_shortcut_steps,
+            history_guidance_mode=cfg.history_guidance_mode,
+            history_guidance_scale=cfg.history_guidance_scale,
+            history_guidance_tau_target=cfg.history_guidance_tau_target,
         )
 
         # Output directory and logger

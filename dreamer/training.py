@@ -21,7 +21,7 @@ import optax
 import time
 
 from dreamer.configs import DynamicsConfig, HeadsConfig, OptimalTransportConfig
-from dreamer.generation import DenoiseSchedule
+from dreamer.generation import DenoiseSchedule, HistoryGuidanceConfig
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
@@ -882,9 +882,9 @@ def run_evaluation(
 
     Grid layout:
       - Rows: rollout samples
-      - Columns: [ground_truth, online_diffusion, ema_diffusion, online_shortcut, ema_shortcut]
+      - Columns: [ground_truth] + selected rollout columns
 
-    PSNR is computed on only the first generated frame (t = ctx_length).
+    PSNR is computed on only the first generated frame (t = prompt_length).
     Also runs x0 and attention visualizations for both online and EMA dynamics.
     """
     if dynamics_online.cfg.k_max != dynamics_ema.cfg.k_max:
@@ -895,19 +895,39 @@ def run_evaluation(
 
     T = val_data.shape[1]
     assert T > 5, f"Sequence length {T} must be > 5"
-    eval_ctx_length = getattr(cfg, "eval_ctx_length", None)
-    default_ctx_length = dynamics_online.cfg.context_length if dynamics_online.cfg.context_length is not None else 4
-    requested_ctx_length = default_ctx_length if eval_ctx_length is None else int(eval_ctx_length)
-    ctx_length = max(1, min(requested_ctx_length, T - 1))
-    horizon = T - ctx_length
+    eval_prompt_length = getattr(cfg, "eval_prompt_length", getattr(cfg, "eval_ctx_length", None))
+    default_prompt_length = dynamics_online.cfg.context_length if dynamics_online.cfg.context_length is not None else 4
+    requested_prompt_length = default_prompt_length if eval_prompt_length is None else int(eval_prompt_length)
+    prompt_length = max(1, min(requested_prompt_length, T - 1))
+    horizon = T - prompt_length
     k_max = dynamics_online.cfg.k_max
 
-    rollout_specs = [
-        ("online_diffusion", dynamics_online, DenoiseSchedule.init(k_max, k_max)),
-        ("ema_diffusion", dynamics_ema, DenoiseSchedule.init(k_max, k_max)),
-        ("online_shortcut", dynamics_online, DenoiseSchedule.init(4, k_max)),
-        ("ema_shortcut", dynamics_ema, DenoiseSchedule.init(4, k_max)),
-    ]
+    shortcut_steps = int(getattr(cfg, "eval_shortcut_steps", 4))
+    history_guidance = HistoryGuidanceConfig(
+        mode=str(getattr(cfg, "history_guidance_mode", "off")),
+        scale=float(getattr(cfg, "history_guidance_scale", 0.0)),
+        tau_target=float(getattr(cfg, "history_guidance_tau_target", 0.5)),
+    )
+    all_rollout_specs = {
+        "online_diffusion": ("online_diffusion", dynamics_online, DenoiseSchedule.init(k_max, k_max)),
+        "ema_diffusion": ("ema_diffusion", dynamics_ema, DenoiseSchedule.init(k_max, k_max)),
+        "online_shortcut": ("online_shortcut", dynamics_online, DenoiseSchedule.init(shortcut_steps, k_max)),
+        "ema_shortcut": ("ema_shortcut", dynamics_ema, DenoiseSchedule.init(shortcut_steps, k_max)),
+    }
+    requested_tags = getattr(cfg, "eval_rollout_tags", None)
+    if requested_tags is None:
+        rollout_tags = ["online_diffusion", "ema_diffusion", "online_shortcut", "ema_shortcut"]
+    else:
+        rollout_tags = [str(tag) for tag in requested_tags]
+    invalid_tags = [tag for tag in rollout_tags if tag not in all_rollout_specs]
+    if invalid_tags:
+        raise ValueError(
+            f"Unknown eval_rollout_tags={invalid_tags}. "
+            f"Expected a subset of {list(all_rollout_specs)}."
+        )
+    if not rollout_tags:
+        raise ValueError("eval_rollout_tags must select at least one rollout column.")
+    rollout_specs = [all_rollout_specs[tag] for tag in rollout_tags]
 
     dataset_std = cfg.dataset.dataset_std[0]
     psnr_windows = (1, 3, 8)
@@ -925,6 +945,7 @@ def run_evaluation(
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=eval_rng, policy=None, task_embedder=None,
                 latents=val_data,
+                history_guidance=history_guidance,
             )
             gt_frames_for_metrics = gt_decoded_frames
         else:
@@ -932,6 +953,7 @@ def run_evaluation(
                 tokenizer, dynamics_model, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=eval_rng, policy=None, task_embedder=None,
+                history_guidance=history_guidance,
             )
             assert original_frames is not None
             gt_frames_for_metrics = original_frames
@@ -959,8 +981,8 @@ def run_evaluation(
             n_eval = min(n, horizon)
             return float(
                 compute_psnr(
-                    pred_frames[:, ctx_length:ctx_length + n_eval] / 255,
-                    gt_frames_for_metrics[:, ctx_length:ctx_length + n_eval] / 255,
+                    pred_frames[:, prompt_length:prompt_length + n_eval] / 255,
+                    gt_frames_for_metrics[:, prompt_length:prompt_length + n_eval] / 255,
                 )
             )
 
@@ -973,7 +995,7 @@ def run_evaluation(
             f"MSE={mse:.6g} | {psnr_log} | {dt:.2f}s"
         )
 
-        pred_frames = pred_frames.at[:, :ctx_length].set(apply_border(pred_frames[:, :ctx_length]))
+        pred_frames = pred_frames.at[:, :prompt_length].set(apply_border(pred_frames[:, :prompt_length]))
         pred_columns[tag] = pred_frames
         rollout_metrics[tag] = {
             "mse": mse,
@@ -988,13 +1010,7 @@ def run_evaluation(
     if logger is not None:
         num_videos = min(4, ground_truth_frames.shape[0])
 
-        grid_columns = [
-            ground_truth_frames,
-            pred_columns["online_diffusion"],
-            pred_columns["ema_diffusion"],
-            pred_columns["online_shortcut"],
-            pred_columns["ema_shortcut"],
-        ]
+        grid_columns = [ground_truth_frames] + [pred_columns[tag] for tag in rollout_tags]
         stacked_frames = jnp.stack(grid_columns)[:, :num_videos]
         videos = rearrange(stacked_frames, 'S B T H W C -> T (B H) (S W) C', B=num_videos)
 
@@ -1004,7 +1020,7 @@ def run_evaluation(
         video_written = False
         try:
             videos = jax.device_get(videos)
-            iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
+            iio.imwrite(str(mp4_path), videos, fps=20, plugin='pyav', codec='libx264')
             video_written = True
         except Exception as e:
             print(f"[eval] consolidated MP4 write failed: {e}")
