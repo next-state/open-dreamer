@@ -21,7 +21,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.tree_util import Partial
 from omegaconf import DictConfig, OmegaConf
 from reactor_runtime import VideoModel, command, get_ctx
 from reactor_runtime.model_api import model
@@ -125,91 +124,89 @@ def create_noop_wm_action(with_time_dim: bool) -> Actions:
     )
 
 
-def create_update_caches_fn(tokenizer, dynamics, schedule: DenoiseSchedule, task_embedding):
+def update_caches(
+    frame: jax.Array,  # (1, 1, H, W, C)
+    action: Actions,   # (1, 1, ...)
+    dynamics_cache,
+    tokenizer_cache,
+    rng: jax.Array,
+    *,
+    tokenizer,
+    dynamics,
+    schedule: DenoiseSchedule,
+    task_embedding,
+):
     """Update dynamics/tokenizer caches from a real observed frame and action."""
-    emax = schedule.emax
-    k_max = schedule.k_max
+    rng, enc_key = jax.random.split(rng)
 
-    def update_caches(
-        frame: jax.Array,  # (1, 1, H, W, C)
-        action: Actions,   # (1, 1, ...)
-        dynamics_cache,
-        tokenizer_cache,
-        rng: jax.Array,
-    ):
-        rng, enc_key = jax.random.split(rng)
+    latent, _ = tokenizer.encode(
+        frame,
+        deterministic=True,
+        rngs=nnx.Rngs(mae=enc_key),
+    )  # (1, 1, n_latents, D_s)
 
-        latent, _ = tokenizer.encode(
-            frame,
-            deterministic=True,
-            rngs=nnx.Rngs(mae=enc_key),
-        )  # (1, 1, n_latents, D_s)
+    latent_norm = normalize_latents(latent, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
-        latent_norm = normalize_latents(latent, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+    # tau=1.0 (clean), step_idx=emax — matches training prefill for ground truth frames
+    step_indices = jnp.full((1, 1), schedule.emax, dtype=jnp.int32)
+    tau_indices = jnp.full((1, 1), schedule.k_max, dtype=jnp.int32)
 
-        # tau=1.0 (clean), step_idx=emax — matches training prefill for ground truth frames
-        step_indices = jnp.full((1, 1), emax, dtype=jnp.int32)
-        tau_indices = jnp.full((1, 1), k_max, dtype=jnp.int32)
+    _, (h_new, dynamics_cache_new) = dynamics(
+        action,
+        step_indices,
+        tau_indices,
+        latent_norm,
+        task_embeddings=task_embedding,
+        deterministic=True,
+        caches=dynamics_cache,
+    )
 
-        _, (h_new, dynamics_cache_new) = dynamics(
-            action,
-            step_indices,
-            tau_indices,
-            latent_norm,
-            task_embeddings=task_embedding,
-            deterministic=True,
-            caches=dynamics_cache,
-        )
+    _, tokenizer_cache_new = tokenizer.decode(
+        latent,
+        caches=tokenizer_cache,
+        deterministic=True,
+        rngs=None,
+    )
 
-        _, tokenizer_cache_new = tokenizer.decode(
-            latent,
-            caches=tokenizer_cache,
-            deterministic=True,
-            rngs=None,
-        )
-
-        return h_new, dynamics_cache_new, tokenizer_cache_new, rng
-
-    return update_caches
+    return h_new, dynamics_cache_new, tokenizer_cache_new, rng
 
 
-def create_update_caches_from_latent_fn(tokenizer, dynamics, schedule: DenoiseSchedule, task_embedding):
+def update_caches_from_latent(
+    latent: jax.Array,  # (1, 1, n_latents, D_s)
+    action: Actions,
+    dynamics_cache,
+    tokenizer_cache,
+    rng: jax.Array,
+    *,
+    tokenizer,
+    dynamics,
+    schedule: DenoiseSchedule,
+    task_embedding,
+):
     """Update dynamics/tokenizer caches from a pre-computed latent (skip tokenizer encode)."""
-    emax = schedule.emax
-    k_max = schedule.k_max
+    latent_norm = normalize_latents(latent, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
-    def update_caches_from_latent(
-        latent: jax.Array,  # (1, 1, n_latents, D_s)
-        action: Actions,
-        dynamics_cache,
-        tokenizer_cache,
-        rng: jax.Array,
-    ):
-        latent_norm = normalize_latents(latent, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+    step_indices = jnp.full((1, 1), schedule.emax, dtype=jnp.int32)
+    tau_indices = jnp.full((1, 1), schedule.k_max, dtype=jnp.int32)
 
-        step_indices = jnp.full((1, 1), emax, dtype=jnp.int32)
-        tau_indices = jnp.full((1, 1), k_max, dtype=jnp.int32)
+    _, (h_new, dynamics_cache_new) = dynamics(
+        action,
+        step_indices,
+        tau_indices,
+        latent_norm,
+        task_embeddings=task_embedding,
+        deterministic=True,
+        caches=dynamics_cache,
+    )
 
-        _, (h_new, dynamics_cache_new) = dynamics(
-            action,
-            step_indices,
-            tau_indices,
-            latent_norm,
-            task_embeddings=task_embedding,
-            deterministic=True,
-            caches=dynamics_cache,
-        )
+    _, tokenizer_cache_new = tokenizer.decode(
+        latent,
+        caches=tokenizer_cache,
+        deterministic=True,
+        rngs=None,
+    )
 
-        _, tokenizer_cache_new = tokenizer.decode(
-            latent,
-            caches=tokenizer_cache,
-            deterministic=True,
-            rngs=None,
-        )
-
-        return h_new, dynamics_cache_new, tokenizer_cache_new, rng
-
-    return update_caches_from_latent
+    return h_new, dynamics_cache_new, tokenizer_cache_new, rng
 
 
 @model(name="world_model", config="configs/world_model.yaml")
@@ -254,10 +251,11 @@ class WorldModelVideoModel(VideoModel):
     @command("reprefill", description="Reset caches and re-prefill from a new dataset batch")
     def reprefill(self):
         logger.info("Reprefilling from dataset...")
-        self._reset_caches()
-        data_iterator = make_iterator(self.dataset_cfg, device=self.data_sharding)
-        batch = next(iter(data_iterator))
-        self._prefill_from_batch(batch, emit=True)
+        with jax.set_mesh(self.mesh):
+            self._reset_caches()
+            data_iterator = make_iterator(self.dataset_cfg, device=self.data_sharding)
+            batch = next(iter(data_iterator))
+            self._prefill_from_batch(batch, emit=True)
         logger.info("Reprefill complete")
 
     @command("switch_to_policy", description="Switch between user input and policy control")
@@ -283,6 +281,7 @@ class WorldModelVideoModel(VideoModel):
 
         logger.info("Loading world model bundle from: %s", self.cfg.dynamics_ckpt)
         mesh, data_sharding, mesh_rules = build_parallel("data")
+        self.mesh = mesh
         with jax.set_mesh(mesh):
             dyn_bundle = DynamicsCheckpointBundle.from_pretrained(
                 self.cfg.dynamics_ckpt,
@@ -350,25 +349,19 @@ class WorldModelVideoModel(VideoModel):
                 task = jnp.full((1,), self.cfg.task_id, dtype=jnp.int32)
                 self.task_embedding = self.task_embedder(task=task, B=1, T=1)
 
-            self.next_frame_compiled = jax.jit(
-                Partial(
-                    next_frame,
-                    tokenizer=self.tokenizer,
-                    dynamics=self.dynamics,
-                    schedule=self.schedule,
-                    latent_shape=self.latent_shape,
-                )
-            )
+            # Bind schedule in closures so its scalar fields (num_steps, emax, etc.)
+            # stay concrete during JIT tracing, while its tiny arrays (~100 bytes)
+            # are captured as constants. Model weights (multi-GB) are passed as
+            # traced arguments via nnx.jit to avoid constant capture.
+            schedule = self.schedule
 
-            update_caches_fn = create_update_caches_fn(
-                self.tokenizer, self.dynamics, self.schedule, self.task_embedding
-            )
-            self.update_caches_compiled = jax.jit(update_caches_fn)
+            def next_frame_fn(tokenizer, dynamics, action, latent_shape, dynamics_cache, tokenizer_cache, rng, task_embedding=None):
+                return next_frame(tokenizer, dynamics, schedule, action, latent_shape, dynamics_cache, tokenizer_cache, rng, task_embedding)
 
-            update_caches_latent_fn = create_update_caches_from_latent_fn(
-                self.tokenizer, self.dynamics, self.schedule, self.task_embedding
-            )
-            self.update_caches_from_latent_compiled = jax.jit(update_caches_latent_fn)
+            from functools import partial as ft_partial
+            self.next_frame_jit = nnx.jit(next_frame_fn, static_argnames=('latent_shape',))
+            self.update_caches_jit = nnx.jit(ft_partial(update_caches, schedule=schedule))
+            self.update_caches_from_latent_jit = nnx.jit(ft_partial(update_caches_from_latent, schedule=schedule))
 
             n_agent = 0 if self.policy_head is None else self.policy_head.L
             self.initial_dynamics_cache = self.dynamics.create_static_caches(
@@ -385,8 +378,6 @@ class WorldModelVideoModel(VideoModel):
             )
 
             # Build DatasetConfig: data-loading fields from yaml, stats/dims from checkpoint.
-            # The iterator is created lazily in start_session to avoid holding worker
-            # processes between sessions
             dataset_section = self.cfg.dataset or OmegaConf.create({})
             dataset_dict = OmegaConf.to_container(dataset_section, resolve=True)
             self.dataset_cfg: DatasetConfig = from_dict(DatasetConfig, dataset_dict)
@@ -397,6 +388,41 @@ class WorldModelVideoModel(VideoModel):
             self.dataset_cfg.latent_std = self.dynamics_cfg.latent_std
             self.use_latent_data = self.dataset_cfg.data_type == "latent"
             self.data_sharding = data_sharding
+
+            # Do dataset loading, prefill, and JIT warmup during init so
+            # start_session has zero cold-start (client ping timeout is 10s).
+            logger.info("Loading initial prefill batch from dataset...")
+            data_iterator = make_iterator(self.dataset_cfg, device=data_sharding)
+            init_batch = next(iter(data_iterator))
+
+            logger.info("Prefilling %d frames (triggers JIT compilation)...", self.cfg.num_prefill_frames)
+            self.dynamics_cache = self.initial_dynamics_cache
+            self.tokenizer_cache = self.initial_tokenizer_cache
+            self.h_last = None
+            self._prefill_from_batch(init_batch, emit=False)
+
+            dummy_action = create_noop_wm_action(with_time_dim=False)
+            _, self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = (
+                self.next_frame_jit(
+                    self.tokenizer,
+                    self.dynamics,
+                    dummy_action,
+                    self.latent_shape,
+                    self.dynamics_cache,
+                    self.tokenizer_cache,
+                    self.rng,
+                    task_embedding=self.task_embedding,
+                )
+            )
+            # Force compilation + execution to complete before init returns,
+            # so start_session doesn't block on deferred compilation.
+            jax.block_until_ready((self.h_last, self.dynamics_cache, self.tokenizer_cache))
+            logger.info("Init prefill and JIT warmup complete")
+
+            # Store prefilled state so start_session can restore it instantly
+            self.prefilled_dynamics_cache = self.dynamics_cache
+            self.prefilled_tokenizer_cache = self.tokenizer_cache
+            self.prefilled_h_last = self.h_last
 
         self.dynamics_cache = None
         self.tokenizer_cache = None
@@ -469,8 +495,10 @@ class WorldModelVideoModel(VideoModel):
                 latent_t = jnp.asarray(latents[0:1, t:t+1])  # (1, 1, n_latents, D)
                 self.rng, key = jax.random.split(self.rng)
                 self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = (
-                    self.update_caches_from_latent_compiled(
-                        latent_t, noop_action, self.dynamics_cache, self.tokenizer_cache, key
+                    self.update_caches_from_latent_jit(
+                        latent_t, noop_action, self.dynamics_cache, self.tokenizer_cache, key,
+                        tokenizer=self.tokenizer, dynamics=self.dynamics,
+                        task_embedding=self.task_embedding,
                     )
                 )
                 if emit:
@@ -489,8 +517,10 @@ class WorldModelVideoModel(VideoModel):
                 frame_jax = jnp.asarray(self._to_model_frame(frame))[None, None]
                 self.rng, key = jax.random.split(self.rng)
                 self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = (
-                    self.update_caches_compiled(
-                        frame_jax, noop_action, self.dynamics_cache, self.tokenizer_cache, key
+                    self.update_caches_jit(
+                        frame_jax, noop_action, self.dynamics_cache, self.tokenizer_cache, key,
+                        tokenizer=self.tokenizer, dynamics=self.dynamics,
+                        task_embedding=self.task_embedding,
                     )
                 )
                 if emit:
@@ -500,86 +530,93 @@ class WorldModelVideoModel(VideoModel):
         return input_to_wm_action(self.controller_state, self.mouse_state, with_time_dim=with_time_dim)
 
     def start_session(self) -> None:
+        t0 = time.time()
+        print(f"[world_model] start_session called", flush=True)
         self._running = True
         self.actiongen_mode = ActionGenMode.USER_INPUT
         self.controller_state = {}
         self.mouse_state = {"left": False, "right": False, "middle": False, "dx": 0.0, "dy": 0.0}
 
-        self._reset_caches()
+        # Restore prefilled cache state (computed during __init__)
+        self.dynamics_cache = self.prefilled_dynamics_cache
+        self.tokenizer_cache = self.prefilled_tokenizer_cache
+        self.h_last = self.prefilled_h_last
+        print(f"[world_model] caches restored: {time.time()-t0:.2f}s", flush=True)
 
-        logger.info("Loading prefill batch from dataset...")
-        data_iterator = make_iterator(self.dataset_cfg, device=self.data_sharding)
-        batch = next(iter(data_iterator))
-        logger.info("Prefilling %d frames...", self.cfg.num_prefill_frames)
-        self._prefill_from_batch(batch, emit=False)
-        logger.info("Prefill complete")
-
-        # Trigger JIT compilation
-        self.rng, compile_key = jax.random.split(self.rng)
-        dummy_action = create_noop_wm_action(with_time_dim=False)
-        frame_jax, self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = (
-            self.next_frame_compiled(
-                action=dummy_action,
-                dynamics_cache=self.dynamics_cache,
-                tokenizer_cache=self.tokenizer_cache,
-                rng=compile_key,
-                task_embedding=self.task_embedding,
-            )
-        )
-        logger.info("Warmup compile complete")
-        get_ctx().get_track().emit(self._to_display_frame(np.asarray(frame_jax[0, 0])))
-
-        frame_time = 1.0 / self.fps
-
-        try:
-            last_frame_time = time.time()
-            while not get_ctx().should_stop():
-                self.rng, key, policy_key = jax.random.split(self.rng, 3)
-
-                if (
-                    self.actiongen_mode == ActionGenMode.POLICY
-                    and isinstance(self.policy_head, PolicyHeadMTP)
-                    and self.h_last is not None
-                ):
-                    sampled = self.policy_head.sample(
-                        self.h_last, deterministic=False, rng=policy_key
-                    )
-                    wm_action = Actions(
-                        binary=sampled.binary[:, 0, 0, :] if sampled.binary is not None else None,
-                        categorical=sampled.categorical[:, 0, 0] if sampled.categorical is not None else None,
-                        continuous=sampled.continuous[:, 0, 0, :] if sampled.continuous is not None else None,
-                    )
-                else:
-                    wm_action = self._current_wm_action(with_time_dim=False)
-
-                frame_jax, self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = (
-                    self.next_frame_compiled(
-                        action=wm_action,
-                        dynamics_cache=self.dynamics_cache,
-                        tokenizer_cache=self.tokenizer_cache,
-                        rng=key,
-                        task_embedding=self.task_embedding,
-                    )
+        with jax.set_mesh(self.mesh):
+            # Generate first frame immediately (JIT already compiled)
+            self.rng, key = jax.random.split(self.rng)
+            dummy_action = create_noop_wm_action(with_time_dim=False)
+            frame_jax, self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = (
+                self.next_frame_jit(
+                    self.tokenizer,
+                    self.dynamics,
+                    dummy_action,
+                    self.latent_shape,
+                    self.dynamics_cache,
+                    self.tokenizer_cache,
+                    key,
+                    task_embedding=self.task_embedding,
                 )
-                frame = self._to_display_frame(np.asarray(frame_jax[0, 0]))
-                get_ctx().get_track().emit(frame)
+            )
+            print(f"[world_model] first frame generated: {time.time()-t0:.2f}s", flush=True)
+            get_ctx().get_track().emit(self._to_display_frame(np.asarray(frame_jax[0, 0])))
+            print(f"[world_model] first frame emitted: {time.time()-t0:.2f}s", flush=True)
 
-                self.mouse_state["dx"] = 0.0
-                self.mouse_state["dy"] = 0.0
+            frame_time = 1.0 / self.fps
 
-                current_time = time.time()
-                elapsed = current_time - last_frame_time
-                sleep_time = max(0.0, frame_time - elapsed)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+            try:
                 last_frame_time = time.time()
+                while not get_ctx().should_stop():
+                    self.rng, key, policy_key = jax.random.split(self.rng, 3)
 
-        except Exception as e:
-            logger.error("Error in session: %s", e, exc_info=True)
-            self._running = False
-            raise
-        finally:
-            self._running = False
-            self.dynamics_cache = None
-            self.tokenizer_cache = None
-            logger.info("DynamicsOnly session ended")
+                    if (
+                        self.actiongen_mode == ActionGenMode.POLICY
+                        and isinstance(self.policy_head, PolicyHeadMTP)
+                        and self.h_last is not None
+                    ):
+                        sampled = self.policy_head.sample(
+                            self.h_last, deterministic=False, rng=policy_key
+                        )
+                        wm_action = Actions(
+                            binary=sampled.binary[:, 0, 0, :] if sampled.binary is not None else None,
+                            categorical=sampled.categorical[:, 0, 0] if sampled.categorical is not None else None,
+                            continuous=sampled.continuous[:, 0, 0, :] if sampled.continuous is not None else None,
+                        )
+                    else:
+                        wm_action = self._current_wm_action(with_time_dim=False)
+
+                    frame_jax, self.h_last, self.dynamics_cache, self.tokenizer_cache, self.rng = (
+                        self.next_frame_jit(
+                            self.tokenizer,
+                            self.dynamics,
+                            wm_action,
+                            self.latent_shape,
+                            self.dynamics_cache,
+                            self.tokenizer_cache,
+                            key,
+                            task_embedding=self.task_embedding,
+                        )
+                    )
+                    frame = self._to_display_frame(np.asarray(frame_jax[0, 0]))
+                    get_ctx().get_track().emit(frame)
+
+                    self.mouse_state["dx"] = 0.0
+                    self.mouse_state["dy"] = 0.0
+
+                    current_time = time.time()
+                    elapsed = current_time - last_frame_time
+                    sleep_time = max(0.0, frame_time - elapsed)
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    last_frame_time = time.time()
+
+            except Exception as e:
+                logger.error("Error in session: %s", e, exc_info=True)
+                self._running = False
+                raise
+            finally:
+                self._running = False
+                self.dynamics_cache = None
+                self.tokenizer_cache = None
+                logger.info("DynamicsOnly session ended")

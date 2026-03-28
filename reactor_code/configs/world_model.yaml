@@ -1,4 +1,4 @@
-dynamics_ckpt: /root/dreamer4-jax-private/logs/dynamics-time-layer-start-bigg-ish/checkpoints
+dynamics_ckpt: /home/ubuntu/checkpoints
 
 num_prefill_frames: 4
 num_steps: 4
@@ -10,8 +10,8 @@ width: 640
 
 dataset:
   name: minecraft_vpt
-  data_type: video
-  array_record_path: /root/data
+  data_type: latent
+  array_record_path: /home/ubuntu/latents-0312-h200
   index_max: 1
   H: 360
   W: 640
