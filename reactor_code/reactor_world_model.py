@@ -27,7 +27,7 @@ from reactor_runtime.model_api import model
 
 from dreamer.actions import Actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES, mouse_movement_to_categorical
 from dreamer.checkpointing import DynamicsCheckpointBundle, HeadsCheckpointBundle
-from dreamer.configs import DatasetConfig
+from dreamer.configs import DataloaderConfig, DatasetConfig
 from dreamer.data import make_iterator
 from dreamer.utils import from_dict, normalize_latents
 from dreamer.generation import DenoiseSchedule, next_frame
@@ -253,7 +253,7 @@ class WorldModelVideoModel(VideoModel):
         logger.info("Reprefilling from dataset...")
         with jax.set_mesh(self.mesh):
             self._reset_caches()
-            data_iterator = make_iterator(self.dataset_cfg, device=self.data_sharding)
+            data_iterator = make_iterator(self.dataset_cfg, dataloader_cfg=self.prefill_dataloader_cfg)
             batch = next(iter(data_iterator))
             self._prefill_from_batch(batch, emit=True)
         logger.info("Reprefill complete")
@@ -391,8 +391,20 @@ class WorldModelVideoModel(VideoModel):
 
             # Do dataset loading, prefill, and JIT warmup during init so
             # start_session has zero cold-start (client ping timeout is 10s).
+            # Single-process dataloader for prefill (only need one batch,
+            # no need for multiprocessing worker pool).
+            self.prefill_dataloader_cfg = DataloaderConfig(
+                B=self.dataset_cfg.dataloader_cfg.B,
+                num_workers=0,
+                prefetch_buffer_size=1,
+                device_prefetch_buffer_size=0,
+                short_T=self.dataset_cfg.dataloader_cfg.short_T,
+                long_T=self.dataset_cfg.dataloader_cfg.long_T,
+                dtype=self.dataset_cfg.dataloader_cfg.dtype,
+            )
+
             logger.info("Loading initial prefill batch from dataset...")
-            data_iterator = make_iterator(self.dataset_cfg, device=data_sharding)
+            data_iterator = make_iterator(self.dataset_cfg, dataloader_cfg=self.prefill_dataloader_cfg)
             init_batch = next(iter(data_iterator))
 
             logger.info("Prefilling %d frames (triggers JIT compilation)...", self.cfg.num_prefill_frames)
