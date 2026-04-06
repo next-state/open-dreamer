@@ -6,7 +6,7 @@ import optax
 import operator
 from einops import rearrange
 from enum import IntEnum
-from typing import Tuple
+from typing import NamedTuple, Tuple
 from hydra.core.hydra_config import HydraConfig
 from dreamer.configs import LRScheduleConfig, OptimizerConfig
 
@@ -388,6 +388,76 @@ def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
         )
 
 
+class ScaleByLaPropState(NamedTuple):
+    step: jax.Array
+    mu: optax.Updates
+    nu: optax.Updates
+
+
+def scale_by_laprop(
+    b1: float = 0.9,
+    b2: float = 0.999,
+    eps: float = 1e-8,
+) -> optax.GradientTransformation:
+    """Rescale updates according to the LaProp algorithm (Ziyin et al., 2020).
+
+    Unlike Adam, LaProp folds bias correction into the moment accumulation,
+    which provides better per-coordinate adaptivity.
+    """
+
+    def init_fn(params):
+        mu = jax.tree.map(jnp.zeros_like, params)
+        nu = jax.tree.map(jnp.zeros_like, params)
+        return ScaleByLaPropState(step=jnp.zeros([], jnp.int32), mu=mu, nu=nu)
+
+    def update_fn(updates, state, params=None):
+        del params
+        count_inc: jax.Array = state.step + 1
+
+        # v_t = β2 * v_{t-1} + (1 - β2) / (1 - β2^t) * g_t^2
+        nu_scale = (1.0 - b2) / (1.0 - b2 ** count_inc)
+        nu = jax.tree.map(
+            lambda v, g: b2 * v + nu_scale * g ** 2, state.nu, updates
+        )
+
+        # β1_hat = β1 * (1 - β1^{t-1}) / (1 - β1^t)
+        # At t=1: β1_hat = β1 * 0 / (1 - β1) = 0, so m_1 = g_1
+        b1_hat = jnp.where(
+            count_inc == 1,
+            0.0,
+            b1 * (1.0 - jnp.float32(b1) ** (count_inc - 1)) / (1.0 - jnp.float32(b1) ** count_inc),
+        )
+
+        # m_t = β1_hat * m_{t-1} + (1 - β1_hat) * g_t
+        mu = jax.tree.map(
+            lambda m, g: b1_hat * m + (1.0 - b1_hat) * g, state.mu, updates
+        )
+
+        # update = m_t / (sqrt(v_t) + eps)
+        new_updates = jax.tree.map(
+            lambda m, v: m / (jnp.sqrt(v) + eps), mu, nu
+        )
+
+        return new_updates, ScaleByLaPropState(step=count_inc, mu=mu, nu=nu)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def laprop(
+    learning_rate: optax.ScalarOrSchedule,
+    b1: float = 0.9,
+    b2: float = 0.999,
+    eps: float = 1e-8,
+    weight_decay: float = 0.0,
+) -> optax.GradientTransformation:
+    """LaProp optimizer with decoupled weight decay."""
+    return optax.chain(
+        scale_by_laprop(b1=b1, b2=b2, eps=eps),
+        optax.add_decayed_weights(weight_decay),
+        optax.scale_by_learning_rate(learning_rate),
+    )
+
+
 def _muon_weight_dims(params):
     """Map params to Muon dimension numbers, excluding embeddings.
 
@@ -441,6 +511,19 @@ def build_optimizer(
             b2=optimizer_cfg.adam_b2,
             weight_decay=optimizer_cfg.weight_decay,
         )
+    elif optimizer_cfg.optimizer_type == "laprop":
+        if optimizer_cfg.mup_scaling:
+            scaled_schedule = lambda step, s=lr_schedule, m=mup_scale: s(step) * m
+        else:
+            scaled_schedule = lr_schedule
+
+        tx = laprop(
+            scaled_schedule,
+            b1=optimizer_cfg.adam_b1,
+            b2=optimizer_cfg.adam_b2,
+            eps=optimizer_cfg.adam_eps,
+            weight_decay=optimizer_cfg.weight_decay,
+        )
     elif optimizer_cfg.optimizer_type == "muon":
         muon_schedule = lr_schedule
         adam_ratio = optimizer_cfg.adam_lr_ratio
@@ -465,6 +548,12 @@ def build_optimizer(
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_cfg.optimizer_type}")
+
+    if optimizer_cfg.agc_clipping > 0:
+        tx = optax.chain(
+            optax.adaptive_grad_clip(optimizer_cfg.agc_clipping, eps=optimizer_cfg.agc_eps),
+            tx,
+        )
 
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     return optimizer
