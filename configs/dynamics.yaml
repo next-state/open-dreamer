@@ -3,18 +3,18 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics
+run_name: dynamics-wilson
 use_wandb: true
-tokenizer_ckpt: /data/minecraft-vpt/models/tokenizer-asymmetric-small-normal-latent-space/checkpoints/
+tokenizer_ckpt: logs/tokenizer-asymmetric-small-normal-latent-space/checkpoints
 
 ckpt:
-  max_to_keep: 99999
+  max_to_keep: 1
   save_interval_steps: 5_000
 
 dataset:
-  array_record_path: /home/ubuntu/latents-0312-h200
+  array_record_path: /root/minecraft-vpt/latents-final
   dataloader_cfg:
-    B: ???
+    B: 8
     num_workers: 0
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
@@ -24,7 +24,7 @@ dataset:
 
 dynamics:
     d_bottleneck: 16
-    depth: 32
+    depth: 16
     d_model: ${mul:64,${dynamics.depth}}
     n_heads: ${floordiv:${dynamics.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${dynamics.n_heads},8}}
@@ -51,9 +51,9 @@ dynamics:
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
 
-ema_decay: 0.9997
+ema_decay: 0.999
 
-bootstrap_start: 50_000  # Number of start steps trained exclusively on flow-matching objective
+bootstrap_start: 200_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
 image_fraction: 0.0  # Fraction of batch to train as images (no temporal attention)
 
@@ -67,14 +67,14 @@ ot:
   pairing: barycentric
   scale_cost: mean
 
-max_steps: 100_000
+max_steps: 200_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
   lr: 3e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
-  warmup_ratio: 0.1  # 10k steps at 100k max_steps
+  warmup_ratio: 0.05
   decay_ratio: 0.1
   max_steps: ${max_steps}
 
@@ -87,6 +87,6 @@ optimizer:
   agc_clipping: 0.3
   agc_eps: 1e-3
 
-write_video_every: 0
+write_video_every: 10_000
 dtype: ${dataset.dataloader_cfg.dtype}
 param_dtype: bfloat16
