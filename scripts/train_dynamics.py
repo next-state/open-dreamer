@@ -7,7 +7,7 @@ def _append_xla_flag(flag: str) -> None:
         os.environ["XLA_FLAGS"] = f"{current} {flag}".strip()
 
 
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.80")
 _append_xla_flag("--xla_gpu_triton_gemm_any=True")
 _append_xla_flag("--xla_gpu_enable_latency_hiding_scheduler=true")
 
@@ -44,11 +44,11 @@ from dreamer.utils import (
     setup_training_directories,
     build_lr_schedule,
     build_optimizer,
+    to_jnp_dtype,
 )
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
 
 
 # Register OmegaConf resolver for arithmetic expressions
@@ -157,10 +157,11 @@ def train_step(
 
     return {**metrics, 'grad_norm': grad_norm}
 
-def build_ema_model(dynamics: Dynamics) -> Dynamics:
+def build_ema_model(dynamics: Dynamics, *, ema_dtype: str | jnp.dtype) -> Dynamics:
     ema = nnx.clone(dynamics)
     params = nnx.state(ema, nnx.Param)
-    nnx.update(ema, jax.tree.map(lambda p: p.astype(jnp.float32), params))
+    ema_dtype = to_jnp_dtype(ema_dtype)
+    nnx.update(ema, jax.tree.map(lambda p: p.astype(ema_dtype), params))
     return ema
 
 
@@ -168,7 +169,6 @@ def build_ema_model(dynamics: Dynamics) -> Dynamics:
 def ema_update_step(dynamics: Dynamics, dynamics_ema: Dynamics, *, ema_decay: float):
     online_params = nnx.state(dynamics, nnx.Param)
     ema_params    = nnx.state(dynamics_ema, nnx.Param)
-    # Keep EMA in float32 to avoid bf16 quantization (tiny EMA increments get rounded to 0)
     updated_ema = jax.tree.map(
         lambda e, o: ema_decay * e + (1.0 - ema_decay) * o.astype(e.dtype),
         ema_params, online_params,
@@ -249,7 +249,7 @@ def run(cfg: DynamicsConfig):
         optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model)
 
         # Build EMA model
-        dynamics_ema = build_ema_model(dynamics)
+        dynamics_ema = build_ema_model(dynamics, ema_dtype=cfg.ema_dtype)
 
         # Create checkpoint bundle (includes frozen tokenizer for self-contained checkpoints)
         bundle = DynamicsCheckpointBundle(
@@ -259,7 +259,7 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        dataloader = make_dual_iterator(cfg.dataset, device=data_sharding)
+        dataloader = make_dual_iterator(cfg.dataset, device=data_sharding, dtype=cfg.dtype)
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)

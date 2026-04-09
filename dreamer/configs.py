@@ -379,6 +379,7 @@ class DynamicsConfig(BaseExperimentConfig):
 
     # EMA model
     ema_decay: float = 0.999
+    ema_dtype: str = "bfloat16"
 
 
 @dataclass(frozen=False)
