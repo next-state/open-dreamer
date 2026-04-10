@@ -1146,7 +1146,7 @@ class TimestepEmbedder(nnx.Module):
         Returns:
             (..., out_dim) embedding array.
         """
-        t = t.astype(jnp.float32)
+        t = t.astype(jnp.float32) * 1000.0  # scale so t spans a useful range of the sinusoidal basis (DiT convention)
         half = self.freq_dim // 2
         freqs = jnp.exp(-math.log(self.max_period) * jnp.arange(half, dtype=jnp.float32) / half)
         args = t[..., None] * freqs  # (..., half)
