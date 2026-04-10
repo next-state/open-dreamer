@@ -12,7 +12,6 @@ ckpt:
   save_interval_steps: 5_000
 
 dataset:
-  array_record_path: /root/minecraft-vpt/latents-final
   dataloader_cfg:
     B: 8
     num_workers: 0
