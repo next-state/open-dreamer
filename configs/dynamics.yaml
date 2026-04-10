@@ -88,5 +88,3 @@ optimizer:
   agc_eps: 1e-3
 
 write_video_every: 10_000
-dtype: ${dataset.dataloader_cfg.dtype}
-param_dtype: bfloat16
