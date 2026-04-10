@@ -12,6 +12,7 @@ from dreamer.logging import build_logger
 from dreamer.parallel import build_parallel
 from dreamer.training import run_evaluation, run_x0_visualization
 from dreamer.checkpointing import DynamicsCheckpointBundle
+from dreamer.actions import shift_actions
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
@@ -49,6 +50,7 @@ def run(cfg):
         batch = next(iter(iterator))
 
         actions = batch["actions"]
+        actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
         input_tensor = batch.get("latents") if use_latent_data else batch.get("videos")
         print(f"Batch loaded: shape={input_tensor.shape}, use_latent_data={use_latent_data}")
 
@@ -78,7 +80,8 @@ def run(cfg):
                 eval_cfg,  # type: ignore[arg-type]
                 step=cfg.step,
                 tokenizer=bundle.tokenizer,
-                dynamics=bundle.dynamics_ema,
+                dynamics_online=bundle.dynamics,
+                dynamics_ema=bundle.dynamics_ema,
                 val_data=input_tensor,
                 val_actions=actions,
                 use_latent_data=use_latent_data,

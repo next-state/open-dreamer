@@ -331,7 +331,7 @@ def latent_rollout(
 
     if use_kv_cache:
         # Initialize caches and process context
-        window_size = T_ctx + num_steps
+        window_size = dynamics.cfg.context_length
         n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
         caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
 

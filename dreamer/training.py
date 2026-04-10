@@ -1000,7 +1000,7 @@ def run_evaluation(
         video_written = False
         try:
             videos = jax.device_get(videos)
-            iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
+            iio.imwrite(str(mp4_path), videos, fps=20, plugin='pyav', codec='libx264')
             video_written = True
         except Exception as e:
             print(f"[eval] consolidated MP4 write failed: {e}")
