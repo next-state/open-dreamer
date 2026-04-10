@@ -36,7 +36,7 @@ dynamics:
     time_layer_offset: 0
     mlp_ratio: 4
     dropout_rate: 0.00
-    k_max: 128
+    k_max: 256
     context_length: 192  # Attention window for sliding window attention
     use_residual_lambdas: false
     use_bias: false
@@ -44,8 +44,8 @@ dynamics:
     dtype: ${dtype}
     param_dtype: ${param_dtype}
     
-    latent_mean: null
-    latent_std: null
+    latent_mean: ${dataset.latent_mean}
+    latent_std: ${dataset.latent_std}
 
     num_binary_actions: ${dataset.num_binary_actions}
     categorical_action_dim: ${dataset.categorical_action_dim}
@@ -86,5 +86,6 @@ optimizer:
   adam_eps: 1e-20
   agc_clipping: 0.3
   agc_eps: 1e-3
+  mup_scaling: false
 
 write_video_every: 10_000
