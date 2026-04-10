@@ -434,6 +434,19 @@ def scale_by_laprop(
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+def _kernel_wd_mask(params):
+    """Mask for decoupled weight decay: decay only linear-layer ``kernel`` params.
+
+    Excludes biases, norm scales (RMSNorm/LayerNorm), learned embeddings/tokens,
+    and any other scalar/1-D parameters.
+    """
+    def fn(path, x):
+        path_str = "/".join(str(getattr(k, "key", k)) for k in path)
+        is_kernel = path_str.endswith("kernel") or path_str.endswith("kernel/.value")
+        return bool(is_kernel and x.ndim >= 2)
+    return jax.tree_util.tree_map_with_path(fn, params)
+
+
 def laprop(
     learning_rate: optax.ScalarOrSchedule,
     b1: float = 0.9,
@@ -441,10 +454,10 @@ def laprop(
     eps: float = 1e-8,
     weight_decay: float = 0.0,
 ) -> optax.GradientTransformation:
-    """LaProp optimizer with decoupled weight decay."""
+    """LaProp optimizer with decoupled weight decay (masked to kernels only)."""
     return optax.chain(
         scale_by_laprop(b1=b1, b2=b2, eps=eps),
-        optax.add_decayed_weights(weight_decay),
+        optax.add_decayed_weights(weight_decay, mask=_kernel_wd_mask),
         optax.scale_by_learning_rate(learning_rate),
     )
 
@@ -501,6 +514,7 @@ def build_optimizer(
             b1=optimizer_cfg.adam_b1,
             b2=optimizer_cfg.adam_b2,
             weight_decay=optimizer_cfg.weight_decay,
+            mask=_kernel_wd_mask,
         )
     elif optimizer_cfg.optimizer_type == "laprop":
         if optimizer_cfg.mup_scaling:
