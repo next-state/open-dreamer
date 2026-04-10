@@ -56,6 +56,7 @@ OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').red
 OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
 OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
 OmegaConf.register_new_resolver("max", lambda *args: max(args))
+OmegaConf.register_new_resolver("min", lambda *args: min(args))
 
 # jax.config.update("jax_compilation_cache_dir", "/scratch/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)

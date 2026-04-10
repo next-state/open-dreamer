@@ -36,7 +36,7 @@ dynamics:
     mlp_ratio: 4
     dropout_rate: 0.00
     k_max: 256
-    context_length: 192  # Attention window for sliding window attention
+    context_length: ${min:192,${dataset.dataloader_cfg.long_T}}  # Attention window for sliding window attention
     use_residual_lambdas: false
     use_bias: false
     use_rmsnorm_scale: true
