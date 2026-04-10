@@ -399,11 +399,7 @@ def scale_by_laprop(
     b2: float = 0.999,
     eps: float = 1e-8,
 ) -> optax.GradientTransformation:
-    """Rescale updates according to the LaProp algorithm (Ziyin et al., 2020).
-
-    Unlike Adam, LaProp folds bias correction into the moment accumulation,
-    which provides better per-coordinate adaptivity.
-    """
+    """Rescale updates according to the LaProp algorithm (Ziyin et al., 2020)."""
 
     def init_fn(params):
         mu = jax.tree.map(jnp.zeros_like, params)
@@ -414,29 +410,24 @@ def scale_by_laprop(
         del params
         count_inc: jax.Array = state.step + 1
 
-        # v_t = β2 * v_{t-1} + (1 - β2) / (1 - β2^t) * g_t^2
-        nu_scale = (1.0 - b2) / (1.0 - b2 ** count_inc)
+        # n_t = ν n_{t-1} + (1 - ν) g_t^2  (standard EMA)
         nu = jax.tree.map(
-            lambda v, g: b2 * v + nu_scale * g ** 2, state.nu, updates
+            lambda v, g: b2 * v + (1.0 - b2) * g ** 2, state.nu, updates
         )
 
-        # β1_hat = β1 * (1 - β1^{t-1}) / (1 - β1^t)
-        # At t=1: β1_hat = β1 * 0 / (1 - β1) = 0, so m_1 = g_1
-        b1_hat = jnp.where(
-            count_inc == 1,
-            0.0,
-            b1 * (1.0 - jnp.float32(b1) ** (count_inc - 1)) / (1.0 - jnp.float32(b1) ** count_inc),
-        )
+        # Bias-correction factors
+        c_n = 1.0 - jnp.float32(b2) ** count_inc
+        c_m = 1.0 - jnp.float32(b1) ** count_inc
 
-        # m_t = β1_hat * m_{t-1} + (1 - β1_hat) * g_t
+        # m_t = μ m_{t-1} + (1 - μ) g_t / (sqrt(n_t / c_n) + ε)
+        # Gradient is normalized BEFORE being accumulated into momentum.
         mu = jax.tree.map(
-            lambda m, g: b1_hat * m + (1.0 - b1_hat) * g, state.mu, updates
+            lambda m, g, v: b1 * m + (1.0 - b1) * g / (jnp.sqrt(v / c_n) + eps),
+            state.mu, updates, nu,
         )
 
-        # update = m_t / (sqrt(v_t) + eps)
-        new_updates = jax.tree.map(
-            lambda m, v: m / (jnp.sqrt(v) + eps), mu, nu
-        )
+        # θ_{t+1} = θ_t - λ_t m_t / c_m
+        new_updates = jax.tree.map(lambda m: m / c_m, mu)
 
         return new_updates, ScaleByLaPropState(step=count_inc, mu=mu, nu=nu)
 
