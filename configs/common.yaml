@@ -25,7 +25,8 @@ logger:
 
 # Precision
 dtype: bfloat16
-param_dtype: bfloat16
+param_dtype: float32
+ema_dtype: ${param_dtype}
 
 # Parallel
 parallel_strategy: data  # data | fsdp | tp | sp

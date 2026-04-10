@@ -52,7 +52,6 @@ dynamics:
     continuous_action_dim: ${dataset.continuous_action_dim}
 
 ema_decay: 0.999
-ema_dtype: bfloat16
 
 bootstrap_start: 200_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
@@ -90,4 +89,3 @@ optimizer:
 
 write_video_every: 10_000
 dtype: ${dataset.dataloader_cfg.dtype}
-param_dtype: bfloat16

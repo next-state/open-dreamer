@@ -273,7 +273,7 @@ def run(cfg: DynamicsConfig):
 
                 rng, master_key = jax.random.split(rng, num=2)
 
-                n_splits = int(batch.pop("n_splits"))
+                n_splits = int(batch.get("n_splits",1))
 
                 # Use pre-allocated batch
                 actions = batch["actions"]
