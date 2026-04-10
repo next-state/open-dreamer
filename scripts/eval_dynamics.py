@@ -7,7 +7,7 @@ import jax
 from omegaconf import OmegaConf
 
 from dreamer.configs import LoggerConfig
-from dreamer.data import make_iterator
+from dreamer.data import build_iterator
 from dreamer.logging import build_logger
 from dreamer.parallel import build_parallel
 from dreamer.training import run_evaluation, run_x0_visualization
@@ -47,7 +47,7 @@ def run(cfg):
 
         # Load one batch of data
         print(f"Loading data from: {cfg.dataset.array_record_path}")
-        iterator = make_iterator(cfg.dataset, device=data_sharding)
+        iterator = build_iterator(cfg.dataset, device=data_sharding)
         batch = next(iter(iterator))
 
         actions = batch["actions"]

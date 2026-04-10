@@ -17,7 +17,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dreamer.configs import TokenizerConfig
 from dreamer.training import compute_psnr
-from dreamer.data import make_iterator
+from dreamer.data import build_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Tokenizer
 from dreamer.parallel import build_parallel, MeshRules
@@ -232,7 +232,7 @@ def run(cfg: TokenizerConfig):
         bundle = TokenizerCheckpointBundle(tokenizer=tokenizer, tokenizer_optimizer=optimizer)
 
         # Data iterator
-        train_dataloader = make_iterator(cfg.dataset, device=data_sharding, seq_len=dl_cfg.long_T)
+        train_dataloader = build_iterator(cfg.dataset, device=data_sharding, seq_len=dl_cfg.long_T)
 
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=TokenizerCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint

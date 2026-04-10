@@ -24,7 +24,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import DynamicsConfig, OptimalTransportConfig
-from dreamer.data import make_dual_iterator
+from dreamer.data import build_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, shift_actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES
@@ -260,7 +260,7 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        dataloader = make_dual_iterator(cfg.dataset, device=data_sharding)
+        dataloader = build_dual_iterator(cfg.dataset, device=data_sharding)
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
