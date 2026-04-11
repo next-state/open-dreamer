@@ -44,7 +44,8 @@ from dreamer.utils import (
     setup_training_directories,
     build_lr_schedule,
     build_optimizer,
-    to_jnp_dtype,
+    build_ema_model,
+    ema_update_step,
 )
 
 # Suppress absl info logs
@@ -156,25 +157,6 @@ def train_step(
     optimizer.update(dynamics, grads)
 
     return {**metrics, 'grad_norm': grad_norm}
-
-def build_ema_model(dynamics: Dynamics, *, ema_dtype: str | jnp.dtype) -> Dynamics:
-    ema = nnx.clone(dynamics)
-    params = nnx.state(ema, nnx.Param)
-    ema_dtype = to_jnp_dtype(ema_dtype)
-    nnx.update(ema, jax.tree.map(lambda p: p.astype(ema_dtype), params))
-    return ema
-
-
-@nnx.jit(static_argnames=("ema_decay",))
-def ema_update_step(dynamics: Dynamics, dynamics_ema: Dynamics, *, ema_decay: float):
-    online_params = nnx.state(dynamics, nnx.Param)
-    ema_params    = nnx.state(dynamics_ema, nnx.Param)
-    updated_ema = jax.tree.map(
-        lambda e, o: ema_decay * e + (1.0 - ema_decay) * o.astype(e.dtype),
-        ema_params, online_params,
-    )
-    nnx.update(dynamics_ema, updated_ema)
-
 
 # ---------------------------
 # Main

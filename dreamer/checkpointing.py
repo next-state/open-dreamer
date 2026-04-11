@@ -251,9 +251,11 @@ class TokenizerCheckpointBundle(CheckpointBundle):
 
     _model_registry: ClassVar[dict[str, tuple[type, type]]] = {
         "tokenizer": (TokenizerModelConfig, Tokenizer),
+        "tokenizer_ema": (TokenizerModelConfig, Tokenizer),
     }
 
     tokenizer: Tokenizer
+    tokenizer_ema: Tokenizer
     tokenizer_optimizer: nnx.Optimizer | None = None
 
 

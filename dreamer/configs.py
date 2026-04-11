@@ -346,6 +346,10 @@ class TokenizerConfig(BaseExperimentConfig):
     mae_finetune_p_max_start: float | None = None
     mae_finetune_p_max_end: float | None = None
 
+    # EMA model
+    ema_decay: float = 0.999
+    ema_dtype: str = "bfloat16"
+
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
 

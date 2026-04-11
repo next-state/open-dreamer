@@ -3,13 +3,14 @@ defaults:
   - dataset: minecraft_vpt
   - _self_
 
-run_name: tokenizer-asymmetric
+run_name: tokenizer-big
+use_wandb: false
 
 dataset:
   dataloader_cfg:
-    B: 32
-    short_T: 32
-    long_T: 32
+    B: 8
+    short_T: 16
+    long_T: 16
 
 ckpt:
   max_to_keep: 1
@@ -19,7 +20,7 @@ tokenizer:
   encoder:
     n_latents: 512
     d_bottleneck: 16
-    depth: 6
+    depth: 12
     d_model: ${mul:128,${tokenizer.encoder.depth}}
     n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
@@ -45,7 +46,7 @@ tokenizer:
   decoder:
     n_latents: ${tokenizer.encoder.n_latents}
     d_bottleneck: ${tokenizer.encoder.d_bottleneck}
-    depth: 3
+    depth: 8
     d_model: ${mul:128,${tokenizer.decoder.depth}}
     n_heads: ${floordiv:${tokenizer.decoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.decoder.n_heads},8}}
@@ -69,12 +70,12 @@ tokenizer:
     dataset_std: ${dataset.dataset_std}
 
 mae_finetune: false
-max_steps: 30_000
+max_steps: 300_000
 tokenizer_loss_type: mse  # mse | mae
 freeze_encoder: false
-mae_finetune: false
 mae_finetune_p_max_start: 0.9
 mae_finetune_p_max_end: 0.0
+ema_decay: 0.999
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
@@ -92,6 +93,8 @@ optimizer:
   adam_lr_ratio: 1.0
   adam_b1: 0.9
   adam_b2: 0.99
+  agc_clipping: 0.0
+  agc_eps: 1e-3
   mup_scaling: true
   mup_base_dim: 640
   # Muon params (for 2D matrix weights)
@@ -102,7 +105,7 @@ optimizer:
 lpips_weight: 0.2
 lpips_frac: 0.5
 visualize_every: 1000
-parallel_strategy: data
+parallel_strategy: fsdp
 
 # Precision
 dtype: bfloat16

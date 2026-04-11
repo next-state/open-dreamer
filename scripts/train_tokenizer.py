@@ -33,6 +33,8 @@ from dreamer.utils import (
     setup_training_directories,
     build_lr_schedule,
     build_optimizer,
+    build_ema_model,
+    ema_update_step,
 )
 
 # disable preallocation completely
@@ -81,6 +83,8 @@ def lpips_on_mae_recon(lpips_model: LPIPS, pred, target, subsample_frac=1.0):
     pred_lp = einops.rearrange(pred, "b t h w c -> (b t) h w c")
     tgt_lp  = einops.rearrange(target, "b t h w c -> (b t) h w c")
     return jnp.mean(lpips_model(pred_lp, tgt_lp))
+
+
 
 # ------------------------
 # Train step
@@ -140,35 +144,37 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | 
     optimizer.update(model, grads)
 
     return aux
-
 # ------------------------
 # Visualization
 # ------------------------
 
 @partial(jax.jit, static_argnames=())
-def viz_step_jit(model: Tokenizer, videos, *, mae_key, drop_key, mae_p_max=None):
+def viz_step_jit(model: Tokenizer, model_ema: Tokenizer, videos, *, mae_key, drop_key, mae_p_max=None):
     """Visualization step with NNX model."""
-    rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
-    recon, (mask, _) = model(videos, deterministic=False, rngs=rngs, mae_p_max=mae_p_max)
+    online_rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
+    ema_rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
+    recon, (mask, _) = model(videos, deterministic=False, rngs=online_rngs, mae_p_max=mae_p_max)
+    recon_ema, _ = model_ema(videos, deterministic=False, rngs=ema_rngs, mae_p_max=mae_p_max)
 
     masked = videos * (1.0 - mask)
     recon_masked = masked + recon * mask
+    recon_masked_ema = masked + recon_ema * mask
 
-    grid = jnp.concatenate([videos, masked, recon_masked, recon], axis=2)
+    grid = jnp.concatenate([videos, masked, recon_masked, recon, recon_masked_ema, recon_ema], axis=2)
     grid = einops.rearrange(grid, "b t h w c -> h (b t w) c")
     return grid.clip(0, 255).astype(jnp.uint8)
 
-def viz_step(model: Tokenizer, videos, rng, step, vis_dir, logger, mae_p_max=None):
+def viz_step(model: Tokenizer, model_ema: Tokenizer, videos, rng, step, vis_dir, logger, mae_p_max=None):
     rng = jax.random.fold_in(rng, step)
     mae_key, drop_key = jax.random.split(rng)
 
     T = min(videos.shape[1],256)
-    grid = viz_step_jit(model, videos[:2,:T:T//4], mae_key=mae_key, drop_key=drop_key, mae_p_max=mae_p_max)
+    grid = viz_step_jit(model, model_ema, videos[:2,:T:T//4], mae_key=mae_key, drop_key=drop_key, mae_p_max=mae_p_max)
     grid = jax.device_get(grid)
 
     imageio.imwrite(vis_dir / f"step_{step:06d}.png", grid)
 
-    logger.log_image(step, "reconstruction", np.array(grid), caption=f"Step {step}")
+    logger.log_image(step, "reconstruction", np.array(grid), caption=f"Step {step}: original | masked | online(masked) | online | ema(masked) | ema")
 
 # ------------------------
 # Run
@@ -198,6 +204,7 @@ def run(cfg: TokenizerConfig):
 
         # Initialize tokenizer
         tokenizer = Tokenizer(cfg.tokenizer, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        tokenizer_ema = build_ema_model(tokenizer, ema_dtype=cfg.ema_dtype)
         param_counts = count_parameters_by_component(tokenizer)
         param_counts_formatted = {k: f"{v:,}" for k, v in param_counts.items()}
         print(f"Parameter counts: {param_counts_formatted}")
@@ -228,7 +235,11 @@ def run(cfg: TokenizerConfig):
         lpips_model = LPIPS(pretrained_network="alexnet") if cfg.lpips_weight > 0 else None
 
         # Create checkpoint bundle
-        bundle = TokenizerCheckpointBundle(tokenizer=tokenizer, tokenizer_optimizer=optimizer)
+        bundle = TokenizerCheckpointBundle(
+            tokenizer=tokenizer,
+            tokenizer_ema=tokenizer_ema,
+            tokenizer_optimizer=optimizer,
+        )
 
         # Data iterator
         train_dataloader = make_iterator(cfg.dataset, device=data_sharding, seq_len=dl_cfg.long_T)
@@ -269,6 +280,8 @@ def run(cfg: TokenizerConfig):
                     freeze_encoder=cfg.mae_finetune,
                 )
 
+                ema_update_step(bundle.tokenizer, bundle.tokenizer_ema, ema_decay=cfg.ema_decay)
+
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(aux)
                     scaling.on_step(step, metrics_cpu)
@@ -302,7 +315,16 @@ def run(cfg: TokenizerConfig):
                 if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
                     # Move a subset to host for visualization
                     viz_videos = batch["videos"][:8]
-                    viz_step(bundle.tokenizer, viz_videos, step_rng, step, vis_dir, logger, mae_p_max=current_mae_p_max)
+                    viz_step(
+                        bundle.tokenizer,
+                        bundle.tokenizer_ema,
+                        viz_videos,
+                        step_rng,
+                        step,
+                        vis_dir,
+                        logger,
+                        mae_p_max=current_mae_p_max,
+                    )
 
             scaling.finalize()
 

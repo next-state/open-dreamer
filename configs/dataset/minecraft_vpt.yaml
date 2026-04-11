@@ -4,14 +4,14 @@ defaults:
 name: minecraft_vpt
 data_type: video
 
-array_record_path: /home/dreamer/data/arrayrecords-mp4
-index_max: 500
+array_record_path: /alloc/data/arrayrecords-mp4
+index_max: 1500
 num_max_samples: -1
 
 dataloader_cfg:
   B: 8
-  num_workers: 16
-  prefetch_buffer_size: 10
+  num_workers: 4
+  prefetch_buffer_size: 3
   device_prefetch_buffer_size: 1
   short_T: ???
   long_T: ???

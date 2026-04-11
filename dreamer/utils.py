@@ -11,6 +11,25 @@ from hydra.core.hydra_config import HydraConfig
 from dreamer.configs import LRScheduleConfig, OptimizerConfig
 
 
+def build_ema_model(dynamics: nnx.Module, *, ema_dtype: str | jnp.dtype) -> nnx.Module:
+    ema = nnx.clone(dynamics)
+    params = nnx.state(ema, nnx.Param)
+    ema_dtype = to_jnp_dtype(ema_dtype)
+    nnx.update(ema, jax.tree.map(lambda p: p.astype(ema_dtype), params))
+    return ema
+
+
+@nnx.jit(static_argnames=("ema_decay",))
+def ema_update_step(model: nnx.Module, model_ema: nnx.Module, *, ema_decay: float) -> None:
+    online_params = nnx.state(model, nnx.Param)
+    ema_params = nnx.state(model_ema, nnx.Param)
+    updated_ema = jax.tree.map(
+        lambda e, o: ema_decay * e + (1.0 - ema_decay) * o.astype(e.dtype),
+        ema_params,
+        online_params,
+    )
+    nnx.update(model_ema, updated_ema)
+
 # --- dtype helpers ---
 
 def to_jnp_dtype(dtype: str | jnp.dtype) -> jnp.dtype:
