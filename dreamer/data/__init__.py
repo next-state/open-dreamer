@@ -29,7 +29,6 @@ __all__ = [
     "ProcessEpisodeAndSlice",
     "ProcessMinecraftEpisodeAndSlice",
     "ProcessLatentAndSlice",
-    "CreateActions",
     # Utilities
     "ShardWriter",
     "serialization",
