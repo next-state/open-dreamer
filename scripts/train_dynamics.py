@@ -264,8 +264,11 @@ def run(cfg: DynamicsConfig):
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
-            scaling.start_training()
 
+            if use_latent_data:
+                del bundle.tokenizer.encoder  # Only decoder needed for evaluation
+
+            scaling.start_training()
 
             pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True, disable=not is_main_process)
             for step, batch in pbar:
