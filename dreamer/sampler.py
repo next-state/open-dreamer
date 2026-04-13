@@ -51,7 +51,6 @@ def sample_video(
         original_frames: (B, ctx+horizon, H, W, C) original frames [0, 255] uint8, or None if using latents
     """
 
-
     if latents is not None:
         # Pre-tokenized latent path
         # Latents are already unpacked

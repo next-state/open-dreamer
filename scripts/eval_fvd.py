@@ -10,7 +10,7 @@ Three FVD comparisons are reported:
 
 Usage:
     uv run scripts/eval_fvd.py dynamics_ckpt=<path> mode=both num_videos=256
-    uv run scripts/eval_fvd.py dynamics_ckpt=<path> mode=generate num_videos=16 batch_size=4
+    uv run scripts/eval_fvd.py dynamics_ckpt=<path> mode=generate num_videos=16 dataset.dataloader_cfg.B=4
     uv run scripts/eval_fvd.py mode=evaluate video_dir=./logs/eval_fvd_videos
 """
 import logging
@@ -30,6 +30,7 @@ from dreamer.fvd import frechet_distance, get_fvd_logits, load_i3d_pretrained
 from dreamer.generation import DenoiseSchedule
 from dreamer.parallel import build_parallel
 from dreamer.training import compute_eval
+from dreamer.actions import shift_actions
 import os
 
 logging.getLogger('absl').setLevel(logging.WARNING)
@@ -57,9 +58,8 @@ def generate_videos(cfg):
     assert dynamics_ckpt, "dynamics_ckpt must be set for generation"
 
     num_videos = cfg.num_videos
-    batch_size = cfg.batch_size
     ctx_length = cfg.ctx_length
-    horizon = cfg.get("horizon", None)
+    horizon = cfg.horizon
     video_dir = Path(cfg.video_dir)
 
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
@@ -84,20 +84,11 @@ def generate_videos(cfg):
         dynamics = bundle.dynamics_ema if use_ema else bundle.dynamics
 
         use_latent_data = cfg.dataset.data_type == "latent"
-        T = cfg.dataset.dataloader_cfg.long_T
-
-        if horizon is None:
-            horizon = T - ctx_length
-        assert ctx_length + horizon <= T, (
-            f"ctx_length({ctx_length}) + horizon({horizon}) > T({T})")
 
         k_max = dynamics.cfg.k_max
         num_steps = 4 if use_shortcut else k_max
         schedule_config = DenoiseSchedule.init(num_steps, k_max)
         print(f"Rollout type: {rollout_type} (num_steps={num_steps}, k_max={k_max})")
-
-        # Override dataloader batch size
-        cfg.dataset.dataloader_cfg.B = batch_size
 
         dataloader = make_iterator(cfg.dataset, seed=cfg.seed, device=data_sharding)
         rng = jax.random.PRNGKey(cfg.seed)
@@ -119,6 +110,7 @@ def generate_videos(cfg):
             else:
                 val_data = batch["videos"]
             val_actions = batch["actions"]
+            val_actions = shift_actions(val_actions, cfg.dataset.categorical_action_dim)
 
             B_batch = val_data.shape[0]
 
@@ -197,6 +189,19 @@ def evaluate_fvd(cfg):
         ref_videos = ref_videos[:, ctx_length:]
 
     T = pred_videos.shape[1]
+    fvd_chunk_size = cfg.get("fvd_chunk_size", None)
+    if fvd_chunk_size is not None:
+        assert T % fvd_chunk_size == 0, (
+            f"Video length {T} not divisible by fvd_chunk_size {fvd_chunk_size}")
+        num_chunks = T // fvd_chunk_size
+        N, _, H, W, C = pred_videos.shape
+        pred_videos = pred_videos.reshape(N * num_chunks, fvd_chunk_size, H, W, C)
+        gt_dec_videos = gt_dec_videos.reshape(N * num_chunks, fvd_chunk_size, H, W, C)
+        ref_videos = ref_videos.reshape(N * num_chunks, fvd_chunk_size, H, W, C)
+        T = fvd_chunk_size
+        num_videos = N * num_chunks
+        print(f"Chunked {N} videos into {num_chunks} chunks of {fvd_chunk_size} frames -> {num_videos} total clips")
+
     assert T >= 10, f"I3D requires >=10 frames, got {T} after trimming"
     print(f"Computing FVD on {num_videos} videos, {T} frames each")
 
