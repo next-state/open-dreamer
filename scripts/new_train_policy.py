@@ -55,7 +55,7 @@ from dreamer.training import (
     symexp,
 )
 from dreamer.generation import latent_rollout, DenoiseSchedule
-from dreamer.data import make_iterator
+from dreamer.data import build_iterator
 from dreamer.configs import RLConfig, DynamicsConfig
 from dreamer.utils import make_manager
 from dreamer.logging import MetricLogger
@@ -449,7 +449,7 @@ def run(cfg: RLConfig, ctx):
     
     # Load dataset
     print("Loading dataset...")
-    data_iter = make_iterator(
+    data_iter = build_iterator(
         data_path=cfg.data_path,
         batch_size=cfg.dataset.B,
         num_workers=cfg.num_workers,

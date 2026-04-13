@@ -434,8 +434,7 @@ def shortcut_forcing_step(
     sigma_full = jnp.concatenate([sigma_emp, sigma_self], axis=0)
     sigma_idx_full = jnp.concatenate([sigma_idx_emp, sigma_idx_self], axis=0)
 
-    # --- Corrupt latents: z_tilde = (1 - (1-eps)*sigma) * z0 + sigma * z1 ---
-    # The 1e-5 epsilon prevents the ODE from becoming singular at sigma=1
+    # --- Corrupt latents: z_tilde = (1 - sigma) * z0 + sigma * z1 ---
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
     z0 = apply_ot_coupling(
         z0,
@@ -443,7 +442,7 @@ def shortcut_forcing_step(
         key_ot,
         ot_cfg=ot_cfg,
     )
-    z_tilde = (1.0 - (1.0 - 1e-5) * sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
+    z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
     
     # --- Forward pass (full batch) ---
     rngs1 = nnx.Rngs(dropout=key_dropout1)
@@ -1026,7 +1025,7 @@ def run_evaluation(
         video_written = False
         try:
             videos = jax.device_get(videos)
-            iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
+            iio.imwrite(str(mp4_path), videos, fps=20, plugin='pyav', codec='libx264')
             video_written = True
         except Exception as e:
             print(f"[eval] consolidated MP4 write failed: {e}")

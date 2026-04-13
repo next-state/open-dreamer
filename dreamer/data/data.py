@@ -24,7 +24,7 @@ from dreamer.data.transforms import (
 # Factory
 # ==============================================================================
 
-def make_iterator(
+def build_iterator(
     cfg: DatasetConfig,
     *,
     seed: int = 42,
@@ -222,7 +222,7 @@ class AlternatingIterator:
         return self
 
 
-def make_dual_iterator(
+def build_dual_iterator(
     cfg: DatasetConfig,
     *,
     seed: int = 42,
@@ -252,16 +252,16 @@ def make_dual_iterator(
 
     if short_T == long_T:
         logging.warning("short_T == long_T, using just one iterator")
-        return make_iterator(cfg, seed=seed, print_filter_warnings=print_filter_warnings, device=device, dtype=dtype, seq_len=long_T)
+        return build_iterator(cfg, seed=seed, print_filter_warnings=print_filter_warnings, device=device, dtype=dtype, seq_len=long_T)
 
     # Long pipeline: single episodes of length long_T, batch B → (B, long_T, ...)
-    long_iter = make_iterator(
+    long_iter = build_iterator(
         cfg, seed=seed, print_filter_warnings=print_filter_warnings,
         device=device, dtype=dtype, seq_len=long_T,
     )
 
     # Short pipeline: short_T episodes, batch B*n_splits, pack → (B, long_T, ...)
-    short_iter = make_iterator(
+    short_iter = build_iterator(
         cfg, seed=seed + short_T, print_filter_warnings=print_filter_warnings,
         device=device, dtype=dtype, seq_len=short_T, pack_factor=n_splits,
     )

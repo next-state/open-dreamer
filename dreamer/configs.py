@@ -261,7 +261,7 @@ class CheckpointConfig:
 @dataclass(frozen=False)
 class OptimizerConfig:
     """Configuration for optimizer."""
-    # Optimizer type: "adamw" or "muon"
+    # Optimizer type: "adamw", "laprop", or "muon"
     optimizer_type: str = "muon"
     weight_decay: float = 1e-4
 
@@ -269,10 +269,15 @@ class OptimizerConfig:
     adam_lr_ratio: float = 1.0      # adam_lr = muon_lr * adam_lr_ratio
     adam_b1: float = 0.9
     adam_b2: float = 0.9
+    adam_eps: float = 1e-8
 
     # MuP scaling (scales AdamW LR by (d_model/mup_base_dim)^-0.5)
     mup_base_dim: int = 512         # Reference dimension for MuP scaling
     mup_scaling: bool = False       # Enable MuP LR scaling
+
+    # Adaptive Gradient Clipping (AGC)
+    agc_clipping: float = 0.0       # 0 = disabled; e.g. 0.3 clips at 30% of weight norm
+    agc_eps: float = 1e-3           # Floor for weight norm in AGC
 
     # Muon-specific hyperparameters (for 2D matrix params, excluding embeddings)
     muon_beta: float = 0.95         # Momentum for Muon

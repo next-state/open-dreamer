@@ -24,7 +24,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import DynamicsConfig, OptimalTransportConfig
-from dreamer.data import make_dual_iterator
+from dreamer.data import build_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, shift_actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES
@@ -56,6 +56,7 @@ OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').red
 OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
 OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
 OmegaConf.register_new_resolver("max", lambda *args: max(args))
+OmegaConf.register_new_resolver("min", lambda *args: min(args))
 
 # jax.config.update("jax_compilation_cache_dir", "/scratch/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
@@ -259,12 +260,15 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        dataloader = make_dual_iterator(cfg.dataset, device=data_sharding)
+        dataloader = build_dual_iterator(cfg.dataset, device=data_sharding)
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
-            scaling.start_training()
 
+            if use_latent_data:
+                del bundle.tokenizer.encoder  # Only decoder needed for evaluation
+
+            scaling.start_training()
 
             pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True, disable=not is_main_process)
             for step, batch in pbar:
@@ -273,7 +277,7 @@ def run(cfg: DynamicsConfig):
 
                 rng, master_key = jax.random.split(rng, num=2)
 
-                n_splits = int(batch.pop("n_splits"))
+                n_splits = int(batch.pop("n_splits", 1))
 
                 # Use pre-allocated batch
                 actions = batch["actions"]

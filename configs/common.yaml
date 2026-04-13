@@ -25,7 +25,7 @@ logger:
 
 # Precision
 dtype: bfloat16
-param_dtype: bfloat16
+param_dtype: float32
 
 # Parallel
 parallel_strategy: data  # data | fsdp | tp | sp
@@ -36,4 +36,4 @@ seed: 0
 # Hydra
 hydra:
   run:
-    dir: /data/logs/${run_name}
+    dir: logs/${run_name}

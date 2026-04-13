@@ -7,11 +7,12 @@ import jax
 from omegaconf import OmegaConf
 
 from dreamer.configs import LoggerConfig
-from dreamer.data import make_iterator
+from dreamer.data import build_iterator
 from dreamer.logging import build_logger
 from dreamer.parallel import build_parallel
 from dreamer.training import run_evaluation, run_x0_visualization
 from dreamer.checkpointing import DynamicsCheckpointBundle
+from dreamer.actions import shift_actions
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
@@ -21,6 +22,7 @@ OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').red
 OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
 OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
 OmegaConf.register_new_resolver("max", lambda *args: max(args))
+OmegaConf.register_new_resolver("min", lambda *args: min(args))
 
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
@@ -45,10 +47,11 @@ def run(cfg):
 
         # Load one batch of data
         print(f"Loading data from: {cfg.dataset.array_record_path}")
-        iterator = make_iterator(cfg.dataset, device=data_sharding)
+        iterator = build_iterator(cfg.dataset, device=data_sharding)
         batch = next(iter(iterator))
 
         actions = batch["actions"]
+        actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
         input_tensor = batch.get("latents") if use_latent_data else batch.get("videos")
         print(f"Batch loaded: shape={input_tensor.shape}, use_latent_data={use_latent_data}")
 
@@ -78,7 +81,8 @@ def run(cfg):
                 eval_cfg,  # type: ignore[arg-type]
                 step=cfg.step,
                 tokenizer=bundle.tokenizer,
-                dynamics=bundle.dynamics_ema,
+                dynamics_online=bundle.dynamics,
+                dynamics_ema=bundle.dynamics_ema,
                 val_data=input_tensor,
                 val_actions=actions,
                 use_latent_data=use_latent_data,

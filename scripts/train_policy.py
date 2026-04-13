@@ -53,7 +53,7 @@ from dreamer.models import (
     RewardHeadMTP,
     ValueHead,
 )
-from dreamer.data import make_iterator
+from dreamer.data import build_iterator
 # TODO: make_env_reset_fn and make_env_step_fn not yet implemented
 from dreamer.configs import RLConfig
 from dreamer.parallel import ParallelContext
@@ -1506,7 +1506,7 @@ def run(cfg: RLConfig):
         ctx = ParallelContext.create(batch_size=cfg.dataset.B)
 
         # Data iterator
-        next_batch = make_iterator(cfg.dataset)
+        next_batch = build_iterator(cfg.dataset)
 
         # Initialize models and load checkpoints
         init_rng = jax.random.PRNGKey(0)
