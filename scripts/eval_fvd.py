@@ -25,7 +25,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.checkpointing import DynamicsCheckpointBundle
-from dreamer.data import make_iterator
+from dreamer.data import build_iterator
 from dreamer.fvd import frechet_distance, get_fvd_logits, load_i3d_pretrained
 from dreamer.generation import DenoiseSchedule
 from dreamer.parallel import build_parallel
@@ -47,7 +47,7 @@ OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
 OmegaConf.register_new_resolver("max", lambda *args: max(args))
 
 
-def _save_video(frames, path, fps=5):
+def _save_video(frames, path, fps=20):
     """Save (T, H, W, C) uint8 array as MP4."""
     iio.imwrite(str(path), frames, plugin="pyav", fps=fps, codec="libx264")
 
@@ -84,13 +84,19 @@ def generate_videos(cfg):
         dynamics = bundle.dynamics_ema if use_ema else bundle.dynamics
 
         use_latent_data = cfg.dataset.data_type == "latent"
+        if use_latent_data:
+            print(
+                "WARNING: Using latent data — original pixel videos are not available. "
+                "FVD will be computed against autoencoded (gt_decoded) videos, not originals. "
+                "For scientifically rigorous evaluation, use raw video data instead."
+            )
 
         k_max = dynamics.cfg.k_max
         num_steps = 4 if use_shortcut else k_max
         schedule_config = DenoiseSchedule.init(num_steps, k_max)
         print(f"Rollout type: {rollout_type} (num_steps={num_steps}, k_max={k_max})")
 
-        dataloader = make_iterator(cfg.dataset, seed=cfg.seed, device=data_sharding)
+        dataloader = build_iterator(cfg.dataset, seed=cfg.seed, device=data_sharding)
         rng = jax.random.PRNGKey(cfg.seed)
 
         out_dir = video_dir / rollout_type
