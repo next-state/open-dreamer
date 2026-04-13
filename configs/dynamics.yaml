@@ -3,9 +3,9 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-wilson
+run_name: dynamics-stable-big-latents
 use_wandb: true
-tokenizer_ckpt: logs/tokenizer-asymmetric-small-normal-latent-space/checkpoints
+tokenizer_ckpt: logs/tokenizer-500M/checkpoints
 
 ckpt:
   max_to_keep: 1
