@@ -310,7 +310,8 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             start = int(rng.integers(0, max_start + 1))
             frame_indices = list(range(start, start + self.seq_len))
             video = vr.get_batch(frame_indices).asnumpy()
-            actions = Actions(binary=None, categorical=None, continuous=None) # TODO: might be better to pass None at this point, but i'm keeping it in not to break any backward compatibility
+            all_actions = parse_action_dicts(data.get("actions"))
+            actions = all_actions[start:start + self.seq_len]
 
         # For tokenization pipelines, keeping uint8 here dramatically reduces
         # multiprocessing/shared-memory pressure; cast later on-device.
