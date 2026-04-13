@@ -230,7 +230,7 @@ def get_fvd_logits(videos, params, bs=10):
     """Extract I3D logits from a batch of videos.
 
     Args:
-        videos: jnp.ndarray of shape [B, T, H, W, C] in uint8 [0, 255].
+        videos: numpy or jax array of shape [B, T, H, W, C] in uint8 [0, 255].
         params: nested param dict from load_i3d_pretrained().
         bs: batch size for chunked inference.
 
@@ -239,7 +239,7 @@ def get_fvd_logits(videos, params, bs=10):
     """
     logits = []
     for i in range(0, videos.shape[0], bs):
-        batch = videos[i:i + bs]
+        batch = jnp.array(videos[i:i + bs])
         logits.append(_preprocess_and_forward(params, batch))
     return jnp.concatenate(logits, axis=0)
 

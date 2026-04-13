@@ -212,9 +212,9 @@ def evaluate_fvd(cfg):
     print(f"Computing FVD on {num_videos} videos, {T} frames each")
 
     print("Extracting I3D features...")
-    feats_pred = get_fvd_logits(jnp.array(pred_videos), i3d_params, bs=i3d_bs)
-    feats_gt_dec = get_fvd_logits(jnp.array(gt_dec_videos), i3d_params, bs=i3d_bs)
-    feats_ref = get_fvd_logits(jnp.array(ref_videos), i3d_params, bs=i3d_bs)
+    feats_pred = get_fvd_logits(pred_videos, i3d_params, bs=i3d_bs)
+    feats_gt_dec = get_fvd_logits(gt_dec_videos, i3d_params, bs=i3d_bs)
+    feats_ref = get_fvd_logits(ref_videos, i3d_params, bs=i3d_bs)
 
     fvd_e2e = frechet_distance(feats_ref, feats_pred)
     fvd_tokenizer = frechet_distance(feats_ref, feats_gt_dec)
