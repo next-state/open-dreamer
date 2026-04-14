@@ -15,6 +15,11 @@ from .generation import DenoiseSchedule, latent_rollout
 # Multi-frame rollout wrapper
 # ---------------------------
 
+@nnx.jit
+def decode_jit(tokenizer: Tokenizer, z: jax.Array) -> jax.Array:
+    frames, _ = tokenizer.decode(z, deterministic=True)
+    return frames
+
 def sample_video(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -85,7 +90,8 @@ def sample_video(
 
     # Decode GT latents for visualization
     # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
-    gt_decoded_frames = jnp.clip(tokenizer.decode(latents, deterministic=True)[0], 0, 255).astype(jnp.uint8)
+    gt_decoded_frames = decode_jit(tokenizer, latents)
+    gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
     # Use policy if provided, otherwise use ground truth future actions
@@ -113,7 +119,7 @@ def sample_video(
 
     # Decode predicted latents to frames
     # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
-    pred_frames = tokenizer.decode(rollout_result['latents'], deterministic=True)[0]
+    pred_frames = decode_jit(tokenizer, rollout_result['latents'])
     pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
 

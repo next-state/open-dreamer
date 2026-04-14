@@ -242,7 +242,7 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        dataloader = build_dual_iterator(cfg.dataset, device=data_sharding, dtype=cg.dtype)
+        dataloader = build_dual_iterator(cfg.dataset, device=data_sharding, dtype=cfg.dtype)
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
