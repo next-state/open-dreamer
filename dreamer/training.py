@@ -1231,7 +1231,7 @@ def run_attention_visualization(
         dynamics.register_tokens.value.astype(dynamics.dtype)[None, None],
         (B, T, dynamics.n_register, dynamics.d_model),
     )
-    step_emb   = dynamics.step_embed(step_indices.astype(jnp.float32))
+    step_emb   = dynamics.step_embed(step_indices.astype(jnp.int32))
     signal_emb = dynamics.signal_embed(tau_indices.astype(jnp.float32) / dynamics.k_max)
     shortcut_token = jnp.concatenate([step_emb, signal_emb], axis=-1)[:, :, None, :]
 
