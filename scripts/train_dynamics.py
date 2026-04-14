@@ -247,9 +247,6 @@ def run(cfg: DynamicsConfig):
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
 
-            if use_latent_data:
-                del bundle.tokenizer.encoder  # Only decoder needed for evaluation
-
             scaling.start_training()
 
             pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True, disable=not is_main_process)

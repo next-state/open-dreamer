@@ -1203,13 +1203,15 @@ class Dynamics(nnx.Module):
             mesh_rules=mesh_rules, rngs=rngs
         )
 
-        # Sinusoidal embeddings for shortcut conditioning
-        # step_idx ∈ {0,...,log2(k_max)} passed as float; tau ∈ [0,1] (tau_idx/k_max)
+        # Shortcut conditioning embeddings.
+        # step_idx ∈ {0,...,log2(k_max)} → categorical embedding table.
+        # tau ∈ [0,1] (tau_idx/k_max) → sinusoidal embedding.
         half_dim = cfg.d_model // 2
-        self.step_embed = TimestepEmbedder(
-            out_dim=half_dim,
+        self.step_embed = nnx.Embed(
+            int(math.log2(cfg.k_max)) + 1, half_dim,
             dtype=self.dtype, param_dtype=self.param_dtype,
-            mesh_rules=mesh_rules, rngs=rngs,
+            embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
+            rngs=rngs,
         )
         self.signal_embed = TimestepEmbedder(
             out_dim=half_dim,
@@ -1317,10 +1319,10 @@ class Dynamics(nnx.Module):
             (B, T, self.n_register, self.d_model),
         )
 
-        # Shortcut embeddings (sinusoidal, concatenated to single token)
-        # step_indices: int log2(K) → float for sinusoidal PE
+        # Shortcut embeddings concatenated to a single token.
+        # step_indices: int log2(K) → categorical embedding lookup
         # tau_indices: int τ*k_max → normalize to [0,1] for sinusoidal PE
-        step_emb = self.step_embed(step_indices.astype(jnp.float32))                          # (B, T, d_model//2)
+        step_emb = self.step_embed(step_indices.astype(jnp.int32))                            # (B, T, d_model//2)
         signal_emb = self.signal_embed(tau_indices.astype(jnp.float32) / self.k_max)          # (B, T, d_model//2)
         shortcut_token = jnp.concatenate([step_emb, signal_emb], axis=-1)[:, :, None, :]     # (B, T, 1, d_model)
 
@@ -1378,6 +1380,8 @@ class Dynamics(nnx.Module):
                 excluded += binary_emb.embedding.value.size
         if self.action_encoder.categorical_embeds is not None:
             excluded += self.action_encoder.categorical_embeds.embedding.value.size
+        # Shortcut step embedding
+        excluded += self.step_embed.embedding.value.size
         # Per-layer scalars
         excluded += self.transformer.count_excluded_params()
         return excluded

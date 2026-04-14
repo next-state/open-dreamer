@@ -1,6 +1,6 @@
 defaults:
   - common
-  - dataset: minecraft_vpt
+  - dataset: minecraft_vpt_latent
   - _self_
 
 run_name: dynamics-stable-big-latents
@@ -55,7 +55,7 @@ ema_decay: 0.999
 
 bootstrap_start: 200_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
-image_fraction: 0.0  # Fraction of batch to train as images (no temporal attention)
+image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
 
 # Optimal transport coupling (minibatch OT)
 ot:
