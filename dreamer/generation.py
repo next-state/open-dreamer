@@ -1,3 +1,4 @@
+import dataclasses
 import math
 import einops
 import jax
@@ -6,7 +7,6 @@ from typing import Any, Tuple
 from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 from .actions import Actions
 from .utils import normalize_latents, unnormalize_latents
-from flax.struct import dataclass
 from tqdm import tqdm
 
 
@@ -78,7 +78,8 @@ class DenoiseSchedule:
         tau_idx_ctx = j_ctx * (k_max // K_ctx)
 
         return cls(num_steps, k_max, d, step_idx, emax, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
-    
+
+
 # ---------------------------
 # Single-step τ-ladder denoiser
 # ---------------------------
@@ -331,7 +332,7 @@ def latent_rollout(
 
     if use_kv_cache:
         # Initialize caches and process context
-        window_size = T_ctx + num_steps
+        window_size = min(T_ctx + num_steps, dynamics.cfg.context_length)
         n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
         caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
 

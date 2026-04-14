@@ -216,14 +216,7 @@ def apply_ot_coupling(
     from ott.solvers import linear
 
     geom = pointcloud.PointCloud(x, y, epsilon=ot_cfg.epsilon, scale_cost=ot_cfg.scale_cost)
-    out = linear.solve(
-        geom,
-        a=a,
-        b=b,
-        lse_mode=ot_cfg.lse_mode,
-        threshold=ot_cfg.threshold,
-        max_iterations=ot_cfg.max_iter,
-    )
+    out = linear.solve(geom, a=a, b=b, lse_mode=ot_cfg.lse_mode, threshold=ot_cfg.threshold, max_iterations=ot_cfg.max_iter)
 
     P = jax.lax.stop_gradient(out.matrix)
 
@@ -434,16 +427,10 @@ def shortcut_forcing_step(
     sigma_full = jnp.concatenate([sigma_emp, sigma_self], axis=0)
     sigma_idx_full = jnp.concatenate([sigma_idx_emp, sigma_idx_self], axis=0)
 
-    # --- Corrupt latents: z_tilde = (1 - (1-eps)*sigma) * z0 + sigma * z1 ---
-    # The 1e-5 epsilon prevents the ODE from becoming singular at sigma=1
+    # --- Corrupt latents: z_tilde = (1 - sigma) * z0 + sigma * z1 ---
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
-    z0 = apply_ot_coupling(
-        z0,
-        latents,
-        key_ot,
-        ot_cfg=ot_cfg,
-    )
-    z_tilde = (1.0 - (1.0 - 1e-5) * sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
+    z0 = apply_ot_coupling(z0, latents, key_ot, ot_cfg=ot_cfg)
+    z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
     
     # --- Forward pass (full batch) ---
     rngs1 = nnx.Rngs(dropout=key_dropout1)
@@ -863,6 +850,32 @@ def compute_policy_loss(
 # ---------------------------
 
 
+#TODO: refactor it
+@nnx.jit(static_argnames=("schedule_config", "horizon", "use_latent_data"))
+def compute_eval(tokenizer, dynamics, val_data, val_actions, rng,
+                 schedule_config, horizon, use_latent_data,
+                 policy=None, task_embedder=None):
+    """JIT-compiled core: sample_video + metrics. Returns raw frames for saving."""
+    sample_kwargs = dict(tokenizer=tokenizer, dynamics=dynamics, actions=val_actions,
+                         horizon=horizon, schedule_config=schedule_config, rng=rng,
+                         policy=policy, task_embedder=task_embedder)
+    if use_latent_data:
+        sample_kwargs["frames"] = None
+        sample_kwargs["latents"] = val_data
+    else:
+        sample_kwargs["frames"] = val_data
+
+    pred_frames, gt_decoded_frames, original_frames = sample_video(**sample_kwargs)
+    gt_frames_for_metrics = original_frames if original_frames is not None else gt_decoded_frames
+
+    pred_f = pred_frames[:, -horizon:] / 255.0
+    gt_f   = gt_frames_for_metrics[:, -horizon:] / 255.0
+    mse = jnp.mean((pred_f - gt_f) ** 2)
+    psnr = compute_psnr(pred_f, gt_f)
+
+    return mse, psnr, pred_frames, gt_decoded_frames, original_frames
+
+
 def run_evaluation(
     cfg: DynamicsConfig,
     step: int,
@@ -917,7 +930,7 @@ def run_evaluation(
         rng, eval_rng = jax.random.split(rng)
 
         if use_latent_data:
-            pred_frames, gt_decoded_frames, _, _ = sample_video(
+            pred_frames, gt_decoded_frames, _ = sample_video(
                 tokenizer, dynamics_model, frames=None,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=eval_rng, policy=None, task_embedder=None,
@@ -925,7 +938,7 @@ def run_evaluation(
             )
             gt_frames_for_metrics = gt_decoded_frames
         else:
-            pred_frames, _, original_frames, _ = sample_video(
+            pred_frames, _, original_frames = sample_video(
                 tokenizer, dynamics_model, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=eval_rng, policy=None, task_embedder=None,
@@ -1001,7 +1014,7 @@ def run_evaluation(
         video_written = False
         try:
             videos = jax.device_get(videos)
-            iio.imwrite(str(mp4_path), videos, fps=5, plugin='pyav', codec='libx264')
+            iio.imwrite(str(mp4_path), videos, fps=20, plugin='pyav', codec='libx264')
             video_written = True
         except Exception as e:
             print(f"[eval] consolidated MP4 write failed: {e}")
