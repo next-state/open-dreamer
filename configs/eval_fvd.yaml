@@ -1,0 +1,33 @@
+defaults:
+  - dynamics
+  - _self_
+
+# Path to dynamics checkpoint (contains both dynamics + tokenizer)
+dynamics_ckpt: ???
+
+# Mode: "both" runs generate then evaluate, "generate" only saves videos,
+# "evaluate" only computes FVD from previously saved videos
+mode: both
+
+# Rollout type: one of ema_shortcut, ema_diffusion, online_shortcut, online_diffusion
+# - ema/online: which model weights to use
+# - shortcut (4 steps) vs diffusion (k_max steps)
+rollout_type: ema_diffusion
+
+# Generation settings
+num_videos: 256
+ctx_length: 4
+horizon: 240  # has to be divisible by fvd_chunk_size if pred_frames_only is true
+
+# Video I/O
+video_dir: ./logs/eval_fvd_videos
+
+# FVD evaluation settings
+i3d_bs: 32
+pred_frames_only: true  # if true, FVD only over predicted frames (exclude context)
+fvd_chunk_size: 16  # split videos into chunks of this many frames for FVD
+
+dataset:
+  dataloader_cfg:
+    B: 8
+    long_T: ${sum:${ctx_length},${horizon}}

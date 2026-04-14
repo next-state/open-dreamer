@@ -757,8 +757,9 @@ class BlockCausalTransformer(nnx.Module):
         """
         n_time = sum(layer.is_time_layer for layer in self.layers)
         n_space = self.depth - n_time
+        t_eff = seq_time if self.cfg.context_length is None else min(seq_time, self.cfg.context_length)
         space_attn = 12 * n_space * self.d_model * (seq_space ** 2) * batch_size * seq_time
-        time_attn = 12 * n_time * self.d_model * (seq_time ** 2) * batch_size * seq_space
+        time_attn = 12 * n_time * self.d_model * seq_time * t_eff * batch_size * seq_space
         return int(space_attn + time_attn)
 
     def count_excluded_params(self) -> int:
@@ -1146,7 +1147,7 @@ class TimestepEmbedder(nnx.Module):
         Returns:
             (..., out_dim) embedding array.
         """
-        t = t.astype(jnp.float32)
+        t = t.astype(jnp.float32) * 1000.0  # scale so t spans a useful range of the sinusoidal basis (DiT convention)
         half = self.freq_dim // 2
         freqs = jnp.exp(-math.log(self.max_period) * jnp.arange(half, dtype=jnp.float32) / half)
         args = t[..., None] * freqs  # (..., half)
