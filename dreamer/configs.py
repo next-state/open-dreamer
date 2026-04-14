@@ -9,20 +9,20 @@ class DataloaderConfig:
     """Configuration for dataloader parameters."""
     # Batch dimension
     B: int = 32  # batch size
-    
+
     # Common parameters
     num_workers: int = 16
     prefetch_buffer_size: int = 10
     device_prefetch_buffer_size: int = 1
-    
+
     # Dual iterator parameters (for alternating short/long sequences)
     short_T: int = 64
     long_T: int = 64
     long_ratio: float = 0.0
     start_step: int = 0
-    
+
     dtype: str = "bfloat16"
-    
+
 @dataclass(frozen=False, unsafe_hash=True)
 class DatasetConfig:
     """Configuration for dataset parameters.
@@ -55,7 +55,7 @@ class DatasetConfig:
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] = (0.288675, 0.288675, 0.288675)  # sqrt(1/12)
-    
+
     latent_mean: tuple[float, ...] | None = None
     latent_std: tuple[float, ...] | None = None
 
@@ -64,7 +64,7 @@ class DatasetConfig:
 
     # Data type: "video" (default) or "latent" (pre-tokenized)
     data_type: str = "video"
-    
+
 
 # ---- Model Configs ----
 
@@ -164,7 +164,7 @@ class DynamicsModelConfig:
     num_binary_actions: int = 0
     categorical_action_dim: int = 0
     continuous_action_dim: int = 0
-    
+
     latent_mean: tuple[float, ...] | None = None
     latent_std: tuple[float, ...] | None = None
 
@@ -356,6 +356,7 @@ class TokenizerConfig(BaseExperimentConfig):
     # Optimizer
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
+    #TODO: add dataset stats
 
 @dataclass(frozen=False)
 class DynamicsConfig(BaseExperimentConfig):
