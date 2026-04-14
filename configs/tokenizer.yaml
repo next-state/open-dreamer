@@ -106,7 +106,3 @@ lpips_weight: 0.2
 lpips_frac: 0.5
 visualize_every: 1000
 parallel_strategy: fsdp
-
-# Precision
-dtype: bfloat16
-param_dtype: float32

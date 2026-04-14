@@ -174,7 +174,7 @@ def viz_step(model: Tokenizer, model_ema: Tokenizer, videos, rng, step, vis_dir,
 
     imageio.imwrite(vis_dir / f"step_{step:06d}.png", grid)
 
-    logger.log_image(step, "reconstruction", np.array(grid), caption=f"Step {step}: original | masked | online(masked) | online | ema(masked) | ema")
+    logger.log_image(step, "reconstruction", np.array(grid), caption=f"Step {step}: original | masked | online(mixed) | online | ema(mixed) | ema")
 
 # ------------------------
 # Run
