@@ -34,6 +34,7 @@ def build_iterator(
     dataloader_cfg: DataloaderConfig | None = None,
     seq_len: int | None = None,
     pack_factor: int = 1,
+    return_actions: bool = False,
 ):
     """Creates a data loading pipeline using Grain from a DatasetConfig.
 
@@ -105,6 +106,7 @@ def build_iterator(
                 padding_h=cfg.padding_H,
                 padding_w=cfg.padding_W,
                 patch_size=cfg.patch_size,
+                return_actions=return_actions,
             )
         ]
     else:
