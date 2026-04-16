@@ -15,6 +15,8 @@ from .generation import DenoiseSchedule, latent_rollout
 # Multi-frame rollout wrapper
 # ---------------------------
 
+# Calls under `jax.set_mesh(...)` must be jit'd: `with_partitioning` -> `with_sharding_constraint`
+# is a no-op in eager mode (jax#17422), so eager activations get mis-laid-out and frames look corrupt.
 @nnx.jit
 def encode_jit(tokenizer: Tokenizer, frames: jax.Array) -> jax.Array:
     latents, _ = tokenizer.encode(frames, deterministic=True)
@@ -72,23 +74,13 @@ def sample_video(
         B, T, H, W, C = frames.shape
 
         # Encode frames to clean latents (returns unpacked)
-        # CRITICAL: Encoder must be JIT-compiled to produce correct spatial layout
         latents = encode_jit(tokenizer, frames)
 
     # Split context vs future
-    latents_ctx_clean, latent_future = latents[:, :-horizon, :, :], latents[:, -horizon:, :, :]
+    latents_ctx, latent_future = latents[:, :-horizon, :, :], latents[:, -horizon:, :, :]
     actions_ctx, actions_future = actions[:, :-horizon], actions[:, -horizon:]
 
-    # Single-shot context corruption for visualization "floor" only
-    latents_ctx = latents_ctx_clean
-    # if schedule_config.tau_ctx < 1.0:  # FIXME: this is NOT taken from the evaluation config
-    #     rng, nkey = jax.random.split(rng)
-    #     noise = jax.random.normal(nkey, latents_ctx_clean.shape, latents_ctx_clean.dtype)
-    #     tau = jnp.asarray(schedule_config.tau_ctx, latents_ctx_clean.dtype)
-    #     latents_ctx = tau * latents_ctx_clean + (1.0 - tau) * noise
-
     # Decode GT latents for visualization
-    # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
     gt_decoded_frames = decode_jit(tokenizer, latents)
     gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
 
@@ -117,7 +109,6 @@ def sample_video(
     )
 
     # Decode predicted latents to frames
-    # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
     pred_frames = decode_jit(tokenizer, rollout_result['latents'])
     pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
