@@ -154,6 +154,10 @@ class DynamicsModelConfig:
     dtype: str = "float32"
     param_dtype: str = "float32"
 
+    # stability fixes (see loss_spike_report.md)
+    use_depth_scaled_init: bool = False  # scale W_O and W_2 by 1/sqrt(2*depth)
+    use_embed_ln: bool = False           # RMSNorm on concatenated tokens before transformer
+
     # schedule
     k_max: int = 8
 

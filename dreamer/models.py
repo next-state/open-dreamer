@@ -269,7 +269,8 @@ class MLP(nnx.Module):
     def __init__(self, d_model: int, mlp_ratio: float = 4.0, dropout_rate: float = 0.0,
                  swiglu: bool = True, parity_2over3: bool = False, use_norm: bool = True,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 output_proj_init=None,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.d_model = d_model
         self.mlp_ratio = mlp_ratio
@@ -297,7 +298,8 @@ class MLP(nnx.Module):
         else:
             self.fc_in = nnx.Linear(d_model, hidden, use_bias=self.use_bias, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
 
-        self.fc_out = nnx.Linear(hidden, d_model, use_bias=self.use_bias, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        _out_init = output_proj_init if output_proj_init is not None else nnx.initializers.lecun_normal()
+        self.fc_out = nnx.Linear(hidden, d_model, use_bias=self.use_bias, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(_out_init, mesh_rules('mlp')), rngs=rngs)
         self.dropout = nnx.Dropout(dropout_rate)
 
     def __call__(self, x: jnp.ndarray, *, deterministic: bool = True, rngs: nnx.Rngs | None = None) -> jnp.ndarray:
@@ -328,6 +330,7 @@ class GroupedQueryAttention(nnx.Module):
                  is_causal: bool = False, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
                  use_seq_parallel: bool = False,
+                 output_proj_init=None,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.dim = dim
@@ -352,7 +355,8 @@ class GroupedQueryAttention(nnx.Module):
 
         self.to_q = nnx.Linear(dim, dim, use_bias=self.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
         self.to_kv = nnx.Linear(dim, 2 * kv_dim, use_bias=self.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
-        self.to_out = nnx.Linear(dim, dim, use_bias=self.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
+        _out_init = output_proj_init if output_proj_init is not None else nnx.initializers.lecun_normal()
+        self.to_out = nnx.Linear(dim, dim, use_bias=self.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(_out_init, mesh_rules('attn')), rngs=rngs)
         self.dropout = nnx.Dropout(dropout_rate)
 
         if self.qk_norm_type == 'qknorm':
@@ -506,14 +510,16 @@ class SpaceSelfAttention(nnx.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 output_proj_init=None,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
             rope_theta=rope_theta, is_causal=False,
             use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
-            dtype=dtype, param_dtype=param_dtype, 
+            output_proj_init=output_proj_init,
+            dtype=dtype, param_dtype=param_dtype,
             mesh_rules=mesh_rules, rngs=rngs
         )
 
@@ -546,6 +552,7 @@ class TimeSelfAttention(nnx.Module):
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
                  use_seq_parallel: bool = False,
+                 output_proj_init=None,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
         self.attn = GroupedQueryAttention(
@@ -554,6 +561,7 @@ class TimeSelfAttention(nnx.Module):
             rope_theta=rope_theta, is_causal=True,
             use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
             use_seq_parallel=use_seq_parallel,
+            output_proj_init=output_proj_init,
             dtype=dtype, param_dtype=param_dtype,
             mesh_rules=mesh_rules, rngs=rngs
         )
@@ -590,6 +598,7 @@ class BlockCausalLayer(nnx.Module):
                  mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4, time_layer_offset: int = 1,
                  rope_theta: float = 10000.0, use_bias: bool = False,
                  use_rmsnorm_scale: bool = True, use_seq_parallel: bool = False,
+                 output_proj_init=None,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
                  rngs: nnx.Rngs, mesh_rules: MeshRules):
         self.layer_index = layer_index
@@ -607,6 +616,7 @@ class BlockCausalLayer(nnx.Module):
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
                 use_seq_parallel=use_seq_parallel,
+                output_proj_init=output_proj_init,
                 dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             )
@@ -617,12 +627,13 @@ class BlockCausalLayer(nnx.Module):
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
+                output_proj_init=output_proj_init,
                 dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             )
 
         # MLP
-        self.mlp = MLP(dim, mlp_ratio, dropout_rate, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
+        self.mlp = MLP(dim, mlp_ratio, dropout_rate, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale, output_proj_init=output_proj_init, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
 
     @property
     def is_time_layer(self) -> bool:
@@ -664,6 +675,7 @@ class BlockCausalTransformer(nnx.Module):
                  mlp_ratio: float = 4.0, time_every: int = 4, time_layer_offset: int = 1, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
                  use_seq_parallel: bool = False,
+                 depth_scaled_init: bool = False,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
                  use_residual_lambdas: bool = False, *,
                  mesh_rules: MeshRules, rngs: nnx.Rngs):
@@ -685,6 +697,11 @@ class BlockCausalTransformer(nnx.Module):
                 sharding_names=(None,)  # Small per-layer params, no sharding needed
             )
 
+        output_proj_init = (
+            nnx.initializers.normal(stddev=1.0 / math.sqrt(2 * depth))
+            if depth_scaled_init else None
+        )
+
         # Create layers
         self.layers = nnx.List([
             BlockCausalLayer(
@@ -693,6 +710,7 @@ class BlockCausalTransformer(nnx.Module):
                 mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every, time_layer_offset=time_layer_offset,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
                 use_seq_parallel=use_seq_parallel,
+                output_proj_init=output_proj_init,
                 dtype=dtype, param_dtype=param_dtype,
                 mesh_rules=mesh_rules, rngs=rngs
             ) for i in range(depth)
@@ -1199,9 +1217,16 @@ class Dynamics(nnx.Module):
             mlp_ratio=cfg.mlp_ratio, time_every=cfg.time_every, time_layer_offset=cfg.time_layer_offset, rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
             use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
+            depth_scaled_init=getattr(cfg, 'use_depth_scaled_init', False),
             dtype=self.dtype, param_dtype=self.param_dtype,
             use_residual_lambdas=cfg.use_residual_lambdas,
             mesh_rules=mesh_rules, rngs=rngs
+        )
+
+        self.embed_ln: nnx.RMSNorm | None = (
+            nnx.RMSNorm(cfg.d_model, use_scale=cfg.use_rmsnorm_scale,
+                        dtype=jnp.float32, param_dtype=self.param_dtype, rngs=rngs)
+            if getattr(cfg, 'use_embed_ln', False) else None
         )
 
         # Sinusoidal embeddings for shortcut conditioning
@@ -1331,6 +1356,9 @@ class Dynamics(nnx.Module):
             tokens.append(task_embeddings)
 
         tokens = jnp.concatenate(tokens, axis=2)  # (B, T, S, D)
+
+        if self.embed_ln is not None:
+            tokens = self.embed_ln(tokens)
 
         # Make the layout for masking
         n_agent = task_embeddings.shape[2] if task_embeddings is not None else 0

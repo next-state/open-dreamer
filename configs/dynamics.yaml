@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-stable-big-latents
+run_name: dynamics-stable-asdafe-spike-no-more
 tokenizer_ckpt: logs/tokenizer-500M/checkpoints
 
 ckpt:
@@ -12,7 +12,7 @@ ckpt:
 
 dataset:
   dataloader_cfg:
-    B: 16
+    B: 8
     num_workers: 16
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
@@ -39,6 +39,10 @@ dynamics:
     use_residual_lambdas: false
     use_bias: false
     use_rmsnorm_scale: true
+    ### Edward's spike no more ablation, set to False to disable.
+    use_depth_scaled_init: false
+    use_embed_ln: false
+    ### End of Edward's spike no more ablation.
     dtype: ${dtype}
     param_dtype: ${param_dtype}
     
@@ -81,8 +85,8 @@ optimizer:
   optimizer_type: laprop
   weight_decay: 0.1
   adam_b1: 0.9
-  adam_b2: 0.99
-  adam_eps: 1e-20
+  adam_b2: 0.95
+  adam_eps: 1e-6
   mup_scaling: false
   mup_base_dim: 512
   agc_clipping: 0.3
