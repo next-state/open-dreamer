@@ -1,5 +1,4 @@
 defaults:
-  - dynamics
   - dataset: minecraft_vpt
   - _self_
 
