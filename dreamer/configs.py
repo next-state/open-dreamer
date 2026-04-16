@@ -79,6 +79,7 @@ class EncoderModelConfig:
     patch_size: int = 8
     dropout_rate: float = 0.05
     qk_norm_type: str | None = None
+    attn_logit_softcap: float | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
     time_layer_offset: int = 1
@@ -108,6 +109,7 @@ class DecoderModelConfig:
     d_patch: int = 192  # DatasetConfig.patch_size**2 * DatasetConfig.C
     dropout_rate: float = 0.05
     qk_norm_type: str | None = None
+    attn_logit_softcap: float | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
     time_layer_offset: int = 1
@@ -142,6 +144,7 @@ class DynamicsModelConfig:
     packing_factor: int = 2
     n_register: int = 4 # number of register tokens for dynamics
     qk_norm_type: str | None = None
+    attn_logit_softcap: float | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
     time_layer_offset: int = 1
@@ -200,6 +203,7 @@ class PolicyHeadModelConfig:
     use_bias: bool = False
     dtype: str = "float32"
     param_dtype: str = "float32"
+    final_logit_softcap: float | None = None
 
     # action conditioning
     num_binary_actions: int = 0
@@ -222,6 +226,7 @@ class RewardHeadModelConfig:
     use_bias: bool = False
     dtype: str = "float32"
     param_dtype: str = "float32"
+    final_logit_softcap: float | None = None
 
 
 # ---- Experiment Configs ----

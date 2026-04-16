@@ -3,11 +3,11 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-stable-asdafe-spike-no-more
+run_name: dynamics-stable-asdafe-rerun
 tokenizer_ckpt: logs/tokenizer-500M/checkpoints
 
 ckpt:
-  max_to_keep: 1
+  max_to_keep: 0
   save_interval_steps: 5_000
 
 dataset:
@@ -29,6 +29,7 @@ dynamics:
     packing_factor: 2
     n_register: 32
     qk_norm_type: qknorm
+    attn_logit_softcap: null  # e.g. 50.0 — set to null to disable
     rope_theta: 10000.0
     time_every: 4
     time_layer_offset: 0
