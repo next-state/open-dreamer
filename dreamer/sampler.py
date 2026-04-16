@@ -16,6 +16,11 @@ from .generation import DenoiseSchedule, latent_rollout
 # ---------------------------
 
 @nnx.jit
+def encode_jit(tokenizer: Tokenizer, frames: jax.Array) -> jax.Array:
+    latents, _ = tokenizer.encode(frames, deterministic=True)
+    return latents
+
+@nnx.jit
 def decode_jit(tokenizer: Tokenizer, z: jax.Array) -> jax.Array:
     frames, _ = tokenizer.decode(z, deterministic=True)
     return frames
@@ -66,15 +71,9 @@ def sample_video(
         # Video path - encode frames
         B, T, H, W, C = frames.shape
 
-        rng, mae_key = jax.random.split(rng)
-        rngs = nnx.Rngs(mae=mae_key)
-
         # Encode frames to clean latents (returns unpacked)
-        latents, _ = tokenizer.encode(
-            frames,
-            deterministic=True,
-            rngs=rngs
-        )
+        # CRITICAL: Encoder must be JIT-compiled to produce correct spatial layout
+        latents = encode_jit(tokenizer, frames)
 
     # Split context vs future
     latents_ctx_clean, latent_future = latents[:, :-horizon, :, :], latents[:, -horizon:, :, :]
