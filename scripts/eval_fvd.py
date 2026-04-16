@@ -19,7 +19,6 @@ from pathlib import Path
 import hydra
 import imageio.v3 as iio
 import jax
-import jax.numpy as jnp
 import numpy as np
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -29,7 +28,7 @@ from dreamer.data import build_iterator
 from dreamer.fvd import frechet_distance, get_fvd_logits, load_i3d_pretrained
 from dreamer.generation import DenoiseSchedule
 from dreamer.parallel import build_parallel
-from dreamer.training import compute_eval
+from dreamer.sampler import sample_video
 from dreamer.actions import shift_actions
 import os
 
@@ -70,18 +69,21 @@ def generate_videos(cfg):
             candidate = str(Path(ckpt_path) / 'checkpoints')
             if Path(candidate).exists():
                 ckpt_path = candidate
-        print(f"Loading checkpoint from {ckpt_path}...")
-        bundle = DynamicsCheckpointBundle.from_pretrained(
-            ckpt_path, mesh_rules=mesh_rules,
-        )
-        tokenizer = bundle.tokenizer
 
         rollout_type = cfg.get("rollout_type", "ema_shortcut")
         valid_types = ("ema_shortcut", "ema_diffusion", "online_shortcut", "online_diffusion")
         assert rollout_type in valid_types, f"rollout_type must be one of {valid_types}, got {rollout_type!r}"
         use_ema = rollout_type.startswith("ema")
         use_shortcut = rollout_type.endswith("shortcut")
-        dynamics = bundle.dynamics_ema if use_ema else bundle.dynamics
+        dynamics_field = "dynamics_ema" if use_ema else "dynamics"
+
+        print(f"Loading checkpoint from {ckpt_path} (models: {dynamics_field}, tokenizer)...")
+        bundle = DynamicsCheckpointBundle.from_pretrained(
+            ckpt_path, mesh_rules=mesh_rules,
+            model_names={dynamics_field, "tokenizer"},
+        )
+        tokenizer = bundle.tokenizer
+        dynamics = getattr(bundle, dynamics_field)
 
         use_latent_data = cfg.dataset.data_type == "latent"
         if use_latent_data:
@@ -96,8 +98,12 @@ def generate_videos(cfg):
         schedule_config = DenoiseSchedule.init(num_steps, k_max)
         print(f"Rollout type: {rollout_type} (num_steps={num_steps}, k_max={k_max})")
 
-        raise NotImplementedError("you should make sure that ProcessMinecraftEpisodeAndSlice inside of build_iterator is initialized with return_actions==True, this has to be implemented.")
-        dataloader = build_iterator(cfg.dataset, seed=cfg.seed, device=data_sharding)
+        dataloader = build_iterator(
+            cfg.dataset,
+            seed=cfg.seed,
+            device=data_sharding,
+            return_actions=not use_latent_data,  # ensure video dataset returns actions
+        )
         rng = jax.random.PRNGKey(cfg.seed)
 
         out_dir = video_dir / rollout_type
@@ -121,15 +127,17 @@ def generate_videos(cfg):
 
             B_batch = val_data.shape[0]
 
-            mse, psnr, pred_frames, gt_decoded_frames, original_frames = compute_eval(
+            pred_frames, gt_decoded_frames, original_frames = sample_video(
                 tokenizer=tokenizer,
                 dynamics=dynamics,
-                val_data=val_data,
-                val_actions=val_actions,
-                rng=eval_rng,
-                schedule_config=schedule_config,
+                frames=None if use_latent_data else val_data,
+                actions=val_actions,
                 horizon=horizon,
-                use_latent_data=use_latent_data,
+                schedule_config=schedule_config,
+                rng=eval_rng,
+                policy=None,
+                task_embedder=None,
+                latents=val_data if use_latent_data else None,
             )
 
             gt_decoded = jax.device_get(gt_decoded_frames)

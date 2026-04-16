@@ -6,6 +6,9 @@ defaults:
 # Path to dynamics checkpoint (contains both dynamics + tokenizer)
 dynamics_ckpt: ???
 
+seed: 0
+parallel_strategy: data
+
 # Mode: "both" runs generate then evaluate, "generate" only saves videos,
 # "evaluate" only computes FVD from previously saved videos
 mode: both
@@ -21,7 +24,7 @@ ctx_length: 4
 horizon: 240  # has to be divisible by fvd_chunk_size if pred_frames_only is true
 
 # Video I/O
-video_dir: ./logs/eval_fvd_videos
+video_dir: logs/eval_fvd_videos
 
 # FVD evaluation settings
 i3d_bs: 32
@@ -30,5 +33,6 @@ fvd_chunk_size: 16  # split videos into chunks of this many frames for FVD
 
 dataset:
   dataloader_cfg:
+    num_workers: 0
     B: 8
     long_T: ${sum:${ctx_length},${horizon}}
