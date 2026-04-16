@@ -4,7 +4,6 @@ defaults:
   - _self_
 
 run_name: dynamics-stable-big-latents
-use_wandb: true
 tokenizer_ckpt: logs/tokenizer-500M/checkpoints
 
 ckpt:
@@ -15,6 +14,8 @@ dataset:
   dataloader_cfg:
     B: 16
     num_workers: 16
+    B: 16
+    num_workers: 16
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
     short_T: 64
@@ -23,6 +24,7 @@ dataset:
 
 dynamics:
     d_bottleneck: 16
+    depth: 32
     depth: 32
     d_model: ${mul:64,${dynamics.depth}}
     n_heads: ${floordiv:${dynamics.d_model},64}
@@ -43,7 +45,7 @@ dynamics:
     dtype: ${dtype}
     param_dtype: ${param_dtype}
     
-    #TODO: remove it from here and put it in the tokenizer
+    #TODO: remove latent stats from here and put them in the tokenizer
     latent_mean: ${dataset.latent_mean}
     latent_std: ${dataset.latent_std}
 
@@ -53,7 +55,8 @@ dynamics:
 
 ema_decay: 0.999
 
-bootstrap_start: 200_000  # Number of start steps trained exclusively on flow-matching objective
+max_steps: 200_000
+bootstrap_start: 100_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
 image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
 
@@ -88,6 +91,5 @@ optimizer:
   mup_base_dim: 512
   agc_clipping: 0.3
   agc_eps: 1e-3
-  mup_scaling: false
 
 write_video_every: 10_000
