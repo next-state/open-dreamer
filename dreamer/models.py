@@ -749,7 +749,8 @@ class BlockCausalTransformer(nnx.Module):
 
         return x, new_caches, all_weights
 
-    def estimate_attention_flops(self, batch_size: int, seq_time: int, seq_space: int) -> int:
+    def estimate_attention_flops(self, batch_size: int, seq_time: int, seq_space: int,
+                                 time_window: int | None = None) -> int:
         """Attention FLOPs per training step (forward + backward).
 
         Computes FLOPs for Q@K^T and attn@V operations only (not weight matrices).
@@ -757,7 +758,7 @@ class BlockCausalTransformer(nnx.Module):
         """
         n_time = sum(layer.is_time_layer for layer in self.layers)
         n_space = self.depth - n_time
-        t_eff = seq_time if self.cfg.context_length is None else min(seq_time, self.cfg.context_length)
+        t_eff = seq_time if time_window is None else min(seq_time, time_window)
         space_attn = 12 * n_space * self.d_model * (seq_space ** 2) * batch_size * seq_time
         time_attn = 12 * n_time * self.d_model * seq_time * t_eff * batch_size * seq_space
         return int(space_attn + time_attn)
@@ -1400,7 +1401,7 @@ class Dynamics(nnx.Module):
         weight_flops = 6 * (total_params - excluded) * batch_size * seq_length * S
 
         # Attention FLOPs
-        attn_flops = self.transformer.estimate_attention_flops(batch_size, seq_length, S)
+        attn_flops = self.transformer.estimate_attention_flops(batch_size, seq_length, S, self.cfg.context_length)
 
         return int(weight_flops + attn_flops)
 

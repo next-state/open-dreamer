@@ -14,8 +14,6 @@ dataset:
   dataloader_cfg:
     B: 16
     num_workers: 16
-    B: 16
-    num_workers: 16
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
     short_T: 64
@@ -24,7 +22,6 @@ dataset:
 
 dynamics:
     d_bottleneck: 16
-    depth: 32
     depth: 32
     d_model: ${mul:64,${dynamics.depth}}
     n_heads: ${floordiv:${dynamics.d_model},64}
@@ -45,7 +42,7 @@ dynamics:
     dtype: ${dtype}
     param_dtype: ${param_dtype}
     
-    #TODO: remove latent stats from here and put them in the tokenizer
+    #TODO: remove it from here and put it in the tokenizer
     latent_mean: ${dataset.latent_mean}
     latent_std: ${dataset.latent_std}
 
@@ -70,7 +67,6 @@ ot:
   pairing: barycentric
   scale_cost: mean
 
-max_steps: 50_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
