@@ -21,7 +21,8 @@ from .parallel import MeshRules
 from .actions import Actions
 
 
-def softcap(x: jnp.ndarray, cap: float) -> jnp.ndarray:
+def softcap(x: jnp.ndarray, cap: float | None) -> jnp.ndarray:
+    if cap is None: return x
     return cap * jnp.tanh(x / cap)
 
 
@@ -125,6 +126,18 @@ class KVCache:
 
 
 KVCachesDict = Dict[int, KVCache]  # Type alias for KV cache dictionaries
+
+
+def make_causal_history_mask(seq_len: int, history_window: int | None = None) -> jnp.ndarray:
+    """Boolean mask for causal attention, optionally limited to `history_window` past steps."""
+    if history_window is None:
+        history_window = seq_len - 1
+    query_pos = jnp.arange(seq_len)[:, None]
+    key_pos = jnp.arange(seq_len)[None, :]
+    return jnp.logical_and(
+        key_pos >= (query_pos - history_window),
+        key_pos <= query_pos,
+    )[None, None]
 
 
 def create_transformer_caches(
@@ -331,9 +344,8 @@ class GroupedQueryAttention(nnx.Module):
 
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
-                 is_causal: bool = False, rope_theta: float = 10000.0,
+                 rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 use_seq_parallel: bool = False,
                  attn_logit_softcap: float | None = None,
                  output_proj_init=None,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
@@ -343,11 +355,9 @@ class GroupedQueryAttention(nnx.Module):
         self.num_kv_heads = num_kv_heads
         self.dropout_rate = dropout_rate
         self.qk_norm_type = qk_norm_type
-        self.is_causal = is_causal
         self.rope_theta = rope_theta
         self.use_bias = use_bias
         self.use_rmsnorm_scale = use_rmsnorm_scale
-        self.use_seq_parallel = use_seq_parallel
         self.attn_logit_softcap = attn_logit_softcap
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
@@ -376,7 +386,6 @@ class GroupedQueryAttention(nnx.Module):
             x,
             *args,
             mask: jnp.ndarray | None = None,
-            local_window_size: int | tuple[int, int] | None = None,
             deterministic: bool = True,
             cache: KVCache | None = None,
             rngs: nnx.Rngs | None = None,
@@ -406,138 +415,34 @@ class GroupedQueryAttention(nnx.Module):
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
             scale = 1.0
 
-        # Sequence parallel path: all-gather K,V across sequence axis for training
-        if self.use_seq_parallel and cache is None:
-            # Get sequence axis info from the mesh
-            seq_axis_size = jax.lax.psum(1, axis_name='seq')
-            seq_axis_idx = jax.lax.axis_index('seq')
+        G = self.num_heads // self.num_kv_heads
+        start_pos = cache.index if cache is not None else 0
+        q, k = self.rope(q, k, start_pos=start_pos)
 
-            T_local = k.shape[1]
-            T_global = T_local * seq_axis_size
+        if cache is not None:
+            cache = cache.update(k, v)
+            k, v, cache_mask = cache.get_ordered_kv(query_len=q.shape[1])
+            mask = cache_mask if mask is None else jnp.logical_and(mask, cache_mask)
 
-            # Global position offset for RoPE
-            global_start_pos = seq_axis_idx * T_local
-            q, k = self.rope(q, k, start_pos=global_start_pos)
+        assert mask is not None
+        k = jnp.repeat(k, G, axis=2)  # (B, S, N, H)
+        v = jnp.repeat(v, G, axis=2)
+        logits = jnp.einsum('B T N H, B S N H -> B N T S', q, k) * scale
+        logits = softcap(logits, self.attn_logit_softcap)
 
-            # All-gather K, V across sequence axis
-            # tiled=True means the results are concatenated along the axis rather than stacked
-            k_full = jax.lax.all_gather(k, axis_name='seq', axis=1, tiled=True)
-            v_full = jax.lax.all_gather(v, axis_name='seq', axis=1, tiled=True)
+        logits = jnp.where(mask, logits, jnp.finfo(logits.dtype).min)
 
-            # Build causal mask for local Q vs full K
-            # q_pos: positions of local queries in global sequence
-            # k_pos: positions of all keys (0 to T_global-1)
-            q_pos = jnp.arange(T_local) + global_start_pos
-            k_pos = jnp.arange(T_global)
-            causal_mask = q_pos[:, None] >= k_pos[None, :]  # (T_local, T_global)
-            causal_mask = causal_mask[None, None, :, :]  # (1, 1, T_local, T_global)
-
-            # Combine with any input mask if provided
-            if mask is not None:
-                causal_mask = jnp.logical_and(mask, causal_mask)
-
-            new_cache = None
-
-            if self.attn_logit_softcap is not None:
-                G = self.num_heads // self.num_kv_heads
-                k_exp = jnp.repeat(k_full, G, axis=2)  # (B, S, N, H)
-                v_exp = jnp.repeat(v_full, G, axis=2)
-                logits = jnp.einsum('B T N H, B S N H -> B N T S', q, k_exp) * scale
-                logits = softcap(logits, self.attn_logit_softcap)
-                logits = jnp.where(causal_mask, logits, jnp.finfo(logits.dtype).min)
-                attn_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-                attn = jnp.einsum('B N T S, B S N H -> B T N H', attn_weights.astype(self.dtype), v_exp)
-                if not return_weights:
-                    attn_weights = None
-            else:
-                # SDPA with explicit causal mask (is_causal=False since we handle it)
-                attn = jax.nn.dot_product_attention(
-                    q, k_full, v_full,
-                    mask=causal_mask,
-                    scale=scale,
-                    is_causal=False,  # Handled by our custom mask
-                )
-                if return_weights:
-                    G = self.num_heads // self.num_kv_heads
-                    k_exp = jnp.repeat(k_full, G, axis=2)  # (B, S, N, H)
-                    logits = jnp.einsum('B T N H, B S N H -> B N T S', q, k_exp) * scale
-                    logits = jnp.where(causal_mask, logits, jnp.finfo(logits.dtype).min)
-                    attn_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-                else:
-                    attn_weights = None
-
-        else:
-            # Standard non-SP path
-            # RoPE
-            start_pos = cache.index if cache is not None else 0
-            q, k = self.rope(q, k, start_pos=start_pos)
-
-            # KV cache
-            if self.is_causal and cache is not None:
-                # CACHED INFERENCE MODE
-                new_cache = cache.update(k, v)
-
-                T = q.shape[1]
-                k_attn, v_attn, cache_mask = new_cache.get_ordered_kv(query_len=T)
-
-                attn_is_causal = False  # Handled manually by cache_mask
-                if mask is not None:
-                    mask_attn = jnp.logical_and(mask, cache_mask)
-                else:
-                    mask_attn = cache_mask
-            else:
-                # TRAINING or NON-CAUSAL (SPACE) ATTENTION
-                new_cache = None
-                k_attn, v_attn = k, v
-                mask_attn = mask
-                attn_is_causal = self.is_causal and (mask is None)
-
-            if self.attn_logit_softcap is not None:
-                G = self.num_heads // self.num_kv_heads
-                k_exp = jnp.repeat(k_attn, G, axis=2)  # (B, S, N, H)
-                v_exp = jnp.repeat(v_attn, G, axis=2)
-                logits = jnp.einsum('B T N H, B S N H -> B N T S', q, k_exp) * scale
-                logits = softcap(logits, self.attn_logit_softcap)
-                if mask_attn is not None:
-                    logits = jnp.where(mask_attn, logits, jnp.finfo(logits.dtype).min)
-                elif attn_is_causal:
-                    T_q, T_k = q.shape[1], k_attn.shape[1]
-                    causal = jnp.tril(jnp.ones((T_q, T_k), dtype=jnp.bool_))
-                    logits = jnp.where(causal[None, None], logits, jnp.finfo(logits.dtype).min)
-                attn_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-                attn = jnp.einsum('B N T S, B S N H -> B T N H', attn_weights.astype(self.dtype), v_exp)
-                if not return_weights:
-                    attn_weights = None
-            else:
-                # SDPA
-                attn = jax.nn.dot_product_attention(
-                    q, k_attn, v_attn,
-                    mask=mask_attn,
-                    scale=scale,
-                    is_causal=attn_is_causal,
-                    local_window_size=local_window_size
-                )  # TODO: try setting implementation="cudnn"
-
-                if return_weights:
-                    G = self.num_heads // self.num_kv_heads
-                    k_exp = jnp.repeat(k_attn, G, axis=2)  # (B, S, N, H)
-                    logits = jnp.einsum('B T N H, B S N H -> B N T S', q, k_exp) * scale
-                    if mask_attn is not None:
-                        logits = jnp.where(mask_attn, logits, jnp.finfo(logits.dtype).min)
-                    elif attn_is_causal:
-                        T_q, T_k = q.shape[1], k_attn.shape[1]
-                        causal = jnp.tril(jnp.ones((T_q, T_k), dtype=jnp.bool_))
-                        logits = jnp.where(causal[None, None], logits, jnp.finfo(logits.dtype).min)
-                    attn_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-                else:
-                    attn_weights = None
+        attn_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+        attn = jnp.einsum('B N T S, B S N H -> B T N H', attn_weights.astype(self.dtype), v)
+        if not return_weights: 
+            attn_weights = None
 
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
         out = self.dropout(out, deterministic=deterministic, rngs=rngs)
 
-        return out, new_cache, attn_weights
+        return out, cache, attn_weights
 
 class SpaceSelfAttention(nnx.Module):
     """Space self-attention with modality routing."""
@@ -552,7 +457,7 @@ class SpaceSelfAttention(nnx.Module):
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
-            rope_theta=rope_theta, is_causal=False,
+            rope_theta=rope_theta,
             use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
             attn_logit_softcap=attn_logit_softcap,
             output_proj_init=output_proj_init,
@@ -565,14 +470,12 @@ class SpaceSelfAttention(nnx.Module):
             x,
             *,
             mask: jnp.ndarray | None = None,
-            local_window_size: int | tuple[int, int] | None = None,
             deterministic: bool = True,
             cache: KVCache | None = None,
             rngs: nnx.Rngs | None = None,
             return_weights: bool = False,
         ):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
-        # Note: local_window_size is ignored for space attention (just for compatibility)
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B T) S D")
 
@@ -588,7 +491,6 @@ class TimeSelfAttention(nnx.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
                  qk_norm_type: str | None = None, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 use_seq_parallel: bool = False,
                  attn_logit_softcap: float | None = None,
                  output_proj_init=None,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
@@ -596,9 +498,8 @@ class TimeSelfAttention(nnx.Module):
         self.attn = GroupedQueryAttention(
             dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
-            rope_theta=rope_theta, is_causal=True,
+            rope_theta=rope_theta,
             use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
-            use_seq_parallel=use_seq_parallel,
             attn_logit_softcap=attn_logit_softcap,
             output_proj_init=output_proj_init,
             dtype=dtype, param_dtype=param_dtype,
@@ -610,7 +511,6 @@ class TimeSelfAttention(nnx.Module):
         x,
         *,
         mask: jnp.ndarray | None = None,
-        local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None,
@@ -623,7 +523,7 @@ class TimeSelfAttention(nnx.Module):
         if mask is not None and mask.ndim >= 3 and mask.shape[0] == B:
             mask = repeat(mask, 'B ... -> (B S) ...', S=S)
 
-        out, new_cache, attn_weights = self.attn(x, mask=mask, local_window_size=local_window_size, cache=cache, deterministic=deterministic, rngs=rngs, return_weights=return_weights)
+        out, new_cache, attn_weights = self.attn(x, mask=mask, cache=cache, deterministic=deterministic, rngs=rngs, return_weights=return_weights)
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         if attn_weights is not None:
             attn_weights = rearrange(attn_weights, "(B S) N T1 T2 -> B S N T1 T2", B=B, S=S)
@@ -636,7 +536,7 @@ class BlockCausalLayer(nnx.Module):
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4, time_layer_offset: int = 1,
                  rope_theta: float = 10000.0, use_bias: bool = False,
-                 use_rmsnorm_scale: bool = True, use_seq_parallel: bool = False,
+                 use_rmsnorm_scale: bool = True,
                  attn_logit_softcap: float | None = None,
                  output_proj_init=None,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
@@ -655,7 +555,6 @@ class BlockCausalLayer(nnx.Module):
                 dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
-                use_seq_parallel=use_seq_parallel,
                 attn_logit_softcap=attn_logit_softcap,
                 output_proj_init=output_proj_init,
                 dtype=dtype, param_dtype=param_dtype,
@@ -687,7 +586,6 @@ class BlockCausalLayer(nnx.Module):
         *,
         space_mask: jnp.ndarray | None = None,
         time_mask: jnp.ndarray | None = None,
-        time_local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None,
@@ -695,13 +593,8 @@ class BlockCausalLayer(nnx.Module):
     ):
         # Attention (time or space, depending on layer_index)
         y = self.norm(x)
-        if self.is_time_layer:
-            attn_mask = time_mask
-            local_window_size = time_local_window_size
-        else:
-            attn_mask = space_mask
-            local_window_size = None
-        y, new_cache, attn_weights = self.attn(y, mask=attn_mask, local_window_size=local_window_size, deterministic=deterministic, cache=cache, rngs=rngs, return_weights=return_weights)
+        attn_mask = time_mask if self.is_time_layer else space_mask
+        y, new_cache, attn_weights = self.attn(y, mask=attn_mask, deterministic=deterministic, cache=cache, rngs=rngs, return_weights=return_weights)
         x = x + y
 
         # MLP
@@ -716,7 +609,6 @@ class BlockCausalTransformer(nnx.Module):
                  dropout_rate: float = 0.0, qk_norm_type: str | None = None,
                  mlp_ratio: float = 4.0, time_every: int = 4, time_layer_offset: int = 1, rope_theta: float = 10000.0,
                  use_bias: bool = False, use_rmsnorm_scale: bool = True,
-                 use_seq_parallel: bool = False,
                  depth_scaled_init: bool = False,
                  attn_logit_softcap: float | None = None,
                  dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
@@ -752,7 +644,6 @@ class BlockCausalTransformer(nnx.Module):
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
                 mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every, time_layer_offset=time_layer_offset,
                 rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
-                use_seq_parallel=use_seq_parallel,
                 attn_logit_softcap=attn_logit_softcap,
                 output_proj_init=output_proj_init,
                 dtype=dtype, param_dtype=param_dtype,
@@ -766,7 +657,6 @@ class BlockCausalTransformer(nnx.Module):
         *,
         space_mask: jnp.ndarray | None = None,
         time_mask: jnp.ndarray | None = None,
-        time_local_window_size: int | tuple[int, int] | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
         rngs: nnx.Rngs | None = None,
@@ -776,8 +666,7 @@ class BlockCausalTransformer(nnx.Module):
         Args:
             x: (B, T, S, D) input tensor
             space_mask: optional spatial attention mask
-            time_mask: optional time attention mask (unused)
-            time_local_window_size: optional local window size for time attention (left, right) or int for symmetric
+            time_mask: optional time attention mask
             deterministic: whether to use deterministic mode (no dropout)
             caches: optional dict mapping layer_index -> KVCache
             rngs: optional RNG state for dropout
@@ -800,7 +689,7 @@ class BlockCausalTransformer(nnx.Module):
             is_time_layer = layer.is_time_layer
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
 
-            x, new_cache_i, w_i = layer(x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs, return_weights=return_weights)
+            x, new_cache_i, w_i = layer(x, space_mask=space_mask, time_mask=time_mask, deterministic=deterministic, cache=cache_i, rngs=rngs, return_weights=return_weights)
             if all_weights is not None:
                 all_weights.append(w_i)
 
@@ -857,7 +746,6 @@ class Encoder(nnx.Module):
             dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
             time_every=cfg.time_every, time_layer_offset=getattr(cfg, 'time_layer_offset', 1), rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
-            use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             attn_logit_softcap=getattr(cfg, 'attn_logit_softcap', None),
             dtype=dtype, param_dtype=param_dtype,
             use_residual_lambdas=cfg.use_residual_lambdas,
@@ -897,10 +785,10 @@ class Encoder(nnx.Module):
             (Modality.IMAGE, patch_tokens.shape[-2]),
         ))
         space_mask = layout.build_space_mask("encoder")  # (1, 1, q_len, k_len)
+        time_mask = make_causal_history_mask(T, None if self.context_length is None else self.context_length - 1)
 
         # Feed tokens into transformer
-        time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
-        encoded_tokens, _, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, rngs=rngs)
+        encoded_tokens, _, _ = self.transformer(tokens, space_mask=space_mask, time_mask=time_mask, deterministic=deterministic, rngs=rngs)
 
         # Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
@@ -937,7 +825,6 @@ class Decoder(nnx.Module):
             dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
             time_every=cfg.time_every, time_layer_offset=getattr(cfg, 'time_layer_offset', 1), rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
-            use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             attn_logit_softcap=getattr(cfg, 'attn_logit_softcap', None),
             dtype=dtype, param_dtype=param_dtype,
             use_residual_lambdas=cfg.use_residual_lambdas,
@@ -975,9 +862,9 @@ class Decoder(nnx.Module):
         # Make mask
         layout = self.get_token_layout()
         space_mask = layout.build_space_mask("decoder")
+        time_mask = make_causal_history_mask(T, None if self.context_length is None else self.context_length - 1) if caches is None else None
 
-        time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
-        x, new_caches, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, caches=caches, rngs=rngs)
+        x, new_caches, _ = self.transformer(tokens, space_mask=space_mask, time_mask=time_mask, deterministic=deterministic, caches=caches, rngs=rngs)
 
         # Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
@@ -1262,7 +1149,6 @@ class Dynamics(nnx.Module):
             depth=cfg.depth, dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type,
             mlp_ratio=cfg.mlp_ratio, time_every=cfg.time_every, time_layer_offset=cfg.time_layer_offset, rope_theta=cfg.rope_theta,
             use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
-            use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
             depth_scaled_init=getattr(cfg, 'use_depth_scaled_init', False),
             attn_logit_softcap=getattr(cfg, 'attn_logit_softcap', None),
             dtype=self.dtype, param_dtype=self.param_dtype,
@@ -1360,7 +1246,8 @@ class Dynamics(nnx.Module):
             tau_indices: (B, T) int32 - signal indices for embedding lookup
             unpacked_enc_tokens: (B, T, n_latents, d_bottleneck) unpacked encoder tokens
             context_length: optional context length for sliding window attention. If provided,
-                           creates local_window_size=(context_length - 1, 0) for causal sliding window.
+                           intersects `time_mask` with a causal history window of `context_length - 1`;
+                           otherwise uses full causal attention.
             time_mask: optional (B, 1, T, T) boolean mask for temporal attention
             task_embeddings: (B, T, n_agent, d_model) optional agent tokens
             caches: optional dict of KVCache for each layer
@@ -1413,15 +1300,13 @@ class Dynamics(nnx.Module):
         layout = self.get_token_layout(n_latents=n_latents, n_agent=n_agent)
         space_mask = layout.build_space_mask("wm_agent")
 
-        # Compute local_window_size from context_length for sliding window causal attention
-        time_local_window_size = None
-        if context_length is not None:
-            time_local_window_size = (context_length - 1, 0)
+        if caches is None:
+            history_mask = make_causal_history_mask(T, None if context_length is None else context_length - 1)
+            time_mask = history_mask if time_mask is None else jnp.logical_and(time_mask, history_mask)
 
         x, new_caches, _ = self.transformer(
             tokens, space_mask=space_mask,
             time_mask=time_mask,
-            time_local_window_size=time_local_window_size,
             deterministic=deterministic,
             caches=caches,
             rngs=rngs
@@ -1592,22 +1477,19 @@ class PolicyHeadMTP(nnx.Module):
 
         if self.out_binary is not None:
             binary_logits = self.out_binary(x)
-            if cap is not None:
-                binary_logits = softcap(binary_logits, cap)
+            binary_logits = softcap(binary_logits, cap)
             binary_logits = rearrange(binary_logits, "b t (l a) -> b t l a", l=self.cfg.L, a=self.num_binary_actions)
             outputs["binary_logits"] = binary_logits
 
         if self.out_categorical is not None:
             categorical_logits = self.out_categorical(x)
-            if cap is not None:
-                categorical_logits = softcap(categorical_logits, cap)
+            categorical_logits = softcap(categorical_logits, cap)
             categorical_logits = rearrange(categorical_logits, "b t (l a) -> b t l a", l=self.cfg.L, a=self.categorical_action_dim)
             outputs["categorical_logits"] = categorical_logits
 
         if self.out_continuous is not None:
             continuous_out = self.out_continuous(x)
-            if cap is not None:
-                continuous_out = softcap(continuous_out, cap)
+            continuous_out = softcap(continuous_out, cap)
             continuous_out = rearrange(continuous_out, "b t (l m) -> b t l m", l=self.cfg.L, m=self.cfg.continuous_action_dim * 2)
             outputs["continuous_mean"] = continuous_out[..., :self.cfg.continuous_action_dim]
             outputs["continuous_log_var"] = continuous_out[..., self.cfg.continuous_action_dim:]
@@ -1686,8 +1568,7 @@ class RewardHeadMTP(nnx.Module):
         h_t = einops.rearrange(h_t, '... n c -> ... (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, L*K)
-        if self.cfg.final_logit_softcap is not None:
-            logits = softcap(logits, self.cfg.final_logit_softcap)
+        logits = softcap(logits, self.cfg.final_logit_softcap)
         logits = rearrange(logits, '... (l k) -> ... l k', l=self.cfg.L, k=self.cfg.num_bins)
         return logits, self.symexp_centers_log
 
@@ -1728,6 +1609,5 @@ class ValueHead(nnx.Module):
         h_t = einops.rearrange(h_t, 'b t n c -> b t (n c)')
         x = self.projector(h_t, deterministic=deterministic, rngs=rngs)   # (B, T, D)
         logits = self.out(x)                                   # (B, T, K)
-        if self.final_logit_softcap is not None:
-            logits = softcap(logits, self.final_logit_softcap)
+        logits = softcap(logits, self.final_logit_softcap)
         return logits, self.symexp_centers_log

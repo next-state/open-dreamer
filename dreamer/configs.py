@@ -88,7 +88,6 @@ class EncoderModelConfig:
     use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
-    use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
     context_length: int | None = None  # sliding window size for temporal attention; None = full causal
@@ -116,7 +115,6 @@ class DecoderModelConfig:
     use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
-    use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
     context_length: int | None = None  # sliding window size for temporal attention; None = full causal
@@ -153,7 +151,6 @@ class DynamicsModelConfig:
     use_residual_lambdas: bool = False
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
-    use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
 

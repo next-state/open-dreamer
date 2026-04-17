@@ -22,7 +22,7 @@ import time
 
 from dreamer.configs import DynamicsConfig, HeadsConfig, OptimalTransportConfig
 from dreamer.generation import DenoiseSchedule
-from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
+from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder, make_causal_history_mask
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
 from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents, unnormalize_latents
@@ -374,7 +374,7 @@ def shortcut_forcing_step(
         B_img_emp: Number of empirical rows treated as image-only (first rows in empirical slice).
                   Used only to split flow MSE logging into image vs full-sequence subsets.
         context_length: optional context length for sliding window attention. If provided,
-                       creates local_window_size=(context_length - 1, 0) for causal sliding window.
+                       creates a causal history window of `context_length - 1`.
         task_embeddings: Optional (B, T, n_agent, d_model) agent tokens
         bootstrap_model: Model used for the two stop-gradient half-steps that generate bootstrap
                         targets. Defaults to dynamics_model when None. Pass an EMA model here
@@ -1202,13 +1202,13 @@ def run_attention_visualization(
     n_latents = latents.shape[2]
     layout = dynamics.get_token_layout(n_latents=n_latents, n_agent=0)
     space_mask = layout.build_space_mask("wm_agent")
+    time_mask = make_causal_history_mask(T, None if dynamics.cfg.context_length is None else dynamics.cfg.context_length - 1)
 
     # --- 3. Forward pass with attention weight capture (no JIT) ---
     _, _, all_weights = dynamics.transformer(
         tokens,
         space_mask=space_mask,
-        time_mask=None,
-        time_local_window_size=None,
+        time_mask=time_mask,
         deterministic=True,
         caches=None,
         rngs=None,
