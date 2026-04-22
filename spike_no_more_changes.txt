@@ -1,0 +1,85 @@
+Spike No More: Depth-Scaled Init & Embed LayerNorm
+====================================================
+Commit: af30ddc ("spike no more ablation")
+Author: Francesco215, 2026-04-16
+
+Two independent stability fixes, each gated by a config flag.
+Both default to False so the baseline is unchanged.
+
+---
+## 1. Depth-Scaled Output Projection Init (use_depth_scaled_init)
+
+**What it does:**
+Scales the weight initializer of all output projections (W_O in attention,
+W_2 in MLP) by 1/sqrt(2 * depth). This is the "GPT-2 style" init that
+prevents activation variance from growing with depth.
+
+**Config:**
+  configs/dynamics.yaml   → use_depth_scaled_init: true
+  dreamer/configs.py      → use_depth_scaled_init: bool = False
+
+**Code changes (dreamer/models.py):**
+
+1. BlockCausalTransformer.__init__ gains a `depth_scaled_init: bool = False` param.
+   When True, computes:
+     output_proj_init = nnx.initializers.normal(stddev=1.0 / math.sqrt(2 * depth))
+   Otherwise output_proj_init = None (falls back to lecun_normal).
+
+2. output_proj_init is threaded down the call chain:
+     BlockCausalTransformer → BlockCausalLayer → TimeSelfAttention / SpaceSelfAttention / MLP
+     → GroupedQueryAttention / MLP
+
+3. In GroupedQueryAttention.__init__:
+     self.to_out uses output_proj_init if provided, else lecun_normal.
+
+4. In MLP.__init__:
+     self.fc_out uses output_proj_init if provided, else lecun_normal.
+
+5. Dynamics passes the flag through:
+     depth_scaled_init=getattr(cfg, 'use_depth_scaled_init', False)
+
+---
+## 2. Embedding LayerNorm (use_embed_ln)
+
+**What it does:**
+Applies an RMSNorm to the concatenated token tensor immediately before
+it enters the transformer. This normalizes the joint embedding of latents,
+actions, task embeddings, etc., preventing large input activations.
+
+**Config:**
+  configs/dynamics.yaml   → use_embed_ln: true
+  dreamer/configs.py      → use_embed_ln: bool = False
+
+**Code changes (dreamer/models.py):**
+
+1. Dynamics.__init__ optionally creates:
+     self.embed_ln = nnx.RMSNorm(cfg.d_model, use_scale=cfg.use_rmsnorm_scale,
+                                  dtype=jnp.float32, param_dtype=self.param_dtype, rngs=rngs)
+   if use_embed_ln is True, else self.embed_ln = None.
+
+2. Dynamics.__call__ (forward pass), after the tokens concatenation line:
+     tokens = jnp.concatenate(tokens, axis=2)  # (B, T, S, D)
+   adds:
+     if self.embed_ln is not None:
+         tokens = self.embed_ln(tokens)
+
+---
+## Summary of files changed
+
+configs/dynamics.yaml
+  - Added use_depth_scaled_init: true
+  - Added use_embed_ln: true
+
+dreamer/configs.py  (DynamicsModelConfig dataclass)
+  - Added use_depth_scaled_init: bool = False
+  - Added use_embed_ln: bool = False
+
+dreamer/models.py
+  - MLP.__init__: added output_proj_init param; used for fc_out kernel_init
+  - GroupedQueryAttention.__init__: added output_proj_init param; used for to_out kernel_init
+  - SpaceSelfAttention.__init__: added output_proj_init param; forwarded to GQA
+  - TimeSelfAttention.__init__: added output_proj_init param; forwarded to GQA
+  - BlockCausalLayer.__init__: added output_proj_init param; forwarded to attn + MLP
+  - BlockCausalTransformer.__init__: added depth_scaled_init param; computes output_proj_init; forwards to layers
+  - Dynamics.__init__: passes depth_scaled_init to transformer; creates optional embed_ln
+  - Dynamics.__call__: applies embed_ln to tokens after concatenation, before transformer

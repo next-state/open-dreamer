@@ -1,0 +1,2118 @@
+License: arXiv.org perpetual non-exclusive license
+arXiv:2312.16903v2 [cs.CL] 02 Feb 2024
+Spike No More: Stabilizing the Pre-training of Large Language Models
+Sho Takase
+Shun Kiyono
+Sosuke Kobayashi
+Jun Suzuki
+Abstract
+Loss spikes often occur during pre-training of large language models. The spikes degrade the performance of large language models and sometimes ruin the pre-training. Since the pre-training needs a vast computational budget, we should avoid such spikes. To investigate the cause of loss spikes, we focus on gradients of internal layers. Through theoretical analyses, we reveal two causes of the exploding gradients, and provide requirements to prevent the explosion. In addition, we propose a method to satisfy the requirements by combining the initialization method and a simple modification to embeddings. We conduct various experiments to verify our theoretical analyses empirically. Experimental results indicate that the combination is effective in preventing spikes during pre-training.
+
+Machine Learning, ICML
+1Introduction
+Large language models (LLMs) have been fundamental assets for various applications (Brown et al., 2020; Chowdhery et al., 2022; Touvron et al., 2023). Increasing the number of parameters in (neural) language models and the number of training data usually leads to better LLMs (Kaplan et al., 2020). Consequently, the pre-training requires a vast budget, and thus, minimizing the risk of failure of the pre-training is a paramount concern.
+
+Despite their widespread use as the foundational architecture for LLMs, a comprehensive theoretical understanding of Transformers (Vaswani et al., 2017) has not yet been achieved. One of the crucial unresolved questions is the reason for the frequent occurrence of pre-training failures in Transformer-based LLMs due to spikes in loss values (loss spike) that can lead to catastrophic divergence (Chowdhery et al., 2022) as illustrated in Vanilla in Figure 1. While several empirical strategies have been proposed to mitigate this issue (Chowdhery et al., 2022; Le Scao et al., 2022; Zeng et al., 2023), the absence of theoretical justification for these methods casts unclear on their generalizability to other situations, such as varying sizes of model parameters.
+
+Refer to caption
+Figure 1:Training loss values of Transformers, whose dimensions and the number of layers are the same as the 1.7 billion parameters configuration in Narayanan et al. (2021). In Vanilla, some spikes occur at the beginning of the training, and its loss value exploded at about 13000 steps.
+In this research, we provide theoretical analyses focusing on the loss spike issue during LLM pre-training. We identify two primary factors that lead to the issue: (1) the rapid amplification of the norm of the shortcut part in the residual connection during forward propagation and (2) the intensification of gradients before and after layer normalizations (LNs) (Ba et al., 2016) in each layer. Our research also demonstrates that the impact of each factor is closely related to the chosen parameter initialization technique. We provide evidence that initializing parameters using a typical methodology (He et al., 2015) results in gradient explosion attributable to the shortcut. Conversely, a popular initialization method in LLM pre-training, which reduces certain parameters to smaller values, promotes the exploding gradients due to LNs although it mitigates the gradient explosion arising from the shortcut. To prevent both exploding gradients, we describe a requirement and introduce a simple modification to satisfy the requirement.
+
+To substantiate our theoretical analyses, we conduct a series of empirical experiments. The results show that a method satisfying the requirement hinders the occurrence of loss spikes and explosions. This contrasts with methods that fail to satisfy the requirement, which remain susceptible to the exploding gradients even when previously advocated as an empirical solution. Additionally, we demonstrate that a method satisfying the requirement enables LLMs to be pre-trained with a comparatively larger learning rate, culminating in superior performance outcomes.
+
+2Preliminary
+2.1Pre-LN Transformer
+This paper mainly focuses on the neural architecture used in the GPT series (Radford et al., 2018, 2019; Brown et al., 2020). They use the Pre-LN Transformer (Xiong et al., 2020) which is the de facto standard architecture in recent implementations of Transformers because the architecture is more stable than the original Transformer architecture when we stack many layers (Xiong et al., 2020; Liu et al., 2020; Takase et al., 2023). Let 
+x
+∈
+ℝ
+d
+ be an input of a layer of the Transformer, where 
+d
+ denotes the dimension of the layer. The layer outputs 
+y
+ with the following equations:
+
+y
+=
+x
+′
++
+FFN
+⁢
+(
+LN
+⁢
+(
+x
+′
+)
+)
+,
+(1)
+x
+′
+=
+x
++
+Attention
+⁢
+(
+LN
+⁢
+(
+x
+)
+)
+,
+(2)
+where 
+LN
+ is the layer normalization function. We call the first terms in Equations (1) and (2), i.e., 
+x
+ and 
+x
+′
+, shortcut. In addition, 
+FFN
+ and 
+Attention
+ are defined as follows1
+1
+To simplify equations, we omit bias terms.
+:
+
+FFN
+⁢
+(
+x
+)
+=
+ℱ
+⁢
+(
+x
+⁢
+W
+1
+)
+⁢
+W
+2
+,
+(3)
+Attention
+⁢
+(
+x
+)
+=
+concat
+⁢
+(
+head
+1
+⁢
+(
+x
+)
+,
+…
+,
+head
+h
+⁢
+(
+x
+)
+)
+⁢
+W
+O
+,
+(4)
+head
+i
+⁢
+(
+x
+)
+=
+softmax
+⁢
+(
+x
+⁢
+W
+Q
+⁢
+i
+⁢
+(
+X
+⁢
+W
+K
+⁢
+i
+)
+T
+d
+h
+⁢
+e
+⁢
+a
+⁢
+d
+)
+⁢
+X
+⁢
+W
+V
+⁢
+i
+,
+(5)
+where 
+ℱ
+ is an activation function, 
+concat
+ concatenates input vectors, 
+softmax
+ applies the softmax function to an input vector, and 
+W
+1
+∈
+ℝ
+d
+×
+d
+f
+⁢
+f
+⁢
+n
+, 
+W
+2
+∈
+ℝ
+d
+f
+⁢
+f
+⁢
+n
+×
+d
+, 
+W
+Q
+⁢
+i
+∈
+ℝ
+d
+×
+d
+h
+⁢
+e
+⁢
+a
+⁢
+d
+, 
+W
+K
+⁢
+i
+∈
+ℝ
+d
+×
+d
+h
+⁢
+e
+⁢
+a
+⁢
+d
+, 
+W
+V
+⁢
+i
+∈
+ℝ
+d
+×
+d
+h
+⁢
+e
+⁢
+a
+⁢
+d
+, and 
+W
+O
+∈
+ℝ
+d
+×
+d
+ are parameter matrices, and 
+d
+f
+⁢
+f
+⁢
+n
+ and 
+d
+h
+⁢
+e
+⁢
+a
+⁢
+d
+ are the internal dimensions of FFN and multi-head attention sub-layers, respectively. In addition, we pack the sequence of input vectors into a matrix as 
+X
+ to compute the self-attention.
+
+We discuss the difference from the original Transformer, i.e., Post-LN Transformer in Appendix D and using Root Mean Square layer normalization (RMSNorm) instead of LN in Section 5.3.
+
+2.2Initialization
+Because an initialization method has considerable influence on the training dynamics of neural methods, various initialization methods have been proposed for Transformers (Zhang et al., 2019b; Nguyen & Salazar, 2019; Zhang et al., 2019a; Wang et al., 2022). In this study, we investigate the training stability of Transformers in two kinds of initialization methods; we call them plain initialization and scaled initialization. In the plain initialization, we initialize all parameters with a normal distribution 
+𝒩
+⁢
+(
+0
+,
+σ
+)
+. In the scaled initialization, which is the widely used method in the pre-training of LLMs (Shoeybi et al., 2020; Le Scao et al., 2022; Biderman et al., 2023), we scale 
+W
+2
+ and 
+W
+O
+ to small values. Concretely, we follow Shoeybi et al. (2020); Le Scao et al. (2022) and initialize 
+W
+2
+ and 
+W
+O
+ with a normal distribution 
+𝒩
+⁢
+(
+0
+,
+σ
+/
+2
+⁢
+N
+)
+ where 
+N
+ is the number of layers2
+2
+Biderman et al. (2023) also scaled 
+W
+2
+ and 
+W
+O
+ to small values in the initialization, but they used the strategy introduced by Wang & Komatsuzaki (2021) instead of 
+𝒩
+⁢
+(
+0
+,
+σ
+/
+2
+⁢
+N
+)
+. We discuss the effect of this initialization method in Appendix C.
+. Following Le Scao et al. (2022), we use 
+2
+/
+5
+⁢
+d
+ for 
+σ
+, that is initially proposed by Nguyen & Salazar (2019).
+
+3Analyses on Exploding Gradients
+This section discusses two causes of the exploding gradients and the ways to prevent them. We indicate that the explosion due to the shortcut occurs when we use the plain initialization described in Section 2.2. Moreover, we indicate that the scaled initialization mitigates the explosion due to the shortcut but causes the explosion due to LNs. To prevent both explosions, we describe a requirement and introduce a modification in the scaled initialization.
+
+3.1Explosion due to Shortcut
+In this section, we indicate that the exploding gradients due to the shortcut occur when we use the plain initialization. Moreover, we indicate that the scaled initialization prevents the exploding gradients due to the shortcut.
+
+For the discussion, we analyze the norms of each layer output calculated by Equations (1) and (2). We assume that the vector 
+x
+ at each layer follows the normal distribution, and then we can assume that the mean of the vector 
+x
+ is 
+0
+. In this case, we have to consider only the standard deviation of the vector 
+x
+ to estimate its norm because the standard deviation is in proportion to the norm. In detail, let 
+std
+⁢
+(
+x
+)
+ be the standard deviation of 
+x
+, 
+‖
+x
+‖
+2
+=
+d
+⁢
+std
+⁢
+(
+x
+)
+. In addition, let 
+var
+⁢
+(
+x
+)
+ represent the variance of 
+x
+, we obtain the variance of the sum of two vectors that follow the normal distribution with the following equation:
+
+var
+⁢
+(
+x
++
+y
+)
+=
+var
+⁢
+(
+x
+)
++
+var
+⁢
+(
+y
+)
+.
+(6)
+For both initialization methods, we initialize embeddings with 
+𝒩
+⁢
+(
+0
+,
+σ
+)
+ where 
+σ
+=
+2
+/
+5
+⁢
+d
+≪
+1
+, and thus, the standard deviations of embeddings are much smaller than 
+1
+. Then, we investigate the standard deviations of 
+FFN
+⁢
+(
+x
+)
+ and 
+Attention
+⁢
+(
+x
+)
+ in Equations (3) and (4). If these standard deviations are also much smaller than 
+1
+, the standard deviations of each layer output by Equations (1) and (2) remain on a small scale. In contrast, for the standard deviations of 
+FFN
+⁢
+(
+x
+)
+ and 
+Attention
+⁢
+(
+x
+)
+, if either is close to or larger than 
+1
+, the standard deviation of the shortcut rapidly grows as the layer gets deeper due to Equation (6). This leads to the exponential growth of the norms of each layer calculated by Equations (1) and (2), and thus, causes exploding gradients during the back-propagation.
+
+Let consider 
+var
+⁢
+(
+FFN
+⁢
+(
+x
+)
+)
+. To simplify 
+FFN
+⁢
+(
+x
+)
+ in Equation (3), we assume that 
+ℱ
+ is the identity function. Then, we obtain 
+var
+⁢
+(
+FFN
+⁢
+(
+x
+)
+)
+ at the beginning of the training with the following equation:
+
+var
+⁢
+(
+FFN
+⁢
+(
+x
+)
+)
+=
+d
+f
+⁢
+f
+⁢
+n
+⁢
+d
+⁢
+var
+⁢
+(
+x
+)
+⁢
+var
+⁢
+(
+W
+1
+)
+⁢
+var
+⁢
+(
+W
+2
+)
+.
+(7)
+Here, 
+var
+⁢
+(
+x
+)
+=
+1
+ because we apply LN before the calculation of 
+FFN
+ as in Equation (1). We set 
+d
+f
+⁢
+f
+⁢
+n
+=
+4
+⁢
+d
+ as the widely used configuration. For 
+var
+⁢
+(
+W
+1
+)
+ and 
+var
+⁢
+(
+W
+2
+)
+, we assign actual values described in Section 2.2. For example, in the plain initialization,
+
+var
+⁢
+(
+FFN
+⁢
+(
+x
+)
+)
+=
+4
+⁢
+d
+⁢
+d
+⁢
+2
+5
+⁢
+d
+⁢
+2
+5
+⁢
+d
+=
+16
+25
+.
+(8)
+Thus, the standard deviation is 
+16
+/
+25
+=
+4
+/
+5
+≃
+1
+. Because at least the standard deviation of 
+FFN
+⁢
+(
+x
+)
+ is close to 
+1
+, the plain initialization exponentially increases the standard deviation of the shortcut during forward computation, and then causes exploding gradients during the back-propagation.
+
+In contrast, the scaled initialization alleviates the explosion by scaling 
+W
+2
+ to smaller values, 
+1
+/
+2
+⁢
+N
+. Introducing the scaling, we obtain the following equation:
+
+var
+⁢
+(
+FFN
+⁢
+(
+x
+)
+)
+=
+4
+⁢
+d
+⁢
+d
+⁢
+2
+5
+⁢
+d
+⁢
+2
+5
+⁢
+d
+⁢
+1
+2
+⁢
+N
+=
+8
+25
+⁢
+N
+.
+(9)
+Thus, the standard deviation is 
+8
+/
+25
+⁢
+N
+. Recall that 
+N
+ represents the number of layers as defined in Section 2.2, 
+8
+/
+25
+⁢
+N
+ is much smaller than 1 for typical LLMs since they usually use 
+N
+>
+10
+.
+
+We indicated that the scaled initialization mitigates the increase of the shortcut by 
+FFN
+⁢
+(
+x
+)
+. We prove that the scaled initialization also mitigates the increase by 
+Attention
+⁢
+(
+x
+)
+. Let us consider the standard deviation of Equation (4) in the scaled initialization. Before computing, we consider the standard deviation of each self-attention head computed by Equation (5). To simplify the equation, let 
+x
+⁢
+W
+Q
+⁢
+i
+⁢
+(
+X
+⁢
+W
+K
+⁢
+i
+)
+T
+d
+h
+⁢
+e
+⁢
+a
+⁢
+d
+ be 
+Z
+. Then, we can transform the right term of Equation (5) to 
+softmax
+⁢
+(
+Z
+)
+⁢
+X
+⁢
+W
+V
+⁢
+i
+. Because 
+X
+ is the pack of layer-normalized vectors, the variance of 
+softmax
+⁢
+(
+Z
+)
+⁢
+X
+ reaches the maximum value 
+1
+ when the result of 
+softmax
+⁢
+(
+Z
+)
+ is a 
+1
+-hot vector3
+3
+On the other hand, the variance reaches the minimum value when the result of the 
+softmax
+ is a uniform distribution.
+. Thus, we obtain the variance of Equation (5) as follows:
+
+var
+⁢
+(
+head
+i
+⁢
+(
+x
+)
+)
+=
+var
+⁢
+(
+softmax
+⁢
+(
+Z
+)
+⁢
+X
+)
+⁢
+d
+⁢
+var
+⁢
+(
+W
+V
+⁢
+i
+)
+=
+var
+⁢
+(
+softmax
+⁢
+(
+Z
+)
+⁢
+X
+)
+⁢
+d
+⁢
+2
+5
+⁢
+d
+<
+2
+5
+.
+(10)
+Therefore, since we also scale 
+W
+O
+ to 
+1
+/
+2
+⁢
+N
+, the variance of Equation (4) is as follows:
+
+var
+⁢
+(
+Attention
+⁢
+(
+x
+)
+)
+=
+var
+⁢
+(
+head
+⁢
+(
+x
+)
+)
+⁢
+d
+⁢
+var
+⁢
+(
+W
+O
+)
+=
+var
+⁢
+(
+head
+⁢
+(
+x
+)
+)
+⁢
+d
+⁢
+2
+5
+⁢
+d
+⁢
+1
+2
+⁢
+N
+=
+var
+⁢
+(
+head
+⁢
+(
+x
+)
+)
+⁢
+1
+5
+⁢
+N
+<
+2
+25
+⁢
+N
+.
+(11)
+Based on these calculations, the standard deviation of 
+Attention
+⁢
+(
+x
+)
+ is also much smaller than 
+1
+ when we use the scaled initialization. These theoretical analyses prove that the scaled initialization prevents the rapid growth of the shortcut, and thus, it prevents the exploding gradients due to the shortcut.
+
+Refer to caption
+Figure 2:Gradient norms of Transformers at the beginning of the LLM pre-training. To focus on only the explosion due to the shortcut, we prevent the explosion due to LNs by multiplying embeddings by 
+d
+ as described in Section 3.2.
+Figure 2 shows the gradient norms of each layer at the beginning of the LLM pre-training. This figure shows that the gradient norms in the plain initialization rapidly grow as the layer gets shallower. This means that the plain initialization faces the exploding gradients. In contrast, the gradient norms in the scaled initialization remain at almost constant values. Therefore, the scaled initialization, which is widely used in LLM pre-training, is effective in preventing the exploding gradients.
+
+However, in this figure, we prevent the explosion due to LNs to focus on only the explosion due to the shortcut. If we remove the modification, the gradient norms in the scaled initialization also explode. We describe the explosion due to LNs and the modification to address it in the next section.
+
+3.2Explosion due to LNs
+Xiong et al. (2020) proved that the gradient norm of the LN depends on the norm of an input vector as follows:
+
+∥
+δ
+⁢
+LN
+⁢
+(
+x
+)
+δ
+⁢
+x
+∥
+2
+=
+𝒪
+⁢
+(
+d
+‖
+x
+‖
+2
+)
+.
+(12)
+As described in Section 3.1, we assume 
+‖
+x
+‖
+2
+=
+d
+⁢
+std
+⁢
+(
+x
+)
+. Thus, we can modify the above equation as follows:
+
+∥
+δ
+⁢
+LN
+⁢
+(
+x
+)
+δ
+⁢
+x
+∥
+2
+=
+𝒪
+⁢
+(
+1
+std
+⁢
+(
+x
+)
+)
+.
+(13)
+Therefore, the LN increases its gradient norm drastically when 
+std
+⁢
+(
+x
+)
+≪
+1
+. We investigate whether the standard deviations of vectors before each LN are smaller than 
+1
+ to find the point where the gradient increases.
+
+The input vectors of LNs are an embedding at the first layer, and each layer output that is the sum of the shortcut and 
+FFN
+⁢
+(
+x
+)
+ or 
+Attention
+⁢
+(
+x
+)
+ as in Equations (1) and (2). As described, the standard deviations of embeddings are much smaller than 
+1
+ because we initialize embeddings with 
+𝒩
+⁢
+(
+0
+,
+σ
+)
+ where 
+σ
+≪
+1
+. In addition, since the standard deviations of 
+FFN
+⁢
+(
+x
+)
+ and 
+Attention
+⁢
+(
+x
+)
+ are much smaller than 
+1
+ in the scaled initialization as described in Section 3.1, LNs certainly increase gradients due to Equation (13) especially in shallow layers4
+4
+The each layer output grows as the layer gets deeper, because we add 
+FFN
+⁢
+(
+x
+)
+ and 
+Attention
+⁢
+(
+x
+)
+ the number of layers times. For example, we can remove 
+N
+ in denominators of Equations (9) and (11) at the final layer. Therefore, the standard deviations of each layer output at deep layers are close to 
+1
+ in comparison with ones at shallow layers.
+.
+
+To solve this issue, we need to make the standard deviations of vectors immediately before LNs close to 
+1
+. We have two choices to achieve this requirement. One is increasing the standard deviation of the shortcut, and the other is increasing the standard deviations of 
+FFN
+⁢
+(
+x
+)
+ and 
+Attention
+⁢
+(
+x
+)
+. However, as described in Section 3.1, if we make the standard deviations of 
+FFN
+⁢
+(
+x
+)
+ and 
+Attention
+⁢
+(
+x
+)
+ close to 
+1
+, the explosion due to the shortcut occurs because the norm of the shortcut rapidly grows. Thus, we make the standard deviation of the shortcut close to 
+1
+.
+
+To make the standard deviation of the shortcut close to 
+1
+, we make the standard deviation of each embedding close to 
+1
+. To achieve this, we introduce two kinds of modification: “Scaled Embed” and “Embed LN”. The Scaled Embed is scaling embeddings with an appropriate value5
+5
+In this study, we use word tying (Press & Wolf, 2017; Inan et al., 2017). In this configuration, we have to initialize embeddings with a small value to use them in the output layer. Otherwise, we can initialize embeddings with the normal distribution 
+𝒩
+⁢
+(
+0
+,
+σ
+)
+ where 
+σ
+=
+1
+ to solve the explosion due to LNs.
+. For example, we multiply embeddings by 
+d
+, which is introduced in the original Transformer paper (Vaswani et al., 2017)6
+6
+Although the original Transformer paper introduced this operation, recent implementations ignore this.
+, and then the standard deviations of embeddings become 
+2
+/
+5
+. The Embed LN is applying the LN to embeddings. In fact, Le Scao et al. (2022) reported that the Embed LN strategy prevents loss spikes empirically.
+
+Figure 3 shows the gradient norms of each layer when we use the scaled initialization. This figure indicates that the gradient exponentially increases especially in shallow layers in Vanilla that uses the scaled initialization but does not use any modification to prevent the explosion due to LNs. In contrast, our modifications prevent the exploding gradients because they resolve the explosion due to LNs. Therefore, we require the combination of the scaled initialization and modifications described in this section to prevent both explosions due to the shortcut and LNs.
+
+Refer to caption
+Figure 3:Gradient norms of Transformers at the beginning of the LLM pre-training. To focus on only the explosion due to LNs, we use the scaled initialization method described in Section 2.2.
+4Main Experiments
+We verify the empirical effectiveness of our theoretical analyses. In detail, we demonstrate that the method that prevents the exploding gradients also prevents loss and gradient spikes. In particular, we investigate the effectiveness of modifications to prevent the explosion due to LNs because the empirical effectiveness of the scaled initialization has already been revealed in previous studies (Shoeybi et al., 2020; Le Scao et al., 2022).
+
+Refer to caption
+(a)350M parameters.
+Refer to caption
+(b)1.7B parameters.
+Figure 4:Loss curves of each method in validation data.
+Refer to caption
+(a)350M parameters.
+Refer to caption
+(b)1.7B parameters.
+Figure 5:Gradient norms of each method during the training.
+4.1Datasets
+We used C4 (Raffel et al., 2020) that consists of clean English texts extracted from Common Crawl7
+7
+https://commoncrawl.org/
+ as our LLM pre-training corpus. We also used the separated part of C4 as our validation data. We used GPT-2 vocabulary (Radford et al., 2019) that contains Byte Pair Encoding (BPE) subword units (Sennrich et al., 2016) as our vocabulary. To evaluate each method, we computed perplexity on WikiText (Merity et al., 2017) and LAMBADA (Paperno et al., 2016) datasets.
+
+4.2Model Configurations
+As described in Section 2, we used the Pre-LN Transformer architecture. In addition, we use the scaled initialization because the method is widely used in LLM pre-trainings (Shoeybi et al., 2020; Le Scao et al., 2022). We set the number of layers 
+N
+=
+24
+, and varied 
+d
+ to adjust the total number of parameters to 350 million (350M) and 1.7 billion (1.7B). We set the learning rate (
+lr
+) 5.0 
+×
+10
+−
+4
+. Section 5.1 shows experiments in varying the learning rate. Appendix A describes more details on the experimental configuration.
+
+We compared the following methods. We put 
+✓
+ before the method name if the method satisfies the requirements to prevent the explosion due to LNs.
+
+Vanilla
+This configuration uses only the scaled initialization. Thus, this configuration prevents the explosion due to the shortcut but faces the explosion due to LNs.
+
+Embed Detach
+Zeng et al. (2023) used the shrink embedding gradient technique (Ding et al., 2021) to stabilize their LLM pre-training. This method shrinks gradients on the embedding layer by detaching a part of embeddings from the computational graph as follows:
+
+Embed
+=
+γ
+⁢
+Embed
++
+(
+1
+−
+γ
+)
+⁢
+Detach
+⁢
+(
+Embed
+)
+,
+(14)
+where 
+γ
+ is a hyper-parameter and 
+Detach
+ detaches an input from the computational graph. We assign 
+0.1
+ to 
+γ
+ as in Zeng et al. (2023). Zeng et al. (2023) indicated that this method empirically prevents the loss spike. However, this method does not satisfy the requirements to prevent the explosion due to LNs, and thus, we show that this method does not completely solve the loss spike.
+
+✓
+Embed LN
+Dettmers et al. (2022) and Le Scao et al. (2022) reported that applying the LN to the embedding layer stabilizes their LLM pre-training. As described in Section 3.2, this method satisfies the requirements to prevent the explosion due to LNs in internal layers.
+
+✓
+Scaled Embed
+This method multiplies embeddings by 
+d
+. As described in Section 3.2, this method satisfies the requirements to prevent the explosion due to LNs.
+
+4.3Results
+Figure 4 shows the loss values of each method in validation data. Figure 5 shows the gradient norms of each method. These figures indicate that Vanilla and Embed Detach faced loss and gradient spikes. In contrast, Embed LN and Scaled Embed did not face spikes. These results correspond to our theoretical analyses described in Section 3. Thus, we must prevent the exploding gradients to avoid spikes in LLM pre-training.
+
+In comparison between 350M and 1.7B parameters, spikes occurred more frequent in 1.7B parameters. Because we initialize embeddings with 
+𝒩
+⁢
+(
+0
+,
+σ
+)
+ where 
+σ
+=
+2
+/
+5
+⁢
+d
+, the standard deviations of embeddings become small as 
+d
+ gets larger. This means that the standard deviation of Equations (1) and (2) also become small as 
+d
+ gets larger. As described in Section 3.2, the smaller the standard deviation the LN input is, the larger its gradient is. Therefore, if we increase 
+d
+ without any technique to prevent the explosion due to LNs, a model becomes more unstable. This result corresponds to the previous study reports (Le Scao et al., 2022; Chowdhery et al., 2022; Zeng et al., 2023) that their model became more unstable as they increased the number of parameters.
+
+Table 1:Perplexities of each method with 350M and 1.7B parameters.
+Model	WikiText 
+↓
+LAMBADA 
+↓
+350M parameters
+Vanilla	30.03	24.73
+Embed Detach	30.69	26.93
+Embed LN	29.85	25.03
+Scaled Embed	29.86	24.37
+1.7B parameters
+Vanilla	22.58	15.22
+Embed Detach	22.00	13.88
+Embed LN	21.29	13.00
+Scaled Embed	21.29	12.53
+Table 1 shows the perplexities of each method on WikiText and LAMBADA. This table shows that Embed LN and Scaled Embed achieved comparable performance. This result implies that methods have no significant difference from each other in their performance if each method prevents loss and gradient spikes. In contrast, the perplexities of Vanilla and Embed Detach are worse except for Vanilla with 350M parameters in LAMBADA, and the difference in the performance is larger in a large amount of parameters. This result implies that addressing spikes has a more serious influence on the performance as the parameter size gets larger. We discuss this matter in more detail in Section 5.1.
+
+5Difference from Other Configurations
+In this section, we conduct experiments on other configurations to describe connections with previous study reports.
+
+5.1Varying Learning Rate
+Le Scao et al. (2022) reported that the stable method, such as Embed LN, was worse than Vanilla. However, in Section 4, the stable methods, Scaled Embed and Embed LN, achieved better performance than Vanilla in the 1.7B parameter configuration. We suppose that the difference in the learning rate causes this gap in findings. In this section, we tried to train Vanilla and Scaled Embed with larger and smaller learning rates: 
+lr
+=
+1.0
+×
+10
+−
+3
+ and 
+1.0
+×
+10
+−
+4
+ respectively.
+
+Figure 6 shows loss values of each configuration in validation data. As shown in this figure, the larger the learning rate we used, the more frequent the spikes occurred in Vanilla. In particular, in 
+lr
+=
+1.0
+×
+10
+−
+3
+, the training of Vanilla with 1.7B parameters failed because its gradient exploded, as shown in Figure 7. In contrast, Scaled Embed stabilized the training, and thus, its loss values consistently decreased.
+
+Table 2 shows the perplexities of each configuration in evaluation data. This table indicates that Vanilla with 350M parameters achieved better performance in 
+lr
+=
+1.0
+×
+10
+−
+4
+ that is the situation where its training did not face any spike. This result corresponds to the report of Le Scao et al. (2022). Thus, we suppose that they conducted the comparison with a too-small learning rate to stabilize Vanilla. In contrast, the stable methods are more effective in training with a large learning rate as shown in Figure 6 and Table 2. Therefore, if Le Scao et al. (2022) used a relatively large learning rate in their experiments, their stable method achieved better performance.
+
+Refer to caption
+(a)350M parameters with 
+lr
+=
+1.0
+×
+10
+−
+3
+.
+Refer to caption
+(b)350M parameters with 
+lr
+=
+5.0
+×
+10
+−
+4
+.
+Refer to caption
+(c)350M parameters with 
+lr
+=
+1.0
+×
+10
+−
+4
+.
+Refer to caption
+(d)1.7B parameters with 
+lr
+=
+1.0
+×
+10
+−
+3
+.
+Refer to caption
+(e)1.7B parameters with 
+lr
+=
+5.0
+×
+10
+−
+4
+.
+Refer to caption
+(f)1.7B parameters with 
+lr
+=
+1.0
+×
+10
+−
+4
+.
+Figure 6:Loss values of each method with 350M and 1.7B parameters when we vary a learning rate.
+Refer to caption
+Figure 7:Gradient norms of each method with 
+lr
+=
+1.0
+×
+10
+−
+3
+.
+Table 2:Perplexities of each method with 350M and 1.7B parameters when we vary a learning rate.
+WikiText 
+↓
+LAMBADA 
+↓
+Model	
+lr
+=
+1.0
+×
+10
+−
+3
+lr
+=
+5.0
+×
+10
+−
+4
+lr
+=
+1.0
+×
+10
+−
+4
+lr
+=
+1.0
+×
+10
+−
+3
+lr
+=
+5.0
+×
+10
+−
+4
+lr
+=
+1.0
+×
+10
+−
+4
+350M parameters
+Vanilla	29.96	30.35	34.51	25.12	24.73	32.49
+Scaled Embed	28.09	29.86	35.66	22.03	24.37	37.14
+1.7B parameters
+Vanilla	N/A	22.58	23.54	N/A	15.22	16.17
+Scaled Embed	20.95	21.29	23.78	12.26	12.53	15.39
+5.2Varying Sequence Length
+Refer to caption
+Figure 8:Loss curves of “Vanilla” with 350M parameters in validation data when we vary the input sequence length. We adjust the batch size to use the same number of tokens for the training of each model.
+Li et al. (2022) indicated that it is better to train with a short sequence at the early stage to stabilize the LLM pre-training. They justified their method based on the curriculum learning strategy. On the other hand, in this section, we provide the theoretical justification to their method in terms of the standard deviation of the self-attention layer.
+
+As discussed in Section 3.2, in Vanilla, the smaller the standard deviation of each sub-layer is, the larger the gradient of its layer is. In addition, the standard deviation of the self-attention layer depends on the result of 
+softmax
+ function. We considered the maximum value case in Section 3.2. In contrast, in this section, we consider the minimum value case, i.e., the result of 
+softmax
+ is the uniform distribution. Let 
+L
+ be the length of an input sequence. When the result of 
+softmax
+ is the uniform distribution, we multiply 
+1
+/
+L
+ by each vector in 
+X
+. Because 
+X
+ is the pack of layer-normalized vectors, their variances become 
+(
+1
+/
+L
+)
+2
+ after the multiplication. Then, we compute the sum of the 
+L
+ vectors whose variances are 
+(
+1
+/
+L
+)
+2
+. To obtain the variance after the summation, we multiply 
+L
+ by the 
+(
+1
+/
+L
+)
+2
+ based on Equation (6). Formally, we obtain the minimum variance of 
+softmax
+⁢
+(
+Z
+)
+⁢
+X
+ with the following equation:
+
+min
+⁢
+(
+var
+⁢
+(
+softmax
+⁢
+(
+Z
+)
+⁢
+X
+)
+)
+=
+(
+1
+L
+)
+2
+⁢
+L
+=
+1
+L
+.
+(15)
+The above minimum value is smaller as 
+L
+ is larger. Thus, the larger 
+L
+ is, the more probable Vanilla is to face the loss and gradient spikes. In other words, a small 
+L
+, which means that we use a short sequence for training, mitigates spikes.
+
+We conducted experiments with varying 
+L
+ from 
+128
+ to 
+2048
+. To use the same number of tokens to update parameters, we adjusted the batch size. Figure 8 shows loss values of Vanilla with each 
+L
+ configuration in the validation data. This figure shows that spikes occurred only in the large 
+L
+, i.e., 
+1024
+ and 
+2048
+. Moreover, the spikes are more probable to occur at the early stage of the pre-training. We suppose that the result of 
+softmax
+ in the early stage is similar to the uniform distribution because input vectors at the early stage are similar to random vectors. In other words, we suppose that the result of 
+softmax
+ at the early stage is challenging to be a peaked distribution because input vectors are not trained sufficiently. Therefore, using a short sequence stabilizes the training at the early stage, as reported in Li et al. (2022).
+
+5.3RMSNorm
+Some recent LLMs use the RMSNorm (Zhang & Sennrich, 2019) instead of the LN in their Transformers (Touvron et al., 2023). We discuss such an architecture in this section. Based on the proof in Appendix D in Xiong et al. (2020), we can obtain the order of the RMSNorm gradient norm with the following equation:
+
+∥
+δ
+⁢
+RMSNorm
+⁢
+(
+x
+)
+δ
+⁢
+x
+∥
+2
+=
+𝒪
+⁢
+(
+d
+‖
+x
+‖
+2
+)
+.
+(16)
+In short, the order of the RMSNorm gradient norm is equal to the one of LN described in Equation (12). Thus, we also face the exploding gradients issue discussed in this paper theoretically if we use RMSNorm.
+
+Figures 9 and 10 show the loss values and gradient norms of the Vanilla configuration in Section 4 and the one using RMSNorms instead of LNs (“RMSNorm” in figures) with 350M parameters. We trained them with 
+lr
+=
+5.0
+×
+10
+−
+4
+ as in Section 48
+8
+We tried to train them with 
+lr
+=
+1.0
+×
+10
+−
+3
+ but RMSNorm exploded.
+. As shown in these figures, RMSNorm faced loss and gradient spikes in a similar location to the ones of Vanilla. These empirical results also indicate that the RMSNorms have the same issue as LNs regarding the exploding gradients.
+
+
+Refer to caption
+Figure 9:Loss curves of Vanilla and RMSNorm in validation data.
+
+Refer to caption
+Figure 10:Gradient norms of Vanilla and RMSNorm.
+6Conclusion
+This paper investigated why LLMs sometimes face loss spikes during their pre-training. Specifically, we focused on gradients of internal layers. We introduced two causes of the exploding gradients during LLM pre-training through theoretical analyses: the shortcut and LNs. We also revealed requirements to prevent the exploding gradients. To satisfy the requirements, we also proposed a method combining simple modifications to embeddings and scaled initialization, a widely used initialization method in LLM pre-training. Experiments indicated that the combination avoided loss spikes. Moreover, we demonstrated that the combined method can train with a relatively larger learning rate, and as a result, it can achieve better performance. We hope our theoretical analyses and proposed method avoid wasting valuable time and computational resources during the LLM constructions.
+
+References
+Ba et al. (2016)
+Ba, J. L., Kiros, J. R., and Hinton, G. E.Layer normalization, 2016.
+Biderman et al. (2023)
+Biderman, S., Schoelkopf, H., Anthony, Q., Bradley, H., O’Brien, K., Hallahan, E., Khan, M. A., Purohit, S., Prashanth, U. S., Raff, E., Skowron, A., Sutawika, L., and Van Der Wal, O.Pythia: A suite for analyzing large language models across training and scaling.In Proceedings of the 40th International Conference on Machine Learning (ICML), pp.  2397–â2430, 2023.
+Black et al. (2022)
+Black, S., Biderman, S., Hallahan, E., Anthony, Q., Gao, L., Golding, L., He, H., Leahy, C., McDonell, K., Phang, J., Pieler, M., Prashanth, U. S., Purohit, S., Reynolds, L., Tow, J., Wang, B., and Weinbach, S.GPT-NeoX-20B: An open-source autoregressive language model.In Proceedings of BigScience Episode #5 – Workshop on Challenges & Perspectives in Creating Large Language Models, pp. 95–136, 2022.
+Brown et al. (2020)
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G., Askell, A., Agarwal, S., Herbert-Voss, A., Krueger, G., Henighan, T., Child, R., Ramesh, A., Ziegler, D., Wu, J., Winter, C., Hesse, C., Chen, M., Sigler, E., Litwin, M., Gray, S., Chess, B., Clark, J., Berner, C., McCandlish, S., Radford, A., Sutskever, I., and Amodei, D.Language models are few-shot learners.In Advances in Neural Information Processing Systems 33 (NeurIPS), pp.  1877–1901, 2020.
+Chowdhery et al. (2022)
+Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra, G., Roberts, A., Barham, P., Chung, H. W., Sutton, C., Gehrmann, S., Schuh, P., Shi, K., Tsvyashchenko, S., Maynez, J., Rao, A., Barnes, P., Tay, Y., Shazeer, N., Prabhakaran, V., Reif, E., Du, N., Hutchinson, B., Pope, R., Bradbury, J., Austin, J., Isard, M., Gur-Ari, G., Yin, P., Duke, T., Levskaya, A., Ghemawat, S., Dev, S., Michalewski, H., Garcia, X., Misra, V., Robinson, K., Fedus, L., Zhou, D., Ippolito, D., Luan, D., Lim, H., Zoph, B., Spiridonov, A., Sepassi, R., Dohan, D., Agrawal, S., Omernick, M., Dai, A. M., Pillai, T. S., Pellat, M., Lewkowycz, A., Moreira, E., Child, R., Polozov, O., Lee, K., Zhou, Z., Wang, X., Saeta, B., Diaz, M., Firat, O., Catasta, M., Wei, J., Meier-Hellstern, K., Eck, D., Dean, J., Petrov, S., and Fiedel, N.PaLM: Scaling language modeling with pathways, 2022.
+Dao et al. (2022)
+Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and Re, C.Flashattention: Fast and memory-efficient exact attention with IO-awareness.In Advances in Neural Information Processing Systems 35 (NeurIPS), 2022.
+Dettmers et al. (2022)
+Dettmers, T., Lewis, M., Shleifer, S., and Zettlemoyer, L.8-bit optimizers via block-wise quantization.In Proceedings of the 10th International Conference on Learning Representations (ICLR), 2022.
+Ding et al. (2021)
+Ding, M., Yang, Z., Hong, W., Zheng, W., Zhou, C., Yin, D., Lin, J., Zou, X., Shao, Z., Yang, H., and Tang, J.Cogview: Mastering text-to-image generation via transformers.In Advances in Neural Information Processing Systems 34 (NeurIPS), pp.  19822–19835, 2021.
+He et al. (2015)
+He, K., Zhang, X., Ren, S., and Sun, J.Delving deep into rectifiers: Surpassing human-level performance on imagenet classification.In Proceedings of the 2015 IEEE International Conference on Computer Vision (ICCV), pp.  1026â1034, 2015.
+Huang et al. (2020)
+Huang, X. S., Perez, F., Ba, J., and Volkovs, M.Improving transformer optimization through better initialization.In Proceedings of the 37th International Conference on Machine Learning (ICML), pp.  4475–4483, 2020.
+Inan et al. (2017)
+Inan, H., Khosravi, K., and Socher, R.Tying word vectors and word classifiers: A loss framework for language modeling.In Proceedings of the 5th International Conference on Learning Representations (ICLR), 2017.
+Izsak et al. (2021)
+Izsak, P., Berchansky, M., and Levy, O.How to train BERT with an academic budget.In Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing (EMNLP), pp.  10644–10652, 2021.
+Kaplan et al. (2020)
+Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., Chess, B., Child, R., Gray, S., Radford, A., Wu, J., and Amodei, D.Scaling laws for neural language models, 2020.
+Le Scao et al. (2022)
+Le Scao, T., Wang, T., Hesslow, D., Bekman, S., Bari, M. S., Biderman, S., Elsahar, H., Muennighoff, N., Phang, J., Press, O., Raffel, C., Sanh, V., Shen, S., Sutawika, L., Tae, J., Yong, Z. X., Launay, J., and Beltagy, I.What language model to train if you have one million GPU hours?In Findings of the Association for Computational Linguistics: EMNLP 2022, pp.  765–782, 2022.
+Li et al. (2022)
+Li, C., Zhang, M., and He, Y.The stability-efficiency dilemma: Investigating sequence length warmup for training gpt models.In Advances in Neural Information Processing Systems 35 (NeurIPS), pp.  26736–26750, 2022.
+Liu et al. (2020)
+Liu, L., Liu, X., Gao, J., Chen, W., and Han, J.Understanding the difficulty of training transformers.In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP), pp.  5747–5763, 2020.
+Marie et al. (2021)
+Marie, B., Fujita, A., and Rubino, R.Scientific credibility of machine translation research: A meta-evaluation of 769 papers.In Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (ACL), pp.  7297–7306, 2021.
+Merity et al. (2017)
+Merity, S., Xiong, C., Bradbury, J., and Socher, R.Pointer Sentinel Mixture Models.In Proceedings of the 5th International Conference on Learning Representations (ICLR), 2017.
+Narayanan et al. (2021)
+Narayanan, D., Shoeybi, M., Casper, J., LeGresley, P., Patwary, M., Korthikanti, V., Vainbrand, D., Kashinkunti, P., Bernauer, J., Catanzaro, B., Phanishayee, A., and Zaharia, M.Efficient large-scale language model training on gpu clusters using megatron-lm.In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis (SC), pp.  1–15, 2021.
+Nguyen & Salazar (2019)
+Nguyen, T. Q. and Salazar, J.Transformers without tears: Improving the normalization of self-attention.In Proceedings of the 16th International Conference on Spoken Language Translation (IWSLT), 2019.
+Ott et al. (2018)
+Ott, M., Edunov, S., Grangier, D., and Auli, M.Scaling neural machine translation.In Proceedings of the Third Conference on Machine Translation (WMT), pp.  1–9, 2018.
+Paperno et al. (2016)
+Paperno, D., Kruszewski, G., Lazaridou, A., Pham, N. Q., Bernardi, R., Pezzelle, S., Baroni, M., Boleda, G., and Fernández, R.The LAMBADA dataset: Word prediction requiring a broad discourse context.In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (ACL), pp.  1525–1534, 2016.
+Peitz et al. (2019)
+Peitz, S., Garg, S., Nallasamy, U., and Paulik, M.Cross+Self-Attention for transformer models, 2019.
+Post (2018)
+Post, M.A call for clarity in reporting BLEU scores.In Proceedings of the Third Conference on Machine Translation (WMT), pp.  186–191, 2018.
+Press & Wolf (2017)
+Press, O. and Wolf, L.Using the output embedding to improve language models.In Proceedings of the 15th Conference of the European Chapter of the Association for Computational Linguistics (EACL), pp.  157–163, 2017.
+Radford et al. (2018)
+Radford, A., Narasimhan, K., Salimans, T., and Sutskever, I.Improving language understanding by generative pre-training.2018.
+Radford et al. (2019)
+Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., and Sutskever, I.Language models are unsupervised multitask learners.2019.
+Raffel et al. (2020)
+Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S., Matena, M., Zhou, Y., Li, W., and Liu, P. J.Exploring the limits of transfer learning with a unified text-to-text transformer.Journal of Machine Learning Research, 21(140):1–67, 2020.
+Rajbhandari et al. (2020)
+Rajbhandari, S., Rasley, J., Ruwase, O., and He, Y.Zero: Memory optimizations toward training trillion parameter models, 2020.
+Schwartz et al. (2019)
+Schwartz, R., Dodge, J., Smith, N. A., and Etzioni, O.Green AI.CoRR, abs/1907.10597, 2019.
+Sennrich et al. (2016)
+Sennrich, R., Haddow, B., and Birch, A.Neural machine translation of rare words with subword units.In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (ACL), pp.  1715–1725, 2016.
+Shazeer (2019)
+Shazeer, N.Fast transformer decoding: One write-head is all you need, 2019.
+Shoeybi et al. (2020)
+Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper, J., and Catanzaro, B.Megatron-lm: Training multi-billion parameter language models using model parallelism, 2020.
+Strubell et al. (2019)
+Strubell, E., Ganesh, A., and McCallum, A.Energy and policy considerations for deep learning in NLP.In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics (ACL), pp.  3645–3650, 2019.
+Takase & Kiyono (2021)
+Takase, S. and Kiyono, S.Rethinking perturbations in encoder-decoders for fast training.In Proceedings of the 2021 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (NAACL-HLT), pp.  5767–5780, 2021.
+Takase & Kiyono (2023)
+Takase, S. and Kiyono, S.Lessons on parameter sharing across layers in transformers.In Proceedings of The Fourth Workshop on Simple and Efficient Natural Language Processing (SustaiNLP), pp.  78–90, 2023.
+Takase et al. (2023)
+Takase, S., Kiyono, S., Kobayashi, S., and Suzuki, J.B2T connection: Serving stability and performance in deep transformers.In Findings of the Association for Computational Linguistics: ACL 2023, pp.  3078–3095, 2023.
+Touvron et al. (2023)
+Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi, A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P., Bhosale, S., Bikel, D., Blecher, L., Ferrer, C. C., Chen, M., Cucurull, G., Esiobu, D., Fernandes, J., Fu, J., Fu, W., Fuller, B., Gao, C., Goswami, V., Goyal, N., Hartshorn, A., Hosseini, S., Hou, R., Inan, H., Kardas, M., Kerkez, V., Khabsa, M., Kloumann, I., Korenev, A., Koura, P. S., Lachaux, M.-A., Lavril, T., Lee, J., Liskovich, D., Lu, Y., Mao, Y., Martinet, X., Mihaylov, T., Mishra, P., Molybog, I., Nie, Y., Poulton, A., Reizenstein, J., Rungta, R., Saladi, K., Schelten, A., Silva, R., Smith, E. M., Subramanian, R., Tan, X. E., Tang, B., Taylor, R., Williams, A., Kuan, J. X., Xu, P., Yan, Z., Zarov, I., Zhang, Y., Fan, A., Kambadur, M., Narang, S., Rodriguez, A., Stojnic, R., Edunov, S., and Scialom, T.Llama 2: Open foundation and fine-tuned chat models, 2023.
+Vaswani et al. (2017)
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L. u., and Polosukhin, I.Attention is all you need.In Advances in Neural Information Processing Systems 30 (NIPS), pp.  5998–6008. 2017.
+Wang & Komatsuzaki (2021)
+Wang, B. and Komatsuzaki, A.Gpt-j-6b: A 6 billion parameter autoregressive language model, 2021.
+Wang et al. (2022)
+Wang, H., Ma, S., Dong, L., Huang, S., Zhang, D., and Wei, F.Deepnet: Scaling transformers to 1,000 layers, 2022.
+Wortsman et al. (2023)
+Wortsman, M., Liu, P. J., Xiao, L., Everett, K., Alemi, A., Adlam, B., Co-Reyes, J. D., Gur, I., Kumar, A., Novak, R., Pennington, J., Sohl-dickstein, J., Xu, K., Lee, J., Gilmer, J., and Kornblith, S.Small-scale proxies for large-scale transformer training instabilities, 2023.
+Xiong et al. (2020)
+Xiong, R., Yang, Y., He, D., Zheng, K., Zheng, S., Xing, C., Zhang, H., Lan, Y., Wang, L., and Liu, T.On layer normalization in the transformer architecture.In Proceedings of the 37th International Conference on Machine Learning (ICML), pp.  10524–10533, 2020.
+Zeng et al. (2023)
+Zeng, A., Liu, X., Du, Z., Wang, Z., Lai, H., Ding, M., Yang, Z., Xu, Y., Zheng, W., Xia, X., Tam, W. L., Ma, Z., Xue, Y., Zhai, J., Chen, W., Liu, Z., Zhang, P., Dong, Y., and Tang, J.GLM-130b: An open bilingual pre-trained model.In The Eleventh International Conference on Learning Representations (ICLR), 2023.
+Zhai et al. (2023)
+Zhai, S., Likhomanenko, T., Littwin, E., Busbridge, D., Ramapuram, J., Zhang, Y., Gu, J., and Susskind., J. M.Stabilizing transformer training by preventing attention entropy collapse.In Proceedings of the 40th International Conference on Machine Learning (ICML), 2023.
+Zhang & Sennrich (2019)
+Zhang, B. and Sennrich, R.Root mean square layer normalization.In Advances in Neural Information Processing Systems 32 (NeurIPS), 2019.
+Zhang et al. (2019a)
+Zhang, B., Titov, I., and Sennrich, R.Improving deep transformer with depth-scaled initialization and merged attention.In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP), pp.  898–909, 2019a.
+Zhang et al. (2019b)
+Zhang, H., Dauphin, Y. N., and Ma, T.Fixup initialization: Residual learning without normalization.In Proceedings of the 7th International Conference on Learning Representations (ICLR), 2019b.
+Zhang et al. (2022)
+Zhang, S., Roller, S., Goyal, N., Artetxe, M., Chen, M., Chen, S., Dewan, C., Diab, M., Li, X., Lin, X. V., Mihaylov, T., Ott, M., Shleifer, S., Shuster, K., Simig, D., Koura, P. S., Sridhar, A., Wang, T., and Zettlemoyer, L.Opt: Open pre-trained transformer language models, 2022.
+Appendix AHyper-Parameters
+
+Table 3:Hyper-parameters used in our experiments on the LLM pre-training.
+Name	350M	1.7B	13B
+Precision	float16	float16	float16
+Layer num	24	24	40
+Hidden dim size	1024	2304	5120
+FFN dim size	4096	9216	20480
+Attention heads	16	24	40
+Dropout rate	0.1	0.1	0.1
+Sequence length	2048	2048	2048
+Batch size	528	528	2097152
+The number of updates	35000	35000	50000
+Adam 
+β
+1
+0.9	0.9	0.9
+Adam 
+β
+2
+0.999	0.999	0.95
+Gradient clipping	1.0	1.0	1.0
+Lr decay style	cosine	cosine	cosine
+Lr warmup fraction	0.05	0.05	0.05
+Weight decay	0.01	0.01	0.01
+Table 3 shows that hyper-parameters used in our experiments on LLMs. In addition to experiments described in Section 4, this table also indicates the hyper-parameters of the model with 13B parameters that we evaluated in Appendix E.
+
+Appendix BRelated Work
+Stability
+To stabilize trainings of Transformer-based neural language models, there have been various discussions on the architecture (Xiong et al., 2020; Liu et al., 2020; Takase et al., 2023; Zeng et al., 2023; Zhai et al., 2023), initialization method (Nguyen & Salazar, 2019; Zhang et al., 2019b; Huang et al., 2020; Wang et al., 2022), training strategy (Zhang et al., 2022; Li et al., 2022), and loss function (Chowdhery et al., 2022; Wortsman et al., 2023).
+
+Xiong et al. (2020) theoretically analyzed gradient scales of each part in Transformers, and indicated that the Pre-LN Transformer is more stable than the Post-LN Transformer, that is the original Transformer architecture (Vaswani et al., 2017). Since the Pre-LN Transformer is more stable than the Post-LN Transformer theoretically and empirically, recent studies mainly have used the Pre-LN Transformer to construct an LLM. We also assume using the Pre-LN Transformer in the analysis on the training dynamics in this paper.
+
+To stabilize the LLM pre-training, Le Scao et al. (2022) applied the layer normalization to the embedding layer. Zeng et al. (2023) used shrink embedding gradient technique (Ding et al., 2021). In this study, we proved that the layer normalization to the embedding layer prevents the exploding gradients around layer normalizations in internal layers when we use the scaled initialization, which is a widely used initialization method for LLMs (Nguyen & Salazar, 2019; Shoeybi et al., 2020), and thus, it stabilizes the pre-training.
+
+For the initialization methods, Nguyen & Salazar (2019) proposed a strategy to initialize parameters of Transformers with small values to stabilize their training. Zhang et al. (2019b) and Huang et al. (2020) indicated that we can remove layer normalizations in Transformers if we use their proposed initialization methods. Wang et al. (2022) adjusted initial parameter scales based on the number of layers to stabilize the Post-LN Transformer. In this study, we indicated that an initialization method affects the LLM pre-training dynamics. In particular, we indicated that the widely used initialization method (Shoeybi et al., 2020) prevents the explosion due to the shortcut but causes the explosion due to layer normalizations. Moreover, we proved that we can prevent the explosion due to layer normalizations by making the variance of embeddings close to 
+1
+.
+
+Efficiency
+As shown in Table 2, our modification enables the pre-training with a relatively larger learning rate, and can achieve better performance. Thus, this study can be regarded as on the efficiency of LLM pre-training because our modification can construct a better LLM with a given budget. Strubell et al. (2019) and Schwartz et al. (2019) reported that recent neural methods require substantial computational costs, and thus, they argued that we have to explore a cost-efficient approach.
+
+Rajbhandari et al. (2020) proposed ZeRO that reduces memory redundancies during the multi GPU training without increasing communication volume. Dao et al. (2022) focused on GPU memory reads/writes, and proposed FlashAttention that accelerates the speed of attention mechanisms in Transformers. To reduce the number of computations in the attention mechanism, Shazeer (2019) proposed the multi-query attention that shares one key and value across all of the attention heads in each layer. Takase & Kiyono (2023) explored several parameter sharing strategies, and indicated that parameter sharing across some layers can achieve comparable performance to the vanilla model with a small number of parameters. Moreover, several studies have explored a better construction way with a limited budget (Izsak et al., 2021; Takase & Kiyono, 2021). We believe that we can take advantage of their findings to make our LLMs more efficient.
+
+Appendix CWang and Komatsuzaki Initialization
+Black et al. (2022) and Biderman et al. (2023) initialized 
+W
+2
+ and 
+W
+O
+ with the normal distribution 
+𝒩
+⁢
+(
+0
+,
+2
+/
+(
+N
+⁢
+d
+)
+)
+ instead of using 
+𝒩
+⁢
+(
+0
+,
+σ
+/
+2
+⁢
+N
+)
+. We compare these two standard deviations: 
+2
+/
+(
+N
+⁢
+d
+)
+ and 
+(
+σ
+/
+2
+⁢
+N
+)
+ in this section. As described in Section 2.2, we use 
+σ
+=
+2
+/
+5
+⁢
+d
+, and thus, 
+σ
+/
+2
+⁢
+N
+=
+1
+/
+5
+⁢
+N
+⁢
+d
+.
+
+Let 
+υ
+ be 
+1
+/
+5
+⁢
+N
+⁢
+d
+, then 
+υ
+⁢
+20
+/
+N
+=
+2
+/
+(
+N
+⁢
+d
+)
+. Therefore, if 
+N
+>
+20
+, 
+υ
+>
+2
+/
+(
+N
+⁢
+d
+)
+. In addition, the standard deviations of 
+FFN
+⁢
+(
+x
+)
+ and 
+Attention
+⁢
+(
+x
+)
+ are much smaller than ones described in Section 3.2 in the case where we use the initialization method by Wang & Komatsuzaki (2021) and 
+υ
+>
+2
+/
+(
+N
+⁢
+d
+)
+. As described in Appendix A, 
+N
+ is larger than 
+20
+ in this paper. Thus, we also face the exploding gradients by LNs if we use the initialization method by Wang & Komatsuzaki (2021).
+
+Appendix DComparison with Post-LN Transformer
+As described in Section 2.1, recent studies use the Pre-LN Transformer architecture to construct their LLMs because the architecture is more stable. In contrast, some recent studies reported that the Post-LN Transformer, which is the original architecture, can achieve better performance than the Pre-LN if we address the instability issue in the Post-LN, i.e., the vanishing gradient problem (Liu et al., 2020; Takase et al., 2023; Wang et al., 2022). We discuss whether the Pre-LN Transformer entirely underperforms the Post-LN. We conducted experiments on machine translation experiments because previous studies mainly focused on them.
+
+We followed the experimental settings in Takase et al. (2023). Table 4 shows the details of hyper-parameters. We used the WMT English-to-German training dataset (Vaswani et al., 2017; Ott et al., 2018), and evaluated each model in newstest2010-2016. We used the encoder-decoder architecture proposed by Peitz et al. (2019). To stabilize the Post-LN Transformer, we applied DeepNet (Wang et al., 2022) and B2T connection (Takase et al., 2023). We compared them to Scaled Embed, that is, the Pre-LN Transformer with the stabilizing techniques described in this paper.
+
+Table 5 shows the averaged BLEU scores among newstest2010-2016. For the BLEU score calculation, we used SacreBLEU (Post, 2018) to obtain compatible scores (Marie et al., 2021). The signature of SacreBLEU is BLEU+case.mixed+numrefs.1+smooth.exp+tok.13a+version.1.5.0. As shown in this table, we used two learning rates: 
+lr
+=
+1.0
+×
+10
+−
+3
+ and 
+3.0
+×
+10
+−
+3
+. For 
+lr
+=
+1.0
+×
+10
+−
+3
+, DeepNet and B2T connection outperformed Scaled Embed. Thus, the Post-LN Transformer-based methods achieved better performance than the Pre-LN Transformer-based method. This result corresponds to reports in previous studies (Liu et al., 2020; Wang et al., 2022; Takase et al., 2023).
+
+On the other hand, for 
+lr
+=
+3.0
+×
+10
+−
+3
+, Scaled Embed achieved better performance than the others with 
+lr
+=
+1.0
+×
+10
+−
+3
+, and the training of the others failed due to the exploding gradients. This result indicates that the Pre-LN Transformer-based method can achieve better performance if we use a large learning rate. Therefore, the Pre-LN Transformer (with the stabilizing techniques) is more stable than the Post-LN Transformer-based method, and thus, it can achieve better performance when we use a large learning rate that is too large to train the Post-LN Transformers.
+
+
+Table 4:Hyper-parameters used in the comparison with Post-LN Transformer.
+Precision	float16
+Layer num	18
+Hidden dim size	512
+FFN dim size	2048
+Attention heads	8
+Dropout rate	0.5
+Word dropout rate	0.1
+Max tokens	7168
+Adam 
+β
+1
+0.9
+Adam 
+β
+2
+0.98
+Gradient clipping	0.1
+Lr decay style	inverse square root
+Warmup step	4000
+Weight decay	0
+
+Table 5:Averaged BLEU scores among newstest2010-2016.
+Model	2010	2011	2012	2013	2014	2015	2016	Average 
+↑
+lr
+=
+1.0
+×
+10
+−
+3
+DeepNet	24.65	22.30	22.87	26.51	27.29	29.77	34.87	26.89
+B2T connection	24.46	22.42	22.85	26.51	27.46	29.91	34.65	26.89
+Scaled Embed	24.32	22.21	22.40	26.38	26.89	29.98	34.53	26.67
+lr
+=
+3.0
+×
+10
+−
+3
+DeepNet	N/A	N/A
+B2T connection	N/A	N/A
+Scaled Embed	24.52	22.23	22.86	26.54	27.35	29.90	35.16	26.94
+Appendix EPre-training of the Model with 13B Parameters
+Refer to caption
+(a)
+lr
+=
+3.0
+×
+10
+−
+4
+ .
+Refer to caption
+(b)
+lr
+=
+1.0
+×
+10
+−
+4
+.
+Figure 11:Loss values of each method with 13B parameters when we use two learning rates: 
+lr
+=
+3.0
+×
+10
+−
+4
+ and 
+1.0
+×
+10
+−
+4
+
+Table 6:Perplexities of each method with 13B parameters when we use two learning rates: 
+lr
+=
+3.0
+×
+10
+−
+4
+ and 
+1.0
+×
+10
+−
+4
+.
+WikiText 
+↓
+LAMBADA 
+↓
+Model	
+lr
+=
+3.0
+×
+10
+−
+4
+lr
+=
+1.0
+×
+10
+−
+4
+lr
+=
+3.0
+×
+10
+−
+4
+lr
+=
+1.0
+×
+10
+−
+4
+Vanilla	N/A	15.12	N/A	6.50
+Scaled Embed	14.47	15.25	5.97	6.53
+We conducted pre-trainings of models with 13B parameters to indicate that our modification can stabilize a model with many more parameters than the ones discussed in Section 4. To make this experiment close to a realistic situation, as shown in Table 3, we increased the batch size and the number of updates, and decreased the Adam 
+β
+2
+. In particular, for Adam 
+β
+2
+, most studies have used 
+0.95
+ to stabilize their pre-trainings (Brown et al., 2020; Zhang et al., 2022; Zeng et al., 2023; Biderman et al., 2023; Touvron et al., 2023), and thus, we also used 
+0.95
+ in this experiment. We tried two learning rates: 
+3.0
+×
+10
+−
+4
+, which is the same value in Touvron et al. (2023), and 
+1.0
+×
+10
+−
+4
+.
+
+Figure 11 shows the loss values of each configuration in validation data. As shown in (a) of this figure, the loss value of Vanilla rose from approximately 10000 steps in 
+lr
+=
+3.0
+×
+10
+−
+4
+. Then, the gradient of this model became too large to continue its pre-training. In contrast, the loss value of Scaled Embed consistently decreased. This result indicates that Scaled Embed stabilized the pre-training. We emphasize that the pre-training of Vanilla is essentially unstable even if we use the widely used Adam 
+β
+2
+ value, 
+0.95
+, which is known as the technique to stabilize the pre-training, and our modification is also effective for the stabilization in this realistic situation.
+
+Table 6 shows the perplexities of each configuration in evaluation data. This table indicates that we can achieve better performance when we use a larger learning rate in the same as in Section 5.1. In addition, the perplexities of Scaled Embed were comparable to ones of Vanilla when we used the small learning rate: 
+lr
+=
+1.0
+×
+10
+−
+4
+. These results imply that our modification has no considerable risk in pre-training. Thus, we recommend making the standard deviation of each embedding close to 
+1
+ to stabilize the pre-trainings of LLMs.

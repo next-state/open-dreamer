@@ -151,6 +151,8 @@ class DynamicsModelConfig:
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
+    use_depth_scaled_init: bool = False
+    use_embed_ln: bool = False
     dtype: str = "float32"
     param_dtype: str = "float32"
 

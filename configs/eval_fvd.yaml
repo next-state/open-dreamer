@@ -1,5 +1,5 @@
 defaults:
-  - dataset: minecraft_vpt
+  - dataset: minecraft_vpt_latent
   - _self_
 
 # Path to dynamics checkpoint (contains both dynamics + tokenizer)
