@@ -88,7 +88,11 @@ def build_parallel(strategy: Literal["data", "fsdp", "tp", "sp"]) -> tuple[Mesh,
     elif strategy == "fsdp":
         mesh = jax.make_mesh((n, 1), ('data', 'model'))
         sharding = NamedSharding(mesh, P('data', None))
-        rules = MeshRules(embed='data', mlp='data', attn='data', data='data')
+        # Keep embedding-like parameters replicated under FSDP.
+        # Small vocab / token tables (e.g. binary action embeddings) are not
+        # generally divisible by the data-axis mesh size, and only tensor
+        # parallelism should shard embeddings.
+        rules = MeshRules(embed=None, mlp='data', attn='data', data='data')
 
     elif strategy == "tp":
         mesh = jax.make_mesh((1, n), ('data', 'model'))
