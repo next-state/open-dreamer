@@ -1,4 +1,3 @@
-from numpy.distutils.unixccompiler import UnixCCompiler__compile
 import einops
 import jax.numpy as jnp
 from flax import nnx
@@ -300,7 +299,7 @@ class MLP(nnx.Module):
         self.fc_out = nnx.Linear(hidden, d_model, use_bias=self.use_bias, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
         self.dropout = nnx.Dropout(dropout_rate)
 
-    def __call__(self, x: jnp.ndarray, *, deterministic: bool = True, rngs: nnx.Rngs | None = None) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray,  deterministic: bool = True, rngs: nnx.Rngs | None = None) -> jnp.ndarray:
         if self.use_norm:
             x = self.norm(x)
 
@@ -364,7 +363,6 @@ class GroupedQueryAttention(nnx.Module):
     def __call__(
             self,
             x,
-            *args,
             mask: jnp.ndarray | None = None,
             local_window_size: int | tuple[int, int] | None = None,
             deterministic: bool = True,
@@ -533,7 +531,7 @@ class SpaceSelfAttention(nnx.Module):
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B T) S D")
 
-        out, _, attn_weights = self.attn(x, mask=mask, deterministic=deterministic, cache=None, rngs=rngs, return_weights=return_weights)
+        out, _, attn_weights = nnx.remat(self.attn, static_argnums=(2, 3, 4, 6),)(x, mask, None, deterministic, None, rngs, return_weights)
         out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
         if attn_weights is not None:
             attn_weights = rearrange(attn_weights, "(B T) N S1 S2 -> B T N S1 S2", B=B, T=T)
@@ -576,7 +574,7 @@ class TimeSelfAttention(nnx.Module):
         if mask is not None and mask.ndim >= 3 and mask.shape[0] == B:
             mask = repeat(mask, 'B ... -> (B S) ...', S=S)
 
-        out, new_cache, attn_weights = self.attn(x, mask=mask, local_window_size=local_window_size, cache=cache, deterministic=deterministic, rngs=rngs, return_weights=return_weights)
+        out, new_cache, attn_weights = nnx.remat(self.attn, static_argnums=(2, 3, 4, 6),)(x, mask, local_window_size, deterministic, None, rngs, return_weights)
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         if attn_weights is not None:
             attn_weights = rearrange(attn_weights, "(B S) N T1 T2 -> B S N T1 T2", B=B, S=S)
@@ -652,7 +650,7 @@ class BlockCausalLayer(nnx.Module):
         x = x + y
 
         # MLP
-        y = self.mlp(x, deterministic=deterministic, rngs=rngs)
+        y = nnx.remat(self.mlp)(x, deterministic=deterministic, rngs=rngs)
         x = x + y
         return x, new_cache, attn_weights
 

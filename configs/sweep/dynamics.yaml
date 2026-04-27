@@ -1,34 +1,28 @@
 program: scripts/train_dynamics.py
-method: random
+entity: pal
+project: tiny_dreamer_4
+method: grid
 
 metric:
-  name: eval/diffusion/psnr
-  goal: maximize
+  name: train/flow_mse_sequence
+  goal: minimize
 
 parameters:
-  max_lr:
-    values: [1e-4, 3e-4]
-
-  dynamics.n_register:
-    values: [16, 32]
+  lr_schedule.lr:
+    values: [1e-3, 6e-4, 3e-4, 1e-4]
   
-  # dynamics.k_max:
-  #   values: [8, 64]
-
-  # dynamics.dropout_rate:
-  #   values: [0.05]
-
-  dynamics.n_heads:
-    values: [4, 8]
-  
-  dynamics.n_kv_heads:
-    values: [2, 4]
-
-  use_wandb:
-    value: true
+  optimizer.muon_beta:
+    values: [0.99, 0.95]
 
   max_steps:
-    value: 50000
+    value: 100_000
+  
+  bootstrap_start:
+    value: 50_000
+  
+  dynamics.depth:
+    value: 16
+  
 
 command:
   - uv

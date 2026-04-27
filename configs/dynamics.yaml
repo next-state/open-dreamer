@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-long-muon-beta
+run_name: dynamics-pre-final
 tokenizer_ckpt: logs/tokenizer-500M/checkpoints
 
 ckpt:
@@ -12,12 +12,12 @@ ckpt:
 
 dataset:
   dataloader_cfg:
-    B: 32
-    num_workers: 32
+    B: 8
+    num_workers: 16
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
     short_T: 64
-    long_T: 64
+    long_T: 256
     long_ratio: 0.1  # Fraction of batches that use long_T
 
 dynamics:
@@ -87,8 +87,8 @@ optimizer:
   mup_scaling: false
   agc_clipping: 0.0
   agc_eps: 1e-3
-  muon_beta: 0.95
+  muon_beta: 0.99
   muon_nesterov: true
   muon_ns_steps: 5
 
-write_video_every: 10_000
+write_video_every: 0

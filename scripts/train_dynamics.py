@@ -9,7 +9,7 @@ def _append_xla_flag(flag: str) -> None:
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.80")
 _append_xla_flag("--xla_gpu_triton_gemm_any=True")
-_append_xla_flag("--xla_gpu_enable_latency_hiding_scheduler=true")
+# _append_xla_flag("--xla_gpu_enable_latency_hiding_scheduler=true")
 
 import logging
 
@@ -17,6 +17,7 @@ import hydra
 import jax
 import jax.numpy as jnp
 from jax.experimental import multihost_utils
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import optax
 from flax import nnx
@@ -28,7 +29,7 @@ from dreamer.data import build_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
 from dreamer.actions import Actions, shift_actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES
-from dreamer.parallel import build_parallel
+from dreamer.parallel import build_parallel, MeshRules
 from dreamer.scaling import ScalingContext
 from dreamer.training import (
     run_evaluation,
@@ -50,7 +51,7 @@ from dreamer.utils import (
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.98'
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
 
 # Register OmegaConf resolver for arithmetic expressions
 OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
@@ -60,9 +61,9 @@ OmegaConf.register_new_resolver("max", lambda *args: max(args))
 OmegaConf.register_new_resolver("min", lambda *args: min(args))
 
 # jax.config.update("jax_compilation_cache_dir", "/scratch/jax_cache")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+# jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
 
 
 # ---------------------------
@@ -169,6 +170,10 @@ def run(cfg: DynamicsConfig):
 
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
+    # mesh = jax.make_mesh((cfg.dataset.dataloader_cfg.B, jax.local_device_count()//cfg.dataset.dataloader_cfg.B), ('data', 'seq'))
+    # data_sharding = NamedSharding(mesh, P('data', 'seq', None, None))
+    # mesh_rules = MeshRules(data='data', seq='seq', mlp='data', attn='data')
+
     is_main_process = jax.process_index() == 0
     is_multihost = jax.process_count() > 1
 
@@ -342,3 +347,4 @@ def main(cfg: DynamicsConfig):
 
 if __name__ == "__main__":
     main()
+
