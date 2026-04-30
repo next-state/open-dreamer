@@ -574,7 +574,7 @@ class TimeSelfAttention(nnx.Module):
         if mask is not None and mask.ndim >= 3 and mask.shape[0] == B:
             mask = repeat(mask, 'B ... -> (B S) ...', S=S)
 
-        out, new_cache, attn_weights = nnx.remat(self.attn, static_argnums=(2, 3, 4, 6),)(x, mask, local_window_size, deterministic, None, rngs, return_weights)
+        out, new_cache, attn_weights = nnx.remat(self.attn, static_argnums=(2, 3, 6),)(x, mask, local_window_size, deterministic, cache, rngs, return_weights)
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         if attn_weights is not None:
             attn_weights = rearrange(attn_weights, "(B S) N T1 T2 -> B S N T1 T2", B=B, S=S)
