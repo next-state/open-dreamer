@@ -65,17 +65,24 @@ def make_tokenization_iterator(
     patch_size: int,
     decoder_threads: int = 1,
     worker_buffer_size: int = 1,
+    process_index: int = 0,
+    process_count: int = 1,
 ):
     """Create dataloader for tokenization (sequential, no shuffle, full episodes)."""
     all_shards = sorted(Path(input_dir).glob("shard-*.array_record"))
     if index_max is not None:
         all_shards = all_shards[:index_max]
+
+    # Distribute shards across processes: process i handles shards i, i+N, i+2N, ...
+    if process_count > 1:
+        all_shards = all_shards[process_index::process_count]
+
     shard_paths = [str(p) for p in all_shards]
 
     if not shard_paths:
-        raise ValueError(f"No shards found in {input_dir}")
+        raise ValueError(f"No shards found in {input_dir} for process {process_index}/{process_count}")
 
-    print(f"[tokenize] Found {len(shard_paths)} shards")
+    print(f"[tokenize] Process {process_index}/{process_count}: {len(shard_paths)} shards")
 
     source = grain.sources.ArrayRecordDataSource(shard_paths)
 
@@ -247,12 +254,19 @@ class WelfordAccumulator:
 
 
 def run(cfg: DictConfig):
-    print(f"[tokenize] Loading tokenizer from: {cfg.tokenizer_ckpt}")
-    print(f"[tokenize] Input directory: {cfg.dataset.array_record_path}")
-    print(f"[tokenize] Output directory: {cfg.output_dir}")
     dataloader_cfg = cfg.dataset.dataloader_cfg
 
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
+    rank = jax.process_index()
+    world = jax.process_count()
+
+    # Each process writes to its own subdirectory to avoid shard name collisions
+    base_output_dir = Path(cfg.output_dir)
+    output_dir = base_output_dir / f"process_{rank}" if world > 1 else base_output_dir
+
+    print(f"[tokenize rank={rank}] Loading tokenizer from: {cfg.tokenizer_ckpt}")
+    print(f"[tokenize rank={rank}] Input directory: {cfg.dataset.array_record_path}")
+    print(f"[tokenize rank={rank}] Output directory: {output_dir}")
 
     with jax.set_mesh(mesh):
         # Load pretrained tokenizer
@@ -263,12 +277,12 @@ def run(cfg: DictConfig):
         tokenizer = bundle.tokenizer_ema
         del tokenizer.decoder  # Free decoder params — only encoding
 
-        print(f"[tokenize] Tokenizer loaded successfully")
-        print(f"[tokenize] n_latents: {tokenizer.encoder.n_latents}")
-        print(f"[tokenize] d_bottleneck: {tokenizer.cfg.encoder.d_bottleneck}")
-        print(f"[tokenize] patch_size: {tokenizer.cfg.encoder.patch_size}")
+        print(f"[tokenize rank={rank}] Tokenizer loaded successfully")
+        print(f"[tokenize rank={rank}] n_latents: {tokenizer.encoder.n_latents}")
+        print(f"[tokenize rank={rank}] d_bottleneck: {tokenizer.cfg.encoder.d_bottleneck}")
+        print(f"[tokenize rank={rank}] patch_size: {tokenizer.cfg.encoder.patch_size}")
 
-        # Create dataloader
+        # Create dataloader — each process handles its slice of shards
         base_dataloader = make_tokenization_iterator(
             input_dir=cfg.dataset.array_record_path,
             index_max=cfg.dataset.index_max,
@@ -282,6 +296,8 @@ def run(cfg: DictConfig):
             patch_size=cfg.dataset.patch_size,
             decoder_threads=int(getattr(dataloader_cfg, "decoder_threads", 1)),
             worker_buffer_size=int(getattr(dataloader_cfg, "worker_buffer_size", 1)),
+            process_index=rank,
+            process_count=world,
         )
 
         # Build async prefetch pipeline: CPU buffer → device transfer → device buffer
@@ -293,7 +309,6 @@ def run(cfg: DictConfig):
         )
 
         # Create async shard writer (disk I/O on background thread)
-        output_dir = Path(cfg.output_dir)
         writer = AsyncShardWriter(
             output_dir,
             records_per_shard=cfg.records_per_shard,
@@ -322,7 +337,7 @@ def run(cfg: DictConfig):
         import time
 
         try:
-            pbar = tqdm(prefetched, desc="Tokenizing")
+            pbar = tqdm(prefetched, desc=f"Tokenizing [rank={rank}]")
             t_iter_start = time.perf_counter()
             for batch in pbar:
                 t_iter = time.perf_counter() - t_iter_start
@@ -396,10 +411,10 @@ def run(cfg: DictConfig):
                     num_videos=total_videos,
                 )
 
-        print(f"[tokenize] Done! Processed {total_videos} videos")
-        print(f"[tokenize] Wrote {writer.shard_idx} shards to {cfg.output_dir}")
-        print(f"[tokenize] Total records: {writer.total_records}")
-        print(f"[tokenize] Latent stats saved to: {stats_path}")
+        print(f"[tokenize rank={rank}] Done! Processed {total_videos} videos")
+        print(f"[tokenize rank={rank}] Wrote {writer.shard_idx} shards to {output_dir}")
+        print(f"[tokenize rank={rank}] Total records: {writer.total_records}")
+        print(f"[tokenize rank={rank}] Latent stats saved to: {stats_path}")
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="tokenize")
