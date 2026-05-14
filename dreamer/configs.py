@@ -23,6 +23,10 @@ class DataloaderConfig:
 
     dtype: str = "bfloat16"
 
+    # Video decode (decord) and Grain queue depth — mainly for MP4 / minecraft_vpt.
+    decoder_threads: int = 1
+    worker_buffer_size: int = 1
+
 @dataclass(frozen=False, unsafe_hash=True)
 class DatasetConfig:
     """Configuration for dataset parameters.

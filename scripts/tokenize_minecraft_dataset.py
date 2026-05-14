@@ -63,6 +63,8 @@ def make_tokenization_iterator(
     padding_h: tuple[int, int],
     padding_w: tuple[int, int],
     patch_size: int,
+    decoder_threads: int = 1,
+    worker_buffer_size: int = 1,
 ):
     """Create dataloader for tokenization (sequential, no shuffle, full episodes)."""
     all_shards = sorted(Path(input_dir).glob("shard-*.array_record"))
@@ -94,6 +96,7 @@ def make_tokenization_iterator(
             padding_w=padding_w,
             patch_size=patch_size,
             full_episode=True,
+            decoder_threads=decoder_threads,
         ),
         grain.transforms.Batch(batch_size=batch_size, drop_remainder=True),
     ]
@@ -103,7 +106,7 @@ def make_tokenization_iterator(
         sampler=sampler,
         operations=operations,
         worker_count=num_workers,
-        worker_buffer_size=1,
+        worker_buffer_size=worker_buffer_size,
     )
 
 
@@ -257,7 +260,7 @@ def run(cfg: DictConfig):
             cfg.tokenizer_ckpt,
             mesh_rules=mesh_rules,
         )
-        tokenizer = bundle.tokenizer
+        tokenizer = bundle.tokenizer_ema
         del tokenizer.decoder  # Free decoder params — only encoding
 
         print(f"[tokenize] Tokenizer loaded successfully")
@@ -277,6 +280,8 @@ def run(cfg: DictConfig):
             padding_h=cfg.dataset.padding_H,
             padding_w=cfg.dataset.padding_W,
             patch_size=cfg.dataset.patch_size,
+            decoder_threads=int(getattr(dataloader_cfg, "decoder_threads", 1)),
+            worker_buffer_size=int(getattr(dataloader_cfg, "worker_buffer_size", 1)),
         )
 
         # Build async prefetch pipeline: CPU buffer → device transfer → device buffer

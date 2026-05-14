@@ -107,6 +107,7 @@ def build_iterator(
                 padding_w=cfg.padding_W,
                 patch_size=cfg.patch_size,
                 return_actions=return_actions,
+                decoder_threads=int(getattr(dataloader_cfg, "decoder_threads", 1)),
             )
         ]
     else:
@@ -140,7 +141,7 @@ def build_iterator(
         sampler=sampler,
         operations=operations,
         worker_count=num_workers,
-        worker_buffer_size=1,
+        worker_buffer_size=int(getattr(dataloader_cfg, "worker_buffer_size", 1)),
         read_options=grain.ReadOptions(
             prefetch_buffer_size=prefetch_buffer_size if device is None else 1,
             num_threads=1,
