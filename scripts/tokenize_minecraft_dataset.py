@@ -53,6 +53,7 @@ os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
 
 def make_tokenization_iterator(
     input_dir: str,
+    index_min: int | None,
     index_max: int | None,
     batch_size: int,
     num_workers: int,
@@ -70,6 +71,8 @@ def make_tokenization_iterator(
 ):
     """Create dataloader for tokenization (sequential, no shuffle, full episodes)."""
     all_shards = sorted(Path(input_dir).glob("shard-*.array_record"))
+    if index_min is not None:
+        all_shards = all_shards[index_min:]
     if index_max is not None:
         all_shards = all_shards[:index_max]
 
@@ -285,6 +288,7 @@ def run(cfg: DictConfig):
         # Create dataloader — each process handles its slice of shards
         base_dataloader = make_tokenization_iterator(
             input_dir=cfg.dataset.array_record_path,
+            index_min=cfg.dataset.index_min,
             index_max=cfg.dataset.index_max,
             batch_size=dataloader_cfg.B,
             num_workers=dataloader_cfg.num_workers,

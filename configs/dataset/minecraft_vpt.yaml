@@ -5,6 +5,8 @@ name: minecraft_vpt
 data_type: video
 
 array_record_path: /mnt/data/minecraft-vpt/arrayrecords-mp4
+#412
+index_min: null
 index_max: 1648
 num_max_samples: -1
 
