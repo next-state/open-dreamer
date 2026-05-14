@@ -6,10 +6,9 @@ max_steps: 30_000
 
 dataset:
   dataloader_cfg:
-    B: 2
-    short_T: 32
-    long_T: 128
-    num_workers: 32
+    B: 8
+    short_T: 16
+    long_T: 16
     
 # Freeze encoder, linearly reduce masking from 0.9 → 0.0
 mae_finetune: true
