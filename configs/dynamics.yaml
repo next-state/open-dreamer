@@ -12,7 +12,7 @@ ckpt:
 
 dataset:
   dataloader_cfg:
-    B: 8
+    B: 32
     num_workers: 16
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
