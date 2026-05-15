@@ -3,11 +3,11 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-pre-final
-tokenizer_ckpt: logs/tokenizer-500M/checkpoints
+run_name: Madre_de_dios
+tokenizer_ckpt: /mnt/data/minecraft-vpt/models/tokenizer-500M/checkpoints/
 
 ckpt:
-  max_to_keep: 1
+  max_to_keep: 10000
   save_interval_steps: 5_000
 
 dataset:
@@ -52,10 +52,10 @@ dynamics:
 
 ema_decay: 0.999
 
-max_steps: 200_000
-bootstrap_start: 100_000  # Number of start steps trained exclusively on flow-matching objective
+max_steps: 600_005
+bootstrap_start: 150_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
-image_fraction: 0.0  # Fraction of batch to train as images (no temporal attention)
+image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
 
 # Optimal transport coupling (minibatch OT)
 ot:

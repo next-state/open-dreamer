@@ -37,4 +37,4 @@ seed: 0
 # Hydra
 hydra:
   run:
-    dir: logs/${run_name}
+    dir: /mnt/data/minecraft-vpt/models/${run_name}
