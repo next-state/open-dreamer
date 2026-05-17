@@ -8,8 +8,3 @@ dynamics_ckpt_subdir: ""
 # Denoising
 num_steps: 4
 tau_ctx_target: 0.9
-
-# Output video
-fps: 20
-height: 360
-width: 640

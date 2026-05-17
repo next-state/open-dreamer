@@ -1,6 +1,6 @@
 "use client";
 
-import { useReactor } from "@reactor-team/js-sdk";
+import { useReactor, useStats } from "@reactor-team/js-sdk";
 
 interface ReactorStatusProps {
   className?: string;
@@ -12,6 +12,9 @@ export function ReactorStatus({ className }: ReactorStatusProps) {
     connect: state.connect,
     disconnect: state.disconnect,
   }));
+  const stats = useStats();
+  const fps = stats?.framesPerSecond;
+  const rtt = stats?.rtt;
 
   return (
     <div
@@ -47,6 +50,12 @@ export function ReactorStatus({ className }: ReactorStatusProps) {
                 : "Ready"}
             </span>
           </div>
+          {status === "ready" && (
+            <div className="flex items-center gap-2 text-xs text-gray-400 font-mono">
+              <span>{fps !== undefined ? `${fps.toFixed(1)} FPS` : "— FPS"}</span>
+              {rtt !== undefined && <span>· {rtt.toFixed(0)} ms RTT</span>}
+            </div>
+          )}
         </div>
         {status === "disconnected" ? (
           <button

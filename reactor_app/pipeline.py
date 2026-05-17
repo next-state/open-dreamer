@@ -5,6 +5,7 @@ Dynamics-only autoregressive next-frame generation with action conditioning.
 No prefill, no dataset: each client session starts from empty caches and
 generates frames driven entirely by live keyboard + mouse input.
 """
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,6 +56,10 @@ class WorldModelState(InputState):
     # Set by the `switch_to_policy` event; left private to suppress the
     # auto-generated `set_use_policy` event.
     _use_policy: bool = False
+    # Seed for the RNG; bumped on new_scene. Initialized in @connected.
+    _seed: int = 0
+    # Flipped by new_scene; inference() resets caches + rng on next tick.
+    _reset_requested: bool = False
 
 
 # ----------------------------------------------------------------------------
@@ -109,11 +114,6 @@ class WorldModelPipeline(ReactorPipeline):
     state: WorldModelState
 
     def load(self, config: dict[str, Any]) -> None:
-        # Output sizing
-        self._fps = int(config.get("fps", 20))
-        self._display_h = int(config.get("height", 360))
-        self._display_w = int(config.get("width", 640))
-
         # Mesh + checkpoint
         weights_root = get_weights_path()
         subdir = config.get("dynamics_ckpt_subdir", "")
@@ -197,18 +197,27 @@ class WorldModelPipeline(ReactorPipeline):
 
     @connected
     async def on_connect(self) -> None:
-        # Per-session input state. Each new client starts with no held keys
-        # and a zeroed mouse delta.
+        # Per-session input state. Each new client starts with no held keys,
+        # a zeroed mouse delta, and a fresh random seed (so different sessions
+        # generate different scenes).
         self.state._keyboard = {}
         self.state._mouse = {"left": False, "right": False, "middle": False, "dx": 0.0, "dy": 0.0}
+        self.state._seed = int.from_bytes(os.urandom(4), "big")
+        self.state._reset_requested = False
 
     def inference(self):
-        rng = self._warmup_rng
+        rng = jax.random.PRNGKey(self.state._seed)
         dynamics_cache = self._empty_dynamics_cache
         tokenizer_cache = self._empty_tokenizer_cache
 
         with jax.set_mesh(self._mesh):
             while True:
+                if self.state._reset_requested:
+                    rng = jax.random.PRNGKey(self.state._seed)
+                    dynamics_cache = self._empty_dynamics_cache
+                    tokenizer_cache = self._empty_tokenizer_cache
+                    self.state._reset_requested = False
+
                 rng, key = jax.random.split(rng)
                 action = _build_action(self.state._keyboard, self.state._mouse)
 
@@ -268,3 +277,10 @@ class WorldModelPipeline(ReactorPipeline):
     @event(name="switch_to_policy", description="Toggle policy/manual control (no-op until policy head wired)")
     def switch_to_policy(self, enable: bool = True):
         self.state._use_policy = enable
+
+    @event(name="new_scene", description="Reset KV caches and seed; next frame starts a new scene")
+    def new_scene(self, seed: int = -1):
+        # Negative seed (the default) means "pick fresh random". Any non-negative
+        # value is honoured verbatim so clients can request reproducible scenes.
+        self.state._seed = int(seed) if seed >= 0 else int.from_bytes(os.urandom(4), "big")
+        self.state._reset_requested = True

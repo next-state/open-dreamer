@@ -6,6 +6,7 @@ import {
 import { ReactorStatus } from "@/components/ReactorStatus";
 import { KeyboardController } from "@/components/KeyboardController";
 import { AgentToggle } from "@/components/AgentToggle";
+import { NewSceneButton } from "@/components/NewSceneButton";
 import { useReactor } from "@reactor-team/js-sdk";
 
 function GameInterface() {
@@ -19,6 +20,7 @@ function GameInterface() {
     <div className="flex flex-col gap-3">
       <KeyboardController enabled={isConnected && status === "ready"} />
       <ReactorStatus />
+      <NewSceneButton />
       <AgentToggle />
     </div>
   );
