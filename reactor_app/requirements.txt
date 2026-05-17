@@ -1,0 +1,9 @@
+# Extra Python dependencies installed on top of the reactor-runtime-base
+# image's pre-baked venv. The runtime itself (reactor-runtime[gst]) is
+# already present in the base image — list ONLY your model's extra deps
+# here. The Dockerfile installs this file with `pip install --no-cache-dir
+# -r /app/requirements.txt` against the base image's /opt/venv, so
+# anything you add resolves against the same interpreter the runtime uses.
+
+numpy
+Pillow

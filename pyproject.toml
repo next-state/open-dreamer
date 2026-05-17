@@ -20,15 +20,10 @@ dependencies = [
     "array-record>=0.8.3",
     "grain>=0.2.15",
     "ipykernel>=7.1.0",
-    "reactor-runtime>=1.4",
+    "reactor-runtime>=2.7",
     "pandas>=2.3.3",
     "awscli>=1.27.0",
     "decord>=0.6.0",
-]
-
-[dependency-groups]
-inference = [
-   "minerl",
 ]
 
 

@@ -6,7 +6,6 @@ import {
 import { ReactorStatus } from "@/components/ReactorStatus";
 import { KeyboardController } from "@/components/KeyboardController";
 import { AgentToggle } from "@/components/AgentToggle";
-import { ImaginationToggle } from "@/components/ImaginationToggle";
 import { useReactor } from "@reactor-team/js-sdk";
 
 function GameInterface() {
@@ -20,7 +19,6 @@ function GameInterface() {
     <div className="flex flex-col gap-3">
       <KeyboardController enabled={isConnected && status === "ready"} />
       <ReactorStatus />
-      <ImaginationToggle />
       <AgentToggle />
     </div>
   );
@@ -52,8 +50,8 @@ export default function Home() {
             </a>
           </div>
         </div>
-        <ReactorProvider 
-          modelName="minerl"
+        <ReactorProvider
+          modelName="world-model"
           local
         >
           <GameInterface />

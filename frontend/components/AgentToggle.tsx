@@ -18,7 +18,7 @@ export function AgentToggle({ className }: AgentToggleProps) {
   const handleToggle = () => {
     const newValue = !useAgent;
     setUseAgent(newValue);
-    sendCommand("switch_to_agent", { enable: newValue });
+    sendCommand("switch_to_policy", { enable: newValue });
   };
 
   const isConnected = status === "ready" || status === "waiting";
