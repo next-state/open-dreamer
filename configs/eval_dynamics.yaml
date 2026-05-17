@@ -2,16 +2,16 @@ defaults:
   - dataset: minecraft_vpt_latent   # override with e.g. dataset=coinrun
   - _self_
 
-dynamics_ckpt: logs/dynamics-stable-big-latents/checkpoints          # Required: path to DynamicsCheckpointBundle checkpoint dir
+dynamics_ckpt: checkpoints          # Required: path to DynamicsCheckpointBundle checkpoint dir
 
 run_name: eval_dynamics
 use_wandb: false
 parallel_strategy: data
-seed: 0
+seed: 7
 
 dataset:
   dataloader_cfg:
-    B: 8                    # Number of sequences to sample
+    B: 1                    # Number of sequences to sample
     short_T: 256
     long_T: 256
 

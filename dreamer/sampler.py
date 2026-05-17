@@ -27,6 +27,15 @@ def decode_jit(tokenizer: Tokenizer, z: jax.Array) -> jax.Array:
     frames, _ = tokenizer.decode(z, deterministic=True)
     return frames
 
+def decode_chunked(tokenizer: Tokenizer, z: jax.Array, chunk_size: int) -> jax.Array:
+    """Decode latents in temporal chunks to cap peak VRAM from decoder feature maps."""
+    B, T = z.shape[:2]
+    chunks = [
+        decode_jit(tokenizer, z[:, t:t + chunk_size])
+        for t in range(0, T, chunk_size)
+    ]
+    return jnp.concatenate(chunks, axis=1)
+
 def sample_video(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -38,6 +47,8 @@ def sample_video(
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
     latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
+    use_scan: bool = True,
+    decode_chunk_size: int | None = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array | None]:
     """
     Sample video predictions using Tokenizer and Dynamics.
@@ -81,7 +92,8 @@ def sample_video(
     actions_ctx, actions_future = actions[:, :-horizon], actions[:, -horizon:]
 
     # Decode GT latents for visualization
-    gt_decoded_frames = decode_jit(tokenizer, latents)
+    decode = (lambda tok, z: decode_chunked(tok, z, decode_chunk_size)) if decode_chunk_size else decode_jit
+    gt_decoded_frames = decode(tokenizer, latents)
     gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
@@ -106,10 +118,11 @@ def sample_video(
         rng=rng,
         initial_task_embedding=initial_agent_tokens,
         deterministic=True,
+        use_scan=use_scan,
     )
 
     # Decode predicted latents to frames
-    pred_frames = decode_jit(tokenizer, rollout_result['latents'])
+    pred_frames = decode(tokenizer, rollout_result['latents'])
     pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
 

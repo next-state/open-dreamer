@@ -41,13 +41,14 @@ def run(cfg):
         bundle = DynamicsCheckpointBundle.from_pretrained(
             cfg.dynamics_ckpt, mesh_rules=mesh_rules, model_names={"dynamics_ema", "tokenizer"}
         )
+        del bundle.tokenizer.encoder
         print(f"Loaded dynamics model (k_max={bundle.dynamics_ema.cfg.k_max}, depth={bundle.dynamics_ema.cfg.depth})")
 
         use_latent_data = cfg.dataset.data_type == "latent"
 
         # Load one batch of data
         print(f"Loading data from: {cfg.dataset.array_record_path}")
-        iterator = build_iterator(cfg.dataset, device=data_sharding)
+        iterator = build_iterator(cfg.dataset, seed=cfg.seed, device=data_sharding)
         batch = next(iter(iterator))
 
         actions = batch["actions"]
@@ -89,6 +90,8 @@ def run(cfg):
                 vis_dir=vis_dir,
                 rng=eval_key,
                 logger=logger,
+                use_scan=False,
+                decode_chunk_size=16,
             )
 
             rng, x0_key = jax.random.split(rng)

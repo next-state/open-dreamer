@@ -862,6 +862,8 @@ def run_evaluation(
     vis_dir: Path,
     rng: jax.Array,
     logger,
+    use_scan: bool = True,
+    decode_chunk_size: int | None = None,
 ):
     """
     Run a consolidated periodic dynamics evaluation and save one grid video.
@@ -873,22 +875,15 @@ def run_evaluation(
     PSNR is computed on only the first generated frame (t = ctx_length).
     Also runs x0 and attention visualizations for both online and EMA dynamics.
     """
-    if dynamics_online.cfg.k_max != dynamics_ema.cfg.k_max:
-        raise ValueError(
-            f"Expected matching k_max for online/ema dynamics, got "
-            f"{dynamics_online.cfg.k_max} and {dynamics_ema.cfg.k_max}."
-        )
 
     T = val_data.shape[1]
     assert T > 5, f"Sequence length {T} must be > 5"
-    ctx_length = 4
+    ctx_length = 0
     horizon = T - ctx_length
-    k_max = dynamics_online.cfg.k_max
+    k_max = dynamics_ema.cfg.k_max
 
     rollout_specs = [
-        ("online_diffusion", dynamics_online, DenoiseSchedule.init(k_max, k_max)),
         ("ema_diffusion", dynamics_ema, DenoiseSchedule.init(k_max, k_max)),
-        ("online_shortcut", dynamics_online, DenoiseSchedule.init(4, k_max)),
         ("ema_shortcut", dynamics_ema, DenoiseSchedule.init(4, k_max)),
     ]
 
@@ -907,7 +902,7 @@ def run_evaluation(
                 tokenizer, dynamics_model, frames=None,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=eval_rng, policy=None, task_embedder=None,
-                latents=val_data,
+                latents=val_data, use_scan=use_scan, decode_chunk_size=decode_chunk_size,
             )
             gt_frames_for_metrics = gt_decoded_frames
         else:
@@ -915,6 +910,7 @@ def run_evaluation(
                 tokenizer, dynamics_model, frames=val_data,
                 actions=val_actions, horizon=horizon, schedule_config=schedule_config,
                 rng=eval_rng, policy=None, task_embedder=None,
+                use_scan=use_scan, decode_chunk_size=decode_chunk_size,
             )
             assert original_frames is not None
             gt_frames_for_metrics = original_frames
@@ -973,9 +969,9 @@ def run_evaluation(
 
         grid_columns = [
             ground_truth_frames,
-            pred_columns["online_diffusion"],
+            #pred_columns["online_diffusion"],
             pred_columns["ema_diffusion"],
-            pred_columns["online_shortcut"],
+            #pred_columns["online_shortcut"],
             pred_columns["ema_shortcut"],
         ]
         stacked_frames = jnp.stack(grid_columns)[:, :num_videos]

@@ -283,6 +283,7 @@ def latent_rollout(
     initial_task_embedding: jax.Array | None = None,
     deterministic: bool = False,
     use_kv_cache: bool = True,
+    use_scan: bool = True,
 ):
     """
     Autoregressive rollout in latent space.
@@ -350,12 +351,28 @@ def latent_rollout(
         task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
         h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
 
-        # Run scan
-        _, (rollout_latents, rollout_actions, rollout_hidden, rollout_diags) = jax.lax.scan(
-            scan_step,
-            (h_last, caches, rng),
-            jnp.arange(num_steps)
-        )
+        if use_scan:
+            _, (rollout_latents, rollout_actions, rollout_hidden, rollout_diags) = jax.lax.scan(
+                scan_step,
+                (h_last, caches, rng),
+                jnp.arange(num_steps)
+            )
+        else:
+            # Python for-loop: JIT one step at a time so XLA only compiles a single
+            # denoising step (num_tau inner steps) instead of the full num_steps×num_tau graph.
+            jit_step = jax.jit(scan_step)
+            lats, acts, hs, diags = [], [], [], []
+            carry = (h_last, caches, rng)
+            for i in tqdm(range(num_steps)):
+                carry, (lat, act, h, diag) = jit_step(carry, jnp.array(i))
+                lats.append(lat)
+                acts.append(act)
+                hs.append(h)
+                diags.append(diag)
+            rollout_latents = jnp.stack(lats, axis=0)
+            rollout_actions = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *acts)
+            rollout_hidden = jnp.stack(hs, axis=0) if isinstance(hs[0], jax.Array) else None
+            rollout_diags = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *diags)
 
         # Unpack results
         rollout_latents = einops.rearrange(rollout_latents, 't b s d -> b t s d')

@@ -3,8 +3,8 @@ defaults:
 
 name: minecraft_vpt_latent
 data_type: latent
-array_record_path: /alloc/data/tokenized_data_500M
-index_max: 89
+array_record_path: /home/ubuntu/ema_tokenized_data
+index_max: 2
 num_max_samples: -1
 
 num_binary_actions: 27
