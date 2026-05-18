@@ -17,7 +17,6 @@ import jax
 import jax.numpy as jnp
 from einops import rearrange
 from flax import nnx
-from jax.sharding import PartitionSpec as P
 import optax
 import time
 
@@ -471,23 +470,13 @@ def shortcut_forcing_step(
     boot_target_norm = jnp.array(0.0, dtype=latents.dtype)
     
     if B_self > 0:
-        # Spread the bootstrap subset across the `data` mesh axis so all nodes
-        # share the bootstrap_model forward compute (otherwise the entire
-        # subset lives on the last data shard).
-        _shard_data = lambda x: jax.lax.with_sharding_constraint(x, P('data'))
+        z_pred_self = z_pred_full[B_emp:]
+        z_tilde_self = z_tilde[B_emp:]
+        actions_self = actions[B_emp:]
+        time_mask_self = time_mask[B_emp:] if time_mask is not None else None  # assume aligned with batch
+        task_embeddings_self = task_embeddings[B_emp:] if task_embeddings is not None else None
 
-        z_pred_self = _shard_data(z_pred_full[B_emp:])
-        z_tilde_self = _shard_data(z_tilde[B_emp:])
-        actions_self = jax.tree.map(_shard_data, actions[B_emp:])
-        time_mask_self = _shard_data(time_mask[B_emp:]) if time_mask is not None else None
-        task_embeddings_self = _shard_data(task_embeddings[B_emp:]) if task_embeddings is not None else None
-
-        sigma_self = _shard_data(sigma_self)
-        step_idx_self = _shard_data(step_idx_self)
-        sigma_idx_self = _shard_data(sigma_idx_self)
-        d_self = _shard_data(d_self)
-
-        # Half-step metadata (inherits sharding from the resharded inputs)
+        # Half-step metadata
         d_half = d_self / 2.0
         step_idx_half = step_idx_self + 1
         sigma_plus = sigma_self + d_half
