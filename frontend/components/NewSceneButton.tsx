@@ -14,33 +14,29 @@ export function NewSceneButton({ className }: NewSceneButtonProps) {
 
   const isReady = status === "ready";
 
-  const handleClick = () => {
-    sendCommand("new_scene", {});
-  };
-
   return (
-    <div
-      className={`border border-gray-700/30 bg-gray-900/40 p-3 rounded-lg ${className || ""}`}
+    <button
+      onClick={() => sendCommand("new_scene", {})}
+      disabled={!isReady}
+      className={`group flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium transition-colors duration-200 ${
+        isReady
+          ? "text-white hover:bg-emerald-400/15 cursor-pointer"
+          : "text-white/30 opacity-60 cursor-not-allowed"
+      } ${className || ""}`}
     >
-      <div className="flex flex-row justify-between items-center">
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-400">Scene:</span>
-          <span className="text-xs font-medium text-gray-200">
-            Click to start a new generation with a fresh seed
-          </span>
-        </div>
-        <button
-          onClick={handleClick}
-          disabled={!isReady}
-          className={`px-4 py-1.5 rounded-md text-xs font-medium transition-all duration-200 ${
-            isReady
-              ? "bg-emerald-600/80 text-white hover:bg-emerald-600 cursor-pointer"
-              : "bg-gray-700/50 text-gray-400 border border-gray-600/50 opacity-50 cursor-not-allowed"
-          }`}
-        >
-          New Scene
-        </button>
-      </div>
-    </div>
+      <svg
+        viewBox="0 0 16 16"
+        className={`w-3.5 h-3.5 transition-transform duration-300 ${isReady ? "group-hover:rotate-180" : ""}`}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M14 8a6 6 0 1 1-1.76-4.24" />
+        <path d="M14 2.5V6h-3.5" />
+      </svg>
+      <span>New scene</span>
+    </button>
   );
 }

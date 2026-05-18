@@ -48,11 +48,13 @@ const KEY_DISPLAY: Record<string, string> = {
 interface KeyboardControllerProps {
   enabled?: boolean;
   className?: string;
+  onLockChange?: (isLocked: boolean) => void;
 }
 
 export function KeyboardController({
   enabled = true,
   className,
+  onLockChange,
 }: KeyboardControllerProps) {
   const { sendCommand, status } = useReactor((state) => ({
     sendCommand: state.sendCommand,
@@ -117,6 +119,7 @@ export function KeyboardController({
   const handlePointerLockChange = useCallback(() => {
     const locked = document.pointerLockElement === containerRef.current;
     setIsLocked(locked);
+    onLockChange?.(locked);
     if (!locked) {
       // Released — reset all input state
       pressedKeys.current.clear();
@@ -129,7 +132,7 @@ export function KeyboardController({
       sendKeyboardState();
       sendMouseState();
     }
-  }, [sendKeyboardState, sendMouseState]);
+  }, [sendKeyboardState, sendMouseState, onLockChange]);
 
   // --- Keyboard handlers (only active while pointer-locked) ---
 
@@ -270,79 +273,63 @@ export function KeyboardController({
 
   const hasActiveInput = activeKeys.length > 0 || activeButtons.length > 0;
 
+  const overlay = enabled
+    ? { title: "Click to enter", sub: "ESC to release" }
+    : { title: "Connecting…", sub: "Spinning up the world" };
+
   return (
-    <div className={className || ""}>
-      {/* Game view with pointer lock target */}
+    <div
+      ref={containerRef}
+      onClick={handleClick}
+      className={`relative h-full w-full select-none ${
+        enabled ? "cursor-pointer" : "cursor-default"
+      } ${className || ""}`}
+    >
+      <GameView className="h-full w-full" />
+
+      {/* Vignette — fades the corners so the world feels deeper. */}
       <div
-        ref={containerRef}
-        onClick={handleClick}
-        className="relative cursor-pointer select-none"
-      >
-        <GameView className="w-full aspect-video bg-gradient-to-br from-gray-800 to-gray-900 rounded-xl border border-gray-700/50 shadow-xl overflow-hidden" />
+        className="pointer-events-none absolute inset-0 rounded-2xl"
+        style={{
+          boxShadow:
+            "inset 0 0 120px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(255,255,255,0.06)",
+        }}
+      />
 
-        {/* Overlay: click to play */}
-        {enabled && !isLocked && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/40 rounded-xl transition-opacity">
-            <div className="text-center">
-              <div className="text-white text-lg font-medium mb-1">
-                Click to play
-              </div>
-              <div className="text-gray-300 text-xs">
-                ESC to release cursor
-              </div>
-            </div>
+      {/* Click-to-play overlay — floating headline + sub, no chrome. */}
+      {!isLocked && (
+        <div
+          className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-6 rounded-2xl"
+          style={{ textShadow: "0 2px 24px rgba(0,0,0,0.7)" }}
+        >
+          <div className="text-white text-3xl sm:text-4xl font-semibold tracking-tight">
+            {overlay.title}
           </div>
-        )}
-
-        {/* Indicator: game is focused */}
-        {isLocked && (
-          <div className="absolute top-2 right-2 px-2 py-1 bg-black/60 rounded text-xs text-gray-300">
-            ESC to release
-          </div>
-        )}
-      </div>
-
-      {/* Controls info panel */}
-      <div className="border border-gray-700/30 bg-gray-900/40 p-3 rounded-lg mt-3">
-        <div className="flex flex-col gap-2">
-          {isLocked ? (
-            <>
-              <div className="text-xs text-gray-400 text-center">
-                <kbd className="px-1.5 py-0.5 bg-gray-800/50 border border-gray-700/50 rounded text-gray-300">WASD</kbd> Move
-                {" "}<kbd className="px-1.5 py-0.5 bg-gray-800/50 border border-gray-700/50 rounded text-gray-300">Space</kbd> Jump
-                {" "}<kbd className="px-1.5 py-0.5 bg-gray-800/50 border border-gray-700/50 rounded text-gray-300">Mouse</kbd> Look
-                {" "}<kbd className="px-1.5 py-0.5 bg-gray-800/50 border border-gray-700/50 rounded text-gray-300">LMB</kbd> Attack
-                {" "}<kbd className="px-1.5 py-0.5 bg-gray-800/50 border border-gray-700/50 rounded text-gray-300">RMB</kbd> Use
-              </div>
-              {hasActiveInput && (
-                <div className="flex items-center justify-center gap-2">
-                  <span className="text-xs text-gray-500">Active:</span>
-                  <div className="flex gap-1 flex-wrap justify-center">
-                    {[...activeKeys, ...activeButtons].map((label, idx) => (
-                      <span
-                        key={idx}
-                        className="px-2 py-0.5 bg-emerald-500/20 text-emerald-400 rounded border border-emerald-500/30 text-xs font-medium"
-                      >
-                        {label}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="text-xs text-gray-500 text-center">
-              {!enabled
-                ? status === "disconnected"
-                  ? "Connect to enable controls"
-                  : status === "waiting"
-                  ? "Waiting for connection..."
-                  : "Connecting..."
-                : "Click the game to start playing"}
-            </div>
-          )}
+          <div className="text-white/65 text-sm sm:text-base">{overlay.sub}</div>
         </div>
-      </div>
+      )}
+
+      {/* While locked, a faint reminder in the corner. */}
+      {isLocked && (
+        <div className="pointer-events-none absolute top-3 right-3 glass px-2.5 py-1 rounded-full text-[10px] font-mono tracking-wider text-white/70 uppercase">
+          Esc to release
+        </div>
+      )}
+
+      {/* Active-input chip cluster — anchored bottom-left so it doesn't
+          occlude the hotbar at the bottom-center of the Minecraft viewport. */}
+      {isLocked && hasActiveInput && (
+        <div className="pointer-events-none absolute bottom-4 left-4 flex gap-1.5 flex-wrap max-w-[60%]">
+          {[...activeKeys, ...activeButtons].map((label, idx) => (
+            <span
+              key={idx}
+              className="px-2.5 py-1 rounded-md bg-emerald-400/20 text-emerald-200 border border-emerald-400/30 text-[11px] font-mono backdrop-blur"
+            >
+              {label}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -1,89 +1,131 @@
 "use client";
 
-import {
-  ReactorProvider,
-} from "@reactor-team/js-sdk";
+import { useEffect, useState } from "react";
+import { ReactorProvider, useReactor } from "@reactor-team/js-sdk";
 import { ReactorStatus } from "@/components/ReactorStatus";
 import { KeyboardController } from "@/components/KeyboardController";
 import { AgentToggle } from "@/components/AgentToggle";
 import { NewSceneButton } from "@/components/NewSceneButton";
-import { useReactor } from "@reactor-team/js-sdk";
+
+function Wordmark() {
+  return (
+    <div className="flex items-center gap-2.5">
+      {/* Voxel-block monogram — a subtle Minecraft nod without leaning into kitsch. */}
+      <div
+        className="relative w-7 h-7 rounded-md"
+        style={{
+          background:
+            "linear-gradient(135deg, #34d399 0%, #10b981 50%, #047857 100%)",
+          boxShadow:
+            "inset 0 1px 0 rgba(255,255,255,0.3), inset 0 -1px 0 rgba(0,0,0,0.25), 0 0 20px rgba(52,211,153,0.35)",
+        }}
+      >
+        <div
+          className="absolute inset-1 rounded-sm opacity-60"
+          style={{
+            backgroundImage:
+              "linear-gradient(rgba(255,255,255,0.15) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.15) 1px, transparent 1px)",
+            backgroundSize: "5px 5px",
+          }}
+        />
+      </div>
+      <div className="text-lg font-semibold tracking-tight leading-none">
+        <span className="text-white/55 font-light">Open</span>
+        <span className="text-white">Dreamer</span>
+      </div>
+    </div>
+  );
+}
+
+function ControlsHint() {
+  const items: [string, string][] = [
+    ["WASD", "move"],
+    ["Space", "jump"],
+    ["Mouse", "look"],
+    ["LMB", "attack"],
+    ["RMB", "use"],
+  ];
+  return (
+    <div className="hidden md:flex items-center gap-4 text-[11px] text-white/60 font-mono">
+      {items.map(([key, label]) => (
+        <span key={key} className="flex items-center gap-1.5">
+          <Kbd>{key}</Kbd>
+          <span>{label}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function Kbd({ children }: { children: React.ReactNode }) {
+  return (
+    <kbd className="px-1.5 py-0.5 rounded bg-white/8 border border-white/10 text-white/80 text-[10px] font-mono">
+      {children}
+    </kbd>
+  );
+}
 
 function GameInterface() {
-  const { status } = useReactor((state) => ({
+  const { status, connect } = useReactor((state) => ({
     status: state.status,
+    connect: state.connect,
   }));
+  const [isLocked, setIsLocked] = useState(false);
 
-  const isConnected = status === "ready" || status === "waiting";
+  // Auto-connect on mount and auto-reconnect if the session ever drops.
+  useEffect(() => {
+    if (status === "disconnected") connect();
+  }, [status, connect]);
+
+  const playable = status === "ready";
+  const chromeFade = isLocked ? "opacity-0 pointer-events-none" : "opacity-100";
 
   return (
-    <div className="flex flex-col gap-3">
-      <KeyboardController enabled={isConnected && status === "ready"} />
-      <ReactorStatus />
-      <NewSceneButton />
-      <AgentToggle />
-    </div>
+    <main className="absolute inset-0 flex items-center justify-center px-4 sm:px-8 py-10 sm:py-14">
+      <div className="relative w-full max-w-[1600px] aspect-video">
+        {/* Outer glow, sits behind the canvas */}
+        <div className="absolute inset-0 game-glow rounded-2xl" />
+
+        <div className="relative h-full w-full rounded-2xl overflow-hidden">
+          <KeyboardController enabled={playable} onLockChange={setIsLocked} />
+
+          {/* Top chrome — overlays the top of the game so backdrop blur
+              has actual frames to diffuse. */}
+          <header
+            className={`absolute top-0 left-0 right-0 z-20 flex items-center justify-between gap-4 px-4 sm:px-5 py-4 transition-opacity duration-500 ${chromeFade}`}
+          >
+            <Wordmark />
+            <ReactorStatus />
+          </header>
+
+          {/* Bottom chrome — same idea, single glass deck. */}
+          <footer
+            className={`absolute bottom-4 left-1/2 -translate-x-1/2 z-20 transition-opacity duration-500 ${chromeFade}`}
+          >
+            <div className="glass-strong rounded-2xl px-2.5 py-1.5 flex flex-col items-center gap-1">
+              <div className="flex items-center gap-1">
+                <NewSceneButton />
+                <span className="w-px h-5 bg-white/10 mx-1" />
+                <AgentToggle />
+              </div>
+              <div className="h-px w-full bg-white/10 hidden md:block" />
+              <div className="hidden md:block pb-1 pt-0.5">
+                <ControlsHint />
+              </div>
+            </div>
+          </footer>
+        </div>
+      </div>
+    </main>
   );
 }
 
 export default function Home() {
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-black to-gray-900 p-4 sm:p-6 flex flex-col">
-      <div className="w-full max-w-3xl md:min-w-[640px] lg:min-w-[768px] mx-auto flex flex-col gap-3 flex-1">
-        <div className="text-center space-y-3 pt-8 pb-2">
-          <h1 className="text-4xl sm:text-5xl font-bold leading-tight">
-            <span className="text-gray-400 font-light">Dreamer</span>
-            <span className="text-white"> World Model</span>
-          </h1>
-          <div className="flex flex-wrap items-center justify-center gap-3">
-            <p className="text-gray-300 text-sm font-light tracking-wide">
-              Interactive Minecraft world model with Reactor
-            </p>
-            <a
-              href="https://github.com/reactor-team/js-sdk"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-gray-800/50 hover:bg-gray-700/50 text-gray-300 hover:text-white rounded border border-gray-700/50 hover:border-gray-600 transition-colors"
-            >
-              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" />
-              </svg>
-              View on GitHub
-            </a>
-          </div>
-        </div>
-        <ReactorProvider
-          modelName="world-model"
-          local
-        >
-          <GameInterface />
-        </ReactorProvider>
-      </div>
-
-      {/* Footer */}
-      <footer className="w-full max-w-3xl md:min-w-[640px] lg:min-w-[768px] mx-auto mt-8 pt-6 pb-4 border-t border-gray-800/50">
-        <div className="flex flex-col sm:flex-row items-center justify-center gap-2 sm:gap-4 text-xs text-gray-500">
-          <span>© {new Date().getFullYear()} Dreamer World Model</span>
-          <span className="hidden sm:inline">-</span>
-          <a
-            href="https://reactor.inc"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hover:text-gray-300 transition-colors"
-          >
-            reactor.inc
-          </a>
-          <span className="hidden sm:inline">-</span>
-          <a
-            href="https://docs.reactor.inc/"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hover:text-gray-300 transition-colors"
-          >
-            Documentation
-          </a>
-        </div>
-      </footer>
+    <div className="app-backdrop relative h-screen w-screen overflow-hidden">
+      <ReactorProvider modelName="world-model" local>
+        <GameInterface />
+      </ReactorProvider>
     </div>
   );
 }

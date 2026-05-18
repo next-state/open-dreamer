@@ -9,8 +9,7 @@ interface GameViewProps {
 export function GameView({ className }: GameViewProps) {
   return (
     <ReactorView
-      className={`w-full aspect-video bg-gradient-to-br from-gray-800 to-gray-900 rounded-xl border border-gray-700/50 shadow-xl overflow-hidden ${className || ""}`}
+      className={`h-full w-full bg-black rounded-2xl overflow-hidden ${className || ""}`}
     />
   );
 }
-

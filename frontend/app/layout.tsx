@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Dreamer World Model - Reactor",
-  description: "Interactive coinrun world model with Reactor",
+  title: "OpenDreamer | Interactive World Model",
+  description: "A real-time, video-generative Minecraft world model. Step inside and play.",
 };
 
 export default function RootLayout({
