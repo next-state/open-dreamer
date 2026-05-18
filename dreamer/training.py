@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 from einops import rearrange
 from flax import nnx
+from jax.sharding import PartitionSpec as P
 import optax
 import time
 
@@ -469,21 +470,25 @@ def shortcut_forcing_step(
         sigma_idx_self = jnp.zeros((0, T), dtype=jnp.int32)
 
     # --- Interleave into full (B, T) layout ---
-    step_idx_full = _interleave(step_idx_emp, step_idx_self)
-    sigma_full = _interleave(sigma_emp, sigma_self)
-    sigma_idx_full = _interleave(sigma_idx_emp, sigma_idx_self)
+    # Pin sharding on full (B,...) tensors so XLA doesn't infer odd shardings
+    # for subsets derived from them via _split_emp / _split_self.
+    _pin_full = lambda x: jax.lax.with_sharding_constraint(x, P('data'))
+    step_idx_full = _pin_full(_interleave(step_idx_emp, step_idx_self))
+    sigma_full = _pin_full(_interleave(sigma_emp, sigma_self))
+    sigma_idx_full = _pin_full(_interleave(sigma_idx_emp, sigma_idx_self))
 
     # --- Corrupt latents: z_tilde = (1 - sigma) * z0 + sigma * z1 ---
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
     z0 = apply_ot_coupling(z0, latents, key_ot, ot_cfg=ot_cfg)
-    z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
-    
+    z_tilde = _pin_full((1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents)
+
     # --- Forward pass (full batch) ---
     rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
         actions, step_idx_full, sigma_idx_full, z_tilde,
         context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
     )
+    z_pred_full = _pin_full(z_pred_full)
     
     # --- Flow loss (empirical rows) ---
     z_pred_emp = _split_emp(z_pred_full)
