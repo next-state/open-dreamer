@@ -370,11 +370,13 @@ def shortcut_forcing_step(
         latents: (B, T, S, D) Latent sequence (ground truth)
         rng: Random key
         k_max: Maximum noise resolution
-        B_self: Number of bootstrap examples. Bootstrap rows occupy strided positions
-                [0, stride, 2*stride, ...] with stride = B // B_self (≈ 1/boot_fraction).
-                Empirical rows are the complement.
-        B_img_emp: Number of empirical rows treated as image-only (first rows in empirical slice,
-                   i.e. the lowest-indexed non-stride positions in the batch).
+        B_self: Number of bootstrap examples. The batch is viewed as B_self blocks of
+                size stride = B // B_self (≈ 1/boot_fraction). Within each block, position 0
+                is a bootstrap row and positions 1..stride-1 are empirical rows. Requires
+                B % B_self == 0.
+        B_img_emp: Number of empirical rows treated as image-only. Empirical rows are gathered
+                   in block-major order (block 0's emp rows first, then block 1's, etc.); the
+                   first B_img_emp of that gathered slice are the image-only ones.
                   Used only to split flow MSE logging into image vs full-sequence subsets.
         context_length: optional context length for sliding window attention. If provided,
                        creates local_window_size=(context_length - 1, 0) for causal sliding window.
@@ -395,18 +397,35 @@ def shortcut_forcing_step(
     emax = jnp.log2(k_max).astype(jnp.int32)
 
     # --- Strided bootstrap/empirical row layout ---
-    # Bootstrap rows live at indices [0, stride, 2*stride, ...] (stride = B // B_self ≈ 1/boot_fraction).
-    # Empirical rows are the complement. Indices are static (B and B_self are JIT-static).
-    if B_self > 0:
-        stride = B // B_self
-        boot_positions = list(range(0, B, stride))[:B_self]
-        boot_set = set(boot_positions)
-        emp_positions = [i for i in range(B) if i not in boot_set]
-        boot_idx = jnp.asarray(boot_positions, dtype=jnp.int32)
-        emp_idx = jnp.asarray(emp_positions, dtype=jnp.int32)
-    else:
-        boot_idx = jnp.zeros((0,), dtype=jnp.int32)
-        emp_idx = jnp.arange(B, dtype=jnp.int32)
+    # View the batch as B_self blocks of size `stride = B // B_self` (≈ 1/boot_fraction).
+    # Within each block, position 0 is a bootstrap row, positions 1..stride-1 are empirical.
+    # Requires B % B_self == 0 (asserted at trace time). Interleave/split happens via reshape +
+    # concat, no scatter/gather with index arrays — XLA-friendly.
+    assert B_self == 0 or B % B_self == 0, f"B ({B}) must be divisible by B_self ({B_self})"
+    stride = B // B_self if B_self > 0 else 1
+
+    def _interleave(emp_arr, self_arr):
+        """(B_emp, *inner) + (B_self, *inner) → (B, *inner) with self at strided positions."""
+        if B_self == 0:
+            return emp_arr
+        inner = emp_arr.shape[1:]
+        emp_blocks = emp_arr.reshape(B_self, stride - 1, *inner)
+        self_block = self_arr[:, None]  # (B_self, 1, *inner)
+        return jnp.concatenate([self_block, emp_blocks], axis=1).reshape(B, *inner)
+
+    def _split_self(full_arr):
+        """(B, *inner) → (B_self, *inner) gathering strided bootstrap positions."""
+        if B_self == 0:
+            return jnp.zeros((0,) + full_arr.shape[1:], dtype=full_arr.dtype)
+        inner = full_arr.shape[1:]
+        return full_arr.reshape(B_self, stride, *inner)[:, 0]
+
+    def _split_emp(full_arr):
+        """(B, *inner) → (B_emp, *inner) gathering empirical positions (block-major)."""
+        if B_self == 0:
+            return full_arr
+        inner = full_arr.shape[1:]
+        return full_arr.reshape(B_self, stride, *inner)[:, 1:].reshape(B_emp, *inner)
 
     # Normalize latents before corruption (all operations happen in normalized space)
     latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
@@ -439,14 +458,10 @@ def shortcut_forcing_step(
         sigma_self = jnp.zeros((0, T), dtype=latents.dtype)
         sigma_idx_self = jnp.zeros((0, T), dtype=jnp.int32)
 
-    # --- Scatter into full (B, T) layout ---
-    step_idx_full = jnp.zeros((B, T), dtype=jnp.int32).at[emp_idx].set(step_idx_emp)
-    sigma_full = jnp.zeros((B, T), dtype=latents.dtype).at[emp_idx].set(sigma_emp)
-    sigma_idx_full = jnp.zeros((B, T), dtype=jnp.int32).at[emp_idx].set(sigma_idx_emp)
-    if B_self > 0:
-        step_idx_full = step_idx_full.at[boot_idx].set(step_idx_self)
-        sigma_full = sigma_full.at[boot_idx].set(sigma_self)
-        sigma_idx_full = sigma_idx_full.at[boot_idx].set(sigma_idx_self)
+    # --- Interleave into full (B, T) layout ---
+    step_idx_full = _interleave(step_idx_emp, step_idx_self)
+    sigma_full = _interleave(sigma_emp, sigma_self)
+    sigma_idx_full = _interleave(sigma_idx_emp, sigma_idx_self)
 
     # --- Corrupt latents: z_tilde = (1 - sigma) * z0 + sigma * z1 ---
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
@@ -461,8 +476,8 @@ def shortcut_forcing_step(
     )
     
     # --- Flow loss (empirical rows) ---
-    z_pred_emp = z_pred_full[emp_idx]
-    loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, latents[emp_idx], sigma_emp)
+    z_pred_emp = _split_emp(z_pred_full)
+    loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, _split_emp(latents), sigma_emp)
 
     # Split flow MSE by empirical sample type (image-only rows vs temporal sequence rows).
     n_img_emp = min(max(B_img_emp, 0), B_emp)
@@ -491,11 +506,11 @@ def shortcut_forcing_step(
     boot_target_norm = jnp.array(0.0, dtype=latents.dtype)
     
     if B_self > 0:
-        z_pred_self = z_pred_full[boot_idx]
-        z_tilde_self = z_tilde[boot_idx]
-        actions_self = actions[boot_idx]
-        time_mask_self = time_mask[boot_idx] if time_mask is not None else None  # assume aligned with batch
-        task_embeddings_self = task_embeddings[boot_idx] if task_embeddings is not None else None
+        z_pred_self = _split_self(z_pred_full)
+        z_tilde_self = _split_self(z_tilde)
+        actions_self = _split_self(actions)
+        time_mask_self = _split_self(time_mask) if time_mask is not None else None
+        task_embeddings_self = _split_self(task_embeddings) if task_embeddings is not None else None
 
         # Half-step metadata
         d_half = d_self / 2.0
