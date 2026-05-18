@@ -106,23 +106,20 @@ def train_step(
     B_emp = B - B_self
 
     # Identify image samples (split with same bootstrap ratio).
-    # Bootstrap rows live at strided positions [0, stride, 2*stride, ...] (stride = B // B_self,
-    # ≈ 1/bootstrap_fraction); empirical rows are the complement. Within each group, the lowest-
-    # indexed rows are the image-only ones.
+    # Batch layout (see shortcut_forcing_step): B_self blocks of size `stride = B // B_self`,
+    # block[:, 0] = bootstrap row, block[:, 1:] = empirical rows (block-major flattened).
+    # First B_img_boot bootstrap rows and first B_img_emp empirical rows are image-only.
     B_img_boot = int(B_img * bootstrap_fraction)
     B_img_emp = B_img - B_img_boot
     if B_self > 0:
         stride = B // B_self
-        boot_positions = list(range(0, B, stride))[:B_self]
-        boot_set = set(boot_positions)
-        emp_positions = [i for i in range(B) if i not in boot_set]
+        # Mark image rows directly on the (B_self, stride) view, then flatten.
+        boot_img = jnp.arange(B_self) < B_img_boot                          # (B_self,)
+        emp_img = (jnp.arange(B_self * (stride - 1)) < B_img_emp).reshape(B_self, stride - 1)
+        is_img_blocks = jnp.concatenate([boot_img[:, None], emp_img], axis=1)  # (B_self, stride)
+        is_img = is_img_blocks.reshape(B)
     else:
-        boot_positions = []
-        emp_positions = list(range(B))
-    img_positions = boot_positions[:B_img_boot] + emp_positions[:B_img_emp]
-    is_img = jnp.zeros((B,), dtype=jnp.bool_)
-    if img_positions:
-        is_img = is_img.at[jnp.asarray(img_positions, dtype=jnp.int32)].set(True)
+        is_img = jnp.arange(B) < B_img_emp
 
     # Build time mask for full batch
     mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
