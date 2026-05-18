@@ -73,7 +73,7 @@ lr_schedule:
   lr: 3e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
-  warmup_ratio: 0.05
+  warmup_ratio: 0.005
   decay_ratio: 0.1
   max_steps: ${max_steps}
 

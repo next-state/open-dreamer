@@ -105,11 +105,24 @@ def train_step(
     B_self = int(B * bootstrap_fraction)
     B_emp = B - B_self
 
-    # Identify image samples (split with same bootstrap ratio)
-    idx = jnp.arange(B)
+    # Identify image samples (split with same bootstrap ratio).
+    # Bootstrap rows live at strided positions [0, stride, 2*stride, ...] (stride = B // B_self,
+    # ≈ 1/bootstrap_fraction); empirical rows are the complement. Within each group, the lowest-
+    # indexed rows are the image-only ones.
     B_img_boot = int(B_img * bootstrap_fraction)
     B_img_emp = B_img - B_img_boot
-    is_img = (idx < B_img_emp) | ((idx >= B_emp) & (idx < (B_emp + B_img_boot)))
+    if B_self > 0:
+        stride = B // B_self
+        boot_positions = list(range(0, B, stride))[:B_self]
+        boot_set = set(boot_positions)
+        emp_positions = [i for i in range(B) if i not in boot_set]
+    else:
+        boot_positions = []
+        emp_positions = list(range(B))
+    img_positions = boot_positions[:B_img_boot] + emp_positions[:B_img_emp]
+    is_img = jnp.zeros((B,), dtype=jnp.bool_)
+    if img_positions:
+        is_img = is_img.at[jnp.asarray(img_positions, dtype=jnp.int32)].set(True)
 
     # Build time mask for full batch
     mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
