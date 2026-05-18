@@ -1,0 +1,2674 @@
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Build with Reactor
+
+> Infrastructure purpose-built for real-time video and world models.
+
+<Note>
+  These docs are in **early access**. The [Development](/development/overview) section (runtime, local testing, model building) is production-ready. The [Deployment](/platform/installation) section describes features that are rolling out to partners. [Contact us](mailto:team@reactor.inc) for access.
+</Note>
+
+Reactor is infrastructure for real-time video and world models. You write a Python model, test it locally, and deploy to Reactor's global GPU network. We handle WebRTC streaming, session management, and delivery.
+
+## How it works
+
+<Steps>
+  <Step title="Scaffold a workspace">
+    Use the `reactor` CLI to scaffold a Docker-based workspace. The generated `reactor.yaml` declares everything Reactor knows about the model — registration metadata in `model:`, runtime entrypoint in `runtime:`.
+
+    ```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+    reactor init my-model
+    cd my-model
+    ```
+
+    ```yaml reactor.yaml theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+    model:
+      name: my-model
+      display-name: my-model
+
+    runtime:
+      import: pipeline:MyModel
+      config: config.yaml
+    ```
+  </Step>
+
+  <Step title="Build your model">
+    Edit `pipeline.py`. Wrap your inference loop with `ReactorPipeline` and yield frames from a Python generator — the runtime streams them to clients over WebRTC.
+
+    ```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+    class MyModel(ReactorPipeline):
+        def inference(self):
+            while True:
+                frame = self.pipe.forward(prompt=self.state.prompt)
+                yield MyOutput(main_video=frame)
+    ```
+  </Step>
+
+  <Step title="Test locally">
+    `reactor run` builds the workspace image and starts it on port 8080. Connect from the [Reactor Sandbox](https://reactor-sandbox.vercel.app/) in `Local (Direct)` mode to see frames streaming.
+
+    ```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+    reactor run
+    ```
+  </Step>
+
+  <Step title="Deploy">
+    Authenticate, register the model, publish a release (image + weights in one shot), and deploy it. Your model is live on production GPUs in under 3 minutes.
+
+    ```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+    reactor auth login
+    reactor model register --model-file reactor.yaml
+    reactor model publish my-model:v1.0.0
+    reactor model deploy my-model:v1.0.0
+    ```
+  </Step>
+
+  <Step title="Connect clients">
+    Use the JavaScript or Python SDK to stream your model's output to any application.
+
+    ```tsx theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+    <ReactorProvider modelName="my-model" autoConnect={true}>
+      <ReactorView className="w-full aspect-video" />
+    </ReactorProvider>
+    ```
+  </Step>
+</Steps>
+
+## Why Reactor
+
+<CardGroup cols={2}>
+  <Card title="Sub-50ms streaming" icon="signal">
+    Frames delivered over WebRTC as they are generated. Client inputs received live.
+  </Card>
+
+  <Card title="Stateful sessions" icon="users">
+    Each client gets isolated state, managed from connection to cleanup.
+  </Card>
+
+  <Card title="Global GPU network" icon="globe">
+    Nodes in every major region. A client in Tokyo connects to a GPU in Tokyo.
+  </Card>
+
+  <Card title="No transport code" icon="plug">
+    You never touch WebRTC, WebSockets, or video encoding. Reactor handles it.
+  </Card>
+
+  <Card title="Live in minutes" icon="timer">
+    Publish and your model is running on production GPUs in under 3 minutes.
+  </Card>
+
+  <Card title="You own your model" icon="shield-check">
+    Your weights, your inference logic. Reactor never accesses or trains on your data.
+  </Card>
+</CardGroup>
+
+## Get started
+
+<CardGroup cols={2}>
+  <Card title="Development" icon="code" href="/overview">
+    Install the runtime, build your model, and test locally.
+  </Card>
+
+  <Card title="Deployment" icon="cloud" href="/platform/installation">
+    Authenticate, upload weights, and go live on Reactor's GPUs.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Runtime Overview
+
+> Build real-time interactive video models with Python.
+
+Reactor Runtime is a Python framework for turning inference pipelines into real-time, interactive video streams. You focus on your ML code. Reactor handles the networking, media transport, and client connections.
+
+**Key features:**
+
+* **Real-time streaming**: frames are delivered to clients over WebRTC as they're generated, not after the entire video is done.
+* **Live interaction**: clients can change inputs mid-generation. No restart, no re-queue.
+* **No transport code**: you never import a WebRTC library, manage a WebSocket, or encode video.
+* **Typed, validated inputs**: declare what inputs your model accepts with types and constraints. The runtime handles validation.
+
+## The simplest model
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from dataclasses import dataclass
+from reactor_runtime.interface import Output, Video, ReactorPipeline, InputState, InputField
+
+@dataclass
+class MyOutput(Output):
+    main_video: Video
+
+@dataclass
+class MyState(InputState):
+    prompt: str = InputField(default="a sunny meadow")
+
+class MyModel(ReactorPipeline):
+    state: MyState
+
+    def load(self, config):
+        self.pipe = load_my_model(config["checkpoint"])
+
+    def inference(self):
+        while True:
+            frame = self.pipe.forward(prompt=self.state.prompt)
+            yield MyOutput(main_video=frame)
+```
+
+That's a complete Reactor model. The `inference()` generator yields frames as fast as your model produces them. The client can send `set_prompt` at any time and `self.state.prompt` updates automatically between iterations.
+
+## From model to production
+
+Once your model is wrapped with the runtime, you get two things for free:
+
+**Client SDKs** - Connect any frontend to your model with a few lines of JavaScript or Python. The SDK handles WebRTC, sessions, and real-time input. See the [SDK docs](https://docs.reactor.inc).
+
+**Deploy to Reactor** - Push your model to Reactor's GPU cloud and have it live in under 3 minutes. No infrastructure to manage. See the [deployment guide](/platform/overview).
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install, scaffold, and run your first model in 2 minutes.
+  </Card>
+
+  <Card title="Model Anatomy" icon="microscope" href="/development/reactor-pipeline/model-anatomy">
+    Understand every line of a Reactor model.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Quickstart
+
+> From zero to a running model in 2 minutes.
+
+This guide assumes the `reactor` CLI and a Docker daemon are available on your host.
+
+## Scaffold a project
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+reactor init my-model
+```
+
+This creates a ready-to-run project:
+
+```
+my-model/
+├── pipeline.py         # ReactorPipeline — generator pattern (default scaffold)
+├── reactor.yaml        # Model registration + runtime entrypoint declaration
+├── config.yaml         # Model config (passed to load() as a dict)
+├── requirements.txt    # Extra Python dependencies (on top of the runtime base image)
+└── Dockerfile          # FROM reactor-runtime-base + your code + your deps
+```
+
+The three files you'll actually edit:
+
+* `pipeline.py`: your model class, referenced by `reactor.yaml`'s `runtime.import: pipeline:MyModel`.
+* `config.yaml`: model hyperparameters, loaded into the `config` dict passed to your model's `load()`.
+* `Dockerfile`: the workspace image. Bump the `FROM` tag to upgrade the runtime version.
+
+## Run it
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+cd my-model
+reactor run
+```
+
+`reactor run` starts the workspace container and forwards its logs to your terminal:
+
+```
+INFO   Model loaded: MyModel
+INFO   HTTP server listening on 0.0.0.0:8080
+INFO   Waiting for client...
+```
+
+The first `reactor run` builds your image; later runs reuse the cache. After editing `requirements.txt` or the `Dockerfile`, run `reactor build` to refresh it.
+
+## What just happened
+
+1. `reactor run` built the workspace image from `./Dockerfile`.
+2. Inside the container, the runtime read `reactor.yaml` and resolved `runtime.import: pipeline:MyModel` (that's `pipeline.py`, class `MyModel`).
+3. It loaded `runtime.config` (`config.yaml`) into the `config` dict passed to `MyModel.load()`.
+4. It started an HTTP server with WebRTC signaling endpoints on port 8080.
+
+When a client connects, the runtime calls `inference()` and starts streaming the yielded frames.
+
+## Connect a frontend
+
+The fastest option is the [Demo Frontend](https://reactor-sandbox.vercel.app/). Open it and click **Connect**.
+
+To build your own frontend, use the [JS SDK](https://docs.reactor.inc) with `local: true` to connect directly to your local model on port 8080:
+
+<CodeGroup>
+  ```tsx React theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+  import { ReactorProvider, ReactorView } from "@reactor-team/js-sdk";
+
+  <ReactorProvider modelName="my-model" local={true} autoConnect={true}>
+    <ReactorView className="w-full aspect-video" />
+  </ReactorProvider>
+  ```
+
+  ```javascript Vanilla JS theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+  import { Reactor } from "@reactor-team/js-sdk";
+
+  const reactor = new Reactor({ modelName: "my-model", local: true });
+  await reactor.connect();
+  const stream = reactor.getMediaStream("main_video");
+  document.querySelector("video").srcObject = stream;
+  ```
+</CodeGroup>
+
+## CLI options
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+reactor run --help
+```
+
+Common flags:
+
+| Flag                             | Description                                                                                     |
+| -------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `--port <number>`                | Host port mapped onto the container (default 8080). The runtime binds the same port inside.     |
+| `--gpus <value>`                 | Forwarded to `docker run --gpus`. Accepts `all` (default), `none`, a count, or `device=<list>`. |
+| `-e <KEY>` / `--env <KEY=VALUE>` | Forward host env vars into the container. Repeatable.                                           |
+| `--env-file <path>`              | Dotenv-style file forwarded into the container.                                                 |
+| `--model.<key>=<value>`          | Override config values (e.g. `--model.width=1280`). Passed through to the runtime entrypoint.   |
+| `-v` / `--verbose`               | Debug logging on the CLI side.                                                                  |
+
+Extra tokens (including after `--`) are appended to the container `argv`, with the `run` subcommand auto-prepended so they act as flags to `run` (for example `--runtime _redis`). They do **not** select a different `serve` subcommand such as `schema`; use `python -m reactor_runtime.serve schema` from a dev venv, or `docker run` with `--entrypoint python` on your workspace image.
+
+## Build options
+
+`reactor build` builds your workspace image without running it:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+reactor build
+```
+
+| Flag                                 | Description                                                 |
+| ------------------------------------ | ----------------------------------------------------------- |
+| `-f <path>` / `--dockerfile <path>`  | Use a non-default Dockerfile (e.g. `Dockerfile.gpu`).       |
+| `--no-cache`                         | Skip the layer cache and rebuild every step.                |
+| `--build-secret id=<name>,env=<var>` | Forward a BuildKit secret (e.g. for private package pulls). |
+
+`reactor build` and `reactor run` share the same image tag, so `reactor build && reactor run` always boots the freshly built image.
+
+## Coming from the Python `reactor-runtime` CLI?
+
+The runtime used to ship a `reactor-runtime` console script. That script is gone; the Go `reactor` CLI is the only host-side entry point.
+
+A short translation table:
+
+| Before                                      | Now                                                                                                                                                                                                                                                                           |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pip install reactor-runtime` on the host   | nothing on the host. The runtime ships inside `reactor-runtime-base`.                                                                                                                                                                                                         |
+| `reactor-runtime init my-model`             | `reactor init my-model`                                                                                                                                                                                                                                                       |
+| `reactor-runtime run`                       | `reactor run`                                                                                                                                                                                                                                                                 |
+| `reactor-runtime schema`                    | `python -m reactor_runtime.serve schema` from a dev venv, or `docker run --rm --entrypoint python <workspace-image> -m reactor_runtime.serve schema` with the same mounts/env as your dev run. `reactor run` is scoped to the `run` subcommand and doesn't dispatch `schema`. |
+| Host `.venv/` auto-created in the workspace | no host venv. You can delete `.venv/` from existing workspaces.                                                                                                                                                                                                               |
+
+On an existing workspace, replace `${RUNTIME_VERSION}` in the `Dockerfile`'s `FROM` line with a literal tag:
+
+```dockerfile theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+FROM reactortechnologies/reactor-runtime-base:2.6.0
+```
+
+Your Python code, `reactor.yaml`, and `config.yaml` keep working as-is.
+
+Also: `pip uninstall reactor-runtime` so the old script can't shadow the new binary on `PATH`.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Model Anatomy" icon="microscope" href="/development/reactor-pipeline/model-anatomy">
+    Understand every piece of the scaffolded model.
+  </Card>
+
+  <Card title="Make It Interactive" icon="sliders" href="/development/reactor-pipeline/state">
+    Add parameters that clients can change in real-time.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Choose Your Path
+
+> Two ways to build real-time models on Reactor.
+
+export const PathSelector = () => {
+  const [hovered, setHovered] = useState(null);
+  const paths = [{
+    id: "pipeline",
+    title: "ReactorPipeline",
+    subtitle: "The generator pattern",
+    href: "/tutorial/model-anatomy",
+    recommended: true,
+    situations: ["I have a model and want to make it real-time", "My inference is a loop that produces frames", "I want the runtime to manage connections and state"],
+    cta: "Start with ReactorPipeline"
+  }, {
+    id: "model",
+    title: "ReactorModel",
+    subtitle: "The manual loop",
+    href: "/advanced/reactor-model",
+    recommended: false,
+    situations: ["I need full control over the execution loop", "I want to persist resources across sessions", "I just need a streaming transport for my model"],
+    cta: "Start with ReactorModel"
+  }];
+  return <div className="not-prose" style={{
+    marginTop: "1.5rem",
+    marginBottom: "1.5rem"
+  }}>
+      <div style={{
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: "1rem"
+  }}>
+        {paths.map(p => {
+    const active = hovered === p.id;
+    return <a key={p.id} href={p.href} onMouseEnter={() => setHovered(p.id)} onMouseLeave={() => setHovered(null)} style={{
+      position: "relative",
+      overflow: "visible",
+      display: "flex",
+      flexDirection: "column",
+      textDecoration: "none",
+      color: "inherit",
+      borderRadius: "0.75rem",
+      border: active ? "1px solid #C7C099" : "1px solid var(--border-color, rgba(128,128,128,0.15))",
+      padding: "1.5rem",
+      transition: "all 0.15s ease",
+      transform: active ? "translateY(-1px)" : "none",
+      boxShadow: active ? "0 4px 20px rgba(199,192,153,0.12)" : "none",
+      cursor: "pointer"
+    }}>
+              {p.recommended && <div style={{
+      position: "absolute",
+      top: "-0.5rem",
+      right: "1rem",
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "0.3rem",
+      fontSize: "0.7rem",
+      fontWeight: 600,
+      textTransform: "uppercase",
+      letterSpacing: "0.05em",
+      color: "#C7C099",
+      backgroundColor: "rgba(199,192,153,0.1)",
+      border: "1px solid rgba(199,192,153,0.3)",
+      borderRadius: "0.35rem",
+      padding: "0.1rem 0.35rem",
+      transform: "rotate(3deg)",
+      pointerEvents: "none"
+    }}>
+                  ★ Recommended
+                </div>}
+              <div style={{
+      fontSize: "1.25rem",
+      fontWeight: 700,
+      color: active ? "#C7C099" : "inherit",
+      transition: "color 0.15s ease",
+      marginBottom: "0.15rem"
+    }}>
+                {p.title}
+              </div>
+              <div style={{
+      fontSize: "0.9rem",
+      opacity: 0.45,
+      marginBottom: "0.5rem"
+    }}>
+                {p.subtitle}
+              </div>
+
+              <ul style={{
+      margin: "0.75rem 0 1rem 0",
+      padding: 0,
+      listStyle: "none",
+      flex: 1
+    }}>
+                {p.situations.map((s, i) => <li key={i} style={{
+      fontSize: "0.95rem",
+      opacity: 0.7,
+      lineHeight: 1.65,
+      paddingLeft: "1rem",
+      position: "relative"
+    }}>
+                    <span style={{
+      position: "absolute",
+      left: 0,
+      opacity: 0.4
+    }}>→</span>
+                    {s}
+                  </li>)}
+              </ul>
+
+              <div style={{
+      fontSize: "0.95rem",
+      fontWeight: 600,
+      color: "#C7C099",
+      opacity: active ? 1 : 0.7,
+      transition: "opacity 0.15s ease"
+    }}>
+                {p.cta} →
+              </div>
+            </a>;
+  })}
+      </div>
+    </div>;
+};
+
+Reactor gives you two base classes for building real-time models. Both share the same tracks, events, messages, and deployment system. They differ in how much the runtime manages for you.
+
+<PathSelector />
+
+## Not sure?
+
+Start with **ReactorPipeline**. It covers the vast majority of real-time models: diffusion transformers, style transfer, world simulators, anything where inference is a loop that produces frames. You can always move to ReactorModel later if you outgrow the generator pattern.
+
+Both paths are fully independent. You don't need to read one before the other.
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Model Anatomy
+
+> Understand every piece of a Reactor model.
+
+This page walks through the model that `reactor init` generates, line by line. By the end you'll understand every building block.
+
+## The full model
+
+Here's what `reactor init` gives you, a complete runnable model in a single file:
+
+```python pipeline.py theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import InputField, InputState, Output, ReactorPipeline, Video
+
+@dataclass
+class MyOutput(Output):
+    main_video: Video
+
+
+@dataclass
+class MyState(InputState):
+    brightness: float = InputField(default=1.0, ge=0.0, le=2.0, description="Brightness multiplier")
+
+
+class MyModel(ReactorPipeline):
+    state: MyState
+    buffer_size = 8
+
+    def load(self, config: dict[str, Any]) -> None:
+        self.width = config.get("width", 640)
+        self.height = config.get("height", 480)
+        self.chunk_size = config.get("chunk_size", 4)
+
+    def inference(self):
+        frame_idx = 0
+        while True:
+            batch, frame_idx = render_batch(
+                self.width, self.height, self.chunk_size,
+                frame_idx, self.state.brightness,
+            )
+            yield MyOutput(main_video=batch)
+
+def render_batch(width, height, chunk_size, start_idx, brightness):
+    # ... generates a batch of animated gradient frames with brightness applied
+    # returns (np.ndarray of shape (N, H, W, 3), next_frame_index)
+```
+
+Let's break it down.
+
+## Output tracks
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@dataclass
+class MyOutput(Output):
+    main_video: Video
+```
+
+This declares what media the model sends to clients. Each field is a **track**, a named media channel. `Video` means the field carries video frames.
+
+You can have multiple tracks:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@dataclass
+class MyOutput(Output):
+    main_video: Video
+    main_audio: Audio
+```
+
+The field names (`main_video`, `main_audio`) become the track identifiers that clients use.
+
+## Client state
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@dataclass
+class MyState(InputState):
+    brightness: float = InputField(default=1.0, ge=0.0, le=2.0, description="Brightness multiplier")
+```
+
+This declares parameters that clients can change while the model is running. Your model reads them with `self.state.brightness` inside `inference()`.
+
+The runtime takes care of the rest. We'll cover how in the [Interactive State](/development/reactor-pipeline/state) page.
+
+## The model class
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+class MyModel(ReactorPipeline):
+    state: MyState
+```
+
+`state: MyState` tells the pipeline what is the shape of the input state. You get `self.state` with full IDE autocomplete.
+
+## Loading
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+def load(self, config: dict[str, Any]) -> None:
+    self.width = config.get("width", 640)
+    self.height = config.get("height", 480)
+    self.chunk_size = config.get("chunk_size", 4)
+```
+
+Called once at startup, before any client can connect. The `config` dict comes from `config.yaml`. This is where you load checkpoints, allocate GPU memory, and set up your model inference configuration.
+
+Checkpoints are not baked into the image. Resolve them via `get_weights_path()` so the same code runs locally and in production; see the dedicated [Weights](/development/weights) page for the helper, configuration, and the publish-time upload flow.
+
+## The inference generator
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+def inference(self):
+    frame_idx = 0
+    while True:
+        batch, frame_idx = render_batch(
+            self.width, self.height, self.chunk_size,
+            frame_idx, self.state.brightness,
+        )
+        yield MyOutput(main_video=batch)
+```
+
+This is the heart of the model. It's a Python generator that runs continuously. Each iteration produces one frame, and `yield` sends it to the client. The runtime manages the generator's lifecycle, drives it between client connections, and delivers state updates between iterations.
+
+The [next page](/development/reactor-pipeline/inference) covers `inference()` in detail: sync vs async, batch yields, skipping frames, and how the lifecycle works.
+
+## The manifest
+
+```yaml reactor.yaml theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+model:
+  name: my-model
+
+runtime:
+  import: pipeline:MyModel
+  config: config.yaml
+```
+
+* `model.name`: human-readable identifier, used in logging and routing.
+* `runtime.import`: Python import path in `module:ClassName` format pointing to your model class.
+* `runtime.config`: path to the model config YAML.
+
+For checkpoint configuration (`runtime.weights_path` and `REACTOR_WEIGHTS_PATH`), see the dedicated [Weights](/development/weights) page.
+
+## Beyond the generator
+
+**ReactorPipeline** handles the connection loop and state lifecycle for you. If your model doesn't fit the generator pattern, or you want full control over what happens between client connections, see [**ReactorModel**](/development/reactor-model/model-anatomy).
+
+## Next
+
+Now that you understand the pieces, let's dive deeper into the inference generator.
+
+<CardGroup cols={2}>
+  <Card title="The Inference Generator" icon="play" href="/development/reactor-pipeline/inference">
+    Sync vs async, batch yields, lifecycle, and state consistency.
+  </Card>
+
+  <Card title="Interactive State" icon="sliders-horizontal" href="/development/reactor-pipeline/state">
+    Add richer parameters with validation and custom logic.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# The Inference Generator
+
+> How inference() works, what to yield, and how the runtime drives it.
+
+`inference()` is where your model produces output. It's a Python generator that the runtime calls automatically. You write the loop, `yield` frames, and the runtime handles everything else.
+
+## Basic pattern
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+def inference(self):
+    while True:
+        frame = self.pipe.forward(prompt=self.state.prompt)
+        yield MyOutput(main_video=frame)
+```
+
+Each iteration:
+
+1. Read `self.state` for current parameters.
+2. Run your forward pass.
+3. `yield` an `Output` instance to send it to the client.
+
+The runtime drives the generator, measures compute time, and emits frames at the right rate.
+
+## Sync vs async
+
+`inference()` can be a regular generator or an async generator. Use async when you need to `await` inside the loop, for example sending messages to the client.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+async def inference(self):
+    while True:
+        frame = self.pipe.forward(prompt=self.state.prompt)
+        # ✅ Await to send messages to the client
+        await self.send(Progress(step=self._step))
+        self._step += 1
+        yield MyOutput(main_video=frame)
+```
+
+## What to yield
+
+Yield an `Output` instance with data for each track:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+yield MyOutput(main_video=frame)
+```
+
+For single-track models, you can yield the raw frame directly:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+yield frame
+```
+
+### Batch yields
+
+If your model generates frames in batches, yield the entire batch `(N, H, W, 3)` in a single yield. The runtime splits it and emits each frame at the target rate.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+def inference(self):
+    while True:
+        frames = self.pipe.forward(prompt=self.state.prompt)
+        print(frames.shape)  # (N, H, W, 3)
+        # ✅ Yield the full batch — the runtime splits it
+        yield MyOutput(main_video=frames)
+```
+
+### Idling
+
+Yield `Idle` or `None` to skip an iteration without emitting anything:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import Idle
+
+def inference(self):
+    # Wait for the user to set a prompt
+    while not self.state.prompt:
+        # ✅ Skip this iteration — no frame emitted
+        yield Idle
+    while True:
+        frame = self.pipe.forward(prompt=self.state.prompt)
+        yield MyOutput(main_video=frame)
+```
+
+## Lifecycle
+
+The runtime manages the generator's lifetime automatically:
+
+* **Created** when a client connects, after `@connected` fires.
+* **Closed** when the client disconnects. State is reset and buffers are flushed.
+* **Restarted** if it returns early (e.g. a finite loop ends). The runtime creates a new generator on the same model instance as long as the client is still connected.
+
+A fresh `self.state` is created for each connection, so every client starts with clean defaults.
+
+## State consistency
+
+Events are dispatched **only between `yield` points**. While your generator is running an iteration (reading state, doing a forward pass, awaiting I/O), no event handler can mutate `self.state`. You can safely read state multiple times within an iteration without worrying about concurrent changes.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Interactive State" icon="sliders-horizontal" href="/development/reactor-pipeline/state">
+    Add richer parameters with validation and custom logic.
+  </Card>
+
+  <Card title="Events & Messages" icon="bolt" href="/development/reactor-pipeline/events-and-messages">
+    Custom events, lifecycle hooks, and outbound messages.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Interactive State
+
+> Add parameters clients can change in real-time.
+
+Every real-time model needs a way for clients to change inputs mid-generation. A prompt, a style setting, a slider value. In Reactor, you declare these as fields on an `InputState` dataclass, and the runtime does the rest.
+
+## Declaring state
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from dataclasses import dataclass
+from reactor_runtime.interface import InputState, InputField
+
+@dataclass
+class GameState(InputState):
+    prompt: str = InputField(default="a sunny meadow")
+    action: str = InputField(default="idle", choices=["idle", "left", "right", "jump"])
+    brightness: float = InputField(default=1.0, ge=0.0, le=2.0)
+```
+
+Each public field becomes a client-facing parameter. The runtime auto-generates a `set_<field>` command for each one. From a client application using the official Reactor Client SDK:
+
+<CodeGroup>
+  ```typescript JS SDK theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+  await reactor.sendCommand("set_prompt", { prompt: "a dark forest" });
+  await reactor.sendCommand("set_action", { action: "jump" });
+  await reactor.sendCommand("set_brightness", { brightness: 0.5 });
+  ```
+
+  ```json Wire format theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+  { "type": "set_prompt", "data": { "prompt": "a dark forest" } }
+  { "type": "set_action", "data": { "action": "jump" } }
+  { "type": "set_brightness", "data": { "brightness": 0.5 } }
+  ```
+</CodeGroup>
+
+## Validation with InputField
+
+`InputField` defines constraints that the runtime enforces automatically. Invalid values from clients are silently rejected and the field keeps its current value.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+# Default value (any type)
+score: float = InputField(default=1.0)
+
+# Numeric range (min/max inclusive)
+brightness: float = InputField(default=1.0, ge=0.0, le=1.0)
+
+# String / sequence length
+prompt: str = InputField(default="hello", min_length=1, max_length=500)
+
+# Exhaustive allowed values
+style: str = InputField(default="none", choices=["none", "oil_paint", "sketch"])
+
+# Description (shown in schema)
+seed: int = InputField(default=42, description="Random seed for generation")
+```
+
+## Reading state in inference
+
+Access `self.state` inside `inference()`. It's guaranteed to be updated in real-time.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+class GameModel(ReactorPipeline):
+    state: GameState
+
+    def inference(self):
+        while True:
+            # ✅ Read live state each iteration
+            frame = self.pipe.forward(
+                prompt=self.state.prompt,
+                action=self.state.action,
+            )
+            frame *= self.state.brightness
+            yield MyOutput(main_video=frame)
+```
+
+## Session lifecycle
+
+A fresh `InputState` instance (with all defaults) is created when a client connects. It's destroyed when they disconnect. No state bleeds between sessions.
+
+* **Client connects**: `self.state` is a fresh instance with all defaults.
+* **During session**: fields are mutated by client commands.
+* **Client disconnects**: `self.state` is set to `None`.
+
+## Overriding auto-generated events
+
+If you need custom logic when a field changes (e.g. encoding a prompt), define an `@event` handler with the same name. It replaces the auto-generated one:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import event
+
+@dataclass
+class GameState(InputState):
+    prompt: str = InputField(default="a sunny meadow")
+    _embedding: Any = None
+
+class GameModel(ReactorPipeline):
+    state: GameState
+
+    # ✅ Override the auto-generated set_prompt handler
+    @event(name="set_prompt", description="Scene prompt with encoding")
+    def set_prompt(self, prompt: str = InputField(default="")):
+        self.state.prompt = prompt
+        self.state._embedding = self.encoder.encode(prompt)
+```
+
+<Info>
+  When you override a state handler, you need to manually set `self.state.prompt = prompt` to ensure the state gets updated.
+</Info>
+
+## Private fields
+
+Prefix a field with `_` to hide it from clients. No event is generated, and it doesn't appear in the schema. Use them to store derived values that should be cleaned up automatically when the session ends.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@dataclass
+class GameState(InputState):
+    prompt: str = InputField(default="a sunny meadow")
+    # ✅ Private — hidden from clients, no set_ event generated
+    _embedding: Any = None
+```
+
+The `_embedding` from the override example above is a good use case: the event handler computes it, `inference()` reads it, and the runtime destroys the entire state on disconnect — no manual cleanup needed.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Events & Messages" icon="bolt" href="/development/reactor-pipeline/events-and-messages">
+    Custom events, lifecycle hooks, and outbound messages.
+  </Card>
+
+  <Card title="Media Input" icon="layers" href="/development/reactor-pipeline/media-input">
+    Read webcam, microphone, and other client media.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Events & Messages
+
+> Custom event handlers, lifecycle hooks, and outbound messages.
+
+Beyond auto-generated `set_<field>` events, you can define your own events, send messages back to the client, and run logic when clients connect or disconnect.
+
+## Custom event handlers
+
+Use `@event` to define actions the client can trigger that aren't tied to a single state field. The method's signature becomes the event schema.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import event
+
+@event(name="get_current_prompt", description="Log the current prompt")
+async def get_current_prompt(self):
+    print(f"Current prompt: {self.state.prompt}")
+```
+
+The client sends `{"type": "get_current_prompt", "data": {}}` and the runtime calls your method.
+
+Events can also take parameters:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@event(name="set_style", description="Change the rendering style")
+async def set_style(self, style: str = InputField(default="realistic")):
+    self.state._style_embedding = self.encoder.encode(style)
+```
+
+<Info>
+  In `ReactorPipeline`, events only dispatch between `yield` points, so `self.state` is always consistent within a single iteration.
+</Info>
+
+### Deduplicating expensive handlers
+
+Pass `dedupe=True` to collapse duplicate events that queue up while the model is busy. Only the latest payload is processed; earlier ones are discarded.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@event(
+    name="set_reference_image",
+    description="Upload a reference image",
+    dedupe=True,
+)
+async def set_reference_image(self, image: str = ""):
+    self.state._ref_embedding = self.encoder.encode(image)
+```
+
+Use this for handlers that do heavy compute (encoding) where only the latest value matters.
+
+## Lifecycle hooks
+
+### `@connected`
+
+Runs once when a client connects, before `inference()` starts.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import connected
+
+@connected
+async def on_connect(self):
+    print("Client connected, session starting")
+```
+
+### `@disconnected`
+
+Runs once when a client disconnects, after `inference()` is closed.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import disconnected
+
+@disconnected
+async def on_disconnect(self):
+    print("Client disconnected, session ended")
+```
+
+## Outbound messages
+
+Earlier we printed the prompt to stdout. What if we want to send it to the client instead? Define a `ModelMessage` subclass:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from dataclasses import dataclass
+from reactor_runtime.interface import ModelMessage
+
+@dataclass
+class CurrentPrompt(ModelMessage):
+    prompt: str
+```
+
+Now replace the `print` with `self.send()`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@event(name="get_current_prompt", description="Return the current prompt")
+async def get_current_prompt(self):
+    await self.send(CurrentPrompt(prompt=self.state.prompt))
+```
+
+The client receives this as JSON: `{"type": "current_prompt", "data": {"prompt": "..."}}`. The type on the wire is the snake\_case version of the class name.
+
+You can also send messages from inside `inference()`. If you need to, make it `async`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@dataclass
+class Progress(ModelMessage):
+    step: int
+    total: int
+
+async def inference(self):
+    step = 0
+    while True:
+        frame = self.pipe.forward(prompt=self.state.prompt, step=step)
+        # ✅ Send a message to the client
+        await self.send(Progress(step=step, total=100))
+        step += 1
+        yield MyOutput(main_video=frame)
+```
+
+Note that `inference()` is `async def` here instead of `def` because we need `await` to send messages. Both sync and async generators work; use whichever fits your model.
+
+## File uploads
+
+When your model needs binary files from the client (reference images, style assets, etc.), declare an `UploadedFile`-typed field on your `InputState`. The runtime generates a `set_<field>` event and handles the upload automatically.
+
+`UploadedFile` has four fields: `name`, `mime_type`, `size`, and `data` (the raw bytes). You can use them to filter by type, decode images, or pass the content to your pipeline.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import InputState, InputField, UploadedFile
+
+@dataclass
+class MyState(InputState):
+    prompt: str = InputField(default="a sunny meadow")
+    reference_image: UploadedFile = InputField(
+        default=None,
+        description="Reference image for conditioning",
+    )
+    _img_embedding: Any = None
+```
+
+To run expensive post-processing when a file arrives, override the auto-generated event with a custom `@event` handler. Type the parameter as `UploadedFile`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@event(name="set_reference_image", description="Upload and encode reference image")
+def set_reference_image(self, reference_image: UploadedFile):
+    self.state.reference_image = reference_image
+    pil_image = Image.open(io.BytesIO(reference_image.data)).convert("RGB")
+    self.state._img_embedding = self.encoder.encode(pil_image)
+```
+
+## Putting it together
+
+A model that combines everything from this page: custom events, lifecycle hooks, and outbound messages.
+
+First, the types — state, events, and messages:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@dataclass
+class MyState(InputState):
+    prompt: str = InputField(default="a sunny meadow")
+
+# Sent back to the client when they ask for the current prompt
+@dataclass
+class CurrentPrompt(ModelMessage):
+    prompt: str
+
+# Sent every frame so the client can show a progress indicator
+@dataclass
+class Progress(ModelMessage):
+    step: int
+    total: int
+```
+
+Then the model class:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+class MyModel(ReactorPipeline):
+    state: MyState
+
+    @event(name="get_current_prompt", description="Return the current prompt")
+    async def get_current_prompt(self):
+        await self.send(CurrentPrompt(prompt=self.state.prompt))
+
+    async def inference(self):
+        step = 0
+        while True:
+            frame = self.pipe.forward(prompt=self.state.prompt, step=step)
+            await self.send(Progress(step=step, total=100))
+            step += 1
+            yield MyOutput(main_video=frame)
+```
+
+The client can:
+
+* Send `set_prompt` (auto-generated from `InputState`).
+* Send `get_current_prompt` (custom event) and receive a `current_prompt` message back.
+* Receive `progress` messages each frame.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Media Input" icon="layers" href="/development/reactor-pipeline/media-input">
+    Read webcam, microphone, and other client media.
+  </Card>
+
+  <Card title="Bring Your Own Model" icon="sparkles" href="/development/reactor-pipeline/bring-your-model">
+    Convert an existing research pipeline to Reactor.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Media Input
+
+> Read webcam, microphone, and other client media streams.
+
+Your model can receive live **video** and **audio** from the client (webcam, screen share, microphone, and so on). You describe **which tracks you expect** in a small dataclass, attach it to the model with a single attribute (commonly `input`), then read from **`self.input.<track_name>`** inside `inference()`.
+
+## Declare tracks and attach them to the model
+
+1. Subclass **`Input`** and add one field per track. Use **`Video`** for picture and **`Audio`** for sound. The **field name** is the track id (it must match what the client sends for that track).
+2. On your **`ReactorPipeline`** subclass, add an attribute whose type is that subclass (the attribute name is up to you; **`input`** is conventional).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from dataclasses import dataclass
+from reactor_runtime.interface import Input, Video, Audio, ReactorPipeline
+
+@dataclass
+class SessionInput(Input):
+    webcam: Video   # inbound video track named "webcam"
+    mic: Audio      # inbound audio track named "mic"
+
+class MyModel(ReactorPipeline):
+    input: SessionInput   # runtime fills self.input with live buffers per field
+```
+
+After this wiring, **`self.input.webcam`** and **`self.input.mic`** are the buffers for those tracks. Each buffer exposes **`try_read()`** and **`read()`** (see below).
+
+On **ReactorPipeline**, buffers are reset for you between client sessions, so you normally do not call `close()` or `reset()` yourself.
+
+## What each read returns: `InputFrame`
+
+Every frame you pull from a track buffer is an **`InputFrame`** (a small immutable object), not a bare NumPy array:
+
+| Field      | Meaning                                                                                                                                         |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`data`** | The decoded frame as **`np.ndarray`**. Pass this to OpenCV, PyTorch, etc.                                                                       |
+| **`pts`**  | Presentation time in **seconds** (`float`) when the transport has it, else **`None`**. Useful for aligning video and audio or debugging timing. |
+
+**Video `data`:** shape `(height, width, 3)`, `uint8`, RGB.
+
+**Audio `data`:** shape `(1, samples)`, **`int16`**, **mono**. Inbound client audio is always **48 kHz** today (fixed for WebRTC input).
+
+Example: one video frame, then the array your model actually runs on:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+frames = self.input.webcam.try_read()
+if frames:
+    frame = frames[0]
+    rgb = frame.data   # np.ndarray (H, W, 3)
+    t = frame.pts      # seconds or None
+```
+
+## `try_read()` (non-blocking)
+
+Call it on a buffer: **`self.input.webcam.try_read()`** (optionally pass a count, e.g. **`try_read(4)`** for four frames; default is one).
+
+* **If enough frames are available**, you get a **list** of `InputFrame` instances. With the default **latest-first** behaviour, you get the freshest frames and older queued frames for that track are dropped so you do not fall behind.
+* **If not enough frames are available yet**, you get **`None`**. In that case **nothing is taken out of the buffer** — no frames are consumed and none are thrown away just because you called `try_read`. Try again on the next loop iteration (often after **`yield Idle`** so the runtime can deliver more media and events).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import Idle
+
+def inference(self):
+    while True:
+        frames = self.input.webcam.try_read()
+        while frames is None:
+            yield Idle
+            frames = self.input.webcam.try_read()
+        result = self.pipe.forward(frames[0].data)
+        yield MyOutput(main_video=result)
+```
+
+## `read()` (async, blocking)
+
+**`await self.input.webcam.read(1)`** waits until at least one frame is available, then returns a **list** of `InputFrame` (same `.data` / `.pts` as above). Use it from an **`async def inference()`** when you prefer to wait instead of polling with `try_read` and `Idle`.
+
+## Full example: video-to-video
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from dataclasses import dataclass
+from reactor_runtime.interface import (
+    Input, Output, Video, ReactorPipeline, InputState, InputField, Idle,
+)
+
+@dataclass
+class V2VInput(Input):
+    camera: Video
+
+@dataclass
+class V2VOutput(Output):
+    main_video: Video
+
+@dataclass
+class V2VState(InputState):
+    style: str = InputField(default="none", choices=["none", "oil_paint", "sketch"])
+
+class V2VModel(ReactorPipeline):
+    input: V2VInput
+    state: V2VState
+    fps = 30
+
+    def load(self, config):
+        self.pipe = load_style_model(config["checkpoint"])
+
+    def inference(self):
+        while True:
+            frames = self.input.camera.try_read()
+            while frames is None:
+                yield Idle
+                frames = self.input.camera.try_read()
+            result = self.pipe.apply(frames[0].data, style=self.state.style)
+            yield V2VOutput(main_video=result)
+```
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Bring Your Own Model" icon="sparkles" href="/development/reactor-pipeline/bring-your-model">
+    Convert an existing research pipeline to Reactor.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Bring Your Own Model
+
+> Convert an existing research pipeline into a real-time Reactor model.
+
+You have a working inference pipeline: a diffusion model, a world simulator, a style transfer net. Here's how to make it real-time on Reactor without rewriting your inference code.
+
+## The starting point
+
+A typical research pipeline looks like this: load weights once, take all inputs upfront, run inference, return the result.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+class OriginalPipeline(torch.nn.Module):
+    def __init__(self, config):
+        self.net = load_checkpoint(config["path"])
+
+    def inference(self, prompt, num_frames=100):
+        frames = []
+        for step in range(num_frames):
+            frame = self.net.forward(prompt=prompt, step=step)
+            frames.append(frame)
+        return np.stack(frames)
+```
+
+The problems for real-time: all inputs provided upfront, no frames until the end, no way to change parameters mid-generation.
+
+## The conversion
+
+You don't need to modify your pipeline code. Wrap it in a `ReactorPipeline`:
+
+<Steps>
+  <Step title="Declare your tracks">
+    What does the model send to the client?
+
+    ```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+    @dataclass
+    class MyOutput(Output):
+        main_video: Video
+    ```
+  </Step>
+
+  <Step title="Declare your state">
+    What can the client change in real-time?
+
+    ```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+    @dataclass
+    class MyState(InputState):
+        prompt: str = InputField(default="a sunny meadow")
+        guidance_scale: float = InputField(default=7.5, ge=1.0, le=20.0)
+    ```
+  </Step>
+
+  <Step title="Write the model class">
+    Load your pipeline in `load()`. Drive it from `inference()`. Instead of collecting all frames and returning them at the end, `yield` each frame as it's produced.
+
+    ```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+    class MyModel(ReactorPipeline):
+        state: MyState
+
+        def load(self, config):
+            self.pipe = OriginalPipeline(config)
+
+        def inference(self):
+            for step in range(self.pipe.num_steps):
+                frame = self.pipe.net.forward(
+                    # ✅ Prompt comes from live state, not a function argument
+                    prompt=self.state.prompt,
+                    step=step,
+                )
+                # ✅ Yield each frame instead of collecting them
+                yield MyOutput(main_video=frame)
+    ```
+
+    If your pipeline produces multiple frames at once, yield them as a batch. The runtime splits the batch and emits each frame smoothly at the target rate.
+
+    ```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+        def inference(self):
+            frames = self.pipe.net.forward(prompt=self.state.prompt)
+            print(frames.shape) # (N, H, W, 3)
+            yield MyOutput(main_video=frames)
+    ```
+
+    <Info>
+      If your model generates frames in batches, yield the entire batch in a single yield. The runtime will split it and emit each frame at the target rate.
+    </Info>
+  </Step>
+
+  <Step title="Add reactor.yaml">
+    ```yaml theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+    model:
+      name: my-model
+
+    runtime:
+      import: model:MyModel
+      config: config.yaml
+    ```
+  </Step>
+
+  <Step title="Run it">
+    ```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+    reactor run
+    ```
+  </Step>
+</Steps>
+
+## What changed
+
+The original pipeline's `forward()` call is unchanged. You're just calling it from a different loop:
+
+* **Prompt** is no longer passed once upfront. It comes from `self.state.prompt`, updated live by the client.
+* **Frames** are no longer collected in memory. Each `yield MyOutput(main_video=frame)` streams the frame to the client immediately.
+* **No batch return.** There's no `np.stack(frames)` at the end. Frames are delivered as they're generated. If the generator finishes, the runtime starts it over.
+
+## Going further
+
+The generator pattern covers most real-time models. For cases where you need full control over the execution loop, [**ReactorModel**](/development/reactor-model/model-anatomy) lets you handle connections, state, and frame emission directly while keeping the same tracks, events, and messaging.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="circle-check" href="/overview">
+    Back to the Runtime overview.
+  </Card>
+
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Revisit the quickstart for reference.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+
+Now here for ReactorModel
+# Model Anatomy
+
+> Understand every piece of a ReactorModel.
+
+**ReactorModel** gives you full control over the execution loop. You handle client connections, manage state, emit frames, and clean up between sessions yourself.
+
+## The full model
+
+Here's a complete runnable ReactorModel:
+
+```python model.py theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import Output, Video, ReactorModel, event, connected, disconnected, InputField
+
+@dataclass
+class MyOutput(Output):
+    main_video: Video
+
+class MyModel(ReactorModel):
+
+    def load(self, config):
+        self.pipe = load_checkpoint(config["checkpoint"])
+
+    @connected
+    async def on_connect(self):
+        self.prompt = "a sunny meadow"
+        self._step = 0
+
+    @disconnected
+    async def on_disconnect(self):
+        self.output_buffer.flush()
+
+    @event(name="set_prompt", description="Change the scene prompt")
+    def set_prompt(self, prompt: str = InputField(default="")):
+        self.prompt = prompt
+
+    async def run(self):
+        while True:
+            await self.connected.wait()
+            while self.connected.is_set():
+                frame = self.pipe.forward(prompt=self.prompt, step=self._step)
+                await self.emit(MyOutput(main_video=frame))
+                self._step += 1
+```
+
+Let's break it down.
+
+## Output tracks
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@dataclass
+class MyOutput(Output):
+    main_video: Video
+```
+
+This declares what media the model sends to clients. Each field is a **track**, a named media channel. `Video` means the field carries video frames.
+
+You can have multiple tracks:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@dataclass
+class MyOutput(Output):
+    main_video: Video
+    main_audio: Audio
+```
+
+The field names (`main_video`, `main_audio`) become the track identifiers that clients use.
+
+## The model class
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+class MyModel(ReactorModel):
+```
+
+Subclass `ReactorModel` and override the methods you need. The runtime provides `emit()`, `send()`, `self.connected`, and the event dispatcher.
+
+## Loading
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+def load(self, config):
+    self.pipe = load_checkpoint(config["checkpoint"])
+```
+
+Called once at startup, before any client can connect. The `config` dict comes from `config.yaml`. This is where you load checkpoints, allocate GPU memory, and set up your pipeline.
+
+Checkpoints are not baked into the image. Resolve them via `get_weights_path()` so the same code runs locally and in production; see the dedicated [Weights](/development/weights) page for the helper, configuration, and the publish-time upload flow.
+
+## The run loop
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+async def run(self):
+    while True:
+        await self.connected.wait()
+        while self.connected.is_set():
+            frame = self.pipe.forward(prompt=self.prompt, step=self._step)
+            await self.emit(MyOutput(main_video=frame))
+            self._step += 1
+```
+
+This is the heart of the model. It's an async method that runs for the lifetime of the model:
+
+1. `await self.connected.wait()` blocks until a client connects.
+2. The inner loop produces frames and calls `emit()` to send them to the client.
+3. When `self.connected` is cleared (client disconnects), the inner loop exits and the outer loop waits for the next client.
+
+The [next page](/development/reactor-model/run-loop) covers `run()` in detail: emitting frames, batches, backpressure, and adaptive frame rates.
+
+## Events
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@event(name="set_prompt", description="Change the scene prompt")
+def set_prompt(self, prompt: str = InputField(default="")):
+    self.prompt = prompt
+```
+
+Every event handler is explicit. You write an `@event` for each parameter the client can change.
+
+## Lifecycle hooks
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@connected
+async def on_connect(self):
+    self.prompt = "a sunny meadow"
+    self._step = 0
+
+@disconnected
+async def on_disconnect(self):
+    self.output_buffer.flush()
+```
+
+`@connected` runs when a client connects. Use it to initialize per-session state. `@disconnected` runs when they leave. Use it to clean up buffers and reset resources.
+
+## The manifest
+
+```yaml reactor.yaml theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+model:
+  name: my-model
+
+runtime:
+  import: model:MyModel
+  config: config.yaml
+```
+
+* `model.name`: human-readable identifier, used in logging and routing.
+* `runtime.import`: Python import path in `module:ClassName` format pointing to your model class.
+* `runtime.config`: path to the model config YAML.
+
+For checkpoint configuration (`runtime.weights_path` and `REACTOR_WEIGHTS_PATH`), see the dedicated [Weights](/development/weights) page.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="The Run Loop" icon="play" href="/development/reactor-model/run-loop">
+    Emitting frames, batches, backpressure, and adaptive frame rates.
+  </Card>
+
+  <Card title="Managing State" icon="sliders-horizontal" href="/development/reactor-model/state">
+    Instance attributes, explicit events, and concurrency.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# The Run Loop
+
+> How run() works, emitting frames, and controlling output.
+
+`run()` is where your model's logic lives. It's an async method that the runtime calls once after `load()` and runs for the lifetime of the model. You have full control over what happens inside it.
+
+## Basic pattern
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+async def run(self):
+    while True:
+        # ✅ Block until a client connects
+        await self.connected.wait()
+        while self.connected.is_set():
+            frame = self.pipe.forward(prompt=self.prompt)
+            # ✅ Send the frame to the client
+            await self.emit(MyOutput(main_video=frame))
+```
+
+Each iteration of the inner loop:
+
+1. Run your forward pass.
+2. Call `emit()` to send the output to the client.
+3. Check `self.connected.is_set()` to know if the client is still there.
+
+If you don't override `run()`, the default blocks forever. This is useful for purely event-driven models where all logic lives in `@event` handlers.
+
+## Connection signal
+
+`self.connected` is an `asyncio.Event` that the runtime manages. It is **set** when a client connects and **cleared** when they disconnect.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+async def run(self):
+    while True:
+        await self.connected.wait()
+        # client is connected, start producing
+        while self.connected.is_set():
+            ...
+```
+
+The runtime sets and clears this event internally. You never need to manage it yourself. It is set before your `@connected` handler fires and cleared before your `@disconnected` handler fires.
+
+## Emitting frames
+
+Call `emit()` to send an `Output` instance to the client:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+await self.emit(MyOutput(main_video=frame))
+```
+
+The output buffer controls the emission rate based on `fps`.
+
+### Batches
+
+`emit()` accepts both single frames `(H, W, 3)` and batches `(N, H, W, 3)`. When you pass a batch, the runtime splits it into individual frames and emits them at the target rate. Always pass the full batch in a single `emit()` call:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+frames = self.pipe.forward(prompt=self.prompt)
+print(frames.shape)  # (10, 720, 1280, 3)
+# ✅ Emit the full batch — the runtime splits it
+await self.emit(MyOutput(main_video=frames))
+```
+
+### Blocking
+
+If the output queue is full, `emit()` awaits until a slot opens. This is the natural throttle point: when the model produces faster than the emission rate, it pauses here:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+await self.emit(MyOutput(main_video=frame))
+```
+
+Pass `drop=True` to discard the frame instead of blocking:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+await self.emit(MyOutput(main_video=frame), drop=True)
+```
+
+### Adaptive frame rate
+
+Report how long inference took so the runtime adjusts the emission rate to match your model's throughput:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+t0 = time.perf_counter()
+frames = self.pipe.forward()
+compute_time = time.perf_counter() - t0
+# ✅ Pass compute_time so the runtime adapts the frame rate
+await self.emit(MyOutput(main_video=frames), compute_time=compute_time)
+```
+
+## FPS and buffer size
+
+Set these as class attributes on your `ReactorModel` subclass:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+class MyModel(ReactorModel):
+    fps = 24
+    buffer_size = 4
+
+    async def run(self):
+        ...
+```
+
+`fps` sets the target output frame rate (default 30). `buffer_size` sets the output queue depth (default 4). Higher values smooth out jitter but add latency.
+
+If your model emits frames in batches, set `buffer_size` to at least double the batch size:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+class MyModel(ReactorModel):
+    fps = 30
+    buffer_size = 20  # model emits ~10 frames at a time
+
+    async def run(self):
+        ...
+```
+
+### Dynamic FPS
+
+Change the frame rate at any point during the model's lifecycle:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+self.output_buffer.set_fps(new_fps)
+```
+
+This takes effect immediately on the emission thread.
+
+## Sending messages
+
+Send structured data to the client from inside `run()`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+await self.send(Progress(step=self._step, total=100))
+```
+
+See [Events & Messages](/development/reactor-model/events-and-messages#outbound-messages) for how to define message types.
+
+## Concurrency
+
+`@event` handlers fire concurrently with `run()` at any `await` point. If you read an instance attribute, do an `await`, and read it again, a handler may have changed it in between. Snapshot values into local variables before expensive operations:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+async def run(self):
+    while True:
+        await self.connected.wait()
+        while self.connected.is_set():
+            # ✅ Snapshot before the forward pass — handlers can fire at awaits
+            prompt = self.prompt
+            step = self._step
+            frame = self.pipe.forward(prompt=prompt, step=step)
+            await self.emit(MyOutput(main_video=frame))
+            self._step += 1
+```
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Managing State" icon="sliders-horizontal" href="/development/reactor-model/state">
+    Instance attributes, explicit events, and concurrency.
+  </Card>
+
+  <Card title="Events & Messages" icon="bolt" href="/development/reactor-model/events-and-messages">
+    Custom events, lifecycle hooks, and outbound messages.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Managing State
+
+> Store and update parameters with explicit event handlers.
+
+ReactorModel gives you full control over how client-facing parameters are stored and updated. You keep them as instance attributes and write explicit `@event` handlers for each one.
+
+## Declaring parameters
+
+Store client-facing parameters as instance attributes. Initialize them in your `@connected` handler so each client starts with a clean slate:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@connected
+async def on_connect(self):
+    self.prompt = "a sunny meadow"
+    self.brightness = 1.0
+    self._step = 0
+```
+
+Read them directly in `run()`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+async def run(self):
+    while True:
+        await self.connected.wait()
+        while self.connected.is_set():
+            # ✅ Read instance attributes directly
+            frame = self.pipe.forward(
+                prompt=self.prompt,
+                brightness=self.brightness,
+            )
+            await self.emit(MyOutput(main_video=frame))
+```
+
+## Explicit event handlers
+
+Every parameter the client can change needs an explicit `@event` handler.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import event, InputField
+
+@event(name="set_prompt", description="Change the scene prompt")
+def set_prompt(self, prompt: str = InputField(default="a sunny meadow")):
+    self.prompt = prompt
+
+@event(name="set_brightness", description="Adjust brightness")
+def set_brightness(self, brightness: float = InputField(default=1.0, ge=0.0, le=2.0)):
+    self.brightness = brightness
+```
+
+The client sends `{"type": "set_prompt", "data": {"prompt": "a dark forest"}}` and the runtime calls your method.
+
+## Validation with InputField
+
+`InputField` defines constraints that the runtime enforces automatically. Invalid values from clients are silently rejected.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+# Numeric range (min/max inclusive)
+brightness: float = InputField(default=1.0, ge=0.0, le=1.0)
+
+# String / sequence length
+prompt: str = InputField(default="hello", min_length=1, max_length=500)
+
+# Exhaustive allowed values
+style: str = InputField(default="none", choices=["none", "oil_paint", "sketch"])
+
+# Description (shown in schema)
+seed: int = InputField(default=42, description="Random seed for generation")
+```
+
+These work on `@event` handler parameters, and the runtime enforces them before your handler is called.
+
+## Resetting between clients
+
+If you need to reset your model's state between clients, use the connection hooks:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@connected
+async def on_connect(self):
+    self.prompt = "a sunny meadow"
+    self.brightness = 1.0
+
+@disconnected
+async def on_disconnect(self):
+    # flush the model's output so it doesn't carry over
+    self.output_buffer.flush() 
+```
+
+If you skip initialization in `@connected`, attributes may carry over from the previous session.
+
+## Scheduling
+
+`run()` and `@event` handlers share the same event loop, so handlers can run at any `await` in your loop. If you need consistent values across a forward pass, snapshot them:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+async def run(self):
+    while True:
+        await self.connected.wait()
+        while self.connected.is_set():
+            # ✅ Snapshot — handlers can fire at any await below
+            prompt = self.prompt
+            brightness = self.brightness
+            frame = self.pipe.forward(prompt=prompt)
+            frame = (frame * brightness).clip(0, 255).astype("uint8")
+            await self.emit(MyOutput(main_video=frame))
+```
+
+## Derived state
+
+For expensive derived values (embeddings, cached tensors), compute them in the event handler and store them alongside the raw value:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@event(name="set_prompt", description="Scene prompt with encoding")
+def set_prompt(self, prompt: str = InputField(default="")):
+    self.prompt = prompt
+    # ✅ Cache the expensive encoding so run() doesn't redo it each frame
+    self._embedding = self.encoder.encode(prompt)
+```
+
+Then read `self._embedding` in `run()` instead of re-encoding every frame.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Events & Messages" icon="bolt" href="/development/reactor-model/events-and-messages">
+    Custom events, lifecycle hooks, and outbound messages.
+  </Card>
+
+  <Card title="Media Input" icon="layers" href="/development/reactor-model/media-input">
+    Read client media with manual buffer management.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Events & Messages
+
+> Custom event handlers, lifecycle hooks, and outbound messages.
+
+You define every event handler explicitly. Each `@event` becomes a command the client can send.
+
+## Custom event handlers
+
+Use `@event` to define actions the client can trigger. The method's signature becomes the event schema.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import event
+
+@event(name="get_current_prompt", description="Log the current prompt")
+async def get_current_prompt(self):
+    print(f"Current prompt: {self.prompt}")
+```
+
+The client sends `{"type": "get_current_prompt", "data": {}}` and the runtime calls your method. This works, but printing to stdout isn't useful for the client. We'll see how to send data back in [Outbound messages](#outbound-messages).
+
+Events can also take parameters:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@event(name="set_style", description="Change the rendering style")
+def set_style(self, style: str = InputField(default="realistic")):
+    self._style_embedding = self.encoder.encode(style)
+```
+
+### Deduplicating expensive handlers
+
+Pass `dedupe=True` to collapse duplicate events that queue up while the model is busy. Only the latest payload is processed; earlier ones are discarded.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@event(
+    name="set_reference_image",
+    description="Upload a reference image",
+    dedupe=True,
+)
+async def set_reference_image(self, image: str = ""):
+    self._ref_embedding = self.encoder.encode(image)
+```
+
+Use this for handlers that do heavy compute (forward passes, encoding) where only the latest value matters.
+
+## Lifecycle hooks
+
+### `@connected`
+
+Runs once when a client connects, before `run()` resumes from `await self.connected.wait()`.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import connected
+
+@connected
+async def on_connect(self):
+    self.prompt = "a sunny meadow"
+    self._step = 0
+```
+
+Use it to initialize per-session state. The handler can be `async def` or plain `def`. Only one `@connected` handler is allowed per model class.
+
+### `@disconnected`
+
+Runs once when a client disconnects.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import disconnected
+
+@disconnected
+async def on_disconnect(self):
+    self.output_buffer.flush()
+```
+
+Use it to clean up session resources and flush buffers. The handler can be `async def` or plain `def`. Only one `@disconnected` handler is allowed per model class.
+
+## Outbound messages
+
+Earlier we printed the prompt to stdout. What if we want to send it to the client instead? Define a `ModelMessage` subclass:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from dataclasses import dataclass
+from reactor_runtime.interface import ModelMessage
+
+@dataclass
+class CurrentPrompt(ModelMessage):
+    prompt: str
+```
+
+The client receives this as JSON: `{"type": "current_prompt", "data": {"prompt": "..."}}`. The type on the wire is the snake\_case version of the class name.
+
+Now replace the `print` with `self.send()`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@event(name="get_current_prompt", description="Return the current prompt")
+async def get_current_prompt(self):
+    await self.send(CurrentPrompt(prompt=self.prompt))
+```
+
+You can also send messages from inside `run()`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@dataclass
+class Progress(ModelMessage):
+    step: int
+    total: int
+
+async def run(self):
+    while True:
+        await self.connected.wait()
+        while self.connected.is_set():
+            frame = self.pipe.forward(prompt=self.prompt, step=self._step)
+            # ✅ Send a message to the client
+            await self.send(Progress(step=self._step, total=100))
+            await self.emit(MyOutput(main_video=frame))
+            self._step += 1
+```
+
+## File uploads
+
+When your model needs binary files from the client (reference images, style assets, etc.), type an `@event` parameter as `UploadedFile`. The runtime handles the upload and delivers the file bytes to your handler automatically.
+
+`UploadedFile` has four fields: `name`, `mime_type`, `size`, and `data` (the raw bytes). You can use them to filter by type, decode images, or pass the content to your pipeline:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import UploadedFile
+
+@event(name="set_reference_image", description="Upload and encode reference image")
+def set_reference_image(self, reference_image: UploadedFile):
+    self._reference_image = reference_image
+    pil_image = Image.open(io.BytesIO(reference_image.data)).convert("RGB")
+    self._ref_embedding = self._vae_encode(pil_image)
+```
+
+If you need a generic catch-all for any file the client uploads, use the `@file_uploaded` decorator instead. It fires once per upload regardless of which command triggered it:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime.interface import file_uploaded, UploadedFile
+
+@file_uploaded
+async def on_file(self, uploaded_file: UploadedFile):
+    if uploaded_file.mime_type.startswith("image/"):
+        pil_image = Image.open(io.BytesIO(uploaded_file.data)).convert("RGB")
+        self._reference = self._vae_encode(pil_image)
+```
+
+The handler must accept exactly one parameter named `uploaded_file`. Only one `@file_uploaded` handler is allowed per model class.
+
+## Putting it together
+
+A model that combines everything from this page: explicit events, lifecycle hooks, and outbound messages.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@dataclass
+class CurrentPrompt(ModelMessage):
+    prompt: str
+
+@dataclass
+class Progress(ModelMessage):
+    step: int
+    total: int
+
+class MyModel(ReactorModel):
+    fps = 24
+
+    def load(self, config):
+        self.pipe = load_checkpoint(config["checkpoint"])
+
+    @connected
+    async def on_connect(self):
+        self.prompt = "a sunny meadow"
+        self._step = 0
+
+    @disconnected
+    async def on_disconnect(self):
+        self.output_buffer.flush()
+
+    @event(name="set_prompt", description="Change the scene prompt")
+    def set_prompt(self, prompt: str = InputField(default="")):
+        self.prompt = prompt
+
+    @event(name="get_current_prompt", description="Return the current prompt")
+    async def get_current_prompt(self):
+        await self.send(CurrentPrompt(prompt=self.prompt))
+
+    async def run(self):
+        while True:
+            await self.connected.wait()
+            while self.connected.is_set():
+                prompt = self.prompt
+                frame = self.pipe.forward(prompt=prompt, step=self._step)
+                await self.send(Progress(step=self._step, total=100))
+                await self.emit(MyOutput(main_video=frame))
+                self._step += 1
+```
+
+The client can:
+
+* Send `set_prompt` to change the prompt.
+* Send `get_current_prompt` and receive a `current_prompt` message back.
+* Receive `progress` messages each frame.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Media Input" icon="layers" href="/development/reactor-model/media-input">
+    Read client media with manual buffer management.
+  </Card>
+
+  <Card title="Model Anatomy" icon="microscope" href="/development/reactor-model/model-anatomy">
+    Back to the ReactorModel overview.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Media Input
+
+> Read webcam, microphone, and other client media streams with manual buffer management.
+
+Your model can receive live **video** and **audio** from the client (webcam, screen share, microphone, and so on). You describe **which tracks you expect** in a small dataclass, attach it to the model with a single attribute (commonly `input`), then read from **`self.input.<track_name>`** inside your code.
+
+## Declare tracks and attach them to the model
+
+1. Subclass **`Input`** and add one field per track: **`Video`** for picture, **`Audio`** for sound. The **field name** is the track id.
+2. On your **`ReactorModel`** subclass, declare an attribute typed with that **`Input`** subclass.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from dataclasses import dataclass
+from reactor_runtime.interface import Input, Video, Audio, ReactorModel
+
+@dataclass
+class SessionInput(Input):
+    webcam: Video
+    mic: Audio
+
+class MyModel(ReactorModel):
+    input: SessionInput
+    fps = 24
+```
+
+The runtime wires **`self.input.webcam`** and **`self.input.mic`** to live per-track buffers. You call **`try_read()`** or **`await ...read(n)`** on those objects.
+
+## What each read returns: `InputFrame`
+
+Each frame is an **`InputFrame`**:
+
+| Field      | Meaning                                                           |
+| ---------- | ----------------------------------------------------------------- |
+| **`data`** | **`np.ndarray`** payload for ML / image / DSP code.               |
+| **`pts`**  | Presentation time in **seconds** when available, else **`None`**. |
+
+**Video `data`:** `(height, width, 3)`, `uint8`, RGB.
+
+**Audio `data`:** `(1, samples)`, **`int16`**, **mono**, **48 kHz** inbound (fixed for WebRTC input today).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+frames = self.input.webcam.try_read()
+if frames is not None:
+    rgb = frames[0].data
+    t = frames[0].pts
+```
+
+## `try_read()` (non-blocking)
+
+**`self.input.webcam.try_read()`** — optionally pass a frame count (default `1`).
+
+* When **enough frames exist**, you get a **list** of `InputFrame`. By default the buffer returns the **newest** frames and drops older backlog on that track so you stay current.
+* When **not enough frames exist yet**, you get **`None`**. **No frames are removed from the buffer** for that call: you did not consume anything, so the next successful read can still see every frame that had already arrived.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+async def run(self):
+    while True:
+        await self.connected.wait()
+        while self.connected.is_set():
+            frames = self.input.webcam.try_read()
+            if frames is not None:
+                result = self.pipe.forward(frames[0].data)
+                await self.emit(MyOutput(main_video=result))
+            else:
+                await asyncio.sleep(0.01)
+```
+
+## `read(n)` (async, blocking)
+
+**`await self.input.webcam.read(1)`** blocks until `n` frames are available, then returns a **list** of `InputFrame`. Pass **`read(4)`** when one forward pass needs four frames. Use **`frame.data`** in your pipeline.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+async def run(self):
+    while True:
+        await self.connected.wait()
+        try:
+            while self.connected.is_set():
+                [wrapped] = await self.input.webcam.read(1)
+                result = self.pipe.forward(wrapped.data)
+                await self.emit(MyOutput(main_video=result))
+        except BufferClosed:
+            pass
+```
+
+### `BufferClosed`
+
+If the client disconnects while **`read()`** is waiting, **`BufferClosed`** is raised. It is **not** swallowed for you on **ReactorModel** — catch it around the session loop as above.
+
+## Buffer cleanup between sessions
+
+Input buffers do **not** reset themselves. On each new connection, **`reset()`** clears the buffer and allows reads again. On disconnect, **`close()`** marks end-of-stream and unblocks waiting **`read()`** calls.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+@connected
+async def on_connect(self):
+    self.input.webcam.reset()
+    self.input.mic.reset()
+
+@disconnected
+async def on_disconnect(self):
+    self.input.webcam.close()
+    self.input.mic.close()
+    self.output_buffer.flush()
+```
+
+Skipping **`close()`** can leave frames from the previous session visible. Skipping **`reset()`** can leave the buffer **closed**, so the next client’s **`read()`** fails with **`BufferClosed`**.
+
+## Full example: video-to-video
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from dataclasses import dataclass
+from reactor_runtime.interface import (
+    Input, Output, Video, ReactorModel, InputField,
+    event, connected, disconnected, BufferClosed,
+)
+
+@dataclass
+class V2VInput(Input):
+    camera: Video
+
+@dataclass
+class V2VOutput(Output):
+    main_video: Video
+
+class V2VModel(ReactorModel):
+    input: V2VInput
+    fps = 30
+
+    def load(self, config):
+        self.pipe = load_style_model(config["checkpoint"])
+
+    @connected
+    async def on_connect(self):
+        self.input.camera.reset()
+        self.style = "none"
+
+    @disconnected
+    async def on_disconnect(self):
+        self.input.camera.close()
+        self.output_buffer.flush()
+
+    @event(name="set_style", description="Change the style filter")
+    def set_style(self, style: str = InputField(
+        default="none", choices=["none", "oil_paint", "sketch"]
+    )):
+        self.style = style
+
+    async def run(self):
+        while True:
+            await self.connected.wait()
+            try:
+                while self.connected.is_set():
+                    [wrapped] = await self.input.camera.read(1)
+                    result = self.pipe.apply(wrapped.data, style=self.style)
+                    await self.emit(V2VOutput(main_video=result))
+            except BufferClosed:
+                pass
+```
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Audio Output" icon="volume-2" href="/development/reactor-model/audio">
+    Add audio output tracks to your model.
+  </Card>
+
+  <Card title="The Run Loop" icon="play" href="/development/reactor-model/run-loop">
+    Emitting frames, batches, backpressure, and adaptive frame rates.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Audio Output
+
+> Add audio output tracks to your model.
+
+Audio tracks work the same way as video tracks. Declare them on your Output dataclass, and the runtime handles encoding, transport, and synchronization.
+
+Add an `Audio` field to your Output:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from dataclasses import dataclass
+from reactor_runtime import Audio, Output, Video
+
+@dataclass
+class MyOutput(Output):
+    main_video: Video
+    main_audio: Audio
+```
+
+Emit audio alongside video in your run loop:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+async def run(self):
+    while True:
+        await self.connected.wait()
+        while self.connected.is_set():
+            video_frame = self.pipe.forward(prompt=self.prompt)
+            audio_samples = self.pipe.generate_audio()
+            await self.emit(MyOutput(
+                main_video=video_frame,    # (H, W, 3) uint8
+                main_audio=audio_samples,  # (1, N) int16
+            ))
+```
+
+## Audio format
+
+Audio data is a NumPy array of signed 16-bit integers:
+
+| Property    | Value                                               |
+| ----------- | --------------------------------------------------- |
+| dtype       | `int16`                                             |
+| Shape       | `(channels, samples)` - typically `(1, N)` for mono |
+| Sample rate | 48,000 Hz (default)                                 |
+| Channels    | 1 (mono, default)                                   |
+
+The runtime encodes audio to Opus and streams it over WebRTC. The 48 kHz sample rate matches the Opus standard, so no resampling is needed if your audio is already at 48 kHz.
+
+### Custom sample rates
+
+If your model generates audio at a different sample rate, subclass `Audio`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime import Audio
+
+class Audio16k(Audio):
+    sample_rate = 16_000
+
+@dataclass
+class MyOutput(Output):
+    main_video: Video
+    main_audio: Audio16k
+```
+
+The runtime resamples to 48 kHz for transport automatically.
+
+## Synchronizing audio and video
+
+When you emit an Output with both audio and video, the runtime keeps them in sync. The runtime splits batch video into individual frames and proportionally splits the audio across them.
+
+For models that produce audio and video at different rates (e.g. separate decoder threads), pair them by block index before emitting:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+import queue
+import threading
+
+AUDIO_SAMPLE_RATE = 48000
+
+class AVModel(ReactorModel):
+    fps = 30
+
+    def load(self, config):
+        self.fpb = config.get("frames_per_block", 3)
+
+    async def run(self):
+        while True:
+            await self.connected.wait()
+            block_queue = queue.Queue()
+
+            # Decode audio and video on separate threads
+            audio_thread = threading.Thread(
+                target=self._decode_audio, args=(block_queue,)
+            )
+            video_thread = threading.Thread(
+                target=self._decode_video, args=(block_queue,)
+            )
+            audio_thread.start()
+            video_thread.start()
+
+            # Pair blocks by index and emit synchronized
+            await self._demux_and_emit(block_queue)
+
+    async def _demux_and_emit(self, block_queue):
+        audio_pending = {}
+        video_pending = {}
+        next_idx = 0
+
+        while self.connected.is_set():
+            kind, idx, data = block_queue.get()
+
+            if kind == "audio":
+                audio_pending[idx] = data
+            elif kind == "video":
+                video_pending[idx] = data
+
+            # Emit when both tracks are ready for the next block
+            while next_idx in audio_pending and next_idx in video_pending:
+                await self.emit(AVOutput(
+                    main_video=video_pending.pop(next_idx),
+                    main_audio=audio_pending.pop(next_idx),
+                ))
+                next_idx += 1
+```
+
+Each audio block should contain `frames_per_block` video-frames worth of samples. At 30 fps with 3 frames per block, that's `round(48000 / 30) * 3 = 4,800 samples` (100 ms) per block.
+
+## Full example
+
+A model that plays back an MP4 file with synchronized audio and video:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from dataclasses import dataclass
+from reactor_runtime import (
+    Audio, Output, Video, ReactorModel, ModelMessage,
+    connected, disconnected, event,
+)
+import numpy as np
+import av
+
+AUDIO_SAMPLE_RATE = 48000
+
+@dataclass
+class AVOutput(Output):
+    main_video: Video
+    main_audio: Audio
+
+@dataclass
+class PlaybackStarted(ModelMessage):
+    pass
+
+@dataclass
+class PlaybackPaused(ModelMessage):
+    pass
+
+class PlaybackModel(ReactorModel):
+    fps = 30
+
+    def load(self, config):
+        self.video_path = config["video_path"]
+        self.fpb = config.get("frames_per_block", 3)
+        self.audio_rtf = config.get("audio_rtf", 1.0)
+        self.video_rtf = config.get("video_rtf", 1.0)
+        self.playing = False
+
+    @connected
+    async def on_connect(self):
+        self.playing = True
+        await self.send(PlaybackStarted())
+
+    @disconnected
+    async def on_disconnect(self):
+        self.playing = False
+        self.output_buffer.flush()
+
+    @event(name="pause", description="Pause playback")
+    async def pause(self):
+        self.playing = False
+        await self.send(PlaybackPaused())
+
+    @event(name="play", description="Resume playback")
+    async def play(self):
+        self.playing = True
+        await self.send(PlaybackStarted())
+
+    async def run(self):
+        # See the synchronization section above for the
+        # threaded decode + demux pattern
+        ...
+```
+
+```yaml config.yaml theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+fps: 30
+frames_per_block: 3
+audio_rtf: 1.0
+video_rtf: 1.0
+```
+
+```yaml reactor.yaml theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+model:
+  name: audio-example
+
+runtime:
+  import: model:PlaybackModel
+  config: config.yaml
+```
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Media Input" icon="layers" href="/development/reactor-model/media-input">
+    Read webcam, microphone, and other client media.
+  </Card>
+
+  <Card title="The Run Loop" icon="play" href="/development/reactor-model/run-loop">
+    Emitting frames, batches, backpressure, and adaptive frame rates.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Weights
+
+> Organize, resolve, and ship model weights from local development to production.
+
+Model weights are never baked into the container image. You keep them on disk while you iterate, ship them to Reactor as a separate artifact when you publish a release, and read them back from the same `get_weights_path()` call in both places.
+
+## Resolving the weights directory
+
+The runtime exports a single helper for finding weights. Use it everywhere you would otherwise hard-code a path:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime import get_weights_path
+
+def load(self, config):
+    weights = get_weights_path()
+    self.transformer = AutoModel.from_pretrained(weights / "wan2_2" / "transformer")
+    self.vae = load_vae(weights / "wan2_2" / "vae")
+```
+
+<Check>
+  The same `load()` code runs unchanged from your laptop to production. Only the resolved root path changes.
+</Check>
+
+`get_weights_path()` returns a `pathlib.Path` to the root directory under which all of your checkpoints live. You arrange subdirectories under that root however you like; the runtime never inspects the layout.
+
+### Resolution order
+
+`$REACTOR_WEIGHTS_PATH` wins over `runtime.weights_path` in `reactor.yaml`. If neither is set, the default is `~/.cache/reactor_registry`.
+
+## Configuring the weights path locally
+
+You'll usually pick one of two ways to point the runtime at your local checkpoints.
+
+<CodeGroup>
+  ```yaml reactor.yaml theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+  runtime:
+    import: pipeline:MyModel
+    weights_path: ./weights
+  ```
+
+  ```bash env theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+  export REACTOR_WEIGHTS_PATH=/data/weights
+  ```
+</CodeGroup>
+
+Relative paths in `reactor.yaml` resolve against the workspace root (the directory containing `reactor.yaml`), so `./weights` always points at `<workspace>/weights` regardless of where you launch the runtime from. Absolute paths are passed through unchanged.
+
+<Info>
+  `reactor run` mounts the resolved path into the container, so weights persist across restarts.
+</Info>
+
+## The weights lifecycle
+
+The same `get_weights_path()` call works at every stage of your model's life. You write the code once and the path resolves to the right place automatically.
+
+<Steps>
+  <Step title="Local development">
+    Keep your weights anywhere on disk. Point `runtime.weights_path` or `$REACTOR_WEIGHTS_PATH` at the root and arrange checkpoints under it however you like:
+
+    ```
+    /data/weights/
+    ├── wan2_2/
+    │   ├── transformer/...
+    │   └── vae/...
+    └── tokenizer/...
+    ```
+  </Step>
+
+  <Step title="Shipping">
+    When you're ready to publish, [`reactor model publish`](/platform/publish) uploads the entire subtree as part of the release. Your subdirectory layout is preserved exactly.
+  </Step>
+
+  <Step title="Production">
+    Reactor mounts the uploaded bundle into your model container and points `get_weights_path()` at it. The same `load()` code keeps working.
+  </Step>
+</Steps>
+
+## Shipping weights with a release
+
+`reactor model publish` is the primary path. It registers the release, builds and pushes the image, and uploads weights in a single command:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+reactor model publish my-awesome-model:v1.0.0 --weights ./weights/
+```
+
+### Common forms
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+# Point at a specific bundle.
+reactor model publish my-awesome-model:v1.0.0 --weights ./checkpoints/
+
+# Single-file checkpoint instead of a directory.
+reactor model publish my-awesome-model:v1.0.0 --weights ./weights.safetensors
+
+# Skip the upload; ship weights later.
+reactor model publish my-awesome-model:v1.0.0 --no-weights
+```
+
+See [Publish a release](/platform/publish) for the full flag table and success output.
+
+### Refreshing weights on a release
+
+To swap weights on a release without rebuilding the image, point [`reactor model weights`](/platform/weights) at it:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+reactor model weights my-awesome-model:v1.0.0 ./weights/
+```
+
+Same command covers the deferred case, when you published with `--no-weights` and want to upload them later.
+
+## Layout rules
+
+* **Symlinks are rejected**, both at the bundle root and within the tree. Resolve them first with `cp -L` or `tar --dereference`.
+* **Large bundles are fine.** Hundreds of GB is supported; the upload streams files instead of loading them into memory.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Publish a release" icon="upload" href="/platform/publish">
+    The end-to-end publish command that bundles image and weights.
+  </Card>
+
+  <Card title="Upload weights" icon="cloud-upload" href="/platform/weights">
+    The standalone weights command, plus retries and caveats.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://deploy-docs.reactor.inc/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Changelog
+
+> Reactor Runtime release notes.
+
+Each entry summarises what changes for partners building or running models on Reactor. Entries are listed newest-first.
+
+## Release 2.6.0
+
+### Host CLI is now the Go `reactor` binary; runtime ships inside a container
+
+The runtime no longer publishes a console script. The Go `reactor` binary now owns the host-side surface (`init`, `build`, `run`, and everything around them), and the runtime itself runs only inside a container built on `reactor-runtime-base`.
+
+Replace existing usages:
+
+| Before                                    | Now                                                                                                                                                                                                                                                              |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pip install reactor-runtime` on the host | nothing on the host. The runtime ships inside `reactor-runtime-base`.                                                                                                                                                                                            |
+| `reactor-runtime init my-model`           | `reactor init my-model`                                                                                                                                                                                                                                          |
+| `reactor-runtime run`                     | `reactor run`                                                                                                                                                                                                                                                    |
+| `reactor-runtime schema`                  | `python -m reactor_runtime.serve schema` from a dev venv, or `docker run --rm --entrypoint python <workspace-image> -m reactor_runtime.serve schema` against the workspace image. `reactor run` is scoped to the `run` subcommand and doesn't dispatch `schema`. |
+
+`reactor init` now scaffolds a workspace that doubles as a plain Docker project. `docker build && docker run -p 8080:8080 .` works without the `reactor` CLI installed.
+
+### Workspace runtime version pinned in the `Dockerfile`
+
+The scaffolded `Dockerfile` has a fully-qualified `FROM reactortechnologies/reactor-runtime-base:<X.Y.Z-N>` line, substituted at `reactor init` time. `reactor build` and `reactor run` are version-blind from that point on, with no `RUNTIME_VERSION` flag to thread.
+
+To upgrade an existing workspace, edit the `FROM` line (or re-init). Old templates with `ARG RUNTIME_VERSION` / `FROM …:${RUNTIME_VERSION}` need a one-line edit; everything else in the workspace keeps working unchanged.
+
+### `reactor build` split out of `reactor run`
+
+`reactor run` no longer carries build-time flags. Build-phase concerns (`-f`, `--no-cache`, `--build-secret`) live on `reactor build`; run-phase concerns (`--port`, `--gpus`, `--tty`, `-e`, `--env-file`) live on `reactor run`. Both share the same image tag, so the canonical two-step is:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+reactor build              # build options: -f, --no-cache, --build-secret
+reactor run                # run options: --port, --gpus, --tty, -e, --env-file
+```
+
+If you skip `reactor build`, `reactor run` auto-builds with defaults the first time and reuses the cached image after that.
+
+### Scaffold Dockerfile splits ENTRYPOINT and CMD
+
+`reactor init` emits `ENTRYPOINT [..., "python", "-m", "reactor_runtime.serve"]` and `CMD ["run"]`. `docker run <image>` boots the runtime against `/app/reactor.yaml`; positional args after the image name replace `CMD` wholesale, so `docker run <image> --port 9000` invokes `run --port 9000`. `reactor run` is opinionated about the contract: it always invokes the `run` subcommand, auto-prepending `run` to forwarded flags so partner-supplied flags (and any `model.extra-args` in `reactor.yaml`) land on `run` rather than replacing the default `CMD`. To reach a different `serve` subcommand such as `schema`, bypass `reactor run` (see the migration table above).
+
+## Release 2.5.0
+
+### CLI renamed: `reactor` → `reactor-runtime`
+
+The bundled console script is now `reactor-runtime`. Replace existing usages:
+
+* `reactor run` → `reactor-runtime run`
+* `reactor init` → `reactor-runtime init`
+* `reactor schema` → `reactor-runtime schema`
+
+When the Go `reactor` CLI is installed, `reactor run` keeps working — it delegates to `reactor-runtime run` under the hood.
+
+### `reactor.yaml`: modern nested shape
+
+`reactor.yaml` now uses a richer shape that splits identity from runtime entrypoint:
+
+```yaml reactor.yaml theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+model:
+  name: my-model
+
+runtime:
+  import: pipeline:MyModel
+  config: config.yaml
+```
+
+The legacy flat shape (`model: pipeline:MyModel`, `name: my-model`, `config: config.yaml`) keeps working but logs a one-shot deprecation warning per process. New scaffolds emit the modern shape.
+
+### New `get_weights_path()` helper
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+from reactor_runtime import get_weights_path
+
+def load(self, config):
+    weights = get_weights_path()
+    self.transformer = AutoModel.from_pretrained(weights / "wan2_2" / "transformer")
+```
+
+Resolution order: `$REACTOR_WEIGHTS_PATH` → `runtime.weights_path` in `reactor.yaml` → `~/.cache/reactor_registry`. Returns a `pathlib.Path`.
+
+### `runtime.weights_path` in `reactor.yaml`
+
+New optional field; relative paths are resolved against the workspace root:
+
+```yaml reactor.yaml theme={"theme":{"light":"github-light","dark":"github-dark-high-contrast"}}
+runtime:
+  import: pipeline:MyModel
+  weights_path: ./weights
+```
+
+The env var still takes priority over the YAML value, so production deployments override committed values.
+
+### `reactor-runtime init` improvements
+
+* **Name argument is optional.** `reactor-runtime init` with no argument scaffolds into the current folder (must be empty modulo dotfiles). Pass a name to scaffold into a new subdirectory.
+* **Model name is substituted into `reactor.yaml`** automatically.
+* **`Dockerfile` is part of the scaffold** — `python:3.12-slim` + GStreamer apt deps + `uv` install + `CMD ["reactor-runtime", "run"]`. Build with `docker build -t my-model:dev .`.
+* **`requirements.txt` ships `reactor-runtime`** so the workspace `.venv` has the import target available immediately.
+
+### Multi-line `ModelMessage` docstrings render correctly
+
+`reactor-runtime schema` and downstream SDK / docs generation now preserve the full docstring of each `ModelMessage` subclass. Wrapped one-sentence summaries are no longer truncated at the first newline, and undocumented `@dataclass` messages stop leaking their constructor signature (e.g. `GenerationReset(reason: str)`) into the description.
