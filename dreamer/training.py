@@ -404,7 +404,7 @@ def shortcut_forcing_step(
     assert B_self == 0 or B % B_self == 0, f"B ({B}) must be divisible by B_self ({B_self})"
     stride = B // B_self if B_self > 0 else 1
 
-    def _interleave_arr(emp_arr, self_arr):
+    def _interleave(emp_arr, self_arr):
         """(B_emp, *inner) + (B_self, *inner) → (B, *inner) with self at strided positions."""
         if B_self == 0:
             return emp_arr
@@ -413,29 +413,19 @@ def shortcut_forcing_step(
         self_block = self_arr[:, None]  # (B_self, 1, *inner)
         return jnp.concatenate([self_block, emp_blocks], axis=1).reshape(B, *inner)
 
-    def _split_self_arr(full_arr):
+    def _split_self(full_arr):
         """(B, *inner) → (B_self, *inner) gathering strided bootstrap positions."""
         if B_self == 0:
             return jnp.zeros((0,) + full_arr.shape[1:], dtype=full_arr.dtype)
         inner = full_arr.shape[1:]
         return full_arr.reshape(B_self, stride, *inner)[:, 0]
 
-    def _split_emp_arr(full_arr):
+    def _split_emp(full_arr):
         """(B, *inner) → (B_emp, *inner) gathering empirical positions (block-major)."""
         if B_self == 0:
             return full_arr
         inner = full_arr.shape[1:]
         return full_arr.reshape(B_self, stride, *inner)[:, 1:].reshape(B_emp, *inner)
-
-    # Pytree-aware variants (Actions etc. are flax struct pytrees, not raw arrays).
-    def _split_self(pytree):
-        return jax.tree.map(_split_self_arr, pytree)
-
-    def _split_emp(pytree):
-        return jax.tree.map(_split_emp_arr, pytree)
-
-    def _interleave(emp_pytree, self_pytree):
-        return jax.tree.map(_interleave_arr, emp_pytree, self_pytree)
 
     # Normalize latents before corruption (all operations happen in normalized space)
     latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
