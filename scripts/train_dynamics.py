@@ -72,7 +72,6 @@ OmegaConf.register_new_resolver("min", lambda *args: min(args))
 
 @nnx.jit(
     static_argnames=("k_max", "B_img", "T", "n_splits", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
-    donate_argnames=("data", "actions"),
 )
 def train_step(
     tokenizer: Tokenizer,
