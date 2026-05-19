@@ -330,20 +330,27 @@ def run(cfg: DynamicsConfig):
                 ema_update_step(bundle.dynamics, bundle.dynamics_ema, ema_decay=cfg.ema_decay)
 
                 # Logging — device_get on all hosts to stay in sync, only host 0 logs
-                if logger.should_log(step):
+                #
+                # Bootstrap steps fire at steps ≡ 3 (mod 4).  Log steps fire at
+                # multiples of the log interval.  If the log interval is even, these
+                # two sets are disjoint (odd vs even), so the bootstrap metrics would
+                # never get updated inside the original `if logger.should_log` gate.
+                # Fix: sync and update last_metrics on every bootstrap step, not just
+                # on log steps that happen to also be bootstrap steps.
+                if is_bootstrap_step:
                     metrics_cpu = jax.device_get(metrics)
-                    # Refresh whichever side this step actually computed; the other side
-                    # keeps its previous value so wandb gets both at every log step.
-                    if is_bootstrap_step:
-                        last_metrics["bootstrap_mse"] = float(metrics_cpu["bootstrap_mse"])
-                        last_metrics["boot_target_norm"] = float(metrics_cpu["boot_target_norm"])
-                    else:
-                        last_metrics["flow_mse"] = float(metrics_cpu["flow_mse"])
-                        last_metrics["flow_mse_sequence"] = float(metrics_cpu["flow_mse_sequence"])
-                        last_metrics["flow_mse_image"] = float(metrics_cpu["flow_mse_image"])
-                        last_metrics["flow_mse_low"] = float(metrics_cpu["flow_mse_low"])
-                        last_metrics["flow_mse_mid"] = float(metrics_cpu["flow_mse_mid"])
-                        last_metrics["flow_mse_high"] = float(metrics_cpu["flow_mse_high"])
+                    last_metrics["bootstrap_mse"] = float(metrics_cpu["bootstrap_mse"])
+                    last_metrics["boot_target_norm"] = float(metrics_cpu["boot_target_norm"])
+
+                if logger.should_log(step):
+                    if not is_bootstrap_step:
+                        metrics_cpu = jax.device_get(metrics)
+                    last_metrics["flow_mse"] = float(metrics_cpu["flow_mse"])
+                    last_metrics["flow_mse_sequence"] = float(metrics_cpu["flow_mse_sequence"])
+                    last_metrics["flow_mse_image"] = float(metrics_cpu["flow_mse_image"])
+                    last_metrics["flow_mse_low"] = float(metrics_cpu["flow_mse_low"])
+                    last_metrics["flow_mse_mid"] = float(metrics_cpu["flow_mse_mid"])
+                    last_metrics["flow_mse_high"] = float(metrics_cpu["flow_mse_high"])
                     if is_main_process:
                         scaling.on_step(step, metrics_cpu)
                         logger.log(
