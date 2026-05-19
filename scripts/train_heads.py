@@ -287,7 +287,7 @@ def run(cfg: HeadsConfig):
     )
 
     # Parallelism
-    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
+    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy, cfg.model_axis_size)
 
     with logger, jax.set_mesh(mesh):
         

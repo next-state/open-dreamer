@@ -178,7 +178,7 @@ def run(cfg: DynamicsConfig):
     run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
     # Parallelism
-    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
+    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy, cfg.model_axis_size)
     # mesh = jax.make_mesh((cfg.dataset.dataloader_cfg.B, jax.local_device_count()//cfg.dataset.dataloader_cfg.B), ('data', 'seq'))
     # data_sharding = NamedSharding(mesh, P('data', 'seq', None, None))
     # mesh_rules = MeshRules(data='data', seq='seq', mlp='data', attn='data')

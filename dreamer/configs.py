@@ -324,6 +324,11 @@ class BaseExperimentConfig:
     log_every: int = 100
     seed: int = 0  # Random seed
     parallel_strategy: Literal["data", "fsdp", "tp", "sp"]  = "data"  # data | fsdp | tp | sp
+    # Size of the 'model' mesh axis. With "data" strategy and n total devices, this gives a
+    # (data: n/model_axis_size, model: model_axis_size) mesh — mixed DP + tensor parallelism.
+    # Used to break the per-row T_row floor for the bootstrap forward in shortcut forcing.
+    # Defaults to 1 (pure DP). Must divide n. Must fit within a node for fast TP comm.
+    model_axis_size: int = 1
 
     # Precision
     dtype: str = "bfloat16"

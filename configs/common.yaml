@@ -30,6 +30,7 @@ ema_dtype: ${param_dtype}
 
 # Parallel
 parallel_strategy: data  # data | fsdp | tp | sp
+model_axis_size: 1  # >1 enables intra-node tensor parallelism on top of 'data' strategy
 
 # Random seed
 seed: 0

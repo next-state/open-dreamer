@@ -33,7 +33,7 @@ def run(cfg):
     rng = jax.random.PRNGKey(cfg.seed)
 
     # Parallelism
-    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
+    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy, cfg.model_axis_size)
 
     with jax.set_mesh(mesh):
         # Load checkpoint (includes both dynamics and tokenizer)

@@ -7,6 +7,7 @@ dynamics_ckpt: ???
 
 seed: 0
 parallel_strategy: data
+model_axis_size: 1
 
 # Mode: "both" runs generate then evaluate, "generate" only saves videos,
 # "evaluate" only computes FVD from previously saved videos

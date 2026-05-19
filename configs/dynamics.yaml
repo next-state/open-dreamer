@@ -6,6 +6,12 @@ defaults:
 run_name: Madre_de_dios
 tokenizer_ckpt: /mnt/data/minecraft-vpt/models/tokenizer-500M/checkpoints/
 
+# Mixed DP + TP: 4-way intra-node tensor parallelism on top of 8-way data parallelism
+# (assumes 32 GPUs = 4 nodes x 8 GPUs). Cuts boot-fwd wall-clock from T_row to ~T_row/4
+# by splitting each row's compute across 4 GPUs of a node instead of leaving the boot
+# work on a single 8-GPU subset.
+model_axis_size: 4
+
 ckpt:
   max_to_keep: 10000
   save_interval_steps: 5_000

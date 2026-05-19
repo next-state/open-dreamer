@@ -75,13 +75,26 @@ def maybe_init_distributed() -> None:
     print(f"[distributed] initialized process {jax.process_index()}/{jax.process_count()}")
 
 
-def build_parallel(strategy: Literal["data", "fsdp", "tp", "sp"]) -> tuple[Mesh, NamedSharding, MeshRules]:
-    """Build parallelization setup based on strategy."""
+def build_parallel(strategy: Literal["data", "fsdp", "tp", "sp"], model_axis_size: int = 1) -> tuple[Mesh, NamedSharding, MeshRules]:
+    """Build parallelization setup based on strategy.
+
+    Args:
+        strategy: Parallelization strategy.
+        model_axis_size: Size of the 'model' mesh axis. Only honored under "data" strategy;
+            with model_axis_size > 1, the mesh becomes (data: n/model_axis_size, model: m),
+            which mixes data parallelism (across 'data') with tensor parallelism on params
+            tagged 'model' via mesh rules. Must divide n. Must fit within a node for cheap
+            TP comm. Defaults to 1 (pure DP).
+    """
     maybe_init_distributed()
     n = len(jax.devices())
 
     if strategy == "data":
-        mesh = jax.make_mesh((n, 1), ('data', 'model'))
+        assert n % model_axis_size == 0, f"device count ({n}) must be divisible by model_axis_size ({model_axis_size})"
+        data_size = n // model_axis_size
+        # axis order matters: innermost 'model' axis maps to consecutive devices, which are
+        # typically same-node (NVLink) — keeps TP all-reduces intra-node.
+        mesh = jax.make_mesh((data_size, model_axis_size), ('data', 'model'))
         sharding = NamedSharding(mesh, P('data', None))
         rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
 

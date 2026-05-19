@@ -61,7 +61,7 @@ def generate_videos(cfg):
     horizon = cfg.horizon
     video_dir = Path(cfg.video_dir)
 
-    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
+    mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy, cfg.model_axis_size)
 
     with jax.set_mesh(mesh):
         ckpt_path = str(dynamics_ckpt)

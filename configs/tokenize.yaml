@@ -7,6 +7,7 @@ output_dir: /mnt/data/ema_tokenized_data            # Required: output directory
 records_per_shard: 5000
 seed: 0
 parallel_strategy: data
+model_axis_size: 1
 
 hydra:
   run:
