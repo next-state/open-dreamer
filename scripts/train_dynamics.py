@@ -209,9 +209,11 @@ def run(cfg: DynamicsConfig):
         B = dl_cfg.B
         avg_T = dl_cfg.long_T
 
-        # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
+        # Dynamics FLOPs: 1 of every 4 steps is a pure-bootstrap step (full batch + 2 stop-grad
+        # half-step passes); the other 3 are pure flow (1 forward+backward pass). Per-step average:
+        #   3/4 * 1 + 1/4 * (1 + 2 * 1/3) = 1 + 1/6  (the 1/3 accounts for fwd-only vs fwd+bwd)
         dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
-        bootstrap_multiplier = 1 + cfg.bootstrap_fraction * (2/3)  # two additional gradientless calls to dynamics model, 1/6 for inference
+        bootstrap_multiplier = 1 + (1.0 / 4.0) * (2.0 / 3.0)
         total_dynamics_flops = dynamics_flops * bootstrap_multiplier
 
         # Encoder FLOPs: forward-only (no gradients) when using video data
@@ -254,6 +256,23 @@ def run(cfg: DynamicsConfig):
 
             scaling.start_training()
 
+            # Interleaved schedule: 3 flow steps followed by 1 bootstrap step (after warmup).
+            # Bootstrap fires when (step % BOOTSTRAP_EVERY == BOOTSTRAP_EVERY - 1).
+            BOOTSTRAP_EVERY = 4
+
+            # Carry the last-known flow and bootstrap metrics across steps so wandb sees both
+            # losses at every log step (a given step only computes one of the two).
+            last_metrics: dict[str, float] = {
+                "flow_mse": 0.0,
+                "flow_mse_sequence": 0.0,
+                "flow_mse_image": 0.0,
+                "flow_mse_low": 0.0,
+                "flow_mse_mid": 0.0,
+                "flow_mse_high": 0.0,
+                "bootstrap_mse": 0.0,
+                "boot_target_norm": 0.0,
+            }
+
             pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True, disable=not is_main_process)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
@@ -290,6 +309,8 @@ def run(cfg: DynamicsConfig):
 
                 # Training step
                 B, T = input_tensor.shape[:2]
+                is_bootstrap_step = (step > cfg.bootstrap_start) and (step % BOOTSTRAP_EVERY == BOOTSTRAP_EVERY - 1)
+                bootstrap_fraction = 1.0 if is_bootstrap_step else 0.0
                 metrics = train_step(
                     bundle.tokenizer, bundle.dynamics, bundle.dynamics_ema,
                     bundle.dynamics_optimizer, input_tensor, actions,
@@ -300,7 +321,7 @@ def run(cfg: DynamicsConfig):
                     n_splits=n_splits,
                     k_max=cfg.dynamics.k_max,
                     context_length=cfg.dynamics.context_length,
-                    bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
+                    bootstrap_fraction=bootstrap_fraction,
                     use_latent_data=use_latent_data,
                     ot_cfg=ot_cfg,
                 )
@@ -311,20 +332,32 @@ def run(cfg: DynamicsConfig):
                 # Logging — device_get on all hosts to stay in sync, only host 0 logs
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(metrics)
+                    # Refresh whichever side this step actually computed; the other side
+                    # keeps its previous value so wandb gets both at every log step.
+                    if is_bootstrap_step:
+                        last_metrics["bootstrap_mse"] = float(metrics_cpu["bootstrap_mse"])
+                        last_metrics["boot_target_norm"] = float(metrics_cpu["boot_target_norm"])
+                    else:
+                        last_metrics["flow_mse"] = float(metrics_cpu["flow_mse"])
+                        last_metrics["flow_mse_sequence"] = float(metrics_cpu["flow_mse_sequence"])
+                        last_metrics["flow_mse_image"] = float(metrics_cpu["flow_mse_image"])
+                        last_metrics["flow_mse_low"] = float(metrics_cpu["flow_mse_low"])
+                        last_metrics["flow_mse_mid"] = float(metrics_cpu["flow_mse_mid"])
+                        last_metrics["flow_mse_high"] = float(metrics_cpu["flow_mse_high"])
                     if is_main_process:
                         scaling.on_step(step, metrics_cpu)
                         logger.log(
                             step,
                             metrics={
-                                "flow_mse": metrics_cpu["flow_mse"],
-                                "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
-                                "flow_mse_image": metrics_cpu["flow_mse_image"],
-                                "boot_mse": metrics_cpu["bootstrap_mse"],
+                                "flow_mse": last_metrics["flow_mse"],
+                                "flow_mse_sequence": last_metrics["flow_mse_sequence"],
+                                "flow_mse_image": last_metrics["flow_mse_image"],
+                                "boot_mse": last_metrics["bootstrap_mse"],
                                 "grad_norm": metrics_cpu["grad_norm"],
-                                "flow_mse_low": metrics_cpu["flow_mse_low"],
-                                "flow_mse_mid": metrics_cpu["flow_mse_mid"],
-                                "flow_mse_high": metrics_cpu["flow_mse_high"],
-                                "boot_target_norm": metrics_cpu["boot_target_norm"],
+                                "flow_mse_low": last_metrics["flow_mse_low"],
+                                "flow_mse_mid": last_metrics["flow_mse_mid"],
+                                "flow_mse_high": last_metrics["flow_mse_high"],
+                                "boot_target_norm": last_metrics["boot_target_norm"],
                                 "lr": lr_schedule(step),
                                 "T": T // n_splits,
                                 **scaling.get_step_metrics(step),

@@ -54,7 +54,8 @@ ema_decay: 0.999
 
 max_steps: 600_005
 bootstrap_start: 150_000  # Number of start steps trained exclusively on flow-matching objective
-bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
+# Bootstrap is now scheduled temporally: 3 pure-flow steps followed by 1 pure-bootstrap step
+# (hardcoded BOOTSTRAP_EVERY=4 in scripts/train_dynamics.py), so the old bootstrap_fraction is gone.
 image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
 
 # Optimal transport coupling (minibatch OT)

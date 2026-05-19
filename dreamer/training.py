@@ -440,29 +440,40 @@ def shortcut_forcing_step(
     )
     
     # --- Flow loss (empirical rows) ---
-    z_pred_emp = z_pred_full[:B_emp]
-    loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
+    # If the whole batch is bootstrap (B_emp == 0), skip the flow path entirely —
+    # otherwise jnp.mean() over empty arrays returns NaN.
+    if B_emp > 0:
+        z_pred_emp = z_pred_full[:B_emp]
+        loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
 
-    # Split flow MSE by empirical sample type (image-only rows vs temporal sequence rows).
-    n_img_emp = min(max(B_img_emp, 0), B_emp)
-    n_seq_emp = B_emp - n_img_emp
-    if n_img_emp > 0:
-        flow_mse_image = jnp.mean(mse_per_step_emp[:n_img_emp])
+        # Split flow MSE by empirical sample type (image-only rows vs temporal sequence rows).
+        n_img_emp = min(max(B_img_emp, 0), B_emp)
+        n_seq_emp = B_emp - n_img_emp
+        if n_img_emp > 0:
+            flow_mse_image = jnp.mean(mse_per_step_emp[:n_img_emp])
+        else:
+            flow_mse_image = jnp.array(0.0, dtype=latents.dtype)
+
+        if n_seq_emp > 0:
+            flow_mse_sequence = jnp.mean(mse_per_step_emp[n_img_emp:])
+        else:
+            flow_mse_sequence = jnp.array(0.0, dtype=latents.dtype)
+
+        # Per-σ-bin flow MSE: breaks down where failures occur on the noise schedule
+        mask_low  = sigma_emp < 0.25
+        mask_mid  = (sigma_emp >= 0.25) & (sigma_emp < 0.75)
+        mask_high = sigma_emp >= 0.75
+        flow_mse_low  = jnp.sum(mse_per_step_emp * mask_low)  / jnp.maximum(jnp.sum(mask_low.astype(jnp.float32)),  1.0)
+        flow_mse_mid  = jnp.sum(mse_per_step_emp * mask_mid)  / jnp.maximum(jnp.sum(mask_mid.astype(jnp.float32)),  1.0)
+        flow_mse_high = jnp.sum(mse_per_step_emp * mask_high) / jnp.maximum(jnp.sum(mask_high.astype(jnp.float32)), 1.0)
     else:
+        loss_flow = jnp.array(0.0, dtype=latents.dtype)
+        flow_mse_unweighted = jnp.array(0.0, dtype=latents.dtype)
         flow_mse_image = jnp.array(0.0, dtype=latents.dtype)
-
-    if n_seq_emp > 0:
-        flow_mse_sequence = jnp.mean(mse_per_step_emp[n_img_emp:])
-    else:
         flow_mse_sequence = jnp.array(0.0, dtype=latents.dtype)
-
-    # Per-σ-bin flow MSE: breaks down where failures occur on the noise schedule
-    mask_low  = sigma_emp < 0.25
-    mask_mid  = (sigma_emp >= 0.25) & (sigma_emp < 0.75)
-    mask_high = sigma_emp >= 0.75
-    flow_mse_low  = jnp.sum(mse_per_step_emp * mask_low)  / jnp.maximum(jnp.sum(mask_low.astype(jnp.float32)),  1.0)
-    flow_mse_mid  = jnp.sum(mse_per_step_emp * mask_mid)  / jnp.maximum(jnp.sum(mask_mid.astype(jnp.float32)),  1.0)
-    flow_mse_high = jnp.sum(mse_per_step_emp * mask_high) / jnp.maximum(jnp.sum(mask_high.astype(jnp.float32)), 1.0)
+        flow_mse_low = jnp.array(0.0, dtype=latents.dtype)
+        flow_mse_mid = jnp.array(0.0, dtype=latents.dtype)
+        flow_mse_high = jnp.array(0.0, dtype=latents.dtype)
     
     # --- Bootstrap loss (self-consistency rows) ---
     loss_boot = jnp.array(0.0, dtype=latents.dtype)
