@@ -474,8 +474,18 @@ def shortcut_forcing_step(
     sigma_idx_full = _interleave(sigma_idx_emp, sigma_idx_self)
 
     # --- Corrupt latents: z_tilde = (1 - sigma) * z0 + sigma * z1 ---
+    # OT coupling is only applied to the empirical rows. Including bootstrap rows in the OT
+    # problem changes the optimal permutation seen by the empirical rows at the bootstrap
+    # transition (and across batch composition more generally); the empirical denoising target
+    # would then shift discontinuously even though the per-row math is unchanged. Bootstrap rows
+    # use raw Gaussian noise — they don't need a coupled z0 because their loss is self-consistency,
+    # not direct denoising.
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
-    z0 = apply_ot_coupling(z0, latents, key_ot, ot_cfg=ot_cfg)
+    if B_self > 0:
+        z0_emp = apply_ot_coupling(_split_emp_arr(z0), _split_emp_arr(latents), key_ot, ot_cfg=ot_cfg)
+        z0 = _interleave_arr(z0_emp, _split_self_arr(z0))
+    else:
+        z0 = apply_ot_coupling(z0, latents, key_ot, ot_cfg=ot_cfg)
     z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
     
     # --- Forward pass (full batch) ---
