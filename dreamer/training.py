@@ -405,28 +405,35 @@ def shortcut_forcing_step(
     assert B_self == 0 or B % B_self == 0, f"B ({B}) must be divisible by B_self ({B_self})"
     stride = B // B_self if B_self > 0 else 1
 
+    # Sharding constraint applied to every (B,...) and subset tensor produced by the
+    # strided interleave/split. Without this, XLA's GSPMD has to infer a sharding for
+    # the (B_self, stride, ...) reshape, which doesn't have a clean P('data') mapping
+    # when B doesn't divide 'data' the same way after reshape. Inferred shardings are
+    # what made the strided refactor diverge in earlier attempts.
+    _pin = lambda x: jax.lax.with_sharding_constraint(x, P('data'))
+
     def _interleave_arr(emp_arr, self_arr):
         """(B_emp, *inner) + (B_self, *inner) → (B, *inner) with self at strided positions."""
         if B_self == 0:
-            return emp_arr
+            return _pin(emp_arr)
         inner = emp_arr.shape[1:]
         emp_blocks = emp_arr.reshape(B_self, stride - 1, *inner)
         self_block = self_arr[:, None]  # (B_self, 1, *inner)
-        return jnp.concatenate([self_block, emp_blocks], axis=1).reshape(B, *inner)
+        return _pin(jnp.concatenate([self_block, emp_blocks], axis=1).reshape(B, *inner))
 
     def _split_self_arr(full_arr):
         """(B, *inner) → (B_self, *inner) gathering strided bootstrap positions."""
         if B_self == 0:
             return jnp.zeros((0,) + full_arr.shape[1:], dtype=full_arr.dtype)
         inner = full_arr.shape[1:]
-        return full_arr.reshape(B_self, stride, *inner)[:, 0]
+        return _pin(full_arr.reshape(B_self, stride, *inner)[:, 0])
 
     def _split_emp_arr(full_arr):
         """(B, *inner) → (B_emp, *inner) gathering empirical positions (block-major)."""
         if B_self == 0:
-            return full_arr
+            return _pin(full_arr)
         inner = full_arr.shape[1:]
-        return full_arr.reshape(B_self, stride, *inner)[:, 1:].reshape(B_emp, *inner)
+        return _pin(full_arr.reshape(B_self, stride, *inner)[:, 1:].reshape(B_emp, *inner))
 
     # Pytree-aware variants (Actions etc. are flax struct pytrees, not raw arrays).
     def _split_self(pytree):
@@ -470,17 +477,17 @@ def shortcut_forcing_step(
         sigma_idx_self = jnp.zeros((0, T), dtype=jnp.int32)
 
     # --- Interleave into full (B, T) layout ---
-    # Pin sharding on full (B,...) tensors so XLA doesn't infer odd shardings
-    # for subsets derived from them via _split_emp / _split_self.
-    _pin_full = lambda x: jax.lax.with_sharding_constraint(x, P('data'))
-    step_idx_full = _pin_full(_interleave(step_idx_emp, step_idx_self))
-    sigma_full = _pin_full(_interleave(sigma_emp, sigma_self))
-    sigma_idx_full = _pin_full(_interleave(sigma_idx_emp, sigma_idx_self))
+    # _interleave/_split helpers already apply with_sharding_constraint(_, P('data'))
+    # on their outputs (see _pin above). Full-tensor arithmetic results (z_tilde,
+    # z_pred_full) still need explicit pinning since they don't go through helpers.
+    step_idx_full = _interleave(step_idx_emp, step_idx_self)
+    sigma_full = _interleave(sigma_emp, sigma_self)
+    sigma_idx_full = _interleave(sigma_idx_emp, sigma_idx_self)
 
     # --- Corrupt latents: z_tilde = (1 - sigma) * z0 + sigma * z1 ---
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
     z0 = apply_ot_coupling(z0, latents, key_ot, ot_cfg=ot_cfg)
-    z_tilde = _pin_full((1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents)
+    z_tilde = _pin((1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents)
 
     # --- Forward pass (full batch) ---
     rngs1 = nnx.Rngs(dropout=key_dropout1)
@@ -488,7 +495,7 @@ def shortcut_forcing_step(
         actions, step_idx_full, sigma_idx_full, z_tilde,
         context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
     )
-    z_pred_full = _pin_full(z_pred_full)
+    z_pred_full = _pin(z_pred_full)
     
     # --- Flow loss (empirical rows) ---
     z_pred_emp = _split_emp(z_pred_full)
