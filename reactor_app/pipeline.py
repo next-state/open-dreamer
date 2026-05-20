@@ -146,27 +146,23 @@ class WorldModelPipeline(ReactorPipeline):
             d_bottleneck = tok_cfg.encoder.d_bottleneck
             self._latent_shape = (1, 1, n_latents, d_bottleneck)
 
-            # Cache window: largest context_length declared anywhere, fallback 128.
-            window_candidates = [
-                getattr(tok_cfg.decoder, "context_length", None),
-                getattr(tok_cfg.encoder, "context_length", None),
-                getattr(dyn_cfg, "context_length", None),
-            ]
-            valid = [w for w in window_candidates if isinstance(w, int) and w > 0]
-            self._window_size = max(valid) if valid else 128
+            assert isinstance(dyn_cfg.context_length, int) and dyn_cfg.context_length > 0
+            assert isinstance(tok_cfg.decoder.context_length, int) and tok_cfg.decoder.context_length > 0
+            self._dyn_window_size = dyn_cfg.context_length
+            self._tok_window_size = tok_cfg.decoder.context_length
 
             # Static (empty) KV caches — generation starts from these with no
             # context frames.
             self._empty_dynamics_cache = self._dynamics.create_static_caches(
                 batch_size=1,
                 n_latents=n_latents,
-                window_size=self._window_size,
+                window_size=self._dyn_window_size,
                 n_agent=0,
                 dtype=dyn_cfg.dtype,
             )
             _, self._empty_tokenizer_cache = self._tokenizer.create_static_caches(
                 batch_size=1,
-                window_size=self._window_size,
+                window_size=self._tok_window_size,
                 dtype=tok_cfg.decoder.dtype,
             )
 
