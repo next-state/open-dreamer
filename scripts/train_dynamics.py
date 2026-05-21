@@ -209,11 +209,11 @@ def run(cfg: DynamicsConfig):
         B = dl_cfg.B
         avg_T = dl_cfg.long_T
 
-        # Dynamics FLOPs: 1 of every 4 steps is a pure-bootstrap step (full batch + 2 stop-grad
-        # half-step passes); the other 3 are pure flow (1 forward+backward pass). Per-step average:
-        #   3/4 * 1 + 1/4 * (1 + 2 * 1/3) = 1 + 1/6  (the 1/3 accounts for fwd-only vs fwd+bwd)
+        # Dynamics FLOPs: 1 of every 2 steps is a pure-bootstrap step (full batch + 2 stop-grad
+        # half-step passes); the other 1 is pure flow (1 forward+backward pass). Per-step average:
+        #   1/2 * 1 + 1/2 * (1 + 2 * 1/3) = 4/3  (the 1/3 accounts for fwd-only vs fwd+bwd)
         dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
-        bootstrap_multiplier = 1 + (1.0 / 4.0) * (2.0 / 3.0)
+        bootstrap_multiplier = 1 + (1.0 / 2.0) * (2.0 / 3.0)
         total_dynamics_flops = dynamics_flops * bootstrap_multiplier
 
         # Encoder FLOPs: forward-only (no gradients) when using video data
@@ -256,9 +256,9 @@ def run(cfg: DynamicsConfig):
 
             scaling.start_training()
 
-            # Interleaved schedule: 3 flow steps followed by 1 bootstrap step (after warmup).
+            # Interleaved schedule: 1 flow step followed by 1 bootstrap step (after warmup).
             # Bootstrap fires when (step % BOOTSTRAP_EVERY == BOOTSTRAP_EVERY - 1).
-            BOOTSTRAP_EVERY = 4
+            BOOTSTRAP_EVERY = 2
 
             # Carry the last-known flow and bootstrap metrics across steps so wandb sees both
             # losses at every log step (a given step only computes one of the two).
@@ -331,7 +331,7 @@ def run(cfg: DynamicsConfig):
 
                 # Logging — device_get on all hosts to stay in sync, only host 0 logs
                 #
-                # Bootstrap steps fire at steps ≡ 3 (mod 4).  Log steps fire at
+                # Bootstrap steps fire at odd steps (step % 2 == 1).  Log steps fire at
                 # multiples of the log interval.  If the log interval is even, these
                 # two sets are disjoint (odd vs even), so the bootstrap metrics would
                 # never get updated inside the original `if logger.should_log` gate.
