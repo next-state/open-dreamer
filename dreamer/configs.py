@@ -233,6 +233,7 @@ class LRScheduleConfig:
     # - "constant": constant learning rate (uses lr)
     # - "cos": warmup cosine decay
     # - "wsd": warmup -> hold -> decay (linear warmup, constant hold, linear decay)
+    # - "wse": warmup -> hold -> exponential decay (starts at decay_start_step, ends at lr_end at max_steps)
     schedule_type: str = "constant"
     lr: float = 1e-4  # Used for constant schedule, or as peak/max_lr for other schedules
     init_lr: float = 0.0  # Starting LR for warmup schedules
@@ -240,6 +241,7 @@ class LRScheduleConfig:
     max_steps: int = 1_000_000_000
     warmup_ratio: float = 0.0  # e.g., 0.1 = 10% warmup
     decay_ratio: float = 0.0   # e.g., 0.2 = 20% decay (for wsd)
+    decay_start_step: int = 0  # Absolute step at which decay begins (for wse)
 
 
 @dataclass(frozen=True, unsafe_hash=True)

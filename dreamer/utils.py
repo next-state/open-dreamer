@@ -401,6 +401,28 @@ def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
         ]
         boundaries = [warmup_steps, max_steps - decay_steps]
         return optax.join_schedules(schedules, boundaries)
+    elif schedule_cfg.schedule_type == "wse":
+        decay_start = schedule_cfg.decay_start_step
+        assert warmup_steps <= decay_start <= max_steps, (
+            f"Need warmup ({warmup_steps}) <= decay_start ({decay_start}) <= max_steps ({max_steps})."
+        )
+        assert schedule_cfg.lr_end > 0, "wse requires lr_end > 0 for exponential decay."
+        exp_steps = max_steps - decay_start
+        decay_rate = schedule_cfg.lr_end / schedule_cfg.lr
+        schedules = [
+            optax.linear_schedule(
+                init_value=schedule_cfg.init_lr, end_value=schedule_cfg.lr, transition_steps=warmup_steps
+            ),
+            optax.constant_schedule(value=schedule_cfg.lr),
+            optax.exponential_decay(
+                init_value=schedule_cfg.lr,
+                transition_steps=exp_steps,
+                decay_rate=decay_rate,
+                end_value=schedule_cfg.lr_end,
+            ),
+        ]
+        boundaries = [warmup_steps, decay_start]
+        return optax.join_schedules(schedules, boundaries)
     else:
         raise ValueError(
             f"Unsupported learning rate schedule: {schedule_cfg.schedule_type}"

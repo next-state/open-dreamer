@@ -56,7 +56,7 @@ max_steps: 600_005
 bootstrap_start: 150_000  # Number of start steps trained exclusively on flow-matching objective
 # Bootstrap is now scheduled temporally: 3 pure-flow steps followed by 1 pure-bootstrap step
 # (hardcoded BOOTSTRAP_EVERY=4 in scripts/train_dynamics.py), so the old bootstrap_fraction is gone.
-image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
+image_fraction: 0.07  # Fraction of batch to train as images (no temporal attention)
 
 # Optimal transport coupling (minibatch OT)
 ot:
@@ -70,12 +70,13 @@ ot:
 
 
 lr_schedule:
-  schedule_type: wsd  # constant | wsd | cos
+  schedule_type: wse  # constant | wsd | cos | wse
   lr: 3e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
-  lr_end: 0.0
+  lr_end: 2.0e-5  # 3e-4 / 15
   warmup_ratio: 0.05
-  decay_ratio: 0.1
+  decay_ratio: 0.0
+  decay_start_step: 310_000
   max_steps: ${max_steps}
 
 optimizer:
