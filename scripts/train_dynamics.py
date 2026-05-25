@@ -11,9 +11,9 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.80")
 _append_xla_flag("--xla_gpu_triton_gemm_any=True")
 _append_xla_flag("--xla_gpu_enable_latency_hiding_scheduler=true")
 # Fuse small collectives into large messages — default 256 bytes is too small for IB
-_append_xla_flag("--xla_gpu_all_gather_combine_threshold_bytes=268435456")
-_append_xla_flag("--xla_gpu_reduce_scatter_combine_threshold_bytes=268435456")
-_append_xla_flag("--xla_gpu_all_reduce_combine_threshold_bytes=268435456")
+_append_xla_flag("--xla_gpu_all_gather_combine_threshold_bytes=33554432")
+_append_xla_flag("--xla_gpu_reduce_scatter_combine_threshold_bytes=33554432")
+_append_xla_flag("--xla_gpu_all_reduce_combine_threshold_bytes=33554432")
 
 import logging
 
