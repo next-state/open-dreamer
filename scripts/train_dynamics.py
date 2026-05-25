@@ -10,7 +10,6 @@ def _append_xla_flag(flag: str) -> None:
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.80")
 _append_xla_flag("--xla_gpu_triton_gemm_any=True")
 _append_xla_flag("--xla_gpu_enable_latency_hiding_scheduler=true")
-os.environ.setdefault("JAX_ENABLE_PGLE", "true")
 
 import logging
 
