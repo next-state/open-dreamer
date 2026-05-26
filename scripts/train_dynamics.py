@@ -314,7 +314,7 @@ def run(cfg: DynamicsConfig):
                     n_splits=n_splits,
                     k_max=cfg.dynamics.k_max,
                     context_length=cfg.dynamics.context_length,
-                    bootstrap_fraction=cfg.bootstrap_fraction if step >= cfg.bootstrap_start else 0,
+                    bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                     use_latent_data=use_latent_data,
                     ot_cfg=ot_cfg,
                 )
