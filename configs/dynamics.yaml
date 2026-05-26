@@ -54,7 +54,7 @@ ema_decay: 0.999
 
 max_steps: 600_005
 bootstrap_start: 0  # Number of start steps trained exclusively on flow-matching objective
-bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
+bootstrap_fraction: 0.125  # Fraction of batch used for bootstrap samples
 image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
 
 # Optimal transport coupling (minibatch OT)
