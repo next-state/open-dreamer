@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: Madre_de_dios
+run_name: gatto
 tokenizer_ckpt: /mnt/data/minecraft-vpt/models/tokenizer-500M/checkpoints/
 
 ckpt:

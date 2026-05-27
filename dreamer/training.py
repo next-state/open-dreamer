@@ -301,6 +301,7 @@ def compute_bootstrap_loss(
     b_prime: jnp.ndarray,
     b_doubleprime: jnp.ndarray,
     sigma: jnp.ndarray,
+    boot_row_mask: jnp.ndarray | None = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Bootstrap self-consistency loss for shortcut forcing.
@@ -317,6 +318,10 @@ def compute_bootstrap_loss(
         b_prime: (B, T, S, D) Velocity from first half-step
         b_doubleprime: (B, T, S, D) Velocity from second half-step
         sigma: (B, T) Signal levels
+        boot_row_mask: Optional (B,) bool array. When provided only the rows
+            where True contribute to the loss. Pass this instead of slicing the
+            sharded batch axis: masked sum + scalar division avoids the AllGather
+            that a slice-then-mean would trigger.
 
     Returns:
         loss: Tuple[jnp.float32, jnp.float32]
@@ -336,6 +341,19 @@ def compute_bootstrap_loss(
 
     # Apply ramp weighting and reduce
     weights = ramp_weight(sigma)
+
+    if boot_row_mask is not None:
+        # Masked mean: only count bootstrap rows. sum/count avoids any
+        # AllGather that jnp.mean would trigger over a sharded batch axis.
+        mask_bt = boot_row_mask[:, None].astype(sigma.dtype)  # (B, 1) → broadcast (B, T)
+        n_active = jnp.maximum(
+            jnp.sum(boot_row_mask.astype(sigma.dtype)) * sigma.shape[1], 1.0
+        )
+        return (
+            jnp.sum(boot_per_step * weights * mask_bt) / n_active,
+            jnp.sum(boot_per_step * mask_bt) / n_active,
+        )
+
     return jnp.mean(boot_per_step * weights), jnp.mean(boot_per_step)
 
 
@@ -470,44 +488,70 @@ def shortcut_forcing_step(
     boot_target_norm = jnp.array(0.0, dtype=latents.dtype)
     
     if B_self > 0:
-        z_pred_self = z_pred_full[B_emp:]
-        z_tilde_self = z_tilde[B_emp:]
-        actions_self = actions[B_emp:]
-        time_mask_self = time_mask[B_emp:] if time_mask is not None else None  # assume aligned with batch
-        task_embeddings_self = task_embeddings[B_emp:] if task_embeddings is not None else None
+        # Row mask: True for the B_self bootstrap rows (last B_self in the batch).
+        # This is a replicated scalar-derived array — no inter-device traffic.
+        boot_mask = jnp.arange(B) >= B_emp  # (B,) bool
 
-        # Half-step metadata
-        d_half = d_self / 2.0
-        step_idx_half = step_idx_self + 1
-        sigma_plus = sigma_self + d_half
-        sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
+        # Build full-batch (B, T) half-step metadata.
+        # Emp rows get dummy values (any valid input); they are zeroed out by
+        # boot_mask in the loss so their exact values do not matter.
+        # Crucially we never slice the sharded batch axis, avoiding AllGather.
+        d_half_self = d_self / 2.0  # (B_self, T)
+        d_half_full = jnp.concatenate([
+            jnp.full((B_emp, T), 0.5 / k_max, dtype=latents.dtype),  # dummy for emp rows
+            d_half_self,
+        ], axis=0)  # (B, T)
+
+        # Emp rows keep step_idx_emp=emax (always valid in the step embedding);
+        # bootstrap rows use step_idx_self+1 (coarser half-step).
+        step_idx_half_full = jnp.concatenate(
+            [step_idx_emp, step_idx_self + 1], axis=0
+        )  # (B, T)
+
+        # sigma and sigma_idx extended to full batch (emp dummy → near-zero shift)
+        sigma_plus_full = sigma_full + d_half_full  # (B, T)
+        sigma_idx_plus_full = sigma_idx_full + (k_max * d_half_full).astype(jnp.int32)  # (B, T)
 
         _bootstrap = bootstrap_model if bootstrap_model is not None else dynamics_model
 
-        # First half-step
-        z1_half1, *_ = _bootstrap(
-            actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
+        # First half-step: full batch, no slicing → no AllGather
+        z1_half1_full, *_ = _bootstrap(
+            actions, step_idx_half_full, sigma_idx_full, z_tilde,
+            context_length=context_length, time_mask=time_mask,
+            task_embeddings=task_embeddings, deterministic=True
         )
-        z1_half1 = jax.lax.stop_gradient(z1_half1)
-        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-5)
-        z_prime = z_tilde_self + b_prime * d_half[..., None, None]
-        z_prime = jnp.clip(z_prime, -4.0, 4.0)
-
-        # Second half-step
-        z1_half2, *_ = _bootstrap(
-            actions_self, step_idx_half, sigma_idx_plus, z_prime,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
+        z1_half1_full = jax.lax.stop_gradient(z1_half1_full)
+        b_prime_full = (z1_half1_full - z_tilde) / jnp.maximum(
+            1.0 - sigma_full[..., None, None], 1e-5
         )
-        z1_half2 = jax.lax.stop_gradient(z1_half2)
-        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-5)
+        z_prime_full = z_tilde + b_prime_full * d_half_full[..., None, None]
+        z_prime_full = jnp.clip(z_prime_full, -4.0, 4.0)
 
-        # Bootstrap target health diagnostics (before clipping)
-        v_target_unclipped = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-        boot_target_norm = jnp.mean(jnp.abs(v_target_unclipped))
+        # Second half-step: full batch, no slicing → no AllGather
+        z1_half2_full, *_ = _bootstrap(
+            actions, step_idx_half_full, sigma_idx_plus_full, z_prime_full,
+            context_length=context_length, time_mask=time_mask,
+            task_embeddings=task_embeddings, deterministic=True
+        )
+        z1_half2_full = jax.lax.stop_gradient(z1_half2_full)
+        b_doubleprime_full = (z1_half2_full - z_prime_full) / jnp.maximum(
+            1.0 - sigma_plus_full[..., None, None], 1e-5
+        )
 
-        # Bootstrap loss (computed unconditionally)
-        loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
+        # Bootstrap target health diagnostics — masked mean over bootstrap rows only
+        v_target_unclipped = jax.lax.stop_gradient((b_prime_full + b_doubleprime_full) / 2.0)
+        boot_mask_4d = boot_mask[:, None, None, None].astype(latents.dtype)
+        n_boot_elems = jnp.maximum(
+            jnp.sum(boot_mask.astype(latents.dtype)) * T * S * D, 1.0
+        )
+        boot_target_norm = jnp.sum(jnp.abs(v_target_unclipped) * boot_mask_4d) / n_boot_elems
+
+        # Bootstrap loss: pass boot_mask so compute_bootstrap_loss uses a masked
+        # sum+divide instead of jnp.mean, staying on-device throughout.
+        loss_boot, boot_mse_unweighted = compute_bootstrap_loss(
+            z_pred_full, z_tilde, b_prime_full, b_doubleprime_full, sigma_full,
+            boot_row_mask=boot_mask,
+        )
     
     # --- Combine losses ---
     # Weight by batch composition to keep scale constant
