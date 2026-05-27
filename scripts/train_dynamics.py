@@ -7,7 +7,7 @@ def _append_xla_flag(flag: str) -> None:
         os.environ["XLA_FLAGS"] = f"{current} {flag}".strip()
 
 
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.80")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95")
 _append_xla_flag("--xla_gpu_triton_gemm_any=True")
 #_append_xla_flag("--xla_gpu_enable_latency_hiding_scheduler=true")
 # Fuse small collectives into large messages — default 256 bytes is too small for IB
