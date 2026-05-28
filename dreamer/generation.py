@@ -337,19 +337,23 @@ def latent_rollout(
         n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
         caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
 
-        # Run dynamics on context to prefill caches and get last hidden state
-        # Use clean signal for ground truth context
-        step_idx_prefill = jnp.full((B, T_ctx), schedule.emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
-        tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)  # tau=1.0
-        
-        _, (h_seq, caches) = dynamics(
-            actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
-            task_embeddings=initial_task_embedding, caches=caches, deterministic=True
-        )
-
-        # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
+        # Run dynamics on context to prefill caches and get last hidden state.
+        # Skip when there are no context frames (T_ctx=0 means unconditional generation).
         task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
-        h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
+        h_seq = None
+        if T_ctx > 0:
+            # Use clean signal for ground truth context
+            step_idx_prefill = jnp.full((B, T_ctx), schedule.emax, dtype=jnp.int32)  # tau_idx=k_max was only trained with step_idx=emax (empirical rows)  # FIXME: bootstrap training uses mixed ladders excluding emax, so this might be problematic during shortcut sampling
+            tau_idx_prefill = jnp.full((B, T_ctx), schedule.k_max, dtype=jnp.int32)  # tau=1.0
+
+            _, (h_seq, caches) = dynamics(
+                actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
+                task_embeddings=initial_task_embedding, caches=caches, deterministic=True
+            )
+            # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
+            h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
+        else:
+            h_last = None
 
         if use_scan:
             _, (rollout_latents, rollout_actions, rollout_hidden, rollout_diags) = jax.lax.scan(

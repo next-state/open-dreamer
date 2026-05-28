@@ -3,7 +3,7 @@ defaults:
   - _self_
 
 # Path to dynamics checkpoint (contains both dynamics + tokenizer)
-dynamics_ckpt: ???
+dynamics_ckpt: gatto
 
 seed: 0
 parallel_strategy: data
@@ -15,12 +15,16 @@ mode: both
 # Rollout type: one of ema_shortcut, ema_diffusion, online_shortcut, online_diffusion
 # - ema/online: which model weights to use
 # - shortcut (4 steps) vs diffusion (k_max steps)
-rollout_type: ema_diffusion
+rollout_type: ema_shortcut
 
 # Generation settings
 num_videos: 256
-ctx_length: 4
-horizon: 240  # has to be divisible by fvd_chunk_size if pred_frames_only is true
+ctx_length: 0
+horizon: 256  # has to be divisible by fvd_chunk_size if pred_frames_only is true
+
+# Decode chunk size: tokenizer decoder is applied in temporal chunks to cap peak VRAM.
+# Match this to the fvd_chunk_size (or a divisor of it).
+decode_chunk_size: 16
 
 # Video I/O
 video_dir: logs/eval_fvd_videos
@@ -33,5 +37,5 @@ fvd_chunk_size: 16  # split videos into chunks of this many frames for FVD
 dataset:
   dataloader_cfg:
     num_workers: 0
-    B: 8
+    B: 1
     long_T: ${sum:${ctx_length},${horizon}}

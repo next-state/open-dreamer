@@ -2,12 +2,12 @@ defaults:
   - dataset: minecraft_vpt_latent   # override with e.g. dataset=coinrun
   - _self_
 
-dynamics_ckpt: checkpoints          # Required: path to DynamicsCheckpointBundle checkpoint dir
+dynamics_ckpt: gatto          # Required: path to DynamicsCheckpointBundle checkpoint dir
 
 run_name: eval_dynamics
 use_wandb: false
 parallel_strategy: data
-seed: 7
+seed: 700
 
 dataset:
   dataloader_cfg:

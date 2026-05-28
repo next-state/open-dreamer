@@ -878,7 +878,7 @@ def run_evaluation(
 
     T = val_data.shape[1]
     assert T > 5, f"Sequence length {T} must be > 5"
-    ctx_length = 0
+    ctx_length = 4
     horizon = T - ctx_length
     k_max = dynamics_ema.cfg.k_max
 

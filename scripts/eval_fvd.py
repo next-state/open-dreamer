@@ -19,16 +19,18 @@ from pathlib import Path
 import hydra
 import imageio.v3 as iio
 import jax
+import jax.numpy as jnp
 import numpy as np
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
+from flax import nnx
 from dreamer.checkpointing import DynamicsCheckpointBundle
 from dreamer.data import build_iterator
 from dreamer.fvd import frechet_distance, get_fvd_logits, load_i3d_pretrained
-from dreamer.generation import DenoiseSchedule
+from dreamer.generation import DenoiseSchedule, latent_rollout
 from dreamer.parallel import build_parallel
-from dreamer.sampler import sample_video
+from dreamer.sampler import sample_video, decode_chunked, decode_jit
 from dreamer.actions import shift_actions
 import os
 
@@ -86,11 +88,24 @@ def generate_videos(cfg):
         dynamics = getattr(bundle, dynamics_field)
 
         use_latent_data = cfg.dataset.data_type == "latent"
+        # With ctx_length=0 and raw video we never need the encoder: the rollout
+        # starts from an empty context and the raw frames serve as the FVD reference.
+        skip_encode = (not use_latent_data) and (ctx_length == 0)
+
         if use_latent_data:
+            del tokenizer.encoder
             print(
                 "WARNING: Using latent data — original pixel videos are not available. "
                 "FVD will be computed against autoencoded (gt_decoded) videos, not originals. "
                 "For scientifically rigorous evaluation, use raw video data instead."
+            )
+        elif skip_encode:
+            # Read latent shape before freeing the encoder.
+            n_latents_per_frame = tokenizer.encoder.n_latents
+            del tokenizer.encoder
+            print(
+                "ctx_length=0: encoder not needed — generating from empty context, "
+                "using raw video frames as FVD reference."
             )
 
         k_max = dynamics.cfg.k_max
@@ -109,6 +124,18 @@ def generate_videos(cfg):
         out_dir = video_dir / rollout_type
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # Pre-compile rollout once before the loop so the function identity is
+        # stable across batches and jax.lax.scan fuses into a single XLA op.
+        if skip_encode:
+            decode_chunk_size = cfg.decode_chunk_size
+            def _rollout_fn(dyn, policy_actions, latents_ctx, actions_ctx, rng):
+                return latent_rollout(
+                    dyn, policy=policy_actions, schedule=schedule_config,
+                    latents_ctx=latents_ctx, actions_ctx=actions_ctx,
+                    num_steps=horizon, rng=rng, use_scan=True,
+                )
+            _rollout_jit = nnx.jit(_rollout_fn)
+
         collected = 0
         pbar = tqdm(total=num_videos, desc="Generating videos")
 
@@ -118,28 +145,66 @@ def generate_videos(cfg):
 
             rng, eval_rng = jax.random.split(rng)
 
-            if use_latent_data:
-                val_data = batch.get("latents", batch.get("videos"))
-            else:
-                val_data = batch["videos"]
             val_actions = batch["actions"]
             val_actions = shift_actions(val_actions, cfg.dataset.categorical_action_dim)
 
+            if use_latent_data:
+                val_data = batch.get("latents", batch.get("videos"))
+                pred_frames, gt_decoded_frames, original_frames = sample_video(
+                    tokenizer=tokenizer,
+                    dynamics=dynamics,
+                    frames=None,
+                    latents=val_data,
+                    actions=val_actions,
+                    horizon=horizon,
+                    schedule_config=schedule_config,
+                    rng=eval_rng,
+                    policy=None,
+                    task_embedder=None,
+                    use_scan=False,
+                    decode_chunk_size=cfg.decode_chunk_size,
+                )
+            elif skip_encode:
+                val_data = batch["videos"]
+                B_batch = val_data.shape[0]
+                D_s = dynamics.d_bottleneck
+
+                # Empty context: generate unconditionally from GT actions only.
+                empty_ctx = jnp.zeros((B_batch, 0, n_latents_per_frame, D_s), dtype=jnp.bfloat16)
+                rollout = _rollout_jit(
+                    dynamics,
+                    val_actions[:, :horizon],
+                    empty_ctx,
+                    val_actions[:, :0],
+                    eval_rng,
+                )
+                decode_fn = (
+                    (lambda t, z: decode_chunked(t, z, decode_chunk_size))
+                    if decode_chunk_size else decode_jit
+                )
+                pred_frames = jnp.clip(decode_fn(tokenizer, rollout["latents"]), 0, 255).astype(jnp.uint8)
+                # Raw frames are the reference; use them as gt_decoded too since
+                # there is no tokenizer reconstruction without encoding.
+                original_frames = jnp.clip(val_data[:, :horizon], 0, 255).astype(jnp.uint8)
+                gt_decoded_frames = original_frames
+            else:
+                val_data = batch["videos"]
+                pred_frames, gt_decoded_frames, original_frames = sample_video(
+                    tokenizer=tokenizer,
+                    dynamics=dynamics,
+                    frames=val_data,
+                    latents=None,
+                    actions=val_actions,
+                    horizon=horizon,
+                    schedule_config=schedule_config,
+                    rng=eval_rng,
+                    policy=None,
+                    task_embedder=None,
+                    use_scan=False,
+                    decode_chunk_size=cfg.decode_chunk_size,
+                )
+
             B_batch = val_data.shape[0]
-
-            pred_frames, gt_decoded_frames, original_frames = sample_video(
-                tokenizer=tokenizer,
-                dynamics=dynamics,
-                frames=None if use_latent_data else val_data,
-                actions=val_actions,
-                horizon=horizon,
-                schedule_config=schedule_config,
-                rng=eval_rng,
-                policy=None,
-                task_embedder=None,
-                latents=val_data if use_latent_data else None,
-            )
-
             gt_decoded = jax.device_get(gt_decoded_frames)
             pred = jax.device_get(pred_frames)
             original = jax.device_get(original_frames) if original_frames is not None else None
@@ -186,44 +251,46 @@ def evaluate_fvd(cfg):
     print("Loading I3D weights...")
     i3d_params = load_i3d_pretrained()
 
-    def load_videos(file_list, desc):
-        frames = []
-        for f in tqdm(file_list, desc=desc, leave=False):
-            video = iio.imread(str(f), plugin="pyav")  # (T, H, W, C)
-            frames.append(video)
-        return np.stack(frames, axis=0)  # (N, T, H, W, C)
-
-    pred_videos = load_videos(pred_files, "Loading pred")
-    gt_dec_videos = load_videos(gt_dec_files, "Loading gt_decoded")
-    ref_videos = load_videos(original_files, "Loading original") if has_originals else gt_dec_videos
-
-    if pred_frames_only:
-        print(f"Trimming first {ctx_length} context frames from each video")
-        pred_videos = pred_videos[:, ctx_length:]
-        gt_dec_videos = gt_dec_videos[:, ctx_length:]
-        ref_videos = ref_videos[:, ctx_length:]
-
-    T = pred_videos.shape[1]
+    # Probe one file to get T, H, W, C without loading everything.
+    _probe = iio.imread(str(pred_files[0]), plugin="pyav")
+    trim = ctx_length if pred_frames_only else 0
+    T_full = _probe.shape[0] - trim
     fvd_chunk_size = cfg.get("fvd_chunk_size", None)
     if fvd_chunk_size is not None:
-        assert T % fvd_chunk_size == 0, (
-            f"Video length {T} not divisible by fvd_chunk_size {fvd_chunk_size}")
-        num_chunks = T // fvd_chunk_size
-        N, _, H, W, C = pred_videos.shape
-        pred_videos = pred_videos.reshape(N * num_chunks, fvd_chunk_size, H, W, C)
-        gt_dec_videos = gt_dec_videos.reshape(N * num_chunks, fvd_chunk_size, H, W, C)
-        ref_videos = ref_videos.reshape(N * num_chunks, fvd_chunk_size, H, W, C)
+        assert T_full % fvd_chunk_size == 0, (
+            f"Video length {T_full} not divisible by fvd_chunk_size {fvd_chunk_size}")
         T = fvd_chunk_size
-        num_videos = N * num_chunks
-        print(f"Chunked {N} videos into {num_chunks} chunks of {fvd_chunk_size} frames -> {num_videos} total clips")
-
+        num_chunks = T_full // fvd_chunk_size
+    else:
+        T = T_full
+        num_chunks = 1
     assert T >= 10, f"I3D requires >=10 frames, got {T} after trimming"
-    print(f"Computing FVD on {num_videos} videos, {T} frames each")
+    num_videos = num_videos * num_chunks
+    if fvd_chunk_size is not None:
+        print(f"Chunking {len(pred_files)} videos into {num_chunks} clips of {T} frames -> {num_videos} total clips")
+    print(f"Computing FVD on {num_videos} clips, {T} frames each")
+
+    def stream_features(file_list, desc):
+        """Load and featurise videos in small batches to avoid RAM spikes."""
+        # Process i3d_bs videos at a time; each may expand to num_chunks clips.
+        all_feats = []
+        for i in tqdm(range(0, len(file_list), i3d_bs), desc=desc):
+            batch_files = file_list[i:i + i3d_bs]
+            clips = []
+            for f in batch_files:
+                video = iio.imread(str(f), plugin="pyav")[trim:]  # (T_full, H, W, C)
+                if num_chunks > 1:
+                    clips.append(video.reshape(num_chunks, T, *video.shape[1:]))
+                else:
+                    clips.append(video[None])  # (1, T, H, W, C)
+            batch = np.concatenate(clips, axis=0)  # (B*num_chunks, T, H, W, C)
+            all_feats.append(np.array(get_fvd_logits(batch, i3d_params, bs=len(batch))))
+        return np.concatenate(all_feats, axis=0)
 
     print("Extracting I3D features...")
-    feats_pred = get_fvd_logits(pred_videos, i3d_params, bs=i3d_bs)
-    feats_gt_dec = get_fvd_logits(gt_dec_videos, i3d_params, bs=i3d_bs)
-    feats_ref = get_fvd_logits(ref_videos, i3d_params, bs=i3d_bs)
+    feats_pred   = stream_features(pred_files,     "pred")
+    feats_gt_dec = stream_features(gt_dec_files,   "gt_decoded")
+    feats_ref    = stream_features(original_files, "original") if has_originals else feats_gt_dec
 
     fvd_e2e = frechet_distance(feats_ref, feats_pred)
     fvd_tokenizer = frechet_distance(feats_ref, feats_gt_dec)

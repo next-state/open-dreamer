@@ -8,6 +8,9 @@ wandb/
 run_job.sh
 logs
 checkpoints/
+gatto/
+checkpoints-2/
+data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
