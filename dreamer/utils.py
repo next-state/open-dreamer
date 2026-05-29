@@ -6,10 +6,29 @@ import optax
 import operator
 from einops import rearrange
 from enum import IntEnum
-from typing import Tuple
+from typing import NamedTuple, Tuple
 from hydra.core.hydra_config import HydraConfig
 from dreamer.configs import LRScheduleConfig, OptimizerConfig
 
+
+def build_ema_model(dynamics: nnx.Module, *, ema_dtype: str | jnp.dtype) -> nnx.Module:
+    ema = nnx.clone(dynamics)
+    params = nnx.state(ema, nnx.Param)
+    ema_dtype = to_jnp_dtype(ema_dtype)
+    nnx.update(ema, jax.tree.map(lambda p: p.astype(ema_dtype), params))
+    return ema
+
+
+@nnx.jit(static_argnames=("ema_decay",))
+def ema_update_step(model: nnx.Module, model_ema: nnx.Module, *, ema_decay: float) -> None:
+    online_params = nnx.state(model, nnx.Param)
+    ema_params = nnx.state(model_ema, nnx.Param)
+    updated_ema = jax.tree.map(
+        lambda e, o: ema_decay * e + (1.0 - ema_decay) * o.astype(e.dtype),
+        ema_params,
+        online_params,
+    )
+    nnx.update(model_ema, updated_ema)
 
 # --- dtype helpers ---
 
@@ -395,6 +414,80 @@ def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
         )
 
 
+class ScaleByLaPropState(NamedTuple):
+    step: jax.Array
+    mu: optax.Updates
+    nu: optax.Updates
+
+
+def scale_by_laprop(
+    b1: float = 0.9,
+    b2: float = 0.999,
+    eps: float = 1e-8,
+) -> optax.GradientTransformation:
+    """Rescale updates according to the LaProp algorithm (Ziyin et al., 2020)."""
+
+    def init_fn(params):
+        mu = jax.tree.map(jnp.zeros_like, params)
+        nu = jax.tree.map(jnp.zeros_like, params)
+        return ScaleByLaPropState(step=jnp.zeros([], jnp.int32), mu=mu, nu=nu)
+
+    def update_fn(updates, state, params=None):
+        del params
+        count_inc: jax.Array = state.step + 1
+
+        # n_t = ν n_{t-1} + (1 - ν) g_t^2  (standard EMA)
+        nu = jax.tree.map(
+            lambda v, g: b2 * v + (1.0 - b2) * g ** 2, state.nu, updates
+        )
+
+        # Bias-correction factors
+        c_n = 1.0 - jnp.float32(b2) ** count_inc
+        c_m = 1.0 - jnp.float32(b1) ** count_inc
+
+        # m_t = μ m_{t-1} + (1 - μ) g_t / (sqrt(n_t / c_n) + ε)
+        # Gradient is normalized BEFORE being accumulated into momentum.
+        mu = jax.tree.map(
+            lambda m, g, v: b1 * m + (1.0 - b1) * g / (jnp.sqrt(v / c_n) + eps),
+            state.mu, updates, nu,
+        )
+
+        # θ_{t+1} = θ_t - λ_t m_t / c_m
+        new_updates = jax.tree.map(lambda m: m / c_m, mu)
+
+        return new_updates, ScaleByLaPropState(step=count_inc, mu=mu, nu=nu)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _kernel_wd_mask(params):
+    """Mask for decoupled weight decay: decay only linear-layer ``kernel`` params.
+
+    Excludes biases, norm scales (RMSNorm/LayerNorm), learned embeddings/tokens,
+    and any other scalar/1-D parameters.
+    """
+    def fn(path, x):
+        path_str = "/".join(str(getattr(k, "key", k)) for k in path)
+        is_kernel = path_str.endswith("kernel") or path_str.endswith("kernel/.value")
+        return bool(is_kernel and x.ndim >= 2)
+    return jax.tree_util.tree_map_with_path(fn, params)
+
+
+def laprop(
+    learning_rate: optax.ScalarOrSchedule,
+    b1: float = 0.9,
+    b2: float = 0.999,
+    eps: float = 1e-8,
+    weight_decay: float = 0.0,
+) -> optax.GradientTransformation:
+    """LaProp optimizer with decoupled weight decay (masked to kernels only)."""
+    return optax.chain(
+        scale_by_laprop(b1=b1, b2=b2, eps=eps),
+        optax.add_decayed_weights(weight_decay, mask=_kernel_wd_mask),
+        optax.scale_by_learning_rate(learning_rate),
+    )
+
+
 def _muon_weight_dims(params):
     """Map params to Muon dimension numbers, excluding embeddings.
 
@@ -447,10 +540,22 @@ def build_optimizer(
             b1=optimizer_cfg.adam_b1,
             b2=optimizer_cfg.adam_b2,
             weight_decay=optimizer_cfg.weight_decay,
+            mask=_kernel_wd_mask,
+        )
+    elif optimizer_cfg.optimizer_type == "laprop":
+        if optimizer_cfg.mup_scaling:
+            scaled_schedule = lambda step, s=lr_schedule, m=mup_scale: s(step) * m
+        else:
+            scaled_schedule = lr_schedule
+
+        tx = laprop(
+            scaled_schedule,
+            b1=optimizer_cfg.adam_b1,
+            b2=optimizer_cfg.adam_b2,
+            eps=optimizer_cfg.adam_eps,
+            weight_decay=optimizer_cfg.weight_decay,
         )
     elif optimizer_cfg.optimizer_type == "muon":
-        import optax.contrib
-
         muon_schedule = lr_schedule
         adam_ratio = optimizer_cfg.adam_lr_ratio
         if optimizer_cfg.mup_scaling:
@@ -474,6 +579,12 @@ def build_optimizer(
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_cfg.optimizer_type}")
+
+    if optimizer_cfg.agc_clipping > 0:
+        tx = optax.chain(
+            optax.adaptive_grad_clip(optimizer_cfg.agc_clipping, eps=optimizer_cfg.agc_eps),
+            tx,
+        )
 
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     return optimizer

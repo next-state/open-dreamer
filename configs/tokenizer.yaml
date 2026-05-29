@@ -3,7 +3,8 @@ defaults:
   - dataset: minecraft_vpt
   - _self_
 
-run_name: tokenizer-asymmetric
+run_name: tokenizer-big
+use_wandb: false
 
 dataset:
   dataloader_cfg:
@@ -19,7 +20,7 @@ tokenizer:
   encoder:
     n_latents: 512
     d_bottleneck: 16
-    depth: 8
+    depth: 12
     d_model: ${mul:128,${tokenizer.encoder.depth}}
     n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
@@ -28,7 +29,7 @@ tokenizer:
     qk_norm_type: qknorm  # qknorm | quest | null
     rope_theta: 10000.0
     time_every: 4
-    time_layer_offset: 1
+    time_layer_offset: 3
     mae_p_min: 0.0
     mae_p_max: 0.9
     patch_size: ${dataset.patch_size}
@@ -45,7 +46,7 @@ tokenizer:
   decoder:
     n_latents: ${tokenizer.encoder.n_latents}
     d_bottleneck: ${tokenizer.encoder.d_bottleneck}
-    depth: ${floordiv:${tokenizer.encoder.depth},2}
+    depth: 8
     d_model: ${mul:128,${tokenizer.decoder.depth}}
     n_heads: ${floordiv:${tokenizer.decoder.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${tokenizer.decoder.n_heads},8}}
@@ -68,25 +69,32 @@ tokenizer:
     dataset_mean: ${dataset.dataset_mean}
     dataset_std: ${dataset.dataset_std}
 
-max_steps: 50_000
+mae_finetune: false
+max_steps: 300_000
 tokenizer_loss_type: mse  # mse | mae
+freeze_encoder: false
+mae_finetune_p_max_start: 0.9
+mae_finetune_p_max_end: 0.0
+ema_decay: 0.999
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
   lr: 0.003  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
-  warmup_ratio: 0.05
-  decay_ratio: 0.5
+  warmup_ratio: 0.01
+  decay_ratio: 0.8
   max_steps: ${max_steps}
 
 optimizer:
   optimizer_type: muon
-  weight_decay: 1e-4
+  weight_decay: 0.1
   # AdamW params (for embeddings/biases)
   adam_lr_ratio: 1.0
   adam_b1: 0.9
   adam_b2: 0.99
+  agc_clipping: 0.0
+  agc_eps: 1e-3
   mup_scaling: true
   mup_base_dim: 640
   # Muon params (for 2D matrix weights)
@@ -97,4 +105,4 @@ optimizer:
 lpips_weight: 0.2
 lpips_frac: 0.5
 visualize_every: 1000
-parallel_strategy: data
+parallel_strategy: fsdp

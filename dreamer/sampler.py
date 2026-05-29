@@ -4,17 +4,28 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from einops import rearrange
 from flax import nnx
 
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
-from .generation import DenoiseSchedule, video_rollout, latent_rollout
+from .generation import DenoiseSchedule, latent_rollout
 
 
 # ---------------------------
 # Multi-frame rollout wrapper
 # ---------------------------
+
+# Calls under `jax.set_mesh(...)` must be jit'd: `with_partitioning` -> `with_sharding_constraint`
+# is a no-op in eager mode (jax#17422), so eager activations get mis-laid-out and frames look corrupt.
+@nnx.jit
+def encode_jit(tokenizer: Tokenizer, frames: jax.Array) -> jax.Array:
+    latents, _ = tokenizer.encode(frames, deterministic=True)
+    return latents
+
+@nnx.jit
+def decode_jit(tokenizer: Tokenizer, z: jax.Array) -> jax.Array:
+    frames, _ = tokenizer.decode(z, deterministic=True)
+    return frames
 
 def sample_video(
     tokenizer: Tokenizer,
@@ -27,7 +38,7 @@ def sample_video(
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
     latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
-) -> Tuple[jax.Array, jax.Array, jax.Array | None, jax.Array]:
+) -> Tuple[jax.Array, jax.Array, jax.Array | None]:
     """
     Sample video predictions using Tokenizer and Dynamics.
 
@@ -62,36 +73,15 @@ def sample_video(
         # Video path - encode frames
         B, T, H, W, C = frames.shape
 
-        rng, mae_key = jax.random.split(rng)
-        rngs = nnx.Rngs(mae=mae_key)
-
         # Encode frames to clean latents (returns unpacked)
-        latents, _ = tokenizer.encode(
-            frames,
-            deterministic=True,
-            rngs=rngs
-        )
+        latents = encode_jit(tokenizer, frames)
 
     # Split context vs future
-    latents_ctx_clean, latent_future = latents[:, :-horizon, :, :], latents[:, -horizon:, :, :]
+    latents_ctx, latent_future = latents[:, :-horizon, :, :], latents[:, -horizon:, :, :]
     actions_ctx, actions_future = actions[:, :-horizon], actions[:, -horizon:]
 
-    # Single-shot context corruption for visualization "floor" only
-    latents_ctx = latents_ctx_clean
-    # if schedule_config.tau_ctx < 1.0:  # FIXME: this is NOT taken from the evaluation config
-    #     rng, nkey = jax.random.split(rng)
-    #     noise = jax.random.normal(nkey, latents_ctx_clean.shape, latents_ctx_clean.dtype)
-    #     tau = jnp.asarray(schedule_config.tau_ctx, latents_ctx_clean.dtype)
-    #     latents_ctx = tau * latents_ctx_clean + (1.0 - tau) * noise
-
     # Decode GT latents for visualization
-    # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
-    @nnx.jit
-    def decode_jit(z):
-        frames, _ = tokenizer.decode(z, deterministic=True)
-        return frames
-
-    gt_decoded_frames = decode_jit(latents)
+    gt_decoded_frames = decode_jit(tokenizer, latents)
     gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
@@ -119,10 +109,8 @@ def sample_video(
     )
 
     # Decode predicted latents to frames
-    # CRITICAL: Decoder must be JIT-compiled to produce correct spatial layout
-    pred_frames = decode_jit(rollout_result['latents'])
+    pred_frames = decode_jit(tokenizer, rollout_result['latents'])
     pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
-    ode_diags = rollout_result.get('ode_diags', {})
 
-    return pred_frames, gt_decoded_frames, original_frames, ode_diags
+    return pred_frames, gt_decoded_frames, original_frames

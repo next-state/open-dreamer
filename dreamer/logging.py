@@ -1,7 +1,10 @@
 from typing import Any, Dict, Optional
 from pathlib import Path
 from typing import Literal
+import os
 import re
+
+import jax
 
 from dreamer.configs import LoggerConfig
 
@@ -115,13 +118,7 @@ class WandbLogger(Logger):
 
     def __enter__(self):
         import wandb
-        self._run = wandb.init(
-            entity=self.entity,
-            project=self.project,
-            name=self.name,
-            config=self.config,
-            dir=self.dir,
-        )
+        self._run = wandb.init(entity=self.entity, project=self.project, name=self.name, config=self.config, dir=self.dir, save_code=True)
         self._initialized = True
         return self
 
@@ -154,7 +151,20 @@ def build_logger(
     config: Any = None,
     dir: Optional[str] = None,
 ) -> Logger:
-    if logger_cfg.use_wandb:
+    def _is_primary_process() -> bool:
+        if jax.distributed.is_initialized():
+            return jax.process_index() == 0
+        rank_env = (
+            os.environ.get("JAX_PROCESS_INDEX")
+            or os.environ.get("RANK")
+            or os.environ.get("SLURM_PROCID")
+            or os.environ.get("OMPI_COMM_WORLD_RANK")
+            or "0"
+        )
+        return int(rank_env) == 0
+
+    use_wandb = logger_cfg.use_wandb and _is_primary_process()
+    if use_wandb:
         return WandbLogger(
             logger_cfg=logger_cfg,
             config=config,

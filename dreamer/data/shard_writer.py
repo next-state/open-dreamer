@@ -1,22 +1,17 @@
-"""Unified ArrayRecord shard writer with automatic rotation.
+"""ArrayRecord shard writer with automatic rotation.
 
-Provides a consistent interface for writing records to ArrayRecord shards
-with automatic rotation based on records_per_shard limit.
+Writes msgpack-serialized records to ArrayRecord shards,
+rotating to a new shard file after records_per_shard records.
 """
 
 from array_record.python.array_record_module import ArrayRecordWriter
 from pathlib import Path
-from typing import Literal
-import pickle
 
 from .serialization import serialize_msgpack_record
 
 
 class ShardWriter:
     """Write records to output shards with automatic rotation.
-
-    Maintains a consistent number of records per shard, automatically
-    creating new shards when the limit is reached.
 
     Example:
         >>> with ShardWriter(output_dir, records_per_shard=1000) as writer:
@@ -29,18 +24,9 @@ class ShardWriter:
         self,
         output_dir: Path | str,
         records_per_shard: int = 1000,
-        serialization_format: Literal["pickle", "msgpack"] = "msgpack",
     ):
-        """Initialize shard writer.
-
-        Args:
-            output_dir: Directory to write shards to
-            records_per_shard: Maximum records per shard before rotation
-            serialization_format: Serialization format ("pickle" or "msgpack")
-        """
         self.output_dir = Path(output_dir)
         self.records_per_shard = records_per_shard
-        self.serialization_format = serialization_format
 
         self.writer = None
         self.shard_idx = 0
@@ -48,14 +34,6 @@ class ShardWriter:
         self._total_records = 0
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Select serializer
-        if serialization_format == "pickle":
-            self._serializer = lambda x: pickle.dumps(x)
-        elif serialization_format == "msgpack":
-            self._serializer = serialize_msgpack_record
-        else:
-            raise ValueError(f"Unknown serialization format: {serialization_format}")
 
     def _open_new_shard(self) -> None:
         """Open a new shard file, closing the previous one if it exists."""
@@ -75,7 +53,7 @@ class ShardWriter:
         if self.writer is None or self.records_in_shard >= self.records_per_shard:
             self._open_new_shard()
 
-        serialized = self._serializer(record)
+        serialized = serialize_msgpack_record(record)
         self.writer.write(serialized)
         self.records_in_shard += 1
         self._total_records += 1

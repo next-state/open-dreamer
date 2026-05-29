@@ -1,0 +1,27 @@
+defaults:
+  - tokenizer
+  - _self_
+
+max_steps: 30_000
+
+dataset:
+  dataloader_cfg:
+    B: 8
+    short_T: 16
+    long_T: 16
+    
+# Freeze encoder, linearly reduce masking from 0.9 → 0.0
+mae_finetune: true
+mae_finetune_p_max_start: 0.9
+mae_finetune_p_max_end: 0.0
+lpips_weight: 0.2
+
+# Lower LR for finetuning
+lr_schedule:
+  lr: 1e-3
+  warmup_ratio: 0.05
+  decay_ratio: 0.8
+  max_steps: ${max_steps}
+
+ckpt:
+  save_interval_steps: 1000

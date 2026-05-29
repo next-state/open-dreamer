@@ -9,20 +9,20 @@ class DataloaderConfig:
     """Configuration for dataloader parameters."""
     # Batch dimension
     B: int = 32  # batch size
-    
+
     # Common parameters
     num_workers: int = 16
     prefetch_buffer_size: int = 10
     device_prefetch_buffer_size: int = 1
-    
+
     # Dual iterator parameters (for alternating short/long sequences)
     short_T: int = 64
     long_T: int = 64
     long_ratio: float = 0.0
     start_step: int = 0
-    
+
     dtype: str = "bfloat16"
-    
+
 @dataclass(frozen=False, unsafe_hash=True)
 class DatasetConfig:
     """Configuration for dataset parameters.
@@ -55,7 +55,7 @@ class DatasetConfig:
     # Dataset normalization statistics (for pixel values in [0, 1])
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
     dataset_std: tuple[float, ...] = (0.288675, 0.288675, 0.288675)  # sqrt(1/12)
-    
+
     latent_mean: tuple[float, ...] | None = None
     latent_std: tuple[float, ...] | None = None
 
@@ -64,7 +64,7 @@ class DatasetConfig:
 
     # Data type: "video" (default) or "latent" (pre-tokenized)
     data_type: str = "video"
-    
+
 
 # ---- Model Configs ----
 
@@ -164,7 +164,7 @@ class DynamicsModelConfig:
     num_binary_actions: int = 0
     categorical_action_dim: int = 0
     continuous_action_dim: int = 0
-    
+
     latent_mean: tuple[float, ...] | None = None
     latent_std: tuple[float, ...] | None = None
 
@@ -261,7 +261,7 @@ class CheckpointConfig:
 @dataclass(frozen=False)
 class OptimizerConfig:
     """Configuration for optimizer."""
-    # Optimizer type: "adamw" or "muon"
+    # Optimizer type: "adamw", "laprop", or "muon"
     optimizer_type: str = "muon"
     weight_decay: float = 1e-4
 
@@ -269,10 +269,15 @@ class OptimizerConfig:
     adam_lr_ratio: float = 1.0      # adam_lr = muon_lr * adam_lr_ratio
     adam_b1: float = 0.9
     adam_b2: float = 0.9
+    adam_eps: float = 1e-8
 
     # MuP scaling (scales AdamW LR by (d_model/mup_base_dim)^-0.5)
     mup_base_dim: int = 512         # Reference dimension for MuP scaling
     mup_scaling: bool = False       # Enable MuP LR scaling
+
+    # Adaptive Gradient Clipping (AGC)
+    agc_clipping: float = 0.0       # 0 = disabled; e.g. 0.3 clips at 30% of weight norm
+    agc_eps: float = 1e-3           # Floor for weight norm in AGC
 
     # Muon-specific hyperparameters (for 2D matrix params, excluding embeddings)
     muon_beta: float = 0.95         # Momentum for Muon
@@ -336,12 +341,22 @@ class TokenizerConfig(BaseExperimentConfig):
     visualize_every: int = 10_000
     tokenizer_loss_type: str = "mae" # "mse" | "mae"
 
+    # Finetuning: gradually reduce MAE masking while freezing encoder
+    mae_finetune: bool = False
+    mae_finetune_p_max_start: float | None = None
+    mae_finetune_p_max_end: float | None = None
+
+    # EMA model
+    ema_decay: float = 0.999
+    ema_dtype: str = "bfloat16"
+
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
 
     # Optimizer
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
+    #TODO: add dataset stats
 
 @dataclass(frozen=False)
 class DynamicsConfig(BaseExperimentConfig):
@@ -369,6 +384,7 @@ class DynamicsConfig(BaseExperimentConfig):
 
     # EMA model
     ema_decay: float = 0.999
+    ema_dtype: str = "bfloat16"
 
 
 @dataclass(frozen=False)

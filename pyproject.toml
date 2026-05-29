@@ -13,7 +13,8 @@ dependencies = [
     "nvidia-cusparse-cu12>=12.5.8.93",  # pin to CUDA 12.8 compatible version; 12.5.10.65 requires nvJitLink 12.9
     "jaxlpips",
     "matplotlib",
-    "optax",
+    "optax>=0.2.8",
+    "ott-jax",
     "tqdm",
     "wandb",
     "tyro>=1.0.0",
@@ -23,7 +24,8 @@ dependencies = [
     "reactor-runtime>=2.7",
     "pandas>=2.3.3",
     "awscli>=1.27.0",
-    "decord>=0.6.0",
+    "decord>=0.6.0; sys_platform != 'linux' or platform_machine != 'aarch64'",
+    "ripgrep",
 ]
 
 

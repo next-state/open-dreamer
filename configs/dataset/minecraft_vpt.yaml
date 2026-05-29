@@ -4,14 +4,14 @@ defaults:
 name: minecraft_vpt
 data_type: video
 
-array_record_path: /home/data/arrayrecords-mp4
-index_max: 500
+array_record_path: /alloc/data/arrayrecords-mp4
+index_max: 1500
 num_max_samples: -1
 
 dataloader_cfg:
   B: 8
-  num_workers: 16
-  prefetch_buffer_size: 10
+  num_workers: 4
+  prefetch_buffer_size: 3
   device_prefetch_buffer_size: 1
   short_T: ???
   long_T: ???
@@ -27,7 +27,7 @@ padding_H: [4, 4]
 padding_W: [0, 0]
 patch_size: 16
 
-num_binary_actions: 23  # keyboard actions
+num_binary_actions: 27  # keyboard + mouse buttons + wheel direction
 categorical_action_dim: 121  # mouse actions
 continuous_action_dim: 0
 

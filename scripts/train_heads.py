@@ -24,7 +24,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import HeadsConfig
-from dreamer.data import make_iterator
+from dreamer.data import build_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, PolicyHeadMTP, RewardHeadMTP, TaskEmbedder, Tokenizer
 from dreamer.actions import Actions, shift_actions
@@ -323,7 +323,7 @@ def run(cfg: HeadsConfig):
         dynamics_optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule_dynamics, d_model=d_model)
 
         # Data iterator
-        train_dataloader = make_iterator(cfg.dataset)
+        train_dataloader = build_iterator(cfg.dataset)
         train_iterator = iter(train_dataloader)
 
         # Create RMS loss normalizer for balancing policy/reward/dynamics losses

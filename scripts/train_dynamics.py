@@ -1,9 +1,23 @@
 import os
+
+
+def _append_xla_flag(flag: str) -> None:
+    current = os.environ.get("XLA_FLAGS", "")
+    if flag not in current.split():
+        os.environ["XLA_FLAGS"] = f"{current} {flag}".strip()
+
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.80")
+_append_xla_flag("--xla_gpu_triton_gemm_any=True")
+# _append_xla_flag("--xla_gpu_enable_latency_hiding_scheduler=true")
+
 import logging
 
 import hydra
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import optax
 from flax import nnx
@@ -11,13 +25,16 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from dreamer.configs import DynamicsConfig, OptimalTransportConfig
-from dreamer.data import make_dual_iterator
+from dreamer.data import build_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.actions import Actions, shift_actions
-from dreamer.parallel import build_parallel
+from dreamer.actions import Actions, shift_actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES
+from dreamer.parallel import build_parallel, MeshRules
 from dreamer.scaling import ScalingContext
-from dreamer.training import run_evaluation, run_x0_visualization, run_attention_visualization, shortcut_forcing_step
+from dreamer.training import (
+    run_evaluation,
+    shortcut_forcing_step,
+)
 from dreamer.checkpointing import (
     DynamicsCheckpointBundle,
     TokenizerCheckpointBundle,
@@ -28,23 +45,25 @@ from dreamer.utils import (
     setup_training_directories,
     build_lr_schedule,
     build_optimizer,
+    build_ema_model,
+    ema_update_step,
 )
 
 # Suppress absl info logs
 logging.getLogger('absl').setLevel(logging.WARNING)
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
 
-
 # Register OmegaConf resolver for arithmetic expressions
 OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
 OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
 OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
 OmegaConf.register_new_resolver("max", lambda *args: max(args))
+OmegaConf.register_new_resolver("min", lambda *args: min(args))
 
 # jax.config.update("jax_compilation_cache_dir", "/scratch/jax_cache")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+# jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
 
 
 # ---------------------------
@@ -52,7 +71,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "B_img", "T", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
+    static_argnames=("k_max", "B_img", "T", "n_splits", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -67,6 +86,7 @@ def train_step(
     step: int,
     B_img: int,               # Number of samples to treat as images
     T: int,
+    n_splits: int,            # Number of block-causal chunks (1 = full causal, >1 = split into independent chunks)
     k_max: int,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
     bootstrap_fraction: float,
@@ -93,7 +113,13 @@ def train_step(
 
     # Build time mask for full batch
     mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
-    mask_vid = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))  # causal tokens
+    # Block-causal mask: n_splits independent causal chunks
+    chunk_size = T // n_splits
+    row_idx = jnp.arange(T)
+    col_idx = jnp.arange(T)
+    same_chunk = (row_idx[:, None] // chunk_size) == (col_idx[None, :] // chunk_size)
+    causal = row_idx[:, None] >= col_idx[None, :]
+    mask_vid = (same_chunk & causal)                         # block-causal tokens
     time_mask = jnp.where(
         is_img[:, None, None, None],
         mask_img[None, None, :, :],
@@ -111,6 +137,7 @@ def train_step(
             rng=step_key,
             k_max=k_max,
             B_self=B_self,
+            B_img_emp=B_img_emp,
             context_length=context_length, # Builds sliding window attention
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
@@ -133,25 +160,6 @@ def train_step(
 
     return {**metrics, 'grad_norm': grad_norm}
 
-def build_ema_model(dynamics: Dynamics) -> Dynamics:
-    ema = nnx.clone(dynamics)
-    params = nnx.state(ema, nnx.Param)
-    nnx.update(ema, jax.tree.map(lambda p: p.astype(jnp.float32), params))
-    return ema
-
-
-@nnx.jit(static_argnames=("ema_decay",))
-def ema_update_step(dynamics: Dynamics, dynamics_ema: Dynamics, *, ema_decay: float):
-    online_params = nnx.state(dynamics, nnx.Param)
-    ema_params    = nnx.state(dynamics_ema, nnx.Param)
-    # Keep EMA in float32 to avoid bf16 quantization (tiny EMA increments get rounded to 0)
-    updated_ema = jax.tree.map(
-        lambda e, o: ema_decay * e + (1.0 - ema_decay) * o.astype(e.dtype),
-        ema_params, online_params,
-    )
-    nnx.update(dynamics_ema, updated_ema)
-
-
 # ---------------------------
 # Main
 # ---------------------------
@@ -160,15 +168,17 @@ def run(cfg: DynamicsConfig):
     # Setup
     run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
-    # Logging
-    logger = build_logger(
-        logger_cfg=cfg.logger,
-        config=OmegaConf.to_container(cfg, resolve=True),
-        dir=str(run_dir),
-    )
-
     # Parallelism
     mesh, data_sharding, mesh_rules = build_parallel(cfg.parallel_strategy)
+    # mesh = jax.make_mesh((cfg.dataset.dataloader_cfg.B, jax.local_device_count()//cfg.dataset.dataloader_cfg.B), ('data', 'seq'))
+    # data_sharding = NamedSharding(mesh, P('data', 'seq', None, None))
+    # mesh_rules = MeshRules(data='data', seq='seq', mlp='data', attn='data')
+
+    is_main_process = jax.process_index() == 0
+    is_multihost = jax.process_count() > 1
+
+    # Logging
+    logger = build_logger(logger_cfg=cfg.logger, config=OmegaConf.to_container(cfg, resolve=True), dir=str(run_dir))
 
     with logger, jax.set_mesh(mesh):
         key = jax.random.PRNGKey(cfg.seed)
@@ -179,6 +189,8 @@ def run(cfg: DynamicsConfig):
 
         # Check if using latent data (pre-tokenized)
         use_latent_data = cfg.dataset.data_type == "latent"
+        assert cfg.dataset.num_binary_actions == NUM_BINARY_ACTIONS
+        assert cfg.dataset.categorical_action_dim == NUM_CAMERA_CLASSES
 
         # Load pretrained tokenizer (required for video data, optional for latent data checkpoints)
         tokenizer_bundle = TokenizerCheckpointBundle.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
@@ -195,7 +207,7 @@ def run(cfg: DynamicsConfig):
         n_spatial = n_latents // cfg.dynamics.packing_factor
         dl_cfg = cfg.dataset.dataloader_cfg
         B = dl_cfg.B
-        avg_T = int(dl_cfg.long_ratio * dl_cfg.long_T + (1 - dl_cfg.long_ratio) * dl_cfg.short_T)
+        avg_T = dl_cfg.long_T
 
         # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
         dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
@@ -225,7 +237,7 @@ def run(cfg: DynamicsConfig):
         optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model)
 
         # Build EMA model
-        dynamics_ema = build_ema_model(dynamics)
+        dynamics_ema = build_ema_model(dynamics, ema_dtype=cfg.ema_dtype)
 
         # Create checkpoint bundle (includes frozen tokenizer for self-contained checkpoints)
         bundle = DynamicsCheckpointBundle(
@@ -235,19 +247,21 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        dataloader = make_dual_iterator(cfg.dataset, device=data_sharding)
+        dataloader = build_dual_iterator(cfg.dataset, device=data_sharding, dtype=cfg.dtype)
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
+
             scaling.start_training()
 
-
-            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True)
+            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True, disable=not is_main_process)
             for step, batch in pbar:
                 if step >= cfg.max_steps:
                     break
 
                 rng, master_key = jax.random.split(rng, num=2)
+
+                n_splits = int(batch.get("n_splits", 1))
 
                 # Use pre-allocated batch
                 actions = batch["actions"]
@@ -257,31 +271,22 @@ def run(cfg: DynamicsConfig):
 
                 actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
 
-                # Validation step before training (as input buffers might be donated)
-                if ((step % cfg.write_video_every == 0) and step > 0) or step == cfg.max_steps - 1:
+                # Validation/visualization — all hosts must participate in JAX
+                # compute (model is sharded), but only process 0 does I/O.
+                do_eval = (cfg.write_video_every>0 and step>0 and (step % cfg.write_video_every == 0)) or step == cfg.max_steps - 1
+                if do_eval:
                     val_data = input_tensor[:4]
                     val_actions = actions[:4]
-                    for eval_name, eval_dynamics in [("online", bundle.dynamics), ("ema", bundle.dynamics_ema)]:
-                        run_evaluation(
-                            cfg, step, bundle.tokenizer, eval_dynamics,
-                            val_data=val_data, val_actions=val_actions,
-                            use_latent_data=use_latent_data,
-                            vis_dir=vis_dir, rng=rng, logger=logger, name=eval_name,
-                        )
-                        run_x0_visualization(
-                            cfg, step, bundle.tokenizer, eval_dynamics,
-                            data=input_tensor[:1], actions=actions[:1],
-                            master_key=master_key,
-                            use_latent_data=use_latent_data,
-                            vis_dir=vis_dir, logger=logger, name=eval_name,
-                        )
-                        run_attention_visualization(
-                            cfg, step, bundle.tokenizer,
-                            dynamics=eval_dynamics,
-                            data=input_tensor[:1], actions=actions[:1],
-                            use_latent_data=use_latent_data,
-                            vis_dir=vis_dir, logger=logger, name=eval_name,
-                        )
+                    run_evaluation(
+                        cfg, step, bundle.tokenizer,
+                        dynamics_online=bundle.dynamics,
+                        dynamics_ema=bundle.dynamics_ema,
+                        val_data=val_data,
+                        val_actions=val_actions,
+                        use_latent_data=use_latent_data,
+                        vis_dir=vis_dir, rng=rng,
+                        logger=logger if is_main_process else None,
+                    )
 
                 # Training step
                 B, T = input_tensor.shape[:2]
@@ -292,6 +297,7 @@ def run(cfg: DynamicsConfig):
                     step=step,
                     B_img=int(B * cfg.image_fraction),
                     T=T,
+                    n_splits=n_splits,
                     k_max=cfg.dynamics.k_max,
                     context_length=cfg.dynamics.context_length,
                     bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
@@ -302,31 +308,36 @@ def run(cfg: DynamicsConfig):
                 # EMA update
                 ema_update_step(bundle.dynamics, bundle.dynamics_ema, ema_decay=cfg.ema_decay)
 
-                # Logging
+                # Logging — device_get on all hosts to stay in sync, only host 0 logs
                 if logger.should_log(step):
                     metrics_cpu = jax.device_get(metrics)
-                    scaling.on_step(step, metrics_cpu)
-                    logger.log(
-                        step,
-                        metrics={
-                            "flow_mse": metrics_cpu["flow_mse"],
-                            "boot_mse": metrics_cpu["bootstrap_mse"],
-                            "grad_norm": metrics_cpu["grad_norm"],
-                            "flow_mse_low": metrics_cpu["flow_mse_low"],
-                            "flow_mse_mid": metrics_cpu["flow_mse_mid"],
-                            "flow_mse_high": metrics_cpu["flow_mse_high"],
-                            "boot_target_norm": metrics_cpu["boot_target_norm"],
-                            "lr": lr_schedule(step),
-                            "T": T,
-                            **scaling.get_step_metrics(step),
-                        },
-                        pbar=pbar,
-                    )
+                    if is_main_process:
+                        scaling.on_step(step, metrics_cpu)
+                        logger.log(
+                            step,
+                            metrics={
+                                "flow_mse": metrics_cpu["flow_mse"],
+                                "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
+                                "flow_mse_image": metrics_cpu["flow_mse_image"],
+                                "boot_mse": metrics_cpu["bootstrap_mse"],
+                                "grad_norm": metrics_cpu["grad_norm"],
+                                "flow_mse_low": metrics_cpu["flow_mse_low"],
+                                "flow_mse_mid": metrics_cpu["flow_mse_mid"],
+                                "flow_mse_high": metrics_cpu["flow_mse_high"],
+                                "boot_target_norm": metrics_cpu["boot_target_norm"],
+                                "lr": lr_schedule(step),
+                                "T": T // n_splits,
+                                **scaling.get_step_metrics(step),
+                            },
+                            pbar=pbar,
+                            pbar_filter=r"^(flow_mse|boot_mse|lr)$",
+                        )
 
                 # Checkpointing
                 bundle.maybe_save(checkpoint_manager, step, rng)
 
-            scaling.finalize()
+            if is_main_process:
+                scaling.finalize()
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="dynamics")
@@ -336,3 +347,4 @@ def main(cfg: DynamicsConfig):
 
 if __name__ == "__main__":
     main()
+

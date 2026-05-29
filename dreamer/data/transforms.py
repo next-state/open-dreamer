@@ -9,19 +9,31 @@ Provides flexible, reusable transforms that handle:
 """
 
 import io
+import os
 import pickle
 from typing import Any
 import jax
 import jax.numpy as jnp
-
-import decord
 import grain
 import numpy as np
 
-from ..actions import Actions
+from ..actions import Actions, parse_action_dicts
 from .serialization import deserialize_msgpack_record
 
-decord.bridge.set_bridge("native")
+try:
+    import decord
+except ImportError:
+    decord = None
+
+
+def _require_decord():
+    if decord is None:
+        raise ImportError(
+            "decord is required for Minecraft VPT video decoding but is not installed "
+            "for this platform."
+        )
+    decord.bridge.set_bridge("native")
+    return decord
 
 
 # ==============================================================================
@@ -238,6 +250,9 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
         padding_w: tuple[int, int] = (0, 0),
         patch_size: int | None = None,
         full_episode: bool = False,
+        decoder_threads: int = 1,
+        cast_to_float32: bool = True,
+        return_actions: bool = False,
     ):
         """Initialize Minecraft VPT processor.
 
@@ -250,11 +265,17 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             padding_w: Padding for width (left, right)
             patch_size: Patch size for padding validation (required if padding used)
             full_episode: If True, return full episode without slicing (for tokenization)
+            decoder_threads: Number of decoding threads per worker process
+            cast_to_float32: Whether to cast decoded video to float32
         """
         self.seq_len = seq_len
         self.padding_h = tuple(padding_h) if isinstance(padding_h, list) else padding_h
         self.padding_w = tuple(padding_w) if isinstance(padding_w, list) else padding_w
         self.full_episode = full_episode
+        self.decoder_threads = max(1, int(decoder_threads))
+        self.cast_to_float32 = bool(cast_to_float32)
+        self.return_actions = return_actions
+        
 
         # Validate padding alignment with patch_size
         if patch_size is not None:
@@ -274,26 +295,33 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             Dictionary with videos and actions
         """
         data = pickle.loads(element)
+        decord_module = _require_decord()
 
         # Decode MP4 bytes using decord
         mp4_bytes = io.BytesIO(data["video"])
-        cpu_idx = int(rng.integers(0, 2))
-        vr = decord.VideoReader(mp4_bytes, ctx=decord.cpu(cpu_idx), num_threads=1)
+        vr = decord_module.VideoReader(
+            mp4_bytes, ctx=decord_module.cpu(0), num_threads=self.decoder_threads
+        )
 
         episode_len = len(vr)
 
         if self.full_episode:
-            # Return full episode for tokenization
             video = vr.get_batch(list(range(episode_len))).asnumpy()
+            actions = parse_action_dicts(data.get("actions")).to_dict()
         else:
-            # Random slice for training
             max_start = episode_len - self.seq_len
             start = int(rng.integers(0, max_start + 1))
             frame_indices = list(range(start, start + self.seq_len))
             video = vr.get_batch(frame_indices).asnumpy()
-
-        # Keep as float32 in [0, 255] range (consistent with CoinRun)
-        video = video.astype(np.float32)
+            if self.return_actions:
+                all_actions = parse_action_dicts(data.get("actions"))
+                actions = all_actions[start:start + self.seq_len]
+            else:
+                actions = Actions(binary=None, categorical=None, continuous=None) # TODO: might be better to pass None at this point, but i'm keeping it in not to break any backward compatibility
+        # For tokenization pipelines, keeping uint8 here dramatically reduces
+        # multiprocessing/shared-memory pressure; cast later on-device.
+        if self.cast_to_float32:
+            video = video.astype(np.float32, copy=False)
 
         # Apply padding
         video = np.pad(
@@ -303,11 +331,14 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             constant_values=0
         )
 
-        return {
+        result = {
             "videos": video,
-            "actions": Actions(binary=None, categorical=None, continuous=None),  # FIXME: no actions returned!!
+            "actions": actions,
             "rewards": None,
         }
+        if self.full_episode:
+            result["source"] = data.get("source")
+        return result
 
 
 # ==============================================================================

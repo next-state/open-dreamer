@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import math
 import einops
 import jax
@@ -6,7 +7,6 @@ from typing import Any, Tuple
 from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
 from .actions import Actions
 from .utils import normalize_latents, unnormalize_latents
-from flax.struct import dataclass
 from tqdm import tqdm
 
 
@@ -78,7 +78,8 @@ class DenoiseSchedule:
         tau_idx_ctx = j_ctx * (k_max // K_ctx)
 
         return cls(num_steps, k_max, d, step_idx, emax, tau_values, tau_indices, beta_values, step_idx_ctx, tau_idx_ctx, tau_ctx)
-    
+
+
 # ---------------------------
 # Single-step τ-ladder denoiser
 # ---------------------------
@@ -331,7 +332,7 @@ def latent_rollout(
 
     if use_kv_cache:
         # Initialize caches and process context
-        window_size = T_ctx + num_steps
+        window_size = min(T_ctx + num_steps, dynamics.cfg.context_length)
         n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
         caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
 
@@ -402,63 +403,4 @@ def latent_rollout(
         'ode_diags': ode_diags,
     }
 
-def video_rollout(
-    tokenizer: Tokenizer,
-    dynamics: Dynamics,
-    policy: PolicyHeadMTP | Actions,
-    schedule: DenoiseSchedule,
-    frames_ctx: jax.Array,
-    actions_ctx: Actions,
-    num_steps: int,
-    rng: jax.Array,
-    initial_task_embedding: jax.Array | None = None,
-):
-    """
-    End-to-end video generation rollout.
 
-    Args:
-        tokenizer: Tokenizer NNX model.
-        dynamics: Dynamics NNX model.
-        policy: Policy NNX model or sequence of actions.
-        schedule: DenoiseSchedule.
-        frames_ctx: (B, T_ctx, H, W, C) context frames (0-255 range).
-        actions_ctx: Context actions.
-        num_steps: Number of steps to unroll.
-        rng: Random number generator key.
-        initial_task_embedding: Optional task tokens for context.
-    Returns:
-        pred_frames: (B, T_ctx + num_steps, H, W, C)
-    """
-    from flax import nnx
-
-    # Tokenize
-    rng, mae_key = jax.random.split(rng)
-    rngs = nnx.Rngs(mae=mae_key)
-
-    latents_ctx, _ = tokenizer.encode(
-        frames_ctx,
-        deterministic=True,
-        rngs=rngs
-    )  # Encode returns (B, T, L, D)
-
-    # Latent Rollout
-    # Returns dict with 'latents', 'actions', 'hidden_states', 'context_hidden'
-    rollout_result = latent_rollout(
-        dynamics,
-        policy,
-        schedule,
-        latents_ctx,
-        actions_ctx,
-        num_steps,
-        rng,
-        initial_task_embedding,
-        deterministic=True,  # use deterministic policy for visualization
-    )
-
-    # Decode
-    pred_frames, _ = tokenizer.decode(
-        rollout_result['latents'],
-        deterministic=True
-    )
-
-    return jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)

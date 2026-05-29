@@ -3,16 +3,17 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-time-layer-start
-tokenizer_ckpt: logs/tokenizer-asymmetric-repro/checkpoints/
+run_name: dynamics-pre-final
+tokenizer_ckpt: logs/tokenizer-500M/checkpoints
 
 ckpt:
   max_to_keep: 1
-  save_interval_steps: 1_000
+  save_interval_steps: 5_000
 
 dataset:
   dataloader_cfg:
     B: 8
+    num_workers: 16
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
     short_T: 64
@@ -21,7 +22,7 @@ dataset:
 
 dynamics:
     d_bottleneck: 16
-    depth: 16
+    depth: 30
     d_model: ${mul:64,${dynamics.depth}}
     n_heads: ${floordiv:${dynamics.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${dynamics.n_heads},8}}
@@ -33,14 +34,15 @@ dynamics:
     time_layer_offset: 0
     mlp_ratio: 4
     dropout_rate: 0.00
-    k_max: 128
-    context_length: 192  # Attention window for sliding window attention
+    k_max: 256
+    context_length: ${min:192,${dataset.dataloader_cfg.long_T}}  # Attention window for sliding window attention
     use_residual_lambdas: false
     use_bias: false
     use_rmsnorm_scale: true
     dtype: ${dtype}
     param_dtype: ${param_dtype}
     
+    #TODO: remove it from here and put it in the tokenizer
     latent_mean: ${dataset.latent_mean}
     latent_std: ${dataset.latent_std}
 
@@ -50,9 +52,10 @@ dynamics:
 
 ema_decay: 0.999
 
-bootstrap_start: 50_000  # Number of start steps trained exclusively on flow-matching objective
+max_steps: 200_000
+bootstrap_start: 100_000  # Number of start steps trained exclusively on flow-matching objective
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
-image_fraction: 0.3  # Fraction of batch to train as images (no temporal attention)
+image_fraction: 0.0  # Fraction of batch to train as images (no temporal attention)
 
 # Optimal transport coupling (minibatch OT)
 ot:
@@ -64,31 +67,28 @@ ot:
   pairing: barycentric
   scale_cost: mean
 
-max_steps: 100_000
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos
-  lr: 3e-3  # constant LR or peak LR for schedules
+  lr: 3e-4  # constant LR or peak LR for schedules
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.05
-  decay_ratio: 0.5
+  decay_ratio: 0.1
   max_steps: ${max_steps}
 
 optimizer:
   optimizer_type: muon
   weight_decay: 0.1
-  # AdamW params (for embeddings/biases)
-  adam_lr_ratio: 1.0
   adam_b1: 0.9
   adam_b2: 0.99
+  adam_eps: 1e-8
+  adam_lr_ratio: 1.0
   mup_scaling: false
-  mup_base_dim: 512
-  # Muon params (for 2D matrix weights)
-  muon_beta: 0.95
-  muon_ns_steps: 5
+  agc_clipping: 0.0
+  agc_eps: 1e-3
+  muon_beta: 0.99
   muon_nesterov: true
+  muon_ns_steps: 5
 
-write_video_every: 5000
-dtype: ${dataset.dataloader_cfg.dtype}
-param_dtype: bfloat16
+write_video_every: 0

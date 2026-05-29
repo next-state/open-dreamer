@@ -33,6 +33,8 @@ from dreamer.models import (
 )
 from dreamer.training import RMSLossNormalizer
 from dreamer.parallel import MeshRules
+from jax.experimental import multihost_utils
+
 from dreamer.utils import from_dict
 
 
@@ -48,10 +50,14 @@ def build_checkpoint_manager(
         item_names=("model_state", "optimizer_state", "rngs", "meta"),
     ) -> ocp.CheckpointManager:
 
+    is_multihost = jax.process_count() > 1
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=ckpt_cfg.max_to_keep,
         save_interval_steps=ckpt_cfg.save_interval_steps,
         save_on_steps=[ckpt_cfg.max_steps - 1],  # always save at the end
+        single_host_load_and_broadcast=is_multihost,
+        enable_async_checkpointing=True,
+        multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=0),
     )
 
     if ckpt_cfg.max_to_keep == 0:
@@ -245,9 +251,11 @@ class TokenizerCheckpointBundle(CheckpointBundle):
 
     _model_registry: ClassVar[dict[str, tuple[type, type]]] = {
         "tokenizer": (TokenizerModelConfig, Tokenizer),
+        "tokenizer_ema": (TokenizerModelConfig, Tokenizer),
     }
 
     tokenizer: Tokenizer
+    tokenizer_ema: Tokenizer
     tokenizer_optimizer: nnx.Optimizer | None = None
 
 
