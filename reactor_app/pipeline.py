@@ -160,7 +160,7 @@ class WorldModelPipeline(ReactorPipeline):
                 n_agent=0,
                 dtype=dyn_cfg.dtype,
             )
-            _, self._empty_tokenizer_cache = self._tokenizer.create_static_caches(
+            self._empty_tokenizer_cache = self._tokenizer.create_static_caches(
                 batch_size=1,
                 window_size=self._tok_window_size,
                 dtype=tok_cfg.decoder.dtype,
