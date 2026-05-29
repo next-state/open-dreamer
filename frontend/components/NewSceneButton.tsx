@@ -36,7 +36,7 @@ export function NewSceneButton({ className }: NewSceneButtonProps) {
         <path d="M14 8a6 6 0 1 1-1.76-4.24" />
         <path d="M14 2.5V6h-3.5" />
       </svg>
-      <span>New scene</span>
+      <span>New dream</span>
     </button>
   );
 }
