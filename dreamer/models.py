@@ -1222,7 +1222,7 @@ class Dynamics(nnx.Module):
             use_bias=cfg.use_bias,
             kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
             bias_init=nnx.initializers.zeros,
-            dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs
+            dtype=self.param_dtype, param_dtype=self.param_dtype, rngs=rngs
         )
 
     def get_token_layout(self, n_latents: int, n_agent: int = 0) -> TokenLayout:
@@ -1350,7 +1350,7 @@ class Dynamics(nnx.Module):
             rngs=rngs
         )
 
-        spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
+        spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :].astype(jnp.float32)
         x1_hat_packed = self.flow_x_head(spatial_tokens)  # (B, T, n_spatial, d_spatial)
 
         # Unpack before returning
