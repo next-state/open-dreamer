@@ -99,7 +99,9 @@ def train_step(
         latents, _ = tokenizer.encode(data, deterministic=True)
         latents = jax.lax.stop_gradient(latents)
 
-    latents = latents.astype(dynamics.dtype)
+    # Keep x0 targets and diffusion algebra in fp32. The Dynamics module casts
+    # to its compute dtype at the model boundary.
+    latents = latents.astype(jnp.float32)
 
     B = latents.shape[0]
     B_self = int(B * bootstrap_fraction)
@@ -247,7 +249,8 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        dataloader = build_dual_iterator(cfg.dataset, device=data_sharding, dtype=cfg.dtype)
+        dataloader_dtype = "float32" if use_latent_data else cfg.dtype
+        dataloader = build_dual_iterator(cfg.dataset, device=data_sharding, dtype=dataloader_dtype)
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
@@ -347,4 +350,3 @@ def main(cfg: DynamicsConfig):
 
 if __name__ == "__main__":
     main()
-

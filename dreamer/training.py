@@ -184,6 +184,7 @@ def sample_step_excluding_dmin(
 
 # Loss weighting
 def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float = 1.0) -> jnp.ndarray:
+    sigma = sigma.astype(jnp.float32)
     return (max_weight - min_weight) * sigma + min_weight
 
 
@@ -287,6 +288,10 @@ def compute_flow_loss(
             mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
             mse_per_token: tuple of scalars. MSE loss 
     """
+    z_pred = z_pred.astype(jnp.float32)
+    z_target = z_target.astype(jnp.float32)
+    sigma = sigma.astype(jnp.float32)
+
     mse_per_token = (z_pred - z_target) ** 2  # (B, T, S, D)
     mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
 
@@ -328,6 +333,12 @@ def compute_bootstrap_loss(
             mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
             mse_per_token: tuple of scalars. MSE loss
     """
+    z_pred = z_pred.astype(jnp.float32)
+    z_tilde = z_tilde.astype(jnp.float32)
+    b_prime = b_prime.astype(jnp.float32)
+    b_doubleprime = b_doubleprime.astype(jnp.float32)
+    sigma = sigma.astype(jnp.float32)
+
     # Target velocity is average of two half-steps (stop gradient, clipped)
     v_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
     v_target = jnp.clip(v_target, -4.0, 4.0)
@@ -345,9 +356,9 @@ def compute_bootstrap_loss(
     if boot_row_mask is not None:
         # Masked mean: only count bootstrap rows. sum/count avoids any
         # AllGather that jnp.mean would trigger over a sharded batch axis.
-        mask_bt = boot_row_mask[:, None].astype(sigma.dtype)  # (B, 1) → broadcast (B, T)
+        mask_bt = boot_row_mask[:, None].astype(jnp.float32)  # (B, 1) → broadcast (B, T)
         n_active = jnp.maximum(
-            jnp.sum(boot_row_mask.astype(sigma.dtype)) * sigma.shape[1], 1.0
+            jnp.sum(boot_row_mask.astype(jnp.float32)) * sigma.shape[1], 1.0
         )
         return (
             jnp.sum(boot_per_step * weights * mask_bt) / n_active,
@@ -408,9 +419,12 @@ def shortcut_forcing_step(
     B, T, S, D = latents.shape
     B_emp = B - B_self
     emax = jnp.log2(k_max).astype(jnp.int32)
+    diffusion_dtype = jnp.float32
 
     # Normalize latents before corruption (all operations happen in normalized space)
+    latents = latents.astype(diffusion_dtype)
     latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
+    latents = latents.astype(diffusion_dtype)
 
     # Split RNG
     key_sigma_emp, key_sigma_self, key_step, key_noise, key_dropout1, key_ot = jax.random.split(rng, 6)
@@ -421,9 +435,9 @@ def shortcut_forcing_step(
 
     # Bootstrap rows: coarser steps (if B_self > 0)
     if B_self > 0:
-        d_self, step_idx_self = sample_step_excluding_dmin(key_step, (B_self, T), k_max, dtype=latents.dtype)
+        d_self, step_idx_self = sample_step_excluding_dmin(key_step, (B_self, T), k_max, dtype=diffusion_dtype)
     else:
-        d_self = jnp.zeros((0, T), dtype=latents.dtype)
+        d_self = jnp.zeros((0, T), dtype=diffusion_dtype)
         step_idx_self = jnp.zeros((0, T), dtype=jnp.int32)
 
     step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)
@@ -431,31 +445,32 @@ def shortcut_forcing_step(
     # --- Sample signal levels ---
     # Empirical rows: include tau=1.0 (clean frames) for diffusion forcing flow loss
     sigma_emp, sigma_idx_emp = sample_tau_for_step(
-        key_sigma_emp, (B_emp, T), k_max, step_idx_emp, dtype=latents.dtype, include_endpoint=True
+        key_sigma_emp, (B_emp, T), k_max, step_idx_emp, dtype=diffusion_dtype, include_endpoint=True
     )
     # Bootstrap rows: exclude tau=1.0 (need room for half-steps in bootstrap loss)
     if B_self > 0:
         sigma_self, sigma_idx_self = sample_tau_for_step(
-            key_sigma_self, (B_self, T), k_max, step_idx_self, dtype=latents.dtype, include_endpoint=False
+            key_sigma_self, (B_self, T), k_max, step_idx_self, dtype=diffusion_dtype, include_endpoint=False
         )
     else:
-        sigma_self = jnp.zeros((0, T), dtype=latents.dtype)
+        sigma_self = jnp.zeros((0, T), dtype=diffusion_dtype)
         sigma_idx_self = jnp.zeros((0, T), dtype=jnp.int32)
 
     sigma_full = jnp.concatenate([sigma_emp, sigma_self], axis=0)
     sigma_idx_full = jnp.concatenate([sigma_idx_emp, sigma_idx_self], axis=0)
 
     # --- Corrupt latents: z_tilde = (1 - sigma) * z0 + sigma * z1 ---
-    z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
+    z0 = jax.random.normal(key_noise, latents.shape, dtype=diffusion_dtype)
     z0 = apply_ot_coupling(z0, latents, key_ot, ot_cfg=ot_cfg)
     z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
     
     # --- Forward pass (full batch) ---
     rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
-        actions, step_idx_full, sigma_idx_full, z_tilde,
+        actions, step_idx_full, sigma_idx_full, z_tilde.astype(dynamics_model.dtype),
         context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
     )
+    z_pred_full = z_pred_full.astype(diffusion_dtype)
     
     # --- Flow loss (empirical rows) ---
     z_pred_emp = z_pred_full[:B_emp]
@@ -467,12 +482,12 @@ def shortcut_forcing_step(
     if n_img_emp > 0:
         flow_mse_image = jnp.mean(mse_per_step_emp[:n_img_emp])
     else:
-        flow_mse_image = jnp.array(0.0, dtype=latents.dtype)
+        flow_mse_image = jnp.array(0.0, dtype=diffusion_dtype)
 
     if n_seq_emp > 0:
         flow_mse_sequence = jnp.mean(mse_per_step_emp[n_img_emp:])
     else:
-        flow_mse_sequence = jnp.array(0.0, dtype=latents.dtype)
+        flow_mse_sequence = jnp.array(0.0, dtype=diffusion_dtype)
 
     # Per-σ-bin flow MSE: breaks down where failures occur on the noise schedule
     mask_low  = sigma_emp < 0.25
@@ -483,9 +498,9 @@ def shortcut_forcing_step(
     flow_mse_high = jnp.sum(mse_per_step_emp * mask_high) / jnp.maximum(jnp.sum(mask_high.astype(jnp.float32)), 1.0)
     
     # --- Bootstrap loss (self-consistency rows) ---
-    loss_boot = jnp.array(0.0, dtype=latents.dtype)
-    boot_mse_unweighted = jnp.array(0.0, dtype=latents.dtype)
-    boot_target_norm = jnp.array(0.0, dtype=latents.dtype)
+    loss_boot = jnp.array(0.0, dtype=diffusion_dtype)
+    boot_mse_unweighted = jnp.array(0.0, dtype=diffusion_dtype)
+    boot_target_norm = jnp.array(0.0, dtype=diffusion_dtype)
     
     if B_self > 0:
         # Row mask: True for the B_self bootstrap rows (last B_self in the batch).
@@ -498,7 +513,7 @@ def shortcut_forcing_step(
         # Crucially we never slice the sharded batch axis, avoiding AllGather.
         d_half_self = d_self / 2.0  # (B_self, T)
         d_half_full = jnp.concatenate([
-            jnp.full((B_emp, T), 0.5 / k_max, dtype=latents.dtype),  # dummy for emp rows
+            jnp.full((B_emp, T), 0.5 / k_max, dtype=diffusion_dtype),  # dummy for emp rows
             d_half_self,
         ], axis=0)  # (B, T)
 
@@ -516,11 +531,11 @@ def shortcut_forcing_step(
 
         # First half-step: full batch, no slicing → no AllGather
         z1_half1_full, *_ = _bootstrap(
-            actions, step_idx_half_full, sigma_idx_full, z_tilde,
+            actions, step_idx_half_full, sigma_idx_full, z_tilde.astype(_bootstrap.dtype),
             context_length=context_length, time_mask=time_mask,
             task_embeddings=task_embeddings, deterministic=True
         )
-        z1_half1_full = jax.lax.stop_gradient(z1_half1_full)
+        z1_half1_full = jax.lax.stop_gradient(z1_half1_full).astype(diffusion_dtype)
         b_prime_full = (z1_half1_full - z_tilde) / jnp.maximum(
             1.0 - sigma_full[..., None, None], 1e-5
         )
@@ -529,20 +544,20 @@ def shortcut_forcing_step(
 
         # Second half-step: full batch, no slicing → no AllGather
         z1_half2_full, *_ = _bootstrap(
-            actions, step_idx_half_full, sigma_idx_plus_full, z_prime_full,
+            actions, step_idx_half_full, sigma_idx_plus_full, z_prime_full.astype(_bootstrap.dtype),
             context_length=context_length, time_mask=time_mask,
             task_embeddings=task_embeddings, deterministic=True
         )
-        z1_half2_full = jax.lax.stop_gradient(z1_half2_full)
+        z1_half2_full = jax.lax.stop_gradient(z1_half2_full).astype(diffusion_dtype)
         b_doubleprime_full = (z1_half2_full - z_prime_full) / jnp.maximum(
             1.0 - sigma_plus_full[..., None, None], 1e-5
         )
 
         # Bootstrap target health diagnostics — masked mean over bootstrap rows only
         v_target_unclipped = jax.lax.stop_gradient((b_prime_full + b_doubleprime_full) / 2.0)
-        boot_mask_4d = boot_mask[:, None, None, None].astype(latents.dtype)
+        boot_mask_4d = boot_mask[:, None, None, None].astype(diffusion_dtype)
         n_boot_elems = jnp.maximum(
-            jnp.sum(boot_mask.astype(latents.dtype)) * T * S * D, 1.0
+            jnp.sum(boot_mask.astype(diffusion_dtype)) * T * S * D, 1.0
         )
         boot_target_norm = jnp.sum(jnp.abs(v_target_unclipped) * boot_mask_4d) / n_boot_elems
 
