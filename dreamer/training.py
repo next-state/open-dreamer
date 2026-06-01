@@ -570,7 +570,7 @@ def shortcut_forcing_step(
     
     # --- Combine losses ---
     # Weight by batch composition to keep scale constant
-    loss_total = ((loss_flow * (B - B_self)) + (loss_boot * B_self)) / B
+    loss_total = ((loss_flow * (B - B_self)) + (loss_boot * B_self * 8)) / B
     
     losses = {'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
     aux = {
