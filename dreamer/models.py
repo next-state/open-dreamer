@@ -1238,14 +1238,14 @@ class Dynamics(nnx.Module):
 
         # Output head (zero-init). Optionally predicts mean + log variance.
         out_dim = cfg.d_bottleneck * cfg.packing_factor
-        if cfg.predict_uncertainty:
+        if getattr(cfg, "predict_uncertainty", False):
             out_dim *= 2
         self.flow_x_head = nnx.Linear(
             cfg.d_model, out_dim,
             use_bias=cfg.use_bias,
             kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
             bias_init=nnx.initializers.zeros,
-            dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs
+            dtype=self.param_dtype, param_dtype=self.param_dtype, rngs=rngs
         )
 
     def get_token_layout(self, n_latents: int, n_agent: int = 0) -> TokenLayout:
@@ -1379,7 +1379,6 @@ class Dynamics(nnx.Module):
         )
 
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
-
         x1_hat_packed = self.flow_x_head(spatial_tokens.astype(jnp.float32))  # (B, T, n_spatial, d_spatial)
 
         # Unpack before returning

@@ -272,6 +272,7 @@ def _uncertainty_regression_loss(
     pred: jnp.ndarray,
     target: jnp.ndarray,
     *,
+    row_mask: jnp.ndarray | None = None,
     logvar_min: float = -20.0,
     logvar_max: float = 20.0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -281,7 +282,16 @@ def _uncertainty_regression_loss(
     nll_per_token = logvar + mse_per_token * jnp.exp(-logvar)
     nll_per_step = jnp.mean(nll_per_token, axis=(2, 3))
     mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))
-    return nll_per_step, mse_per_step, jnp.mean(logvar)
+    if row_mask is None:
+        mean_logvar = jnp.mean(logvar)
+    else:
+        mask = row_mask[:, None, None, None].astype(jnp.float32)
+        n_active = jnp.maximum(
+            jnp.sum(row_mask.astype(jnp.float32)) * logvar.shape[1] * logvar.shape[2] * logvar.shape[3],
+            1.0,
+        )
+        mean_logvar = jnp.sum(logvar * mask) / n_active
+    return nll_per_step, mse_per_step, mean_logvar
 
 
 def compute_flow_loss(
@@ -315,6 +325,7 @@ def compute_bootstrap_loss(
     b_prime: jnp.ndarray,
     b_doubleprime: jnp.ndarray,
     sigma: jnp.ndarray,
+    boot_row_mask: jnp.ndarray | None = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Bootstrap self-consistency loss for shortcut forcing.
@@ -344,10 +355,20 @@ def compute_bootstrap_loss(
     one_minus_sigma = (1.0 - sigma)[..., None, None]
     x_target = z_tilde + one_minus_sigma * v_target
 
-    boot_per_step, mse_per_step, mean_logvar = _uncertainty_regression_loss(z_pred, x_target)
+    boot_per_step, mse_per_step, mean_logvar = _uncertainty_regression_loss(
+        z_pred, x_target, row_mask=boot_row_mask
+    )
 
     # Apply ramp weighting and reduce
     weights = ramp_weight(sigma).astype(jnp.float32)
+    if boot_row_mask is not None:
+        mask = boot_row_mask[:, None].astype(jnp.float32)
+        n_active = jnp.maximum(jnp.sum(boot_row_mask.astype(jnp.float32)) * sigma.shape[1], 1.0)
+        return (
+            jnp.sum(boot_per_step * weights * mask) / n_active,
+            jnp.sum(mse_per_step * mask) / n_active,
+            mean_logvar,
+        )
     return jnp.mean(boot_per_step * weights), jnp.mean(mse_per_step), mean_logvar
 
 
@@ -404,7 +425,11 @@ def shortcut_forcing_step(
     emax = jnp.log2(k_max).astype(jnp.int32)
 
     # Normalize latents before corruption (all operations happen in normalized space)
-    latents = normalize_latents(latents, dynamics_model.cfg.latent_mean, dynamics_model.cfg.latent_std)
+    latents = normalize_latents(
+        latents.astype(jnp.float32),
+        dynamics_model.cfg.latent_mean,
+        dynamics_model.cfg.latent_std,
+    )
 
     # Split RNG
     key_sigma_emp, key_sigma_self, key_step, key_noise, key_dropout1, key_ot = jax.random.split(rng, 6)
@@ -447,9 +472,10 @@ def shortcut_forcing_step(
     # --- Forward pass (full batch) ---
     rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
-        actions, step_idx_full, sigma_idx_full, z_tilde,
+        actions, step_idx_full, sigma_idx_full, z_tilde.astype(dynamics_model.dtype),
         context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
     )
+    z_pred_full = z_pred_full.astype(jnp.float32)
     
     # --- Flow loss (empirical rows) ---
     z_pred_emp = z_pred_full[:B_emp]
@@ -483,46 +509,61 @@ def shortcut_forcing_step(
     boot_logvar = jnp.array(0.0, dtype=latents.dtype)
     
     if B_self > 0:
-        z_pred_self = z_pred_full[B_emp:]
-        z_tilde_self = z_tilde[B_emp:]
-        actions_self = actions[B_emp:]
-        time_mask_self = time_mask[B_emp:] if time_mask is not None else None  # assume aligned with batch
-        task_embeddings_self = task_embeddings[B_emp:] if task_embeddings is not None else None
+        boot_mask = jnp.arange(B) >= B_emp
 
-        # Half-step metadata
-        d_half = d_self / 2.0
-        step_idx_half = step_idx_self + 1
-        sigma_plus = sigma_self + d_half
-        sigma_idx_plus = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
+        # Build full-batch half-step metadata. Empirical rows carry valid dummy
+        # values and are masked out of the bootstrap loss. Avoiding a batch-axis
+        # slice here avoids the collective that otherwise has to carry mixed
+        # precision latent and activation tensors.
+        d_half_self = d_self / 2.0
+        d_half_full = jnp.concatenate(
+            [
+                jnp.full((B_emp, T), 0.5 / k_max, dtype=latents.dtype),
+                d_half_self,
+            ],
+            axis=0,
+        )
+        step_idx_half_full = jnp.concatenate([step_idx_emp, step_idx_self + 1], axis=0)
+        sigma_plus_full = sigma_full + d_half_full
+        sigma_idx_plus_full = sigma_idx_full + (k_max * d_half_full).astype(jnp.int32)
 
         _bootstrap = bootstrap_model if bootstrap_model is not None else dynamics_model
 
-        # First half-step
-        z1_half1, *_ = _bootstrap(
-            actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
+        # First half-step over the full batch, no sharded batch-axis slicing.
+        z1_half1_full, *_ = _bootstrap(
+            actions, step_idx_half_full, sigma_idx_full, z_tilde.astype(_bootstrap.dtype),
+            context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings, deterministic=True
         )
-        z1_half1 = dynamics_prediction_mean(z1_half1, z_tilde_self.shape[-1])
-        z1_half1 = jax.lax.stop_gradient(z1_half1)
-        b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-5)
-        z_prime = z_tilde_self + b_prime * d_half[..., None, None]
-        z_prime = jnp.clip(z_prime, -4.0, 4.0)
+        z1_half1_full = dynamics_prediction_mean(z1_half1_full, z_tilde.shape[-1]).astype(jnp.float32)
+        z1_half1_full = jax.lax.stop_gradient(z1_half1_full)
+        b_prime_full = (z1_half1_full - z_tilde) / jnp.maximum(1.0 - sigma_full[..., None, None], 1e-5)
+        z_prime_full = z_tilde + b_prime_full * d_half_full[..., None, None]
+        z_prime_full = jnp.clip(z_prime_full, -4.0, 4.0)
 
-        # Second half-step
-        z1_half2, *_ = _bootstrap(
-            actions_self, step_idx_half, sigma_idx_plus, z_prime,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
+        # Second half-step over the full batch, no sharded batch-axis slicing.
+        z1_half2_full, *_ = _bootstrap(
+            actions, step_idx_half_full, sigma_idx_plus_full, z_prime_full.astype(_bootstrap.dtype),
+            context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings, deterministic=True
         )
-        z1_half2 = dynamics_prediction_mean(z1_half2, z_prime.shape[-1])
-        z1_half2 = jax.lax.stop_gradient(z1_half2)
-        b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-5)
+        z1_half2_full = dynamics_prediction_mean(z1_half2_full, z_prime_full.shape[-1]).astype(jnp.float32)
+        z1_half2_full = jax.lax.stop_gradient(z1_half2_full)
+        b_doubleprime_full = (z1_half2_full - z_prime_full) / jnp.maximum(1.0 - sigma_plus_full[..., None, None], 1e-5)
 
         # Bootstrap target health diagnostics (before clipping)
-        v_target_unclipped = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-        boot_target_norm = jnp.mean(jnp.abs(v_target_unclipped))
+        v_target_unclipped = jax.lax.stop_gradient((b_prime_full + b_doubleprime_full) / 2.0)
+        boot_mask_4d = boot_mask[:, None, None, None].astype(jnp.float32)
+        n_boot_elems = jnp.maximum(jnp.sum(boot_mask.astype(jnp.float32)) * T * S * D, 1.0)
+        boot_target_norm = jnp.sum(jnp.abs(v_target_unclipped) * boot_mask_4d) / n_boot_elems
 
         # Bootstrap loss (computed unconditionally)
-        loss_boot, boot_mse_unweighted, boot_logvar = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
+        loss_boot, boot_mse_unweighted, boot_logvar = compute_bootstrap_loss(
+            z_pred_full,
+            z_tilde,
+            b_prime_full,
+            b_doubleprime_full,
+            sigma_full,
+            boot_row_mask=boot_mask,
+        )
     
     # --- Combine losses ---
     # Weight by batch composition to keep scale constant
