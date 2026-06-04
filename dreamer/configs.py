@@ -151,6 +151,7 @@ class DynamicsModelConfig:
     use_bias: bool = False
     use_rmsnorm_scale: bool = True
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
+    predict_uncertainty: bool = False  # If True, dynamics predicts mean + log variance
     dtype: str = "float32"
     param_dtype: str = "float32"
 

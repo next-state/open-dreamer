@@ -320,6 +320,10 @@ def run(cfg: DynamicsConfig):
                                 "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
                                 "flow_mse_image": metrics_cpu["flow_mse_image"],
                                 "boot_mse": metrics_cpu["bootstrap_mse"],
+                                "flow_loss": metrics_cpu["flow_loss"],
+                                "boot_loss": metrics_cpu["bootstrap_loss"],
+                                "flow_logvar": metrics_cpu["flow_logvar"],
+                                "boot_logvar": metrics_cpu["bootstrap_logvar"],
                                 "grad_norm": metrics_cpu["grad_norm"],
                                 "flow_mse_low": metrics_cpu["flow_mse_low"],
                                 "flow_mse_mid": metrics_cpu["flow_mse_mid"],
@@ -347,4 +351,3 @@ def main(cfg: DynamicsConfig):
 
 if __name__ == "__main__":
     main()
-

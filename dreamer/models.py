@@ -20,6 +20,26 @@ from .parallel import MeshRules
 from .actions import Actions
 
 
+def split_dynamics_prediction(pred: jax.Array, target_dim: int) -> tuple[jax.Array, jax.Array]:
+    """Split a dynamics output into mean and log-variance channels.
+
+    Legacy checkpoints may return only the mean. In that case use logvar=0,
+    which makes the uncertainty loss exactly the old MSE loss.
+    """
+    if pred.shape[-1] == target_dim:
+        return pred, jnp.zeros_like(pred)
+    if pred.shape[-1] != target_dim * 2:
+        raise ValueError(
+            f"Dynamics prediction has last dim {pred.shape[-1]}, expected "
+            f"{target_dim} or {target_dim * 2}."
+        )
+    return pred[..., :target_dim], pred[..., target_dim:]
+
+
+def dynamics_prediction_mean(pred: jax.Array, target_dim: int) -> jax.Array:
+    return split_dynamics_prediction(pred, target_dim)[0]
+
+
 # ============================================================================
 # KV Cache
 # ============================================================================
@@ -1216,9 +1236,12 @@ class Dynamics(nnx.Module):
             mesh_rules=mesh_rules, rngs=rngs,
         )
 
-        # Output head (zero-init)
+        # Output head (zero-init). Optionally predicts mean + log variance.
+        out_dim = cfg.d_bottleneck * cfg.packing_factor
+        if cfg.predict_uncertainty:
+            out_dim *= 2
         self.flow_x_head = nnx.Linear(
-            cfg.d_model, cfg.d_bottleneck * cfg.packing_factor,
+            cfg.d_model, out_dim,
             use_bias=cfg.use_bias,
             kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
             bias_init=nnx.initializers.zeros,
@@ -1295,6 +1318,11 @@ class Dynamics(nnx.Module):
             spatial_tokens: (B, T, n_spatial, d_model)
             action_token:  (B, T, 1, d_model)
             shortcut_token: (B, T, 1, d_model)
+
+        Returns:
+            x1_hat: (B, T, n_latents, d_bottleneck), or (B, T, n_latents, 2*d_bottleneck)
+                when cfg.predict_uncertainty is enabled. The doubled channel layout is
+                [mean, logvar].
         """
         B, T = unpacked_enc_tokens.shape[:2]
 

@@ -39,6 +39,7 @@ dynamics:
     use_residual_lambdas: false
     use_bias: false
     use_rmsnorm_scale: true
+    predict_uncertainty: true
     dtype: ${dtype}
     param_dtype: ${param_dtype}
     

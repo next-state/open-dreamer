@@ -4,7 +4,7 @@ import einops
 import jax
 import jax.numpy as jnp
 from typing import Any, Tuple
-from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
+from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer, dynamics_prediction_mean
 from .actions import Actions
 from .utils import normalize_latents, unnormalize_latents
 from tqdm import tqdm
@@ -167,6 +167,7 @@ def next_latent(
             actions_input, step_indices, tau_indices, latent_input,
             task_embeddings=task_embedding, deterministic=True, caches=caches
         )
+        latent_clean_pred_seq = dynamics_prediction_mean(latent_clean_pred_seq, latent_shape[-1])
 
         latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
@@ -402,5 +403,4 @@ def latent_rollout(
         'context_hidden': h_seq,
         'ode_diags': ode_diags,
     }
-
 

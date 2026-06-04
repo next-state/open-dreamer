@@ -22,7 +22,7 @@ import time
 
 from dreamer.configs import DynamicsConfig, HeadsConfig, OptimalTransportConfig
 from dreamer.generation import DenoiseSchedule
-from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
+from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder, dynamics_prediction_mean, split_dynamics_prediction
 from dreamer.actions import Actions
 from dreamer.sampler import sample_video
 from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents, unnormalize_latents
@@ -268,31 +268,45 @@ def compute_psnr(pred, target):
     psnr_per_sample = -10.0 * jnp.log(mse_per_sample) / jnp.log(10.0)
     return jnp.mean(psnr_per_sample)
     
+def _uncertainty_regression_loss(
+    pred: jnp.ndarray,
+    target: jnp.ndarray,
+    *,
+    logvar_min: float = -20.0,
+    logvar_max: float = 20.0,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    pred_mean, pred_logvar = split_dynamics_prediction(pred, target.shape[-1])
+    mse_per_token = (pred_mean.astype(jnp.float32) - target.astype(jnp.float32)) ** 2
+    logvar = jnp.clip(pred_logvar.astype(jnp.float32), logvar_min, logvar_max)
+    nll_per_token = logvar + mse_per_token * jnp.exp(-logvar)
+    nll_per_step = jnp.mean(nll_per_token, axis=(2, 3))
+    mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))
+    return nll_per_step, mse_per_step, jnp.mean(logvar)
+
+
 def compute_flow_loss(
     z_pred: jnp.ndarray,
     z_target: jnp.ndarray,
     sigma: jnp.ndarray,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Flow matching loss in x-space (direct prediction of clean latents).
     
     Args:
-        z_pred: (B, T, S, D) Predicted clean latents
+        z_pred: (B, T, S, D) predicted clean latents, or (B, T, S, 2D)
+            mean + log variance.
         z_target: (B, T, S, D) Ground truth clean latents
         sigma: (B, T) Signal levels (used for weighting)
         per_example: If True, return (B, T) losses; else return scalar
         
     Returns:
-        loss: Tuple[jnp.float32, jnp.float32]
-            mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
-            mse_per_token: tuple of scalars. MSE loss 
+        Weighted uncertainty loss, raw MSE, per-step raw MSE, and mean logvar.
     """
-    mse_per_token = (z_pred - z_target) ** 2  # (B, T, S, D)
-    mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
+    nll_per_step, mse_per_step, mean_logvar = _uncertainty_regression_loss(z_pred, z_target)
 
     # Apply ramp weighting and reduce
-    weights = ramp_weight(sigma)
-    return jnp.mean(mse_per_step * weights), jnp.mean(mse_per_step), mse_per_step
+    weights = ramp_weight(sigma).astype(jnp.float32)
+    return jnp.mean(nll_per_step * weights), jnp.mean(mse_per_step), mse_per_step, mean_logvar
 
 
 def compute_bootstrap_loss(
@@ -301,7 +315,7 @@ def compute_bootstrap_loss(
     b_prime: jnp.ndarray,
     b_doubleprime: jnp.ndarray,
     sigma: jnp.ndarray,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Bootstrap self-consistency loss for shortcut forcing.
 
@@ -312,16 +326,15 @@ def compute_bootstrap_loss(
       = ||z_pred - (z_tilde + (1-σ)·v_target)||²
 
     Args:
-        z_pred: (B, T, S, D) Predicted latent from full step
+        z_pred: (B, T, S, D) predicted latent from full step, or (B, T, S, 2D)
+            mean + log variance.
         z_tilde: (B, T, S, D) Initial noisy latent
         b_prime: (B, T, S, D) Velocity from first half-step
         b_doubleprime: (B, T, S, D) Velocity from second half-step
         sigma: (B, T) Signal levels
 
     Returns:
-        loss: Tuple[jnp.float32, jnp.float32]
-            mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
-            mse_per_token: tuple of scalars. MSE loss
+        Weighted uncertainty loss, raw MSE, and mean logvar.
     """
     # Target velocity is average of two half-steps (stop gradient, clipped)
     v_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
@@ -331,12 +344,11 @@ def compute_bootstrap_loss(
     one_minus_sigma = (1.0 - sigma)[..., None, None]
     x_target = z_tilde + one_minus_sigma * v_target
 
-    boot_per_token = (z_pred - x_target) ** 2
-    boot_per_step = jnp.mean(boot_per_token, axis=(2, 3))  # (B, T)
+    boot_per_step, mse_per_step, mean_logvar = _uncertainty_regression_loss(z_pred, x_target)
 
     # Apply ramp weighting and reduce
-    weights = ramp_weight(sigma)
-    return jnp.mean(boot_per_step * weights), jnp.mean(boot_per_step)
+    weights = ramp_weight(sigma).astype(jnp.float32)
+    return jnp.mean(boot_per_step * weights), jnp.mean(mse_per_step), mean_logvar
 
 
 # ---------------------------
@@ -441,7 +453,7 @@ def shortcut_forcing_step(
     
     # --- Flow loss (empirical rows) ---
     z_pred_emp = z_pred_full[:B_emp]
-    loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
+    loss_flow, flow_mse_unweighted, mse_per_step_emp, flow_logvar = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
 
     # Split flow MSE by empirical sample type (image-only rows vs temporal sequence rows).
     n_img_emp = min(max(B_img_emp, 0), B_emp)
@@ -468,6 +480,7 @@ def shortcut_forcing_step(
     loss_boot = jnp.array(0.0, dtype=latents.dtype)
     boot_mse_unweighted = jnp.array(0.0, dtype=latents.dtype)
     boot_target_norm = jnp.array(0.0, dtype=latents.dtype)
+    boot_logvar = jnp.array(0.0, dtype=latents.dtype)
     
     if B_self > 0:
         z_pred_self = z_pred_full[B_emp:]
@@ -489,6 +502,7 @@ def shortcut_forcing_step(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
         )
+        z1_half1 = dynamics_prediction_mean(z1_half1, z_tilde_self.shape[-1])
         z1_half1 = jax.lax.stop_gradient(z1_half1)
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-5)
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
@@ -499,6 +513,7 @@ def shortcut_forcing_step(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
             context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
         )
+        z1_half2 = dynamics_prediction_mean(z1_half2, z_prime.shape[-1])
         z1_half2 = jax.lax.stop_gradient(z1_half2)
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-5)
 
@@ -507,7 +522,7 @@ def shortcut_forcing_step(
         boot_target_norm = jnp.mean(jnp.abs(v_target_unclipped))
 
         # Bootstrap loss (computed unconditionally)
-        loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
+        loss_boot, boot_mse_unweighted, boot_logvar = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
     
     # --- Combine losses ---
     # Weight by batch composition to keep scale constant
@@ -519,6 +534,10 @@ def shortcut_forcing_step(
         'flow_mse_sequence': flow_mse_sequence,
         'flow_mse_image': flow_mse_image,
         'bootstrap_mse': boot_mse_unweighted,
+        'flow_loss': loss_flow,
+        'bootstrap_loss': loss_boot,
+        'flow_logvar': flow_logvar,
+        'bootstrap_logvar': boot_logvar,
         'flow_mse_low': flow_mse_low,
         'flow_mse_mid': flow_mse_mid,
         'flow_mse_high': flow_mse_high,
@@ -1053,6 +1072,7 @@ def vis_dynamics_step(
         actions, step_idx, sigma_idx, z_tilde,
         context_length=context_length, time_mask=None, task_embeddings=None, deterministic=True,
     )
+    z_pred = dynamics_prediction_mean(z_pred, latents_norm.shape[-1])
 
     return z_tilde, z_pred, latents_norm, sigma
 
