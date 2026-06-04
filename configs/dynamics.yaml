@@ -3,21 +3,21 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-pre-final
+run_name: logvar
 tokenizer_ckpt: logs/tokenizer-500M/checkpoints
 
 ckpt:
   max_to_keep: 1
-  save_interval_steps: 5_000
+  save_interval_steps: 50_000
 
 dataset:
   dataloader_cfg:
-    B: 8
+    B: 4
     num_workers: 16
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
     short_T: 64
-    long_T: 256
+    long_T: 64
     long_ratio: 0.1  # Fraction of batches that use long_T
 
 dynamics:

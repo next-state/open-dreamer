@@ -94,12 +94,11 @@ def train_step(
     ot_cfg: OptimalTransportConfig,
 ):
     if use_latent_data:
-        latents = data
+        latents = data.astype(jnp.float32)
     else:
+        data = data.astype(jnp.float32)
         latents, _ = tokenizer.encode(data, deterministic=True)
-        latents = jax.lax.stop_gradient(latents)
-
-    latents = latents.astype(dynamics.dtype)
+        latents = jax.lax.stop_gradient(latents).astype(jnp.float32)
 
     B = latents.shape[0]
     B_self = int(B * bootstrap_fraction)
@@ -247,7 +246,7 @@ def run(cfg: DynamicsConfig):
             dynamics_optimizer=optimizer,
         )
 
-        dataloader = build_dual_iterator(cfg.dataset, device=data_sharding, dtype=cfg.dtype)
+        dataloader = build_dual_iterator(cfg.dataset, device=data_sharding, dtype="float32")
         with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=DynamicsCheckpointBundle.get_item_names()) as checkpoint_manager:
             # Resume from checkpoint
             start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)

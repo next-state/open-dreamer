@@ -1379,7 +1379,8 @@ class Dynamics(nnx.Module):
         )
 
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
-        x1_hat_packed = self.flow_x_head(spatial_tokens)  # (B, T, n_spatial, d_spatial)
+
+        x1_hat_packed = self.flow_x_head(spatial_tokens.astype(jnp.float32))  # (B, T, n_spatial, d_spatial)
 
         # Unpack before returning
         x1_hat = rearrange(x1_hat_packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
