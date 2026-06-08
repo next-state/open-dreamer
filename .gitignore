@@ -11,6 +11,8 @@ checkpoints/
 gatto/
 checkpoints-2/
 data/
+jelly
+ramp-2
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
