@@ -3,7 +3,7 @@ defaults:
   - _self_
 
 # Path to dynamics checkpoint (contains both dynamics + tokenizer)
-dynamics_ckpt: gatto
+dynamics_ckpt: jelly
 
 seed: 0
 parallel_strategy: data
