@@ -8,7 +8,7 @@ tokenizer_ckpt: /mnt/data/minecraft-vpt/models/tokenizer-500M/checkpoints/
 
 ckpt:
   max_to_keep: 10000
-  save_interval_steps: 1_000
+  save_interval_steps: 5_000
 
 dataset:
   dataloader_cfg:
