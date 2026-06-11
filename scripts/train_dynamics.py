@@ -74,11 +74,10 @@ OmegaConf.register_new_resolver("min", lambda *args: min(args))
     static_argnames=("k_max", "B_img", "T", "n_splits", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
     donate_argnames=("data", "actions"),
 )
-def train_step(
+def compute_grads(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
     dynamics_ema: Dynamics,   # Used as target network for bootstrap half-steps
-    optimizer: nnx.Optimizer,
     data: jnp.ndarray,        # Full batch: videos (B, T, H, W, C) or latents (B, T, n_latents, d_bottleneck)
     actions: Actions,         # Full batch (B, T, ...)
     *,
@@ -154,13 +153,22 @@ def train_step(
         latents, actions, time_mask, context_length
     )
 
+    return grads, metrics
+
+
+@nnx.jit(donate_argnames=("grads",))
+def apply_grads(
+    dynamics: Dynamics,
+    optimizer: nnx.Optimizer,
+    grads,
+):
     # Compute gradient norm for training health diagnostics
     grad_norm = optax.global_norm(nnx.state(grads))
 
     # Update model with optimizer
     optimizer.update(dynamics, grads)
 
-    return {**metrics, 'grad_norm': grad_norm}
+    return grad_norm
 
 # ---------------------------
 # Main
@@ -222,14 +230,19 @@ def run(cfg: DynamicsConfig):
             tokenizer_training_flops = tokenizer.estimate_flops(batch_size=B, seq_length=avg_T)
             encoder_flops = tokenizer_training_flops // 6  # ~1/6 of tokenizer training FLOPs (half for encoder, 1/3 for inference)
 
-        every_k_schedule = 2
+        # Manual gradient accumulation: average grads over `grad_accum_steps`
+        # micro-batches, then take a single optimizer step. This doubles the
+        # effective batch size without OOM, and (unlike optax.MultiSteps) keeps
+        # opt_state structurally identical to a plain optimizer so checkpoints
+        # stay compatible across changes to this value.
+        grad_accum_steps = 2
 
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=(dynamics_flops + encoder_flops) * every_k_schedule,
-            data_tokens_per_step=B * avg_T * (n_spatial + 1) * every_k_schedule,  # spatial + action
-            total_tokens_per_step=B * avg_T * (2 + n_spatial + cfg.dynamics.n_register) * every_k_schedule,  # action + shortcut + spatial + register
+            flops_per_step=(dynamics_flops + encoder_flops) * grad_accum_steps,
+            data_tokens_per_step=B * avg_T * (n_spatial + 1) * grad_accum_steps,  # spatial + action
+            total_tokens_per_step=B * avg_T * (2 + n_spatial + cfg.dynamics.n_register) * grad_accum_steps,  # action + shortcut + spatial + register
             logger=logger,
             run_dir=run_dir,
         )
@@ -238,7 +251,7 @@ def run(cfg: DynamicsConfig):
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
         # Build optimizer
-        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model, every_k_schedule=every_k_schedule)
+        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model)
 
         # Build EMA model
         dynamics_ema = build_ema_model(dynamics, ema_dtype=cfg.ema_dtype)
@@ -268,7 +281,8 @@ def run(cfg: DynamicsConfig):
 
                 rng, master_key = jax.random.split(rng, num=2)
 
-                for k_step in range(every_k_schedule):
+                grads_acc = None
+                for k_step in range(grad_accum_steps):
                     try:
                         batch = next(dataloader_iter)
                     except StopIteration:
@@ -302,13 +316,13 @@ def run(cfg: DynamicsConfig):
                             logger=logger if is_main_process else None,
                         )
 
-                    # Training step
+                    # Compute gradients for this micro-batch (distinct RNG per micro-step)
                     B, T = input_tensor.shape[:2]
-                    metrics = train_step(
+                    grads, metrics = compute_grads(
                         bundle.tokenizer, bundle.dynamics, bundle.dynamics_ema,
-                        bundle.dynamics_optimizer, input_tensor, actions,
+                        input_tensor, actions,
                         master_key=master_key,
-                        step=step * every_k_schedule + k_step,
+                        step=step * grad_accum_steps + k_step,
                         B_img=int(B * cfg.image_fraction),
                         T=T,
                         n_splits=n_splits,
@@ -318,6 +332,13 @@ def run(cfg: DynamicsConfig):
                         use_latent_data=use_latent_data,
                         ot_cfg=ot_cfg,
                     )
+                    grads_acc = grads if grads_acc is None else jax.tree.map(jnp.add, grads_acc, grads)
+
+                # Average accumulated grads and take a single optimizer step
+                if grad_accum_steps > 1:
+                    grads_acc = jax.tree.map(lambda g: g / grad_accum_steps, grads_acc)
+                grad_norm = apply_grads(bundle.dynamics, bundle.dynamics_optimizer, grads_acc)
+                metrics = {**metrics, 'grad_norm': grad_norm}
 
                 # EMA update
                 ema_update_step(bundle.dynamics, bundle.dynamics_ema, ema_decay=cfg.ema_decay)
