@@ -183,9 +183,9 @@ def sample_step_excluding_dmin(
 
 
 # Loss weighting
-def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float = 1.0) -> jnp.ndarray:
+def ramp_weight(sigma: jnp.ndarray) -> jnp.ndarray:
     sigma = sigma.astype(jnp.float32)
-    return (max_weight - min_weight) * sigma + min_weight
+    return 1.0 / jnp.maximum(1.0 - sigma, 1e-3) ** 2
 
 
 def apply_ot_coupling(
@@ -445,7 +445,7 @@ def shortcut_forcing_step(
     # --- Sample signal levels ---
     # Empirical rows: include tau=1.0 (clean frames) for diffusion forcing flow loss
     sigma_emp, sigma_idx_emp = sample_tau_for_step(
-        key_sigma_emp, (B_emp, T), k_max, step_idx_emp, dtype=diffusion_dtype, include_endpoint=True
+        key_sigma_emp, (B_emp, T), k_max, step_idx_emp, dtype=diffusion_dtype, include_endpoint=False
     )
     # Bootstrap rows: exclude tau=1.0 (need room for half-steps in bootstrap loss)
     if B_self > 0:
@@ -570,7 +570,7 @@ def shortcut_forcing_step(
     
     # --- Combine losses ---
     # Weight by batch composition to keep scale constant
-    loss_total = ((loss_flow * (B - B_self)) + (loss_boot * B_self * 8)) / B
+    loss_total = ((loss_flow * (B - B_self)) + (loss_boot * B_self)) / B
     
     losses = {'total': loss_total, 'flow': loss_flow, 'bootstrap': loss_boot}
     aux = {
