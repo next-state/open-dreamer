@@ -222,6 +222,8 @@ def run(cfg: DynamicsConfig):
             tokenizer_training_flops = tokenizer.estimate_flops(batch_size=B, seq_length=avg_T)
             encoder_flops = tokenizer_training_flops // 6  # ~1/6 of tokenizer training FLOPs (half for encoder, 1/3 for inference)
 
+        every_k_schedule = 2
+
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
@@ -236,7 +238,6 @@ def run(cfg: DynamicsConfig):
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
         # Build optimizer
-        every_k_schedule = 2
         optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model, every_k_schedule=every_k_schedule)
 
         # Build EMA model
