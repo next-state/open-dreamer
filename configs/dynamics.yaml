@@ -8,7 +8,7 @@ tokenizer_ckpt: /mnt/data/minecraft-vpt/models/tokenizer-500M/checkpoints/
 
 ckpt:
   max_to_keep: 10000
-  save_interval_steps: 5_000
+  save_interval_steps: 1_000
 
 dataset:
   dataloader_cfg:
@@ -18,7 +18,7 @@ dataset:
     # Alternating batch lengths (paper: "Sequence length" paragraph)
     short_T: 64
     long_T: 256
-    long_ratio: 0.1  # Fraction of batches that use long_T
+    long_ratio: 0.2  # Fraction of batches that use long_T
 
 dynamics:
     d_bottleneck: 16
