@@ -505,6 +505,7 @@ def build_optimizer(
     model: nnx.Module,
     lr_schedule: optax.Schedule,
     d_model: int,
+    every_k_schedule: int = 1,
 ) -> nnx.Optimizer:
     """
     Build optimizer with given learning rate schedule.
@@ -578,6 +579,9 @@ def build_optimizer(
             optax.adaptive_grad_clip(optimizer_cfg.agc_clipping, eps=optimizer_cfg.agc_eps),
             tx,
         )
+
+    if every_k_schedule > 1:
+        tx = optax.MultiSteps(tx, every_k_schedule=every_k_schedule)
 
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     return optimizer

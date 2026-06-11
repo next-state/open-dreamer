@@ -225,9 +225,9 @@ def run(cfg: DynamicsConfig):
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=dynamics_flops + encoder_flops,
-            data_tokens_per_step=B * avg_T * (n_spatial + 1),  # spatial + action
-            total_tokens_per_step=B * avg_T * (2 + n_spatial + cfg.dynamics.n_register),  # action + shortcut + spatial + register
+            flops_per_step=(dynamics_flops + encoder_flops) * every_k_schedule,
+            data_tokens_per_step=B * avg_T * (n_spatial + 1) * every_k_schedule,  # spatial + action
+            total_tokens_per_step=B * avg_T * (2 + n_spatial + cfg.dynamics.n_register) * every_k_schedule,  # action + shortcut + spatial + register
             logger=logger,
             run_dir=run_dir,
         )
@@ -236,7 +236,8 @@ def run(cfg: DynamicsConfig):
         lr_schedule = build_lr_schedule(cfg.lr_schedule)
 
         # Build optimizer
-        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model)
+        every_k_schedule = 2
+        optimizer = build_optimizer(cfg.optimizer, dynamics, lr_schedule, d_model=cfg.dynamics.d_model, every_k_schedule=every_k_schedule)
 
         # Build EMA model
         dynamics_ema = build_ema_model(dynamics, ema_dtype=cfg.ema_dtype)
@@ -257,56 +258,65 @@ def run(cfg: DynamicsConfig):
 
             scaling.start_training()
 
-            pbar = tqdm(enumerate(dataloader, start_step), initial=start_step, total=cfg.max_steps, dynamic_ncols=True, disable=not is_main_process)
-            for step, batch in pbar:
+            pbar = tqdm(range(start_step, cfg.max_steps), initial=start_step, total=cfg.max_steps, dynamic_ncols=True, disable=not is_main_process)
+            dataloader_iter = iter(dataloader)
+            
+            for step in pbar:
                 if step >= cfg.max_steps:
                     break
 
                 rng, master_key = jax.random.split(rng, num=2)
 
-                n_splits = int(batch.get("n_splits", 1))
+                for k_step in range(every_k_schedule):
+                    try:
+                        batch = next(dataloader_iter)
+                    except StopIteration:
+                        dataloader_iter = iter(dataloader)
+                        batch = next(dataloader_iter)
 
-                # Use pre-allocated batch
-                actions = batch["actions"]
-                videos = batch.get("videos")
-                latents = batch.get("latents")
-                input_tensor = latents if latents is not None else videos
+                    n_splits = int(batch.get("n_splits", 1))
 
-                actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
+                    # Use pre-allocated batch
+                    actions = batch["actions"]
+                    videos = batch.get("videos")
+                    latents = batch.get("latents")
+                    input_tensor = latents if latents is not None else videos
 
-                # Validation/visualization — all hosts must participate in JAX
-                # compute (model is sharded), but only process 0 does I/O.
-                do_eval = (cfg.write_video_every>0 and step>0 and (step % cfg.write_video_every == 0)) or step == cfg.max_steps - 1
-                if do_eval:
-                    val_data = input_tensor[:4]
-                    val_actions = actions[:4]
-                    run_evaluation(
-                        cfg, step, bundle.tokenizer,
-                        dynamics_online=bundle.dynamics,
-                        dynamics_ema=bundle.dynamics_ema,
-                        val_data=val_data,
-                        val_actions=val_actions,
+                    actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
+
+                    # Validation/visualization — all hosts must participate in JAX
+                    # compute (model is sharded), but only process 0 does I/O.
+                    do_eval = (cfg.write_video_every>0 and step>0 and (step % cfg.write_video_every == 0) and k_step == 0) or (step == cfg.max_steps - 1 and k_step == 0)
+                    if do_eval:
+                        val_data = input_tensor[:4]
+                        val_actions = actions[:4]
+                        run_evaluation(
+                            cfg, step, bundle.tokenizer,
+                            dynamics_online=bundle.dynamics,
+                            dynamics_ema=bundle.dynamics_ema,
+                            val_data=val_data,
+                            val_actions=val_actions,
+                            use_latent_data=use_latent_data,
+                            vis_dir=vis_dir, rng=rng,
+                            logger=logger if is_main_process else None,
+                        )
+
+                    # Training step
+                    B, T = input_tensor.shape[:2]
+                    metrics = train_step(
+                        bundle.tokenizer, bundle.dynamics, bundle.dynamics_ema,
+                        bundle.dynamics_optimizer, input_tensor, actions,
+                        master_key=master_key,
+                        step=step * every_k_schedule + k_step,
+                        B_img=int(B * cfg.image_fraction),
+                        T=T,
+                        n_splits=n_splits,
+                        k_max=cfg.dynamics.k_max,
+                        context_length=cfg.dynamics.context_length,
+                        bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                         use_latent_data=use_latent_data,
-                        vis_dir=vis_dir, rng=rng,
-                        logger=logger if is_main_process else None,
+                        ot_cfg=ot_cfg,
                     )
-
-                # Training step
-                B, T = input_tensor.shape[:2]
-                metrics = train_step(
-                    bundle.tokenizer, bundle.dynamics, bundle.dynamics_ema,
-                    bundle.dynamics_optimizer, input_tensor, actions,
-                    master_key=master_key,
-                    step=step,
-                    B_img=int(B * cfg.image_fraction),
-                    T=T,
-                    n_splits=n_splits,
-                    k_max=cfg.dynamics.k_max,
-                    context_length=cfg.dynamics.context_length,
-                    bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
-                    use_latent_data=use_latent_data,
-                    ot_cfg=ot_cfg,
-                )
 
                 # EMA update
                 ema_update_step(bundle.dynamics, bundle.dynamics_ema, ema_decay=cfg.ema_decay)
