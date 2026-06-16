@@ -38,20 +38,43 @@ function Wordmark() {
 }
 
 function ControlsHint() {
-  const items: [string, string][] = [
-    ["WASD", "move"],
-    ["Space", "jump"],
-    ["Mouse", "look"],
-    ["LMB", "attack"],
-    ["RMB", "use"],
+  // Grouped by intent so each row reads as one coherent cluster.
+  const rows: [React.ReactNode, string][][] = [
+    // Move & look
+    [
+      ["WASD", "move"],
+      [<MouseMoveIcon />, "camera"],
+      ["Space", "jump"],
+      ["Ctrl", "sprint"],
+      ["Shift", "sneak"],
+    ],
+    // Act on the world + select what's in hand
+    [
+      [<MouseIcon side="left" />, "break"],
+      [<MouseIcon side="right" />, "place"],
+      [<MouseIcon side="middle" />, "pick"],
+      ["1–9", "hotbar"],
+      ["Scroll", "cycle"],
+    ],
+    // Inventory, items & HUD
+    [
+      ["E", "inventory"],
+      ["Q", "drop"],
+      ["F", "swap"],
+      ["G", "debug"],
+    ],
   ];
   return (
-    <div className="hidden md:flex items-center gap-4 text-[11px] text-white/60 font-mono">
-      {items.map(([key, label]) => (
-        <span key={key} className="flex items-center gap-1.5">
-          <Kbd>{key}</Kbd>
-          <span>{label}</span>
-        </span>
+    <div className="hidden md:flex flex-col items-center gap-1.5 text-[11px] text-white/60 font-mono">
+      {rows.map((items, r) => (
+        <div key={r} className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1">
+          {items.map(([key, label], idx) => (
+            <span key={idx} className="flex items-center gap-1.5">
+              <Kbd>{key}</Kbd>
+              <span>{label}</span>
+            </span>
+          ))}
+        </div>
       ))}
     </div>
   );
@@ -59,9 +82,48 @@ function ControlsHint() {
 
 function Kbd({ children }: { children: React.ReactNode }) {
   return (
-    <kbd className="px-1.5 py-0.5 rounded bg-white/8 border border-white/10 text-white/80 text-[10px] font-mono">
+    <kbd className="inline-flex items-center px-1.5 py-0.5 rounded bg-white/8 border border-white/10 text-white/80 text-[10px] font-mono">
       {children}
     </kbd>
+  );
+}
+
+/** Small mouse glyph with the active button filled. */
+function MouseIcon({ side }: { side: "left" | "right" | "middle" }) {
+  const clipId = `mouse-clip-${side}`;
+  return (
+    <svg width="11" height="16" viewBox="0 0 14 20" aria-hidden="true">
+      <defs>
+        <clipPath id={clipId}>
+          <rect x="1" y="1" width="12" height="18" rx="6" />
+        </clipPath>
+      </defs>
+      <g clipPath={`url(#${clipId})`}>
+        {side === "left" && <rect x="0" y="0" width="7" height="8.5" fill="currentColor" />}
+        {side === "right" && <rect x="7" y="0" width="7" height="8.5" fill="currentColor" />}
+        {side === "middle" && <rect x="5.5" y="2.5" width="3" height="5" rx="1.5" fill="currentColor" />}
+      </g>
+      <rect x="1" y="1" width="12" height="18" rx="6" fill="none" stroke="currentColor" strokeWidth="1.1" />
+      <path d="M7 1.5 V8.5 M1 8.5 H13" stroke="currentColor" strokeWidth="0.9" />
+    </svg>
+  );
+}
+
+/** Mouse with motion arrows — "move the mouse", distinct from the click glyphs. */
+function MouseMoveIcon() {
+  return (
+    <svg width="20" height="15" viewBox="0 0 24 20" aria-hidden="true">
+      <rect x="6" y="1" width="12" height="18" rx="6" fill="none" stroke="currentColor" strokeWidth="1.1" />
+      <path d="M12 1.5 V8.5 M6 8.5 H18" stroke="currentColor" strokeWidth="0.9" />
+      <path
+        d="M3.5 7 L1 10 L3.5 13 M20.5 7 L23 10 L20.5 13"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.1"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   );
 }
 
