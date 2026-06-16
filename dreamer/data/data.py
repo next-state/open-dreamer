@@ -1,4 +1,5 @@
 import logging
+import os
 
 import grain
 import jax
@@ -13,12 +14,26 @@ from dreamer.configs import DatasetConfig, DataloaderConfig
 from dreamer.data.path_utils import build_dataset_paths
 from dreamer.data.serialization import deserialize_msgpack_record
 from dreamer.data.transforms import (
+    BlacklistDropFilter,
     CastDtype,
     EpisodeLengthFilter,
     ProcessEpisodeAndSlice,
     ProcessLatentAndSlice,
     ProcessMinecraftEpisodeAndSlice,
+    StripRecordIndex,
+    build_blacklist_mask,
+    load_blacklist,
 )
+
+# Blacklist of low-quality records (full no-op Minecraft VPT episodes). Each
+# blacklisted record is dropped with probability (1 - BLACKLIST_KEEP_PROB) every
+# time it is sampled; the loader then yields the next sampled record. Filtering
+# runs in the Grain CPU workers before batching, so batch shapes are unchanged.
+BLACKLIST_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "blacklist.json",
+)
+BLACKLIST_KEEP_PROB = 0.02
 
 # ==============================================================================
 # Factory
@@ -79,6 +94,21 @@ def build_iterator(
 
     source = grain.sources.ArrayRecordDataSource(array_record_paths)
 
+    # Optionally wrap the source so transforms can see each record's global index,
+    # enabling probabilistic blacklist filtering of full no-op episodes. Only the
+    # shard-based datasets (latent / minecraft_vpt) share the blacklist's index space.
+    blacklist_ops = []
+    enable_blacklist = os.path.exists(BLACKLIST_PATH) and (
+        use_latent_data or cfg.name.startswith("minecraft_vpt")
+    )
+    if enable_blacklist:
+        mask = build_blacklist_mask(array_record_paths, load_blacklist(BLACKLIST_PATH))
+        source = IndexedDataSource(source)
+        blacklist_ops = [
+            BlacklistDropFilter(mask, BLACKLIST_KEEP_PROB),
+            StripRecordIndex(),
+        ]
+
     sampler = grain.samplers.IndexSampler(
         num_records = cfg.num_max_samples if cfg.num_max_samples>0 else len(source),
         shard_options=grain.sharding.ShardByJaxProcess(drop_remainder=True),
@@ -134,7 +164,7 @@ def build_iterator(
     if pack_factor > 1:
         common_ops.append(PackEpisodes(pack_factor))
     common_ops.append(CastDtype(dataloader_cfg.dtype))
-    operations = operations + common_ops
+    operations = blacklist_ops + operations + common_ops
 
     dataloader = grain.DataLoader(
         data_source=source,
@@ -162,6 +192,28 @@ def build_iterator(
     )
     
     return iter_dataset
+
+
+# ==============================================================================
+# Indexed Data Source
+# ==============================================================================
+
+class IndexedDataSource:
+    """Wraps a random-access source so __getitem__ returns (index, element).
+
+    Grain reads records via `source[record_key]` (the global record index). By
+    returning the key alongside the bytes, downstream transforms can filter on a
+    record's identity (e.g. a blacklist) without changing how Grain samples.
+    """
+
+    def __init__(self, source):
+        self._source = source
+
+    def __len__(self):
+        return len(self._source)
+
+    def __getitem__(self, idx):
+        return idx, self._source[idx]
 
 
 # ==============================================================================

@@ -381,6 +381,91 @@ class ProcessLatentAndSlice(grain.transforms.RandomMap):
         }
 
 
+# ==============================================================================
+# Record Blacklisting
+# ==============================================================================
+
+def load_blacklist(path: str) -> dict[str, set[int]]:
+    """Load a blacklist of records keyed by shard basename.
+
+    Accepts a JSON dict {shard_basename: [record_index, ...]} or a CSV with
+    `shard` and `record_index` columns (extra columns ignored).
+    """
+    import csv
+    import json
+
+    blacklist: dict[str, set[int]] = {}
+    if path.endswith(".json"):
+        with open(path) as f:
+            raw = json.load(f)
+        for shard, idxs in raw.items():
+            blacklist[os.path.basename(shard)] = {int(i) for i in idxs}
+    else:
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                shard = os.path.basename(row["shard"])
+                blacklist.setdefault(shard, set()).add(int(row["record_index"]))
+    return blacklist
+
+
+def build_blacklist_mask(
+    array_record_paths: list[str], blacklist: dict[str, set[int]]
+) -> np.ndarray:
+    """Build a global boolean mask (length = total records) marking blacklisted records.
+
+    The ArrayRecord source concatenates shards in `array_record_paths` order, so a
+    record's global index (the key Grain reads with) is the sum of all preceding
+    shard sizes plus its within-shard index.
+    """
+    from array_record.python.array_record_module import ArrayRecordReader
+
+    counts = []
+    for path in array_record_paths:
+        reader = ArrayRecordReader(path)
+        counts.append(reader.num_records())
+        reader.close()
+
+    mask = np.zeros(sum(counts), dtype=bool)
+    offset = 0
+    for path, n in zip(array_record_paths, counts):
+        for record_index in blacklist.get(os.path.basename(path), ()):
+            if 0 <= record_index < n:
+                mask[offset + record_index] = True
+        offset += n
+    return mask
+
+
+class BlacklistDropFilter(grain.transforms.Filter):
+    """Drop blacklisted records with probability (1 - keep_prob), per encounter.
+
+    Operates on (global_index, element) tuples produced by IndexedDataSource.
+    Non-blacklisted records always pass; a blacklisted record passes with
+    probability `keep_prob`. The dice are re-rolled every time a record is
+    sampled, and the RNG is seeded per-worker (by pid) so workers are
+    uncorrelated.
+    """
+
+    def __init__(self, mask: np.ndarray, keep_prob: float):
+        self.mask = mask
+        self.keep_prob = float(keep_prob)
+        self._rng = None
+
+    def filter(self, element) -> bool:
+        idx, _ = element
+        if not self.mask[idx]:
+            return True
+        if self._rng is None:
+            self._rng = np.random.default_rng(os.getpid())
+        return self._rng.random() < self.keep_prob
+
+
+class StripRecordIndex(grain.transforms.Map):
+    """Unwrap (global_index, element) tuples back to the bare element."""
+
+    def map(self, element):
+        return element[1]
+
+
 class CastDtype(grain.transforms.Map):
     """Cast floating-point arrays to a specified dtype."""
 
