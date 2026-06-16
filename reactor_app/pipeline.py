@@ -72,6 +72,7 @@ _KEY_TO_BINARY_IDX = {
     "e": 7, "q": 8, "f": 10,
     "1": 11, "2": 12, "3": 13, "4": 14, "5": 15,
     "6": 16, "7": 17, "8": 18, "9": 19,
+    "f3": 25,
 }
 
 
@@ -87,6 +88,12 @@ def _build_action(keyboard: dict, mouse: dict) -> Actions:
         binary[21] = 1
     if mouse.get("middle", False):
         binary[22] = 1
+
+    dwheel = float(mouse.get("dwheel", 0.0))
+    if dwheel < 0:
+        binary[23] = 1
+    elif dwheel > 0:
+        binary[24] = 1
 
     dx = np.array([float(mouse.get("dx", 0.0))], dtype=np.float32)
     dy = np.array([float(mouse.get("dy", 0.0))], dtype=np.float32)
@@ -197,7 +204,7 @@ class WorldModelPipeline(ReactorPipeline):
         # a zeroed mouse delta, and a fresh random seed (so different sessions
         # generate different scenes).
         self.state._keyboard = {}
-        self.state._mouse = {"left": False, "right": False, "middle": False, "dx": 0.0, "dy": 0.0}
+        self.state._mouse = {"left": False, "right": False, "middle": False, "dx": 0.0, "dy": 0.0, "dwheel": 0.0}
         self.state._seed = int.from_bytes(os.urandom(4), "big")
         self.state._reset_requested = False
 
@@ -222,9 +229,10 @@ class WorldModelPipeline(ReactorPipeline):
                     self._latent_shape, dynamics_cache, tokenizer_cache, key,
                 )
 
-                # consume accumulated mouse delta
+                # consume accumulated mouse delta + scroll-wheel pulse
                 self.state._mouse["dx"] = 0.0
                 self.state._mouse["dy"] = 0.0
+                self.state._mouse["dwheel"] = 0.0
 
                 frame = np.asarray(frame_jax[0, 0])
                 if frame.dtype != np.uint8:
@@ -243,12 +251,12 @@ class WorldModelPipeline(ReactorPipeline):
         e: bool = False, q: bool = False, f: bool = False,
         n1: bool = False, n2: bool = False, n3: bool = False, n4: bool = False,
         n5: bool = False, n6: bool = False, n7: bool = False, n8: bool = False,
-        n9: bool = False,
+        n9: bool = False, f3: bool = False,
     ):
         self.state._keyboard = {
             "w": w, "a": a, "s": s, "d": d,
             "space": space, "shift": shift, "ctrl": ctrl,
-            "e": e, "q": q, "f": f,
+            "e": e, "q": q, "f": f, "f3": f3,
             "1": n1, "2": n2, "3": n3, "4": n4, "5": n5,
             "6": n6, "7": n7, "8": n8, "9": n9,
         }
@@ -268,7 +276,14 @@ class WorldModelPipeline(ReactorPipeline):
             "middle": middle,
             "dx": prev.get("dx", 0.0) + dx,
             "dy": prev.get("dy", 0.0) + dy,
+            "dwheel": prev.get("dwheel", 0.0),  # preserve pending scroll pulse
         }
+
+    @event(name="send_mouse_wheel", description="Accumulate scroll-wheel ticks (sign = direction)")
+    def send_mouse_wheel(self, dwheel: float = 0.0):
+        mouse = self.state._mouse or {}
+        mouse["dwheel"] = mouse.get("dwheel", 0.0) + float(dwheel)
+        self.state._mouse = mouse
 
     @event(name="switch_to_policy", description="Toggle policy/manual control (no-op until policy head wired)")
     def switch_to_policy(self, enable: bool = True):

@@ -34,13 +34,15 @@ const KEY_CODE_TO_NAME: Record<string, string> = {
   Digit7: "n7",
   Digit8: "n8",
   Digit9: "n9",
+  // Debug overlay — bound to G because the browser reserves F3
+  KeyG: "f3",
 };
 
 /** Display labels for active keys. */
 const KEY_DISPLAY: Record<string, string> = {
   w: "W", a: "A", s: "S", d: "D",
   space: "Jump", shift: "Sneak", ctrl: "Sprint",
-  e: "Inv", q: "Drop", f: "Swap",
+  e: "Inv", q: "Drop", f: "Swap", f3: "Debug",
   n1: "1", n2: "2", n3: "3", n4: "4", n5: "5",
   n6: "6", n7: "7", n8: "8", n9: "9",
 };
@@ -208,10 +210,20 @@ export function KeyboardController({
     if (isLocked) event.preventDefault();
   }, [isLocked]);
 
+  const handleWheel = useCallback(
+    (event: WheelEvent) => {
+      if (!isLocked) return;
+      event.preventDefault();
+      if (event.deltaY === 0) return;
+      sendCommand("send_mouse_wheel", { dwheel: event.deltaY < 0 ? 1 : -1 });
+    },
+    [isLocked, sendCommand]
+  );
+
   function updateActiveButtons() {
     const btns: string[] = [];
-    if (mouseButtons.current.left) btns.push("Attack");
-    if (mouseButtons.current.right) btns.push("Use");
+    if (mouseButtons.current.left) btns.push("Break");
+    if (mouseButtons.current.right) btns.push("Place");
     if (mouseButtons.current.middle) btns.push("Pick");
     setActiveButtons(btns);
   }
@@ -253,6 +265,7 @@ export function KeyboardController({
     window.addEventListener("mousedown", handleMouseDown);
     window.addEventListener("mouseup", handleMouseUp);
     window.addEventListener("contextmenu", handleContextMenu);
+    window.addEventListener("wheel", handleWheel, { passive: false });
 
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
@@ -261,8 +274,9 @@ export function KeyboardController({
       window.removeEventListener("mousedown", handleMouseDown);
       window.removeEventListener("mouseup", handleMouseUp);
       window.removeEventListener("contextmenu", handleContextMenu);
+      window.removeEventListener("wheel", handleWheel);
     };
-  }, [enabled, isLocked, handleKeyDown, handleKeyUp, handleMouseMove, handleMouseDown, handleMouseUp, handleContextMenu]);
+  }, [enabled, isLocked, handleKeyDown, handleKeyUp, handleMouseMove, handleMouseDown, handleMouseUp, handleContextMenu, handleWheel]);
 
   // Exit pointer lock when disabled
   useEffect(() => {
@@ -299,7 +313,7 @@ export function KeyboardController({
       {/* Click-to-play overlay — floating headline + sub, no chrome. */}
       {!isLocked && (
         <div
-          className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-6 rounded-2xl"
+          className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-6 rounded-2xl bg-black/30 backdrop-blur-md backdrop-saturate-75"
           style={{ textShadow: "0 2px 24px rgba(0,0,0,0.7)" }}
         >
           <div className="text-white text-3xl sm:text-4xl font-semibold tracking-tight">
