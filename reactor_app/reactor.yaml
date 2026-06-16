@@ -7,4 +7,4 @@ runtime:
   config: config.yaml
   # Relative paths resolve against this reactor.yaml. Overridden by
   # $REACTOR_WEIGHTS_PATH at runtime if set.
-  weights_path: ../gatto
+  weights_path: ../jelly
