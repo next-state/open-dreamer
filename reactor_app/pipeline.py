@@ -122,9 +122,7 @@ class WorldModelPipeline(ReactorPipeline):
 
     def load(self, config: dict[str, Any]) -> None:
         # Mesh + checkpoint
-        weights_root = get_weights_path()
-        subdir = config.get("dynamics_ckpt_subdir", "")
-        ckpt_path = str(weights_root / subdir) if subdir else str(weights_root)
+        ckpt_path = str(get_weights_path())
 
         mesh, _data_sharding, mesh_rules = build_parallel("data")
         self._mesh = mesh

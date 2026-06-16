@@ -1,6 +1,6 @@
 model:
   name: world-model
-  display-name: Dreamer World Model
+  display-name: OpenDreamer World Model
 
 runtime:
   import: pipeline:WorldModelPipeline

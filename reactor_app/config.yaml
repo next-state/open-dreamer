@@ -1,10 +1,5 @@
 # World model hyperparameters. Passed to WorldModelPipeline.load() as a dict.
 
-# Subdirectory under runtime.weights_path containing the checkpoint bundle
-# loadable by DynamicsCheckpointBundle.from_pretrained(). Empty string = use
-# weights_path directly.
-dynamics_ckpt_subdir: ""
-
 # Denoising
 num_steps: 4
 tau_ctx_target: 0.9
