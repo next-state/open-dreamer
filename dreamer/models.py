@@ -474,7 +474,7 @@ class GroupedQueryAttention(nnx.Module):
                 mask=mask_attn,
                 scale=scale,
                 is_causal=attn_is_causal,
-                local_window_size=local_window_size
+                local_window_size=None
             )  # TODO: try setting implementation="cudnn"
 
             if return_weights:
