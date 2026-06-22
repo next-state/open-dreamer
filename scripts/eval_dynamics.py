@@ -41,7 +41,7 @@ def run(cfg):
         bundle = DynamicsCheckpointBundle.from_pretrained(
             cfg.dynamics_ckpt, mesh_rules=mesh_rules, model_names={"dynamics_ema", "tokenizer"}
         )
-        print(f"Loaded dynamics model (k_max={bundle.dynamics_ema.cfg.k_max}, depth={bundle.dynamics_ema.cfg.depth})")
+        print(f"Loaded dynamics model (num_sampling_steps={bundle.dynamics_ema.cfg.num_sampling_steps}, depth={bundle.dynamics_ema.cfg.depth})")
 
         use_latent_data = cfg.dataset.data_type == "latent"
 
@@ -56,7 +56,7 @@ def run(cfg):
         print(f"Batch loaded: shape={input_tensor.shape}, use_latent_data={use_latent_data}")
 
         # run_evaluation needs cfg.dataset.dataset_std
-        # run_x0_visualization needs cfg.dynamics.k_max and cfg.dynamics.context_length
+        # run_x0_visualization needs cfg.dynamics.context_length
         # Both are available directly: dataset_std from cfg.dataset, dynamics fields from the loaded model
         eval_cfg = types.SimpleNamespace(
             dynamics=bundle.dynamics_ema.cfg,

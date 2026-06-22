@@ -154,8 +154,9 @@ class DynamicsModelConfig:
     dtype: str = "float32"
     param_dtype: str = "float32"
 
-    # schedule
-    k_max: int = 8
+    # Inference-only: number of Euler steps the velocity-head multi-step sampler takes at eval.
+    # Not used during training (DuMo conditions only on the continuous signal level sigma).
+    num_sampling_steps: int = 8
 
     # attention window for sliding window attention (used when T > context_length)
     context_length: int = 192
@@ -365,9 +366,10 @@ class DynamicsConfig(BaseExperimentConfig):
     # Model
     dynamics: DynamicsModelConfig = field(default_factory=DynamicsModelConfig)
 
-    # Training
-    bootstrap_start: int = 5_000  # Number of start steps trained exclusively on flow-matching objective
-    bootstrap_fraction: float = 0.25  # Fraction of batch used for bootstrap samples
+    # Training (DuMo)
+    # Loss weight on the velocity (flow-matching) head; the flow-map (consistency) head
+    # gets weight (1 - dumo_beta): total = dumo_beta * L_v + (1 - dumo_beta) * L_u
+    dumo_beta: float = 0.5
     image_fraction: float = 0.3
 
     # Optimal transport coupling (minibatch OT)
@@ -397,7 +399,7 @@ class HeadsConfig(BaseExperimentConfig):
     reward_head: RewardHeadModelConfig = field(default_factory=RewardHeadModelConfig)
 
     # Training hyperparameters
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
+    dumo_beta: float = 0.5  # Weight on velocity (flow) head vs flow-map (consistency) head
     dynamics_loss_weight: float = 0.1
 
     # Learning rate schedules (one per component)
@@ -412,7 +414,7 @@ class HeadsConfig(BaseExperimentConfig):
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
     # Loss weighting (to balance scales across different loss components)
-    loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
+    loss_weight_dynamics: float = 1.0    # weight for DuMo dynamics loss (MSE units)
     loss_weight_policy: float = 0.3      # weight for policy CE loss (nats)
     loss_weight_reward: float = 0.3      # weight for reward CE loss (nats)
 

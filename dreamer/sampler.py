@@ -38,6 +38,7 @@ def sample_video(
     policy: PolicyHeadMTP | None = None,
     task_embedder: TaskEmbedder | None = None,
     latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
+    head: str = "v",
 ) -> Tuple[jax.Array, jax.Array, jax.Array | None]:
     """
     Sample video predictions using Tokenizer and Dynamics.
@@ -106,6 +107,7 @@ def sample_video(
         rng=rng,
         initial_task_embedding=initial_agent_tokens,
         deterministic=True,
+        head=head,
     )
 
     # Decode predicted latents to frames

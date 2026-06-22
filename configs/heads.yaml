@@ -60,7 +60,7 @@ reward_head:
   param_dtype: ${param_dtype}
 
 # Training hyperparameters
-bootstrap_start: 5000
+dumo_beta: 0.5
 dynamics_loss_weight: 0.1
 
 max_steps: 1_000_000_000
@@ -102,6 +102,6 @@ optimizer:
   muon_nesterov: true
 
 # Loss weighting
-loss_weight_shortcut: 1.0
+loss_weight_dynamics: 1.0
 loss_weight_policy: 0.3
 loss_weight_reward: 0.3

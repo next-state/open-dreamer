@@ -210,7 +210,7 @@ def initialize_rl_training(cfg: RLConfig, ctx):
     print(f"[Created] Optimizer (lr={cfg.lr})")
     
     
-    schedule = DenoiseSchedule.init(num_steps = 4, k_max=dynamics_cfg.k_max)
+    schedule = DenoiseSchedule.init(num_steps=4)
     
     rngs = nnx.Rngs(cfg.seed)
     step = nnx.Variable(0)  # Mutable step counter

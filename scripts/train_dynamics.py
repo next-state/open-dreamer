@@ -33,7 +33,7 @@ from dreamer.parallel import build_parallel, MeshRules
 from dreamer.scaling import ScalingContext
 from dreamer.training import (
     run_evaluation,
-    shortcut_forcing_step,
+    dumo_forcing_step,
 )
 from dreamer.checkpointing import (
     DynamicsCheckpointBundle,
@@ -71,13 +71,12 @@ OmegaConf.register_new_resolver("min", lambda *args: min(args))
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "B_img", "T", "n_splits", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
+    static_argnames=("dumo_beta", "B_img", "T", "n_splits", "context_length", "use_latent_data", "ot_cfg"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
-    dynamics_ema: Dynamics,   # Used as target network for bootstrap half-steps
     optimizer: nnx.Optimizer,
     data: jnp.ndarray,        # Full batch: videos (B, T, H, W, C) or latents (B, T, n_latents, d_bottleneck)
     actions: Actions,         # Full batch (B, T, ...)
@@ -87,9 +86,8 @@ def train_step(
     B_img: int,               # Number of samples to treat as images
     T: int,
     n_splits: int,            # Number of block-causal chunks (1 = full causal, >1 = split into independent chunks)
-    k_max: int,
+    dumo_beta: float,
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
-    bootstrap_fraction: float,
     use_latent_data: bool,    # True if data is already latents, False if data is videos
     ot_cfg: OptimalTransportConfig,
 ):
@@ -102,14 +100,11 @@ def train_step(
     latents = latents.astype(dynamics.dtype)
 
     B = latents.shape[0]
-    B_self = int(B * bootstrap_fraction)
-    B_emp = B - B_self
 
-    # Identify image samples (split with same bootstrap ratio)
+    # Identify image samples: the first B_img rows are trained as independent images (no temporal
+    # attention). DuMo applies both losses to every sample, so there is no bootstrap subset.
     idx = jnp.arange(B)
-    B_img_boot = int(B_img * bootstrap_fraction)
-    B_img_emp = B_img - B_img_boot
-    is_img = (idx < B_img_emp) | ((idx >= B_emp) & (idx < (B_emp + B_img_boot)))
+    is_img = idx < B_img
 
     # Build time mask for full batch
     mask_img = jnp.eye(T, dtype=jnp.bool_)                  # independent tokens
@@ -130,18 +125,16 @@ def train_step(
     step_key = jax.random.fold_in(master_key, step)
 
     def loss_fn(model: Dynamics, latents, actions, mask, context_length):
-        losses, aux = shortcut_forcing_step(
+        losses, aux = dumo_forcing_step(
             dynamics_model=model,
             actions=actions,
             latents=latents,
             rng=step_key,
-            k_max=k_max,
-            B_self=B_self,
-            B_img_emp=B_img_emp,
+            beta=dumo_beta,
+            B_img_emp=B_img,
             context_length=context_length, # Builds sliding window attention
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
-            bootstrap_model=dynamics_ema,  # EMA as stable target network for half-steps
             ot_cfg=ot_cfg,
         )
 
@@ -209,10 +202,11 @@ def run(cfg: DynamicsConfig):
         B = dl_cfg.B
         avg_T = dl_cfg.long_T
 
-        # Dynamics FLOPs: 1 pass on full batch + 2 passes on bootstrap subset
+        # Dynamics FLOPs: DuMo runs one shared backbone pass under jax.jvp (forward + tangent)
+        # plus the gradient backward through both, i.e. roughly 2x the base forward+backward.
         dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
-        bootstrap_multiplier = 1 + cfg.bootstrap_fraction * (2/3)  # two additional gradientless calls to dynamics model, 1/6 for inference
-        total_dynamics_flops = dynamics_flops * bootstrap_multiplier
+        dumo_multiplier = 2.0  # JVP (primal + tangent) over the shared backbone for the consistency target
+        total_dynamics_flops = dynamics_flops * dumo_multiplier
 
         # Encoder FLOPs: forward-only (no gradients) when using video data
         encoder_flops = 0
@@ -223,9 +217,9 @@ def run(cfg: DynamicsConfig):
         scaling = ScalingContext.create(
             cfg=cfg,
             param_count=param_counts["total"],
-            flops_per_step=dynamics_flops + encoder_flops,
+            flops_per_step=total_dynamics_flops + encoder_flops,
             data_tokens_per_step=B * avg_T * (n_spatial + 1),  # spatial + action
-            total_tokens_per_step=B * avg_T * (2 + n_spatial + cfg.dynamics.n_register),  # action + shortcut + spatial + register
+            total_tokens_per_step=B * avg_T * (2 + n_spatial + cfg.dynamics.n_register),  # action + time + spatial + register
             logger=logger,
             run_dir=run_dir,
         )
@@ -291,16 +285,15 @@ def run(cfg: DynamicsConfig):
                 # Training step
                 B, T = input_tensor.shape[:2]
                 metrics = train_step(
-                    bundle.tokenizer, bundle.dynamics, bundle.dynamics_ema,
+                    bundle.tokenizer, bundle.dynamics,
                     bundle.dynamics_optimizer, input_tensor, actions,
                     master_key=master_key,
                     step=step,
                     B_img=int(B * cfg.image_fraction),
                     T=T,
                     n_splits=n_splits,
-                    k_max=cfg.dynamics.k_max,
+                    dumo_beta=cfg.dumo_beta,
                     context_length=cfg.dynamics.context_length,
-                    bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                     use_latent_data=use_latent_data,
                     ot_cfg=ot_cfg,
                 )
@@ -319,18 +312,18 @@ def run(cfg: DynamicsConfig):
                                 "flow_mse": metrics_cpu["flow_mse"],
                                 "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
                                 "flow_mse_image": metrics_cpu["flow_mse_image"],
-                                "boot_mse": metrics_cpu["bootstrap_mse"],
+                                "consistency_mse": metrics_cpu["consistency_mse"],
                                 "grad_norm": metrics_cpu["grad_norm"],
                                 "flow_mse_low": metrics_cpu["flow_mse_low"],
                                 "flow_mse_mid": metrics_cpu["flow_mse_mid"],
                                 "flow_mse_high": metrics_cpu["flow_mse_high"],
-                                "boot_target_norm": metrics_cpu["boot_target_norm"],
+                                "consistency_target_norm": metrics_cpu["consistency_target_norm"],
                                 "lr": lr_schedule(step),
                                 "T": T // n_splits,
                                 **scaling.get_step_metrics(step),
                             },
                             pbar=pbar,
-                            pbar_filter=r"^(flow_mse|boot_mse|lr)$",
+                            pbar_filter=r"^(flow_mse|consistency_mse|lr)$",
                         )
 
                 # Checkpointing

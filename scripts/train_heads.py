@@ -33,7 +33,7 @@ from dreamer.training import (
     compute_policy_loss,
     compute_reward_loss,
     run_evaluation,
-    shortcut_forcing_step,
+    dumo_forcing_step,
     RMSLossNormalizer,
 )
 from dreamer.checkpointing import (
@@ -126,7 +126,7 @@ def gather_future_rewards(rewards_bt: jnp.ndarray, BTL: tuple[int, int, int]) ->
 # Training step
 # ---------------------------
 
-@nnx.jit(static_argnames=("k_max", "L_mtp", "B_self"))
+@nnx.jit(static_argnames=("dumo_beta", "L_mtp"))
 def encode_and_train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -145,9 +145,8 @@ def encode_and_train_step(
     tokenizer_key: jax.Array,
     master_key: jax.Array,
     step: int,
-    k_max: int,
+    dumo_beta: float,
     L_mtp: int,
-    B_self: int,
     dynamics_loss_weight: float,
 ) -> dict:
     """
@@ -167,13 +166,13 @@ def encode_and_train_step(
         loss_normalizer,
         latents, actions, rewards,
         master_key=master_key, step=step,
-        k_max=k_max, L_mtp=L_mtp, B_self=B_self,
+        dumo_beta=dumo_beta, L_mtp=L_mtp,
         dynamics_loss_weight=dynamics_loss_weight
     )
     return metrics
 
 
-@nnx.jit(static_argnames=("k_max", "L_mtp", "B_self"))
+@nnx.jit(static_argnames=("dumo_beta", "L_mtp"))
 def train_step(
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
@@ -190,9 +189,8 @@ def train_step(
     *,
     master_key: jax.Array,
     step: int,
-    k_max: int,
+    dumo_beta: float,
     L_mtp: int,
-    B_self: int,
     dynamics_loss_weight: float,
 ) -> dict:
     """
@@ -221,9 +219,9 @@ def train_step(
     def loss_fn(models):
         dyn, task, pol, rew = models
         # Dynamics loss (also returns hidden states for BC/reward training)
-        dyn_losses, dyn_aux = shortcut_forcing_step(
-            dyn, actions, latents, step_key, k_max,
-            B_self=B_self, task_embeddings=agent_tokens_bt
+        dyn_losses, dyn_aux = dumo_forcing_step(
+            dyn, actions, latents, step_key,
+            beta=dumo_beta, task_embeddings=agent_tokens_bt
         )
         dynamics_loss, h_states = dyn_losses['total'], dyn_aux['h_states']
 
@@ -248,7 +246,7 @@ def train_step(
             "reward_loss": reward_loss,
             "dynamics_loss": dynamics_loss,
             "flow_mse": dyn_aux["flow_mse"],
-            "bootstrap_mse": dyn_aux["bootstrap_mse"],
+            "consistency_mse": dyn_aux["consistency_mse"],
             **{f"policy_loss_{k}": v for k, v in policy_losses.items()},
             **{f"rms_{k}": v for k, v in rms_info.items()},
             **reward_metrics,
@@ -389,9 +387,8 @@ def run(cfg: HeadsConfig):
                     tokenizer_key=tokenizer_key,
                     master_key=master_key,
                     step=step,
-                    k_max=bundle.dynamics.cfg.k_max,
+                    dumo_beta=cfg.dumo_beta,
                     L_mtp=cfg.policy_head.L,
-                    B_self=(B // 2) * (step >= cfg.bootstrap_start),  # This will make the function compile twice. TODO: see if it's worth fixing this
                     dynamics_loss_weight=cfg.dynamics_loss_weight,
                 )
 

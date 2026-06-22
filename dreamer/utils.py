@@ -90,7 +90,7 @@ class Modality(IntEnum):
     PROPRIO  = 2
     REGISTER = 3
     SPATIAL = 4
-    SHORTCUT = 5
+    TIME = 5
     AGENT = 6
 
 @jax.tree_util.register_pytree_node_class

@@ -12,10 +12,10 @@ parallel_strategy: data
 # "evaluate" only computes FVD from previously saved videos
 mode: both
 
-# Rollout type: one of ema_shortcut, ema_diffusion, online_shortcut, online_diffusion
+# Rollout type: one of ema_flowmap, ema_velocity, online_flowmap, online_velocity
 # - ema/online: which model weights to use
-# - shortcut (4 steps) vs diffusion (k_max steps)
-rollout_type: ema_diffusion
+# - flowmap (DuMo few-step, 4 steps) vs velocity (multi-step, num_sampling_steps)
+rollout_type: ema_velocity
 
 # Generation settings
 num_videos: 256

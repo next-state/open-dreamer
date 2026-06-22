@@ -1170,7 +1170,6 @@ class Dynamics(nnx.Module):
         self.n_kv_heads = cfg.n_kv_heads
         self.packing_factor = cfg.packing_factor
         self.n_register = cfg.n_register
-        self.k_max = cfg.k_max
 
         # Project spatial tokens
         self.spatial_proj = nnx.Linear(cfg.d_bottleneck * cfg.packing_factor, cfg.d_model, use_bias=cfg.use_bias, dtype=self.dtype, param_dtype=self.param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
@@ -1202,22 +1201,36 @@ class Dynamics(nnx.Module):
             mesh_rules=mesh_rules, rngs=rngs
         )
 
-        # Sinusoidal embeddings for shortcut conditioning
-        # step_idx ∈ {0,...,log2(k_max)} passed as float; tau ∈ [0,1] (tau_idx/k_max)
-        half_dim = cfg.d_model // 2
-        self.step_embed = TimestepEmbedder(
-            out_dim=half_dim,
-            dtype=self.dtype, param_dtype=self.param_dtype,
-            mesh_rules=mesh_rules, rngs=rngs,
-        )
+        # Sinusoidal embedding for the diffusion signal level sigma ∈ [0, 1] (sigma=1 => clean).
+        # DuMo conditions only on the (continuous) noise level; there is no shortcut step-size
+        # conditioning anymore.
         self.signal_embed = TimestepEmbedder(
-            out_dim=half_dim,
+            out_dim=cfg.d_model,
             dtype=self.dtype, param_dtype=self.param_dtype,
             mesh_rules=mesh_rules, rngs=rngs,
         )
 
-        # Output head (zero-init)
+        # DuMo dual heads, both predicting the clean latent in x-space:
+        #   flow_x_head    -> velocity / instantaneous head (multi-step, flow-matching target).
+        #                     Zero-init; the flow loss target is the (nonzero) data, so the head
+        #                     receives gradient at init.
+        #   flow_map_head  -> flow-map / consistency head (few-step, self-consistency target).
+        #                     Zero-init too, BUT read out with a skip connection from the (noisy)
+        #                     input latent: x_u = z_tilde + flow_map_head(features). In x-space the
+        #                     consistency residual is (1 - sigma) * dG/dsigma; without the skip a
+        #                     zero head gives G == 0 (a spurious self-consistent collapse with no
+        #                     boundary grounding). With the skip, at init G == z_tilde and the
+        #                     skip's JVP tangent re-injects dz_tilde/dsigma = (z1 - z0) — exactly
+        #                     the velocity term that algebraically cancelled — so the residual is
+        #                     the gentle, data-grounded (1 - sigma) * (z1 - z0).
         self.flow_x_head = nnx.Linear(
+            cfg.d_model, cfg.d_bottleneck * cfg.packing_factor,
+            use_bias=cfg.use_bias,
+            kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
+            bias_init=nnx.initializers.zeros,
+            dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs
+        )
+        self.flow_map_head = nnx.Linear(
             cfg.d_model, cfg.d_bottleneck * cfg.packing_factor,
             use_bias=cfg.use_bias,
             kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
@@ -1235,7 +1248,7 @@ class Dynamics(nnx.Module):
         n_spatial = n_latents // self.packing_factor
         segments = [
             (Modality.ACTION, 1),
-            (Modality.SHORTCUT, 1),
+            (Modality.TIME, 1),
             (Modality.SPATIAL, n_spatial),
             (Modality.REGISTER, self.cfg.n_register),
         ]
@@ -1268,33 +1281,40 @@ class Dynamics(nnx.Module):
     def __call__(
         self,
         actions: Actions,
-        step_indices,
-        tau_indices,
+        sigma,
         unpacked_enc_tokens,
         *,
+        head: str = "v",
         context_length: int | None = None,
         time_mask: jnp.ndarray | None = None,
         task_embeddings: jnp.ndarray | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
         rngs: nnx.Rngs | None = None
-    ) -> Tuple[jax.Array, Tuple[jax.Array | None, KVCachesDict | None]]:
+    ) -> Tuple[Any, Tuple[jax.Array | None, KVCachesDict | None]]:
         """
         Args:
             actions: Actions object
-            step_indices: (B, T) int32 — step indices for embedding lookup
-            tau_indices: (B, T) int32 - signal indices for embedding lookup
+            sigma: (B, T) float — continuous signal level in [0, 1] (sigma=1 => clean latents)
             unpacked_enc_tokens: (B, T, n_latents, d_bottleneck) unpacked encoder tokens
+            head: which DuMo head to read out:
+                  "v"    -> velocity/flow-matching x-prediction (default, used for multi-step sampling)
+                  "u"    -> flow-map/consistency x-prediction (used for few-step sampling)
+                  "both" -> tuple (x_v, x_u) of both predictions (used for DuMo training)
             context_length: optional context length for sliding window attention. If provided,
                            creates local_window_size=(context_length - 1, 0) for causal sliding window.
             time_mask: optional (B, 1, T, T) boolean mask for temporal attention
             task_embeddings: (B, T, n_agent, d_model) optional agent tokens
             caches: optional dict of KVCache for each layer
 
+        Returns:
+            (x_pred, (h_t, new_caches)) where x_pred is the requested head's prediction, or a
+            tuple (x_v, x_u) when head="both". x_pred has shape (B, T, n_latents, d_bottleneck).
+
         Shapes produced (internal):
             spatial_tokens: (B, T, n_spatial, d_model)
             action_token:  (B, T, 1, d_model)
-            shortcut_token: (B, T, 1, d_model)
+            time_token:    (B, T, 1, d_model)
         """
         B, T = unpacked_enc_tokens.shape[:2]
 
@@ -1316,15 +1336,13 @@ class Dynamics(nnx.Module):
             (B, T, self.n_register, self.d_model),
         )
 
-        # Shortcut embeddings (sinusoidal, concatenated to single token)
-        # step_indices: int log2(K) → float for sinusoidal PE
-        # tau_indices: int τ*k_max → normalize to [0,1] for sinusoidal PE
-        step_emb = self.step_embed(step_indices.astype(jnp.float32))                          # (B, T, d_model//2)
-        signal_emb = self.signal_embed(tau_indices.astype(jnp.float32) / self.k_max)          # (B, T, d_model//2)
-        shortcut_token = jnp.concatenate([step_emb, signal_emb], axis=-1)[:, :, None, :]     # (B, T, 1, d_model)
+        # Signal-level (sigma) embedding (sinusoidal). DuMo conditions only on the continuous
+        # noise level; sigma in [0, 1] with sigma=1 => clean.
+        signal_emb = self.signal_embed(sigma.astype(jnp.float32))                             # (B, T, d_model)
+        time_token = signal_emb[:, :, None, :]                                                # (B, T, 1, d_model)
 
         # Concatenate in declared layout order (`get_token_layout`)
-        tokens = [action_token, shortcut_token, spatial_tokens, register_tokens]
+        tokens = [action_token, time_token, spatial_tokens, register_tokens]
         if task_embeddings is not None:
             tokens.append(task_embeddings)
 
@@ -1351,13 +1369,27 @@ class Dynamics(nnx.Module):
         )
 
         spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
-        x1_hat_packed = self.flow_x_head(spatial_tokens)  # (B, T, n_spatial, d_spatial)
 
-        # Unpack before returning
-        x1_hat = rearrange(x1_hat_packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
-        
+        def _readout(linear):
+            packed = linear(spatial_tokens)  # (B, T, n_spatial, d_spatial)
+            return rearrange(packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
+
+        # Velocity head: direct x-prediction. Flow-map head: skip connection from the noisy input
+        # latent (consistency-style boundary grounding), so x_u = z_tilde + flow_map_head(features).
+        x_v = lambda: _readout(self.flow_x_head)
+        x_u = lambda: unpacked_enc_tokens + _readout(self.flow_map_head)
+
+        if head == "v":
+            x_pred = x_v()
+        elif head == "u":
+            x_pred = x_u()
+        elif head == "both":
+            x_pred = (x_v(), x_u())
+        else:
+            raise ValueError(f"Unknown head {head!r}; expected 'v', 'u', or 'both'.")
+
         h_t = x[:, :, layout.slices()[Modality.AGENT], :] if task_embeddings is not None else None  # (B,T,n_agent,D) or None
-        return x1_hat, (h_t, new_caches)
+        return x_pred, (h_t, new_caches)
 
     def num_scaling_params(self) -> int:
         """Total params for scaling law analysis (Chinchilla-style, includes all)."""

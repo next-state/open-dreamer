@@ -16,10 +16,10 @@ parameters:
 
   max_steps:
     value: 100_000
-  
-  bootstrap_start:
-    value: 50_000
-  
+
+  dumo_beta:
+    value: 0.5
+
   dynamics.depth:
     value: 16
   
@@ -29,4 +29,4 @@ command:
   - run
   - ${program}
   - ${args_no_hyphens}
-  - run_name=fixed_d_model${dynamics.d_model}_n_register${dynamics.n_register}_depth${dynamics.depth}_k_max${dynamics.k_max}_dropout${dynamics.dropout_rate}_qk_norm${dynamics.qk_norm_type}_rope_theta${dynamics.rope_theta}_n_heads${dynamics.n_heads}_n_kv_heads${dynamics.n_kv_heads}
+  - run_name=fixed_d_model${dynamics.d_model}_n_register${dynamics.n_register}_depth${dynamics.depth}_dropout${dynamics.dropout_rate}_qk_norm${dynamics.qk_norm_type}_rope_theta${dynamics.rope_theta}_n_heads${dynamics.n_heads}_n_kv_heads${dynamics.n_kv_heads}

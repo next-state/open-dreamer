@@ -70,11 +70,12 @@ def generate_videos(cfg):
             if Path(candidate).exists():
                 ckpt_path = candidate
 
-        rollout_type = cfg.get("rollout_type", "ema_shortcut")
-        valid_types = ("ema_shortcut", "ema_diffusion", "online_shortcut", "online_diffusion")
+        rollout_type = cfg.get("rollout_type", "ema_flowmap")
+        valid_types = ("ema_flowmap", "ema_velocity", "online_flowmap", "online_velocity")
         assert rollout_type in valid_types, f"rollout_type must be one of {valid_types}, got {rollout_type!r}"
         use_ema = rollout_type.startswith("ema")
-        use_shortcut = rollout_type.endswith("shortcut")
+        use_flowmap = rollout_type.endswith("flowmap")  # DuMo few-step flow-map head
+        head = "u" if use_flowmap else "v"
         dynamics_field = "dynamics_ema" if use_ema else "dynamics"
 
         print(f"Loading checkpoint from {ckpt_path} (models: {dynamics_field}, tokenizer)...")
@@ -93,10 +94,9 @@ def generate_videos(cfg):
                 "For scientifically rigorous evaluation, use raw video data instead."
             )
 
-        k_max = dynamics.cfg.k_max
-        num_steps = 4 if use_shortcut else k_max
-        schedule_config = DenoiseSchedule.init(num_steps, k_max)
-        print(f"Rollout type: {rollout_type} (num_steps={num_steps}, k_max={k_max})")
+        num_steps = 4 if use_flowmap else dynamics.cfg.num_sampling_steps
+        schedule_config = DenoiseSchedule.init(num_steps)
+        print(f"Rollout type: {rollout_type} (num_steps={num_steps})")
 
         dataloader = build_iterator(
             cfg.dataset,
@@ -138,6 +138,7 @@ def generate_videos(cfg):
                 policy=None,
                 task_embedder=None,
                 latents=val_data if use_latent_data else None,
+                head=head,
             )
 
             gt_decoded = jax.device_get(gt_decoded_frames)
@@ -160,7 +161,7 @@ def generate_videos(cfg):
 
 def evaluate_fvd(cfg):
     """Stage 2: Load saved MP4s and compute FVD."""
-    rollout_type = cfg.get("rollout_type", "ema_shortcut")
+    rollout_type = cfg.get("rollout_type", "ema_flowmap")
     video_dir = Path(cfg.video_dir) / rollout_type
     i3d_bs = cfg.i3d_bs
     pred_frames_only = cfg.pred_frames_only
