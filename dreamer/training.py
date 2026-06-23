@@ -320,6 +320,7 @@ def dumo_forcing_step(
     task_embeddings: jnp.ndarray | None = None,
     ot_cfg: OptimalTransportConfig = OptimalTransportConfig(),
     cons_cfg: ConsistencyConfig = ConsistencyConfig(),
+    target_model: Dynamics | None = None,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
     Compute DuMo dual-momentum losses (velocity flow + flow-map consistency) for a batch.
@@ -329,10 +330,13 @@ def dumo_forcing_step(
       * flow-map head  (flow_map_head):  MeanFlow self-consistency velocity prediction -> L_u
 
     Both losses are applied to every sample (no bootstrap subset). The consistency target uses
-    the true Jacobian-vector product du/dsigma (via jax.jvp over the shared backbone + flow-map
-    head), evaluated along the PF-ODE trajectory with tangent (z1 - z0, 1) and stop-gradient on
-    the target (theta- = stop-grad of the current online params). Diffusion forcing is preserved:
-    sigma is sampled per-(batch, time) and the temporal/image structure is carried by time_mask.
+    the true Jacobian-vector product du/dsigma (via jax.jvp), evaluated along the PF-ODE trajectory
+    with tangent (z1 - z0, 1). The reference network theta- for that tangent is selected by
+    target_model: when None it is the online network with stop-gradient (DuMo's setting); when a
+    model is passed (e.g. the EMA) the du/dsigma tangent is computed through it instead, which
+    damps the self-distillation feedback. In velocity space only the tangent uses theta-; the
+    target's data anchor stays v = z1 - z0 either way. Diffusion forcing is preserved: sigma is
+    sampled per-(batch, time) and the temporal/image structure is carried by time_mask.
 
     Args:
         dynamics_model: NNX Dynamics model instance
@@ -348,6 +352,8 @@ def dumo_forcing_step(
         task_embeddings: Optional (B, T, n_agent, d_model) agent tokens.
         ot_cfg: OT coupling settings.
         cons_cfg: flow-map consistency-loss stabilisers (correction clip + adaptive weighting).
+        target_model: optional reference network (theta-) for the du/dsigma tangent. None => online
+                      net with stop-gradient; pass the EMA model to use it as the consistency target.
 
     Returns:
         losses: Dict with 'total', 'flow', 'consistency' keys.
@@ -378,22 +384,45 @@ def dumo_forcing_step(
     w = latents - z0                 # conditional velocity v = z1 - z0
     sigma_tangent = jnp.ones_like(sigma)
 
-    # --- Dual-head forward pass + JVP over the flow-map head (one shared backbone pass) ---
-    # jax.jvp differentiates only w.r.t. the explicit inputs (z_tilde, sigma); the model params are
-    # captured as constants for forward-mode (theta-), while the primals still carry reverse-mode
-    # gradient w.r.t. params for the loss backward pass.
-    def _fwd(z_in, sigma_in):
-        v_u_pair, (h_t, _) = dynamics_model(
-            actions, sigma_in, z_in,
+    # --- Dual-head predictions + consistency tangent du/dsigma ---
+    # jax.jvp differentiates only w.r.t. the explicit inputs (z_tilde, sigma); model params are
+    # captured as constants for forward-mode, while primals still carry reverse-mode gradient
+    # w.r.t. the online params for the loss backward pass.
+    if target_model is None:
+        # Online stop-grad target (theta- = sg of current params): a single JVP over the online
+        # model yields the prediction primals (gradient-carrying) and the du/dsigma tangent.
+        def _fwd(z_in, sigma_in):
+            (v_p, u_p), (h_t, _) = dynamics_model(
+                actions, sigma_in, z_in,
+                head="both", context_length=context_length, time_mask=time_mask,
+                task_embeddings=task_embeddings, deterministic=True,
+            )
+            return v_p, u_p, h_t
+
+        (v_pred, u_pred, h_states), (_dv, du_dsigma, _dh) = jax.jvp(
+            _fwd, (z_tilde, sigma), (w, sigma_tangent)
+        )
+    else:
+        # EMA target (theta- = target_model params): predictions come from a plain online forward
+        # (gradient-carrying); the consistency tangent du/dsigma is the JVP of the *target* flow-map
+        # head. Only the tangent uses theta- — the target's data anchor stays v = z1 - z0. The EMA
+        # tangent is detached (the EMA is updated by its decay rule, never the optimizer).
+        (v_pred, u_pred), (h_states, _) = dynamics_model(
+            actions, sigma, z_tilde,
             head="both", context_length=context_length, time_mask=time_mask,
             task_embeddings=task_embeddings, deterministic=True,
         )
-        v_pred, u_pred = v_u_pair
-        return v_pred, u_pred, h_t
 
-    (v_pred, u_pred, h_states), (_dv, du_dsigma, _dh) = jax.jvp(
-        _fwd, (z_tilde, sigma), (w, sigma_tangent)
-    )
+        def _u_fwd_target(z_in, sigma_in):
+            u_t, _ = target_model(
+                actions, sigma_in, z_in,
+                head="u", context_length=context_length, time_mask=time_mask,
+                task_embeddings=task_embeddings, deterministic=True,
+            )
+            return u_t
+
+        _u_target, du_dsigma = jax.jvp(_u_fwd_target, (z_tilde, sigma), (w, sigma_tangent))
+        du_dsigma = jax.lax.stop_gradient(du_dsigma)
 
     # --- Velocity (flow-matching) loss: L_v ---
     loss_flow, flow_mse_unweighted, mse_per_step = compute_flow_loss(v_pred, w, sigma)

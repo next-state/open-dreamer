@@ -77,6 +77,7 @@ OmegaConf.register_new_resolver("min", lambda *args: min(args))
 def train_step(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
+    dynamics_ema: Dynamics,   # EMA reference network (theta-) for the consistency-loss JVP target
     optimizer: nnx.Optimizer,
     data: jnp.ndarray,        # Full batch: videos (B, T, H, W, C) or latents (B, T, n_latents, d_bottleneck)
     actions: Actions,         # Full batch (B, T, ...)
@@ -138,6 +139,7 @@ def train_step(
             task_embeddings=None,  # Not used in dynamics pretraining
             ot_cfg=ot_cfg,
             cons_cfg=cons_cfg,
+            target_model=dynamics_ema,  # EMA reference network for the consistency JVP target
         )
 
         return losses['total'], aux
@@ -208,7 +210,9 @@ def run(cfg: DynamicsConfig):
         # Dynamics FLOPs: DuMo runs one shared backbone pass under jax.jvp (forward + tangent)
         # plus the gradient backward through both, i.e. roughly 2x the base forward+backward.
         dynamics_flops = dynamics.estimate_flops(batch_size=B, seq_length=avg_T, n_latents=n_latents)
-        dumo_multiplier = 2.0  # JVP (primal + tangent) over the shared backbone for the consistency target
+        # estimate_flops counts one fwd+bwd (~3 forward-units). DuMo with an EMA target adds an
+        # EMA forward + JVP tangent (~2 forward-units, no backward): (3 + 2) / 3 ≈ 1.7.
+        dumo_multiplier = 1.7
         total_dynamics_flops = dynamics_flops * dumo_multiplier
 
         # Encoder FLOPs: forward-only (no gradients) when using video data
@@ -288,7 +292,7 @@ def run(cfg: DynamicsConfig):
                 # Training step
                 B, T = input_tensor.shape[:2]
                 metrics = train_step(
-                    bundle.tokenizer, bundle.dynamics,
+                    bundle.tokenizer, bundle.dynamics, bundle.dynamics_ema,
                     bundle.dynamics_optimizer, input_tensor, actions,
                     master_key=master_key,
                     step=step,

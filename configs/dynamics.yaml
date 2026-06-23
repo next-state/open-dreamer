@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dumo-u-fix
+run_name: dumo-u-fix-ema
 tokenizer_ckpt: tokenizer
 
 ckpt:
