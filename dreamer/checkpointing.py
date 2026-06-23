@@ -7,11 +7,13 @@ Bundles have `from_pretrained` class methods for loading checkpoints for inferen
 """
 from __future__ import annotations
 
+import gc
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import ClassVar, Self
 
 import jax
+import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from flax import nnx
 from omegaconf import OmegaConf
@@ -42,6 +44,13 @@ from dreamer.utils import from_dict
 class NoOpCheckpointManager(ocp.CheckpointManager):
     """No-op checkpoint manager that does nothing (used when max_to_keep == 0)."""
     def should_save(self, step: int) -> bool: return False
+
+
+def _running_average_leaf(avg, value, count: int):
+    dtype = getattr(avg, "dtype", None)
+    if dtype is not None and jnp.issubdtype(dtype, jnp.inexact):
+        return avg + (value.astype(dtype) - avg) / count
+    return value
 
 
 def build_checkpoint_manager(
@@ -107,6 +116,8 @@ class CheckpointBundle:
         mesh_rules: MeshRules,
         rngs: nnx.Rngs | None = None,
         model_names: set[str] | None = None,
+        average_model_names: set[str] | None = None,
+        average_last_n: int = 1,
     ) -> Self:
         """Load bundle from checkpoint (without optimizers).
 
@@ -118,6 +129,10 @@ class CheckpointBundle:
             mesh_rules: Mesh sharding rules
             rngs: Random number generators (default: Rngs(0))
             model_names: Optional subset of registry keys to load. If None, loads all.
+            average_model_names: Optional subset of loaded model names whose weights
+                should be averaged over the latest `average_last_n` checkpoints.
+            average_last_n: Number of latest checkpoints to average for
+                `average_model_names`. Defaults to 1, which restores only latest.
 
         Returns:
             Bundle with loaded models, unloaded/optimizer fields set to None
@@ -135,10 +150,33 @@ class CheckpointBundle:
         if model_names is not None:
             registry = {k: v for k, v in registry.items() if k in model_names}
 
+        if average_last_n < 1:
+            raise ValueError(f"average_last_n must be >= 1, got {average_last_n}")
+        average_model_names = average_model_names or set()
+        active_average_model_names = (
+            average_model_names if average_last_n > 1 else set()
+        )
+        unknown_average_names = average_model_names - set(registry)
+        if unknown_average_names:
+            raise ValueError(
+                f"Cannot average unloaded models {sorted(unknown_average_names)}. "
+                f"Loaded model names are {sorted(registry)}."
+            )
+
         with ocp.CheckpointManager(checkpoint_path) as checkpoint_manager:
             step = checkpoint_manager.latest_step()
             if step is None:
                 raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
+            steps_to_average = None
+            if active_average_model_names:
+                available_steps = sorted(checkpoint_manager.all_steps(read=True))
+                steps_to_average = available_steps[-average_last_n:]
+                if len(steps_to_average) < average_last_n:
+                    raise FileNotFoundError(
+                        f"Need {average_last_n} checkpoints to average in "
+                        f"{checkpoint_path}, found {len(steps_to_average)}."
+                    )
+                step = steps_to_average[-1]
 
             # Load config from metadata
             meta_restored = checkpoint_manager.restore(
@@ -152,17 +190,48 @@ class CheckpointBundle:
                 cfg = from_dict(config_cls, meta[field_name])
                 models[field_name] = model_cls(cfg, mesh_rules=mesh_rules, rngs=rngs)
 
-            # Restore weights
+            # Restore latest weights for non-averaged models.
             restore_kwargs = {
                 name: ocp.args.StandardRestore(nnx.state(model))
                 for name, model in models.items()
+                if name not in active_average_model_names
             }
-            restore_args = ocp.args.Composite(**restore_kwargs)
-            restored = checkpoint_manager.restore(step, args=restore_args)
+            if restore_kwargs:
+                restore_args = ocp.args.Composite(**restore_kwargs)
+                restored = checkpoint_manager.restore(step, args=restore_args)
 
-            # Update model weights
-            for name, model in models.items():
-                nnx.update(model, restored[name])
+                for name, model in models.items():
+                    if name not in active_average_model_names:
+                        nnx.update(model, restored[name])
+
+                del restored
+
+            # Restore averaged models one checkpoint at a time to avoid keeping
+            # every checkpoint state resident at once.
+            if steps_to_average is not None:
+                for name in sorted(active_average_model_names):
+                    model = models[name]
+                    print(f"Averaging {name} over checkpoint steps {steps_to_average}")
+                    for count, average_step in enumerate(steps_to_average, start=1):
+                        restored = checkpoint_manager.restore(
+                            average_step,
+                            args=ocp.args.Composite(
+                                **{name: ocp.args.StandardRestore(nnx.state(model))}
+                            ),
+                        )[name]
+                        if count == 1:
+                            nnx.update(model, restored)
+                        else:
+                            current = nnx.state(model)
+                            averaged = jax.tree.map(
+                                lambda avg, value: _running_average_leaf(avg, value, count),
+                                current,
+                                restored,
+                            )
+                            nnx.update(model, averaged)
+                            del current, averaged
+                        del restored
+                        gc.collect()
 
         # Build kwargs for dataclass constructor (models + None for optimizers)
         init_kwargs = dict(models)

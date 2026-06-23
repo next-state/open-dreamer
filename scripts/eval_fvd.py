@@ -78,11 +78,18 @@ def generate_videos(cfg):
         use_ema = rollout_type.startswith("ema")
         use_shortcut = rollout_type.endswith("shortcut")
         dynamics_field = "dynamics_ema" if use_ema else "dynamics"
+        ema_checkpoint_average_count = cfg.get("ema_checkpoint_average_count", 1)
+        average_last_n = ema_checkpoint_average_count if use_ema else 1
+        average_model_names = {dynamics_field} if average_last_n > 1 else None
 
         print(f"Loading checkpoint from {ckpt_path} (models: {dynamics_field}, tokenizer)...")
+        if average_model_names:
+            print(f"Averaging latest {average_last_n} EMA checkpoints one by one.")
         bundle = DynamicsCheckpointBundle.from_pretrained(
             ckpt_path, mesh_rules=mesh_rules,
             model_names={dynamics_field, "tokenizer"},
+            average_model_names=average_model_names,
+            average_last_n=average_last_n,
         )
         tokenizer = bundle.tokenizer
         dynamics = getattr(bundle, dynamics_field)

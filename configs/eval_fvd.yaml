@@ -17,6 +17,10 @@ mode: both
 # - shortcut (4 steps) vs diffusion (k_max steps)
 rollout_type: ema_shortcut
 
+# For EMA rollouts, average this many latest dynamics_ema checkpoints.
+# Set to 1 to load only the latest EMA checkpoint.
+ema_checkpoint_average_count: 5
+
 # Generation settings
 num_videos: 256
 ctx_length: 0
