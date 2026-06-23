@@ -13,6 +13,8 @@ checkpoints-2/
 data/
 jelly
 ramp-2
+latents
+tokenizer
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
