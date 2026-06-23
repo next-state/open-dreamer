@@ -251,6 +251,14 @@ class OptimalTransportConfig:
     scale_cost: str = "mean"
 
 
+@dataclass(frozen=True, unsafe_hash=True)
+class ConsistencyConfig:
+    """Stabilisers for the DuMo flow-map (MeanFlow) consistency loss."""
+    correction_clip: float = 1.0   # clip on the (1 - sigma) * du/dsigma JVP correction term
+    adaptive_p: float = 1.0        # MeanFlow adaptive-weight exponent: w = 1 / (err2 + c) ** p
+    adaptive_c: float = 1e-3       # MeanFlow adaptive-weight stabiliser constant
+
+
 @dataclass(frozen=False)
 class CheckpointConfig:
     """Configuration for checkpointing."""
@@ -371,6 +379,9 @@ class DynamicsConfig(BaseExperimentConfig):
     # gets weight (1 - dumo_beta): total = dumo_beta * L_v + (1 - dumo_beta) * L_u
     dumo_beta: float = 0.5
     image_fraction: float = 0.3
+
+    # Flow-map (consistency) loss stabilisers
+    consistency: ConsistencyConfig = field(default_factory=ConsistencyConfig)
 
     # Optimal transport coupling (minibatch OT)
     ot: OptimalTransportConfig = field(default_factory=OptimalTransportConfig)

@@ -24,7 +24,7 @@ from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from dreamer.configs import DynamicsConfig, OptimalTransportConfig
+from dreamer.configs import DynamicsConfig, OptimalTransportConfig, ConsistencyConfig
 from dreamer.data import build_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
@@ -71,7 +71,7 @@ OmegaConf.register_new_resolver("min", lambda *args: min(args))
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("dumo_beta", "B_img", "T", "n_splits", "context_length", "use_latent_data", "ot_cfg"),
+    static_argnames=("dumo_beta", "B_img", "T", "n_splits", "context_length", "use_latent_data", "ot_cfg", "cons_cfg"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -90,6 +90,7 @@ def train_step(
     context_length: int | None,  # None = use is_causal, int = sliding window with local_window_size
     use_latent_data: bool,    # True if data is already latents, False if data is videos
     ot_cfg: OptimalTransportConfig,
+    cons_cfg: ConsistencyConfig,
 ):
     if use_latent_data:
         latents = data
@@ -136,6 +137,7 @@ def train_step(
             time_mask=mask,
             task_embeddings=None,  # Not used in dynamics pretraining
             ot_cfg=ot_cfg,
+            cons_cfg=cons_cfg,
         )
 
         return losses['total'], aux
@@ -179,6 +181,7 @@ def run(cfg: DynamicsConfig):
 
         # Build a plain dataclass OT config for JIT static args.
         ot_cfg = OptimalTransportConfig(**cfg.ot)  # ty: ignore[invalid-argument-type]
+        cons_cfg = ConsistencyConfig(**cfg.consistency)  # ty: ignore[invalid-argument-type]
 
         # Check if using latent data (pre-tokenized)
         use_latent_data = cfg.dataset.data_type == "latent"
@@ -296,6 +299,7 @@ def run(cfg: DynamicsConfig):
                     context_length=cfg.dynamics.context_length,
                     use_latent_data=use_latent_data,
                     ot_cfg=ot_cfg,
+                    cons_cfg=cons_cfg,
                 )
 
                 # EMA update

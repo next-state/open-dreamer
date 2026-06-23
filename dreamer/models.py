@@ -1210,19 +1210,13 @@ class Dynamics(nnx.Module):
             mesh_rules=mesh_rules, rngs=rngs,
         )
 
-        # DuMo dual heads, both predicting the clean latent in x-space:
-        #   flow_x_head    -> velocity / instantaneous head (multi-step, flow-matching target).
-        #                     Zero-init; the flow loss target is the (nonzero) data, so the head
-        #                     receives gradient at init.
-        #   flow_map_head  -> flow-map / consistency head (few-step, self-consistency target).
-        #                     Zero-init too, BUT read out with a skip connection from the (noisy)
-        #                     input latent: x_u = z_tilde + flow_map_head(features). In x-space the
-        #                     consistency residual is (1 - sigma) * dG/dsigma; without the skip a
-        #                     zero head gives G == 0 (a spurious self-consistent collapse with no
-        #                     boundary grounding). With the skip, at init G == z_tilde and the
-        #                     skip's JVP tangent re-injects dz_tilde/dsigma = (z1 - z0) — exactly
-        #                     the velocity term that algebraically cancelled — so the residual is
-        #                     the gentle, data-grounded (1 - sigma) * (z1 - z0).
+        # DuMo dual heads, both predicting in velocity space from the shared backbone:
+        #   flow_x_head    -> velocity head v_θ (multi-step flow matching; target v = z1 - z0).
+        #   flow_map_head  -> flow-map head u_θ (few-step MeanFlow self-consistency).
+        # Both are zero-initialised and read out directly (no skip connection): the velocity
+        # target (z1 - z0) and the flow-map target (which contains the conditional velocity
+        # z1 - z0) are both non-zero, so each head receives gradient at init with no spurious
+        # self-consistent collapse.
         self.flow_x_head = nnx.Linear(
             cfg.d_model, cfg.d_bottleneck * cfg.packing_factor,
             use_bias=cfg.use_bias,
@@ -1298,9 +1292,9 @@ class Dynamics(nnx.Module):
             sigma: (B, T) float — continuous signal level in [0, 1] (sigma=1 => clean latents)
             unpacked_enc_tokens: (B, T, n_latents, d_bottleneck) unpacked encoder tokens
             head: which DuMo head to read out:
-                  "v"    -> velocity/flow-matching x-prediction (default, used for multi-step sampling)
-                  "u"    -> flow-map/consistency x-prediction (used for few-step sampling)
-                  "both" -> tuple (x_v, x_u) of both predictions (used for DuMo training)
+                  "v"    -> velocity prediction v_θ (default, used for multi-step sampling)
+                  "u"    -> flow-map velocity prediction u_θ (used for few-step sampling)
+                  "both" -> tuple (v_θ, u_θ) of both predictions (used for DuMo training)
             context_length: optional context length for sliding window attention. If provided,
                            creates local_window_size=(context_length - 1, 0) for causal sliding window.
             time_mask: optional (B, 1, T, T) boolean mask for temporal attention
@@ -1308,8 +1302,8 @@ class Dynamics(nnx.Module):
             caches: optional dict of KVCache for each layer
 
         Returns:
-            (x_pred, (h_t, new_caches)) where x_pred is the requested head's prediction, or a
-            tuple (x_v, x_u) when head="both". x_pred has shape (B, T, n_latents, d_bottleneck).
+            (pred, (h_t, new_caches)) where pred is the requested head's velocity prediction, or a
+            tuple (v_θ, u_θ) when head="both". pred has shape (B, T, n_latents, d_bottleneck).
 
         Shapes produced (internal):
             spatial_tokens: (B, T, n_spatial, d_model)
@@ -1374,22 +1368,21 @@ class Dynamics(nnx.Module):
             packed = linear(spatial_tokens)  # (B, T, n_spatial, d_spatial)
             return rearrange(packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
 
-        # Velocity head: direct x-prediction. Flow-map head: skip connection from the noisy input
-        # latent (consistency-style boundary grounding), so x_u = z_tilde + flow_map_head(features).
-        x_v = lambda: _readout(self.flow_x_head)
-        x_u = lambda: unpacked_enc_tokens + _readout(self.flow_map_head)
+        # Velocity head v_θ and flow-map head u_θ: both direct readouts in velocity space.
+        v = lambda: _readout(self.flow_x_head)
+        u = lambda: _readout(self.flow_map_head)
 
         if head == "v":
-            x_pred = x_v()
+            pred = v()
         elif head == "u":
-            x_pred = x_u()
+            pred = u()
         elif head == "both":
-            x_pred = (x_v(), x_u())
+            pred = (v(), u())
         else:
             raise ValueError(f"Unknown head {head!r}; expected 'v', 'u', or 'both'.")
 
         h_t = x[:, :, layout.slices()[Modality.AGENT], :] if task_embeddings is not None else None  # (B,T,n_agent,D) or None
-        return x_pred, (h_t, new_caches)
+        return pred, (h_t, new_caches)
 
     def num_scaling_params(self) -> int:
         """Total params for scaling law analysis (Chinchilla-style, includes all)."""

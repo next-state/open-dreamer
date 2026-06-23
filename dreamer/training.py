@@ -20,7 +20,7 @@ from flax import nnx
 import optax
 import time
 
-from dreamer.configs import DynamicsConfig, HeadsConfig, OptimalTransportConfig
+from dreamer.configs import DynamicsConfig, HeadsConfig, OptimalTransportConfig, ConsistencyConfig
 from dreamer.generation import DenoiseSchedule
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
@@ -215,18 +215,17 @@ def compute_flow_loss(
     sigma: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Flow matching loss in x-space (direct prediction of clean latents).
-    
+    Flow-matching loss in velocity space (direct prediction of the velocity v = z1 - z0).
+
     Args:
-        z_pred: (B, T, S, D) Predicted clean latents
-        z_target: (B, T, S, D) Ground truth clean latents
+        z_pred: (B, T, S, D) Predicted velocity v_θ
+        z_target: (B, T, S, D) Conditional velocity target v = z1 - z0
         sigma: (B, T) Signal levels (used for weighting)
-        per_example: If True, return (B, T) losses; else return scalar
-        
+
     Returns:
         loss: Tuple[jnp.float32, jnp.float32]
             mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
-            mse_per_token: tuple of scalars. MSE loss 
+            mse_per_token: tuple of scalars. MSE loss
     """
     mse_per_token = (z_pred - z_target) ** 2  # (B, T, S, D)
     mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
@@ -237,51 +236,71 @@ def compute_flow_loss(
 
 
 def compute_consistency_loss(
-    z_pred_u: jnp.ndarray,
-    dz_pred_u_dsigma: jnp.ndarray,
+    u_pred: jnp.ndarray,
+    du_dsigma: jnp.ndarray,
+    v_target: jnp.ndarray,
     sigma: jnp.ndarray,
-    clip: float = 4.0,
+    *,
+    correction_clip: float = 1.0,
+    adaptive_p: float = 1.0,
+    adaptive_c: float = 1e-3,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    DuMo flow-map (self-consistency) loss in x-space.
+    DuMo flow-map (self-consistency) loss in velocity space.
 
-    The flow-map head G(z_tilde, sigma) predicts the clean latent directly (x-space). DuMo's
-    MeanFlow identity in velocity space, u = v - t * du/dt, becomes — after substituting
-    t = 1 - sigma and the x-prediction u = (z_tilde - G) / t — the clean x-space target
+    The flow-map head predicts the average velocity u_θ(z_tilde, sigma). Along the PF-ODE
+    trajectory (parameterised by the signal level sigma, with dz_tilde/dsigma = z1 - z0 and
+    dsigma/dsigma = 1) the MeanFlow identity reads
 
-        g_target = stop_grad( G + (1 - sigma) * dG/dsigma )
+        u = v + (1 - sigma) * du/dsigma
 
-    where dG/dsigma is the total derivative of the flow-map prediction along the PF-ODE
-    trajectory (its JVP w.r.t. (z_tilde, sigma) in the tangent direction (z1 - z0, 1)). The
-    derivation uses the algebraic collapse x_t - t * v_t = x1 (clean data), so the data term
-    cancels and the residual the network is trained to shrink is exactly (1 - sigma) * dG/dsigma
-    — i.e. the flow-map prediction is pushed to be invariant along the trajectory. We keep the
-    loss in x-space (plain MSE, no 1/(1-sigma) weighting), matching the codebase's x-space
-    prediction design.
+    where v = z1 - z0 is the (conditional) instantaneous velocity and du/dsigma is the total
+    derivative of u_θ along the trajectory (its JVP w.r.t. (z_tilde, sigma) in the tangent
+    (z1 - z0, 1)). With theta- (stop-gradient on the online params) the target is
+
+        u_target = stop_grad( v + (1 - sigma) * du/dsigma )
+
+    and the loss is the L2 ||u_θ - u_target||^2. Keeping the loss in velocity space anchors the
+    flow-map head to data at the clean boundary: as sigma -> 1 the correction vanishes and
+    u_target -> v = z1 - z0, directly supervising u_θ with the conditional velocity.
+
+    Two MeanFlow stabilisers guard against the JVP-magnitude runaway (du/dsigma blowing up as the
+    velocity field sharpens):
+      * correction_clip: the (1 - sigma) * du/dsigma term is clipped (the anchor v_target is left
+        untouched), bounding the worst-case target without distorting the boundary supervision.
+      * adaptive weighting w = 1 / (err2 + c)^p: each (B, T) sample is normalised by its own
+        (detached) error so a few large-JVP samples cannot dominate the gradient.
 
     Args:
-        z_pred_u: (B, T, S, D) Flow-map head clean-latent prediction G (gradient-carrying)
-        dz_pred_u_dsigma: (B, T, S, D) JVP tangent dG/dsigma (from jax.jvp)
+        u_pred: (B, T, S, D) Flow-map head velocity prediction u_θ (gradient-carrying)
+        du_dsigma: (B, T, S, D) JVP tangent du/dsigma (from jax.jvp)
+        v_target: (B, T, S, D) Conditional velocity v = z1 - z0
         sigma: (B, T) Signal levels
-        clip: Symmetric clip applied to the (detached) target for stability
+        correction_clip: symmetric clip on the (1 - sigma) * du/dsigma correction term
+        adaptive_p: MeanFlow adaptive-weight exponent (0 disables; 1.0 = standard adaptive L2)
+        adaptive_c: MeanFlow adaptive-weight stabiliser constant
 
     Returns:
-        loss: scalar mean MSE consistency loss
-        unweighted_mse: scalar mean MSE (== loss; returned for API symmetry/logging)
-        target_norm: scalar mean |(1 - sigma) * dG/dsigma| diagnostic
+        loss: scalar adaptive-weighted consistency loss (training objective)
+        unweighted_mse: scalar mean (unweighted) MSE (the metric to monitor)
+        target_norm: scalar mean |(1 - sigma) * du/dsigma| diagnostic (raw, pre-clip)
     """
-    one_minus_sigma = (1.0 - sigma)[..., None, None]
-    correction = one_minus_sigma * dz_pred_u_dsigma                  # (1 - sigma) * dG/dsigma
+    # Clip the correction itself (not the whole target) so the conditional-velocity anchor
+    # v_target is never distorted; diagnose with the raw (pre-clip) magnitude.
+    raw_correction = (1.0 - sigma)[..., None, None] * du_dsigma       # (1 - sigma) * du/dsigma
+    correction = jnp.clip(raw_correction, -correction_clip, correction_clip)
 
-    g_target = jax.lax.stop_gradient(z_pred_u + correction)
-    g_target = jnp.clip(g_target, -clip, clip)
+    u_target = jax.lax.stop_gradient(v_target + correction)
 
-    cons_per_token = (z_pred_u - g_target) ** 2
-    cons_per_step = jnp.mean(cons_per_token, axis=(2, 3))            # (B, T)
+    cons_per_step = jnp.mean((u_pred - u_target) ** 2, axis=(2, 3))   # (B, T)
 
-    target_norm = jnp.mean(jnp.abs(jax.lax.stop_gradient(correction)))
+    # MeanFlow adaptive weighting: weighted mean is the training loss, unweighted is the metric.
+    weight = jax.lax.stop_gradient(1.0 / (cons_per_step + adaptive_c) ** adaptive_p)  # (B, T)
+    cons_loss = jnp.mean(weight * cons_per_step)
     cons_mse = jnp.mean(cons_per_step)
-    return cons_mse, cons_mse, target_norm
+
+    target_norm = jnp.mean(jnp.abs(jax.lax.stop_gradient(raw_correction)))
+    return cons_loss, cons_mse, target_norm
 
 
 # ---------------------------
@@ -300,16 +319,17 @@ def dumo_forcing_step(
     time_mask: jnp.ndarray | None = None,
     task_embeddings: jnp.ndarray | None = None,
     ot_cfg: OptimalTransportConfig = OptimalTransportConfig(),
+    cons_cfg: ConsistencyConfig = ConsistencyConfig(),
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
     Compute DuMo dual-momentum losses (velocity flow + flow-map consistency) for a batch.
 
-    DuMo trains two heads from one shared backbone:
-      * velocity head  (flow_x_head):    standard flow-matching x-prediction -> L_v
-      * flow-map head  (flow_map_head):  MeanFlow self-consistency x-prediction -> L_u
+    DuMo trains two heads from one shared backbone, both in velocity space:
+      * velocity head  (flow_x_head):    standard flow-matching velocity prediction -> L_v
+      * flow-map head  (flow_map_head):  MeanFlow self-consistency velocity prediction -> L_u
 
     Both losses are applied to every sample (no bootstrap subset). The consistency target uses
-    the true Jacobian-vector product dG/dsigma (via jax.jvp over the shared backbone + flow-map
+    the true Jacobian-vector product du/dsigma (via jax.jvp over the shared backbone + flow-map
     head), evaluated along the PF-ODE trajectory with tangent (z1 - z0, 1) and stop-gradient on
     the target (theta- = stop-grad of the current online params). Diffusion forcing is preserved:
     sigma is sampled per-(batch, time) and the temporal/image structure is carried by time_mask.
@@ -327,6 +347,7 @@ def dumo_forcing_step(
         time_mask: optional (B, 1, T, T) boolean mask for temporal attention.
         task_embeddings: Optional (B, T, n_agent, d_model) agent tokens.
         ot_cfg: OT coupling settings.
+        cons_cfg: flow-map consistency-loss stabilisers (correction clip + adaptive weighting).
 
     Returns:
         losses: Dict with 'total', 'flow', 'consistency' keys.
@@ -352,9 +373,9 @@ def dumo_forcing_step(
 
     # --- Trajectory tangent for the JVP ---
     # The PF-ODE trajectory in the increasing-sigma direction has velocity dz_tilde/dsigma = z1 - z0,
-    # and the conditioning advances as dsigma/dsigma = 1. The total derivative dG/dsigma is then the
+    # and the conditioning advances as dsigma/dsigma = 1. The total derivative du/dsigma is then the
     # JVP of the flow-map prediction at (z_tilde, sigma) in the tangent (z1 - z0, 1).
-    w = latents - z0
+    w = latents - z0                 # conditional velocity v = z1 - z0
     sigma_tangent = jnp.ones_like(sigma)
 
     # --- Dual-head forward pass + JVP over the flow-map head (one shared backbone pass) ---
@@ -362,20 +383,20 @@ def dumo_forcing_step(
     # captured as constants for forward-mode (theta-), while the primals still carry reverse-mode
     # gradient w.r.t. params for the loss backward pass.
     def _fwd(z_in, sigma_in):
-        x_pair, (h_t, _) = dynamics_model(
+        v_u_pair, (h_t, _) = dynamics_model(
             actions, sigma_in, z_in,
             head="both", context_length=context_length, time_mask=time_mask,
             task_embeddings=task_embeddings, deterministic=True,
         )
-        x_v, x_u = x_pair
-        return x_v, x_u, h_t
+        v_pred, u_pred = v_u_pair
+        return v_pred, u_pred, h_t
 
-    (x_v, x_u, h_states), (_dxv, dxu_dsigma, _dh) = jax.jvp(
+    (v_pred, u_pred, h_states), (_dv, du_dsigma, _dh) = jax.jvp(
         _fwd, (z_tilde, sigma), (w, sigma_tangent)
     )
 
     # --- Velocity (flow-matching) loss: L_v ---
-    loss_flow, flow_mse_unweighted, mse_per_step = compute_flow_loss(x_v, latents, sigma)
+    loss_flow, flow_mse_unweighted, mse_per_step = compute_flow_loss(v_pred, w, sigma)
 
     # Split flow MSE by sample type (image-only rows vs temporal sequence rows).
     n_img = min(max(B_img_emp, 0), B)
@@ -399,7 +420,12 @@ def dumo_forcing_step(
     flow_mse_high = jnp.sum(mse_per_step * mask_high) / jnp.maximum(jnp.sum(mask_high.astype(jnp.float32)), 1.0)
 
     # --- Flow-map (self-consistency) loss: L_u ---
-    loss_cons, cons_mse_unweighted, cons_target_norm = compute_consistency_loss(x_u, dxu_dsigma, sigma)
+    loss_cons, cons_mse_unweighted, cons_target_norm = compute_consistency_loss(
+        u_pred, du_dsigma, w, sigma,
+        correction_clip=cons_cfg.correction_clip,
+        adaptive_p=cons_cfg.adaptive_p,
+        adaptive_c=cons_cfg.adaptive_c,
+    )
 
     # --- Combine losses ---
     loss_total = beta * loss_flow + (1.0 - beta) * loss_cons
@@ -764,8 +790,8 @@ def run_evaluation(
     Also runs x0 and attention visualizations for both online and EMA dynamics.
     """
     T = val_data.shape[1]
-    #assert T > 5, f"Sequence length {T} must be > 5"
-    ctx_length = 0
+    assert T > 5, f"Sequence length {T} must be > 5"
+    ctx_length = 4
     horizon = T - ctx_length
     velocity_steps = dynamics_online.cfg.num_sampling_steps
     flowmap_steps = 4
@@ -930,10 +956,14 @@ def vis_dynamics_step(
     z0 = jax.random.normal(key_noise, latents_norm.shape, dtype=latents.dtype)
     z_tilde = (1.0 - (1.0 - 1e-5) * sigma[..., None, None]) * z0 + sigma[..., None, None] * latents_norm
 
-    z_pred, _ = dynamics(
+    v_pred, _ = dynamics(
         actions, sigma, z_tilde,
         head=head, context_length=context_length, time_mask=None, task_embeddings=None, deterministic=True,
     )
+
+    # Heads predict velocity; convert to a clean-latent estimate for visualization:
+    # x_hat = z_tilde + (1 - sigma) * v.
+    z_pred = z_tilde + (1.0 - sigma)[..., None, None] * v_pred
 
     return z_tilde, z_pred, latents_norm, sigma
 

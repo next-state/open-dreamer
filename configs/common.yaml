@@ -24,7 +24,7 @@ logger:
   log_gradients: false
 
 # Precision
-dtype: float32
+dtype: bfloat16
 param_dtype: float32
 ema_dtype: ${param_dtype}
 

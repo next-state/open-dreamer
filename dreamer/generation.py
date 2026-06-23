@@ -23,7 +23,7 @@ class DenoiseSchedule:
     Attributes:
         num_steps: number of sampling steps taken during inference.
         tau_values: signal levels used during denoising, τ = [0, d, 2d, ..., 1 - d, 1].
-        beta_values: x-prediction Euler/DDIM mixing coefficients, beta[s] = (1 - τ[s+1]) / (1 - τ[s]).
+        beta_values: DDIM/Euler mixing coefficients, beta[s] = (1 - τ[s+1]) / (1 - τ[s]).
         tau_ctx: (continuous) noise level applied to context frames during autoregressive rollout.
     """
 
@@ -70,10 +70,10 @@ def next_latent(
     """
     JAX-friendly τ-ladder denoiser for a single future latent with KV caching.
 
-    Each step predicts the clean latent with the requested DuMo head (x-prediction) and applies
-    an x-prediction Euler/DDIM mixing step toward it. With head="v" and many num_steps this is
-    the multi-step velocity sampler; with head="u" and small num_steps it is DuMo's few-step
-    flow-map sampler.
+    Each step predicts the velocity with the requested DuMo head, converts it to a clean-latent
+    estimate (x_hat = z_tilde + (1 - sigma) * v) and applies a DDIM/Euler mixing step toward it
+    (equivalent to a velocity Euler step). With head="v" and many num_steps this is the multi-step
+    velocity sampler; with head="u" and small num_steps it is DuMo's few-step flow-map sampler.
 
     Args:
         dynamics: Dynamics NNX model
@@ -131,14 +131,18 @@ def next_latent(
             sigma_curr    = jnp.full((B, 1), tau_val, dtype=jnp.float32)
             sigma         = jnp.concatenate([sigma_prefill, sigma_decode, sigma_curr], axis=1)        # (B, T_ctx+1)
 
-        # Dynamics call
-        latent_clean_pred_seq, (h_seq, _) = dynamics(
+        # Dynamics call (heads predict velocity)
+        velocity_pred_seq, (h_seq, _) = dynamics(
             actions_input, sigma, latent_input,
             head=head, task_embeddings=task_embedding, deterministic=True, caches=caches
         )
 
-        latent_clean_pred = latent_clean_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
+        velocity_pred = velocity_pred_seq[:, -1:, :, :]  # (B, 1, n_spatial, D_s)
         h_last = h_seq[:, -1:, :, :] if isinstance(h_seq, jax.Array) else h_seq  # (B, n_agent, d_model)
+
+        # Convert velocity to a clean-latent estimate: x_hat = z_tilde + (1 - sigma) * v.
+        # Mixing toward x_hat below is then exactly the velocity Euler step.
+        latent_clean_pred = latent_t + (1.0 - tau_val) * velocity_pred
 
         # Per-step ODE diagnostics
         x0_norm = jnp.mean(jnp.abs(latent_clean_pred))

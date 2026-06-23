@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dumo-img-fp32
+run_name: dumo-u-fix
 tokenizer_ckpt: tokenizer
 
 ckpt:
@@ -12,12 +12,12 @@ ckpt:
 
 dataset:
   dataloader_cfg:
-    B: 128
+    B: 8
     num_workers: 16
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
-    short_T: 1
-    long_T: 1
+    short_T: 64
+    long_T: 64
     long_ratio: 0.1  # Fraction of batches that use long_T
 
 dynamics:
@@ -55,6 +55,12 @@ ema_decay: 0.999
 max_steps: 200_000
 dumo_beta: 0.7  # Weight on velocity (flow) head; flow-map (consistency) head gets (1 - dumo_beta)
 image_fraction: 0.0  # Fraction of batch to train as images (no temporal attention)
+
+# Flow-map (consistency) loss stabilisers (MeanFlow JVP runaway control)
+consistency:
+  correction_clip: 1.0  # clip on the (1 - sigma) * du/dsigma JVP correction
+  adaptive_p: 1.0       # adaptive-weight exponent: w = 1 / (err2 + c) ** p
+  adaptive_c: 1.0e-3    # adaptive-weight stabiliser constant
 
 # Optimal transport coupling (minibatch OT)
 ot:
