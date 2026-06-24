@@ -18,7 +18,7 @@ logger:
   run_name: ${run_name}
   use_wandb: ${use_wandb}
   wandb_entity: Null
-  wandb_project: tiny_dreamer_4
+  wandb_project: dumo
   log_every: 100
   max_steps: ${max_steps}
   log_gradients: false

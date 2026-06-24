@@ -7,6 +7,10 @@ slurm_outs/
 wandb/
 run_job.sh
 logs
+data
+latents
+tokenizer
+jelly
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

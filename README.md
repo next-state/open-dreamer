@@ -84,6 +84,62 @@ python scripts/train_policy.py heads_ckpt=./logs/heads/checkpoints
 
 All scripts save checkpoints under `logs/{run_name}/checkpoints/` by default. You can also enable wandb logging by adding `use_wandb=True` to the launch command. We use hydra to manage the configurations in `/configs`.
 
+## Learned perturbation matching (Qφ)
+
+An optional dynamics-training mode that *learns* the perturbation injected into context
+frames instead of using fixed Gaussian forcing. A small causal network `Qφ` models the
+world model's per-frame error distribution `p(e | z, t)`; we sample from it and add the
+perturbation to the context, so the world model learns to denoise realistic,
+content-dependent context errors. It targets autoregressive **exposure bias** (at inference
+the model conditions on its own imperfect frames). See `dreamer/qphi.py`,
+`QphiModelConfig`, and the integration in `shortcut_forcing_step` / `train_dynamics.py`.
+
+Key properties: `Qφ` outputs an explicit per-frame distribution (low-rank-plus-diagonal
+Gaussian base + identity-initialised normalizing flow) trained by exact `log_prob`; it has a
+**separate optimizer**; the injected perturbation is **detached** into the world model (so
+`L_world` cannot collapse `Qφ`) and the matching target `e` is **stop-gradient**. It is
+gated behind `qphi.enabled` — with it `false` (the default) training is bit-for-bit the
+vanilla baseline.
+
+> Note on this repo's σ convention: `σ` is a *signal* level (`σ=1` clean, `σ=0` max noise),
+> inverted vs. the usual diffusion `t`. The perturbation is injected at the max-noise
+> operating point, so `qphi.t_query=0.0` (not 1.0). Implementation is the single-pass
+> approximation: the perturbation is added to every frame's input (which serves as both
+> target-input and context in this block-causal model), with the regression label left
+> clean.
+
+```bash
+# Baseline (vanilla diffusion forcing) — identical to leaving qphi out entirely
+python scripts/train_dynamics.py tokenizer_ckpt=./logs/tokenizer/checkpoints qphi.enabled=false
+
+# Ablations (paper config points). type ∈ {none, gaussian_iso, gaussian_lowrank, flow}:
+python scripts/train_dynamics.py tokenizer_ckpt=... qphi.enabled=true qphi.type=none              # fixed-Gaussian forcing
+python scripts/train_dynamics.py tokenizer_ckpt=... qphi.enabled=true qphi.type=gaussian_iso      # learned isotropic
+python scripts/train_dynamics.py tokenizer_ckpt=... qphi.enabled=true qphi.type=gaussian_lowrank  # learned anisotropic
+python scripts/train_dynamics.py tokenizer_ckpt=... qphi.enabled=true qphi.type=flow              # full module
+# lambda sweep on any of the above (over-provision robustness; prior λ ≥ 1):
+python scripts/train_dynamics.py tokenizer_ckpt=... qphi.enabled=true qphi.type=flow qphi.lam=1.5
+```
+
+Training logs `qphi/pert_norm`, `qphi/e_norm` (matching-sanity / anti-collapse monitors),
+and `qphi/loss`, `qphi/grad_norm`, `qphi/alpha` (warmup mix).
+
+**Exposure-bias rollout eval (the payoff metric).** Tune `λ` on this rollout metric, never
+on `qphi/loss` (which is teacher-forced and cannot see the rollout gap). Run it per
+checkpoint and overlay the CSVs:
+
+```bash
+python scripts/eval_exposure_bias.py dynamics_ckpt=./logs/<run>/checkpoints \
+    ctx_length=8 horizon=32 num_steps=4 tag=<none|lowrank|flow|lam1.5> \
+    output_dir=eval_outputs/exposure_bias
+```
+
+It writes per-frame normalised-latent-MSE and decoded-PSNR curves (`*.csv` + `*.png`).
+Success = lower error growth over the horizon than `type=none` (vanilla DF).
+
+Acceptance tests for all of the above (baseline reproducibility, gradient isolation, detach,
+anti-collapse, exact density) live in `tests/test_qphi.py` (`pytest tests/test_qphi.py`).
+
 ## Experimental Results
 A log of the training process.
 

@@ -1,0 +1,30 @@
+defaults:
+  - dataset: minecraft_vpt_latent   # override with e.g. dataset=coinrun
+  - _self_
+
+dynamics_ckpt: logs/dynamics-pre-final/checkpoints   # Required: DynamicsCheckpointBundle dir
+
+run_name: eval_exposure_bias
+tag: rollout                # label for output files (e.g. none / lowrank / flow / lam1.5)
+use_wandb: false
+parallel_strategy: data
+seed: 0
+
+# Rollout settings
+ctx_length: 8               # held-out prompt length
+horizon: 32                 # autoregressive frames to generate + score
+num_steps: 4                # few-step sampler steps (paper uses 4)
+num_batches: 4              # held-out batches to average the curve over
+
+dataset:
+  dataloader_cfg:
+    B: 8
+    short_T: 64             # must be >= ctx_length + horizon
+    long_T: 64
+    long_ratio: 0.0
+
+output_dir: eval_outputs/exposure_bias
+
+hydra:
+  run:
+    dir: ${output_dir}

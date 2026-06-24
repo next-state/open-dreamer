@@ -3,8 +3,8 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: dynamics-pre-final
-tokenizer_ckpt: logs/tokenizer-500M/checkpoints
+run_name: pert-matching
+tokenizer_ckpt: tokenizer
 
 ckpt:
   max_to_keep: 1
@@ -17,12 +17,12 @@ dataset:
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
     short_T: 64
-    long_T: 256
+    long_T: 64
     long_ratio: 0.1  # Fraction of batches that use long_T
 
 dynamics:
     d_bottleneck: 16
-    depth: 30
+    depth: 8
     d_model: ${mul:64,${dynamics.depth}}
     n_heads: ${floordiv:${dynamics.d_model},64}
     n_kv_heads: ${max:1,${floordiv:${dynamics.n_heads},8}}
@@ -49,6 +49,33 @@ dynamics:
     num_binary_actions: ${dataset.num_binary_actions}
     categorical_action_dim: ${dataset.categorical_action_dim}
     continuous_action_dim: ${dataset.continuous_action_dim}
+
+# Learned perturbation matching (Qphi). Defaults below are baseline-preserving:
+# enabled=false reproduces vanilla diffusion forcing bit-for-bit. Paper ablations are
+# just config points (override on the CLI), e.g.:
+#   qphi.enabled=true qphi.type=none              # fixed-Gaussian forcing
+#   qphi.enabled=true qphi.type=gaussian_iso      # learned isotropic
+#   qphi.enabled=true qphi.type=gaussian_lowrank  # learned anisotropic (theory's minimal)
+#   qphi.enabled=true qphi.type=flow              # full module
+#   ... then sweep qphi.lam in {1.0, 1.5, 2.0}.
+# NOTE: t_query is in this repo's signal-sigma convention (0.0 = max noise), NOT 1.0.
+qphi:
+  enabled: true
+  type: flow            # none | gaussian_iso | gaussian_lowrank | flow
+  d_model: 256
+  depth: 2
+  n_heads: 4
+  rank: 16
+  n_flow_layers: 4
+  flow_hidden: 128
+  lam: 1.0
+  t_query: 0.0          # signal-sigma for injection sampling (0 = max-noise operating point)
+  warmup_steps: 2000    # anneal fixed-Gaussian -> Qphi samples
+  pert_clip: 4.0
+  lr: 1e-4
+  optimizer: adamw
+  weight_decay: 0.0
+  grad_clip: 1.0
 
 ema_decay: 0.999
 
@@ -91,4 +118,4 @@ optimizer:
   muon_nesterov: true
   muon_ns_steps: 5
 
-write_video_every: 0
+write_video_every: 5_000

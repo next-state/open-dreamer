@@ -169,6 +169,69 @@ class DynamicsModelConfig:
     latent_std: tuple[float, ...] | None = None
 
 
+@dataclass(frozen=False, unsafe_hash=True)
+class QphiModelConfig:
+    """Configuration for the learned perturbation network Qphi (perturbation matching).
+
+    Qphi is a *small* causal network that models the per-frame world-model error
+    distribution p(e | z, t) and supplies a learned replacement for fixed-Gaussian
+    context forcing. All defaults are baseline-preserving: with ``enabled=False`` the
+    dynamics training path is bit-for-bit identical to the un-instrumented baseline.
+
+    Note on the ``t`` convention: this repo's ``sigma``/``tau`` is a *signal* level
+    (sigma=1 -> clean, sigma=0 -> max noise), which is inverted relative to the usual
+    diffusion ``t``. We inject the perturbation at the *maximum-noise* operating point,
+    so ``t_query`` defaults to ``0.0`` in this signal-sigma convention (NOT 1.0).
+    """
+    enabled: bool = False                 # master switch; False => baseline behaviour
+    type: str = "none"                    # none | gaussian_iso | gaussian_lowrank | flow
+
+    # Per-frame error dimensionality. d_e = n_latents * d_bottleneck. Set at build time
+    # from the tokenizer/dynamics configs so it always matches the latent space.
+    n_latents: int = 16
+    d_bottleneck: int = 16
+
+    # Conditioning backbone: small causal transformer over the CLEAN latent sequence.
+    d_model: int = 256
+    depth: int = 2
+    n_heads: int = 4
+    mlp_ratio: float = 4.0
+
+    # Distribution head.
+    rank: int = 16                        # low-rank factor r << d_e (anisotropy)
+    n_flow_layers: int = 4                # affine coupling layers (type=flow only)
+    flow_hidden: int = 128
+    flow_logscale_clamp: float = 2.0      # bound on coupling log-scale (identity at 0)
+    s_floor: float = 1e-4                 # diagonal variance floor (softplus + floor)
+
+    # Injection / matching.
+    lam: float = 1.0                      # lambda perturbation scale (prior >= 1)
+    t_query: float = 0.0                  # signal-sigma for injection sampling (0 = max noise)
+    warmup_steps: int = 2000              # anneal fixed-Gaussian -> Qphi samples
+    pert_clip: float = 4.0                # clamp |pert| during warmup for stability
+
+    # Optimizer (kept SEPARATE from the world-model optimizer).
+    lr: float = 1e-4
+    optimizer: str = "adamw"              # adamw (only option wired for now)
+    b1: float = 0.9
+    b2: float = 0.99
+    eps: float = 1e-8
+    weight_decay: float = 0.0
+    grad_clip: float = 1.0                # global-norm clip on Qphi grads (0 = off)
+
+    dtype: str = "float32"
+    param_dtype: str = "float32"
+
+    @property
+    def d_e(self) -> int:
+        return self.n_latents * self.d_bottleneck
+
+    @property
+    def trainable(self) -> bool:
+        """Whether the matching loss trains a network (type=none is a fixed Gaussian)."""
+        return self.enabled and self.type != "none"
+
+
 @dataclass(frozen=False)
 class TaskEmbedderModelConfig:
     """Model configuration for task embedder."""
@@ -364,6 +427,9 @@ class DynamicsConfig(BaseExperimentConfig):
 
     # Model
     dynamics: DynamicsModelConfig = field(default_factory=DynamicsModelConfig)
+
+    # Learned perturbation matching (Qphi). Defaults are baseline-preserving (enabled=False).
+    qphi: QphiModelConfig = field(default_factory=QphiModelConfig)
 
     # Training
     bootstrap_start: int = 5_000  # Number of start steps trained exclusively on flow-matching objective

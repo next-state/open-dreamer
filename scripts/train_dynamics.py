@@ -24,10 +24,11 @@ from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from dreamer.configs import DynamicsConfig, OptimalTransportConfig
+from dreamer.configs import DynamicsConfig, OptimalTransportConfig, QphiModelConfig
 from dreamer.data import build_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
+from dreamer.qphi import Qphi
 from dreamer.actions import Actions, shift_actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES
 from dreamer.parallel import build_parallel, MeshRules
 from dreamer.scaling import ScalingContext
@@ -71,7 +72,7 @@ OmegaConf.register_new_resolver("min", lambda *args: min(args))
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "B_img", "T", "n_splits", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
+    static_argnames=("k_max", "B_img", "T", "n_splits", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg", "qphi_enabled", "qphi_cfg"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -92,6 +93,10 @@ def train_step(
     bootstrap_fraction: float,
     use_latent_data: bool,    # True if data is already latents, False if data is videos
     ot_cfg: OptimalTransportConfig,
+    qphi=None,                # Qphi perturbation network (None when disabled)
+    qphi_optimizer=None,      # Separate optimizer for Qphi (None when disabled)
+    qphi_enabled: bool = False,
+    qphi_cfg=None,            # QphiModelConfig (static)
 ):
     if use_latent_data:
         latents = data
@@ -129,7 +134,17 @@ def train_step(
     # Training step
     step_key = jax.random.fold_in(master_key, step)
 
-    def loss_fn(model: Dynamics, latents, actions, mask, context_length):
+    # Qphi: warmup mix (fixed-Gaussian -> Qphi samples) and a SEPARATE rng stream so the
+    # dynamics noise/sigma stream is untouched (baseline reproducibility when disabled).
+    if qphi_enabled:
+        qphi_key = jax.random.fold_in(step_key, 777)
+        warmup = qphi_cfg.warmup_steps
+        qphi_alpha = 1.0 if warmup <= 0 else jnp.clip(step / warmup, 0.0, 1.0)
+    else:
+        qphi_key, qphi_alpha = None, 1.0
+
+    # --- World-model loss (gradients wrt dynamics only; Qphi passed but not differentiated) ---
+    def world_loss_fn(model: Dynamics, qphi_model, latents, actions, mask, context_length):
         losses, aux = shortcut_forcing_step(
             dynamics_model=model,
             actions=actions,
@@ -143,12 +158,16 @@ def train_step(
             task_embeddings=None,  # Not used in dynamics pretraining
             bootstrap_model=dynamics_ema,  # EMA as stable target network for half-steps
             ot_cfg=ot_cfg,
+            qphi=qphi_model,
+            qphi_cfg=qphi_cfg,
+            qphi_rng=qphi_key,
+            qphi_alpha=qphi_alpha,
         )
 
         return losses['total'], aux
 
-    (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
-        dynamics,
+    (loss, metrics), grads = nnx.value_and_grad(world_loss_fn, has_aux=True, argnums=0)(
+        dynamics, qphi,
         latents, actions, time_mask, context_length
     )
 
@@ -158,7 +177,44 @@ def train_step(
     # Update model with optimizer
     optimizer.update(dynamics, grads)
 
-    return {**metrics, 'grad_norm': grad_norm}
+    metrics = {**metrics, 'grad_norm': grad_norm}
+
+    # --- Qphi matching loss (SEPARATE optimizer + backward; no shared graph) ---
+    # e and z are stop-gradient targets, so this backward reaches ONLY Qphi params and
+    # the world model receives no gradient from L_match.
+    if qphi_enabled and qphi_cfg.trainable:
+        qphi_e = metrics.pop('qphi_e')
+        qphi_z = metrics.pop('qphi_z')
+        qphi_sigma = metrics.pop('qphi_sigma')
+
+        def match_loss_fn(qphi_model, e, z, sigma):
+            logp = qphi_model.log_prob(e, z, sigma)  # conditioned on the SAME sigma
+            return -jnp.mean(logp)
+
+        loss_match, qphi_grads = nnx.value_and_grad(match_loss_fn, argnums=0)(
+            qphi, qphi_e, qphi_z, qphi_sigma
+        )
+        qphi_optimizer.update(qphi, qphi_grads)
+        metrics['qphi_loss'] = loss_match
+        metrics['qphi_grad_norm'] = optax.global_norm(nnx.state(qphi_grads))
+        metrics['qphi_alpha'] = jnp.asarray(qphi_alpha, dtype=jnp.float32)
+    elif qphi_enabled:
+        # type=none: fixed-Gaussian forcing, no learned network to train.
+        metrics.pop('qphi_e', None)
+        metrics.pop('qphi_z', None)
+        metrics.pop('qphi_sigma', None)
+
+    return metrics
+
+def build_qphi_optimizer(qphi: Qphi, qcfg: QphiModelConfig) -> nnx.Optimizer:
+    """Build the SEPARATE optimizer for Qphi (kept independent of the world model)."""
+    if qcfg.optimizer != "adamw":
+        raise ValueError(f"Unsupported qphi.optimizer: {qcfg.optimizer}")
+    tx = optax.adamw(qcfg.lr, b1=qcfg.b1, b2=qcfg.b2, eps=qcfg.eps, weight_decay=qcfg.weight_decay)
+    if qcfg.grad_clip > 0:
+        tx = optax.chain(optax.clip_by_global_norm(qcfg.grad_clip), tx)
+    return nnx.Optimizer(qphi, tx, wrt=nnx.Param)
+
 
 # ---------------------------
 # Main
@@ -239,12 +295,31 @@ def run(cfg: DynamicsConfig):
         # Build EMA model
         dynamics_ema = build_ema_model(dynamics, ema_dtype=cfg.ema_dtype)
 
+        # Build Qphi (learned perturbation matching). Disabled by default => stays None,
+        # leaving the training path bit-for-bit identical to the baseline.
+        qphi = None
+        qphi_optimizer = None
+        qphi_model_cfg = None
+        if cfg.qphi.enabled:
+            qphi_model_cfg = QphiModelConfig(**OmegaConf.to_container(cfg.qphi, resolve=True))
+            # d_e must match the actual latent space the dynamics regresses in.
+            qphi_model_cfg.n_latents = tokenizer_cfg.encoder.n_latents
+            qphi_model_cfg.d_bottleneck = tokenizer_cfg.encoder.d_bottleneck
+            qphi = Qphi(qphi_model_cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+            qphi_optimizer = build_qphi_optimizer(qphi, qphi_model_cfg)
+            qphi_params = count_parameters_by_component(qphi)["total"]
+            print(f"Qphi enabled: type={qphi_model_cfg.type}, d_e={qphi_model_cfg.d_e}, "
+                  f"rank={qphi_model_cfg.rank}, lam={qphi_model_cfg.lam}, "
+                  f"t_query={qphi_model_cfg.t_query}, params={qphi_params:,}")
+
         # Create checkpoint bundle (includes frozen tokenizer for self-contained checkpoints)
         bundle = DynamicsCheckpointBundle(
             dynamics=dynamics,
             dynamics_ema=dynamics_ema,
             tokenizer=tokenizer,
             dynamics_optimizer=optimizer,
+            qphi=qphi,
+            qphi_optimizer=qphi_optimizer,
         )
 
         dataloader = build_dual_iterator(cfg.dataset, device=data_sharding, dtype=cfg.dtype)
@@ -303,6 +378,10 @@ def run(cfg: DynamicsConfig):
                     bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                     use_latent_data=use_latent_data,
                     ot_cfg=ot_cfg,
+                    qphi=bundle.qphi,
+                    qphi_optimizer=bundle.qphi_optimizer,
+                    qphi_enabled=cfg.qphi.enabled,
+                    qphi_cfg=qphi_model_cfg,
                 )
 
                 # EMA update
@@ -313,22 +392,31 @@ def run(cfg: DynamicsConfig):
                     metrics_cpu = jax.device_get(metrics)
                     if is_main_process:
                         scaling.on_step(step, metrics_cpu)
+                        log_metrics = {
+                            "flow_mse": metrics_cpu["flow_mse"],
+                            "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
+                            "flow_mse_image": metrics_cpu["flow_mse_image"],
+                            "boot_mse": metrics_cpu["bootstrap_mse"],
+                            "grad_norm": metrics_cpu["grad_norm"],
+                            "flow_mse_low": metrics_cpu["flow_mse_low"],
+                            "flow_mse_mid": metrics_cpu["flow_mse_mid"],
+                            "flow_mse_high": metrics_cpu["flow_mse_high"],
+                            "boot_target_norm": metrics_cpu["boot_target_norm"],
+                            "lr": lr_schedule(step),
+                            "T": T // n_splits,
+                            **scaling.get_step_metrics(step),
+                        }
+                        if cfg.qphi.enabled:
+                            # Anti-collapse / matching-sanity monitors (see §6).
+                            log_metrics["qphi/pert_norm"] = metrics_cpu["qphi_pert_norm"]
+                            log_metrics["qphi/e_norm"] = metrics_cpu["qphi_e_norm"]
+                            if "qphi_loss" in metrics_cpu:
+                                log_metrics["qphi/loss"] = metrics_cpu["qphi_loss"]
+                                log_metrics["qphi/grad_norm"] = metrics_cpu["qphi_grad_norm"]
+                                log_metrics["qphi/alpha"] = metrics_cpu["qphi_alpha"]
                         logger.log(
                             step,
-                            metrics={
-                                "flow_mse": metrics_cpu["flow_mse"],
-                                "flow_mse_sequence": metrics_cpu["flow_mse_sequence"],
-                                "flow_mse_image": metrics_cpu["flow_mse_image"],
-                                "boot_mse": metrics_cpu["bootstrap_mse"],
-                                "grad_norm": metrics_cpu["grad_norm"],
-                                "flow_mse_low": metrics_cpu["flow_mse_low"],
-                                "flow_mse_mid": metrics_cpu["flow_mse_mid"],
-                                "flow_mse_high": metrics_cpu["flow_mse_high"],
-                                "boot_target_norm": metrics_cpu["boot_target_norm"],
-                                "lr": lr_schedule(step),
-                                "T": T // n_splits,
-                                **scaling.get_step_metrics(step),
-                            },
+                            metrics=log_metrics,
                             pbar=pbar,
                             pbar_filter=r"^(flow_mse|boot_mse|lr)$",
                         )

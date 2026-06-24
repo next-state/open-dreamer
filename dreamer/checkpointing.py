@@ -196,6 +196,8 @@ class CheckpointBundle:
 
         for field in fields(self):
             field_value = getattr(self, field.name)
+            if field_value is None:  # optional components (e.g. disabled qphi) — skip
+                continue
             restore_kwargs[field.name] = ocp.args.StandardRestore(nnx.state(field_value))
 
         restore_kwargs["rngs"] = ocp.args.StandardRestore({"key": rng})
@@ -206,6 +208,8 @@ class CheckpointBundle:
         # Update bundle fields in-place
         for field in fields(self):
             field_value = getattr(self, field.name)
+            if field_value is None:
+                continue
             nnx.update(field_value, restored[field.name])
 
         rng = restored["rngs"]["key"]
@@ -234,6 +238,8 @@ class CheckpointBundle:
 
         for field in fields(self):
             field_value = getattr(self, field.name)
+            if field_value is None:  # optional components (e.g. disabled qphi) — skip
+                continue
             save_kwargs[field.name] = ocp.args.StandardSave(nnx.state(field_value))
             if hasattr(field_value, 'cfg'):
                 cfg = field_value.cfg
@@ -277,6 +283,11 @@ class DynamicsCheckpointBundle(CheckpointBundle):
     dynamics_ema: Dynamics
     tokenizer: Tokenizer
     dynamics_optimizer: nnx.Optimizer | None = None
+    # Learned perturbation network (None when qphi is disabled). Deliberately NOT in
+    # `_model_registry` so `from_pretrained` keeps loading pre-qphi checkpoints; it is
+    # saved/restored only via the field-introspection path (which skips None fields).
+    qphi: nnx.Module | None = None
+    qphi_optimizer: nnx.Optimizer | None = None
 
 
 @dataclass

@@ -24,7 +24,8 @@ from dreamer.configs import DynamicsConfig, HeadsConfig, OptimalTransportConfig
 from dreamer.generation import DenoiseSchedule
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
-from dreamer.sampler import sample_video
+from dreamer.sampler import sample_video, decode_jit
+from dreamer.generation import latent_rollout
 from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents, unnormalize_latents
 
 
@@ -357,6 +358,10 @@ def shortcut_forcing_step(
     task_embeddings: jnp.ndarray | None = None,
     bootstrap_model: Dynamics | None = None,
     ot_cfg: OptimalTransportConfig = OptimalTransportConfig(),
+    qphi=None,
+    qphi_cfg=None,
+    qphi_rng: jax.Array | None = None,
+    qphi_alpha: jnp.ndarray | float = 1.0,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
     Compute shortcut forcing losses (flow + bootstrap) for a batch.
@@ -431,7 +436,30 @@ def shortcut_forcing_step(
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
     z0 = apply_ot_coupling(z0, latents, key_ot, ot_cfg=ot_cfg)
     z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
-    
+
+    # --- Perturbation matching: inject a learned context perturbation (Qphi) ---
+    # Added at FULL magnitude, sigma-independent (outside the (1-σ)z0+σz interpolation),
+    # so the context error is present regardless of the target's noise level. The flow
+    # regression target stays the clean `latents` (never perturbed). pert is detached:
+    # NO gradient flows from the world-model loss into Qphi (the collapse guard).
+    qphi_enabled = qphi is not None and qphi_cfg is not None and qphi_cfg.enabled
+    pert_norm = jnp.array(0.0, dtype=latents.dtype)
+    if qphi_enabled:
+        key_gauss, key_qsample = jax.random.split(qphi_rng)
+        # Fixed-Gaussian forcing: the warmup starting point and the `type=none` baseline.
+        pert = jax.random.normal(key_gauss, latents.shape, dtype=latents.dtype)
+        if qphi_cfg.trainable:
+            t_query = jnp.full((B, T), qphi_cfg.t_query, dtype=latents.dtype)
+            pert_learned = jax.lax.stop_gradient(
+                qphi.sample(latents, t_query, key_qsample)
+            ).astype(latents.dtype)
+            alpha = jnp.asarray(qphi_alpha, dtype=latents.dtype)  # warmup mix in [0, 1]
+            pert = (1.0 - alpha) * pert + alpha * pert_learned
+        pert = jnp.clip(pert, -qphi_cfg.pert_clip, qphi_cfg.pert_clip)
+        pert = jax.lax.stop_gradient(pert)  # MANDATORY collapse guard
+        z_tilde = z_tilde + qphi_cfg.lam * pert
+        pert_norm = jnp.mean(jnp.sqrt(jnp.sum(pert[:B_emp] ** 2, axis=(2, 3))))
+
     # --- Forward pass (full batch) ---
     rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
@@ -442,6 +470,15 @@ def shortcut_forcing_step(
     # --- Flow loss (empirical rows) ---
     z_pred_emp = z_pred_full[:B_emp]
     loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
+
+    # --- Perturbation-matching target (empirical rows) ---
+    # e[t] = (x0_hat[t] - z[t]).detach(), the model's clean-frame residual at this step's
+    # random sigma. The world model predicts x0 directly (x-space), so x0_hat == z_pred;
+    # no velocity->x0 conversion is needed. `e` is a stop-gradient target for Qphi.
+    if qphi_enabled:
+        qphi_e = jax.lax.stop_gradient(z_pred_emp - latents[:B_emp])
+        qphi_z = jax.lax.stop_gradient(latents[:B_emp])
+        qphi_e_norm = jnp.mean(jnp.sqrt(jnp.sum(qphi_e ** 2, axis=(2, 3))))
 
     # Split flow MSE by empirical sample type (image-only rows vs temporal sequence rows).
     n_img_emp = min(max(B_img_emp, 0), B_emp)
@@ -525,8 +562,18 @@ def shortcut_forcing_step(
         'boot_target_norm': boot_target_norm,
         'h_states': h_states,
     }
-    
-    
+
+    if qphi_enabled:
+        # Tensors for the SEPARATE Qphi matching backward (computed by the caller).
+        # `qphi_e`/`qphi_z` are stop-gradient; `qphi_sigma` is the same sigma the world
+        # model used this step (log_prob is conditioned on it). Diagnostics: matching
+        # sanity compares mean ||e|| vs mean ||pert|| (anti-collapse monitor).
+        aux['qphi_e'] = qphi_e
+        aux['qphi_z'] = qphi_z
+        aux['qphi_sigma'] = sigma_emp
+        aux['qphi_e_norm'] = qphi_e_norm
+        aux['qphi_pert_norm'] = pert_norm
+
     return losses, aux
 
 
@@ -1003,6 +1050,64 @@ def run_evaluation(
 
         if video_written:
             logger.log_video(step, "eval/rollouts_grid/video", mp4_path)
+
+
+# ---------------------------
+# Exposure-bias rollout metric (§6.6)
+# ---------------------------
+
+def rollout_error_curve(
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
+    *,
+    latents: jnp.ndarray,      # (B, T, n_latents, d_bottleneck) clean GT latents
+    actions: Actions,          # (B, T, ...)
+    ctx_length: int,
+    horizon: int,
+    schedule: DenoiseSchedule,
+    rng: jax.Array,
+) -> Dict[str, jnp.ndarray]:
+    """Per-frame autoregressive-rollout error vs ground truth — the exposure-bias curve.
+
+    Rolls out `horizon` frames from a `ctx_length` prompt using ground-truth future
+    actions, then measures, per generated frame, (a) normalised latent MSE and (b) decoded
+    PSNR against the ground-truth continuation. Lower error *growth* over the horizon is the
+    payoff of perturbation matching (compare type=none vs gaussian_lowrank vs flow, and a
+    lam sweep). Qphi is NOT used here: the metric depends only on rollout quality, so it is
+    agnostic to how the model was trained.
+
+    Returns a dict with 'latent_mse' (horizon,) and 'psnr' (horizon,).
+    """
+    total = ctx_length + horizon
+    assert latents.shape[1] >= total, f"need >= {total} frames, got {latents.shape[1]}"
+    latents = latents[:, :total]
+    actions = actions[:, :total]
+
+    latents_ctx = latents[:, :ctx_length]
+    actions_ctx = actions[:, :ctx_length]
+    actions_future = actions[:, ctx_length:total]
+
+    result = latent_rollout(
+        dynamics, policy=actions_future, schedule=schedule,
+        latents_ctx=latents_ctx, actions_ctx=actions_ctx, num_steps=horizon,
+        rng=rng, deterministic=True,
+    )
+    pred = result['latents'][:, ctx_length:total]          # (B, horizon, S, D), unnormalised
+    gt = latents[:, ctx_length:total]
+
+    # Normalised latent MSE per generated frame (comparable to the training flow MSE).
+    pred_n = normalize_latents(pred, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+    gt_n = normalize_latents(gt, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+    latent_mse = jnp.mean((pred_n - gt_n) ** 2, axis=(0, 2, 3))  # (horizon,)
+
+    # Decoded per-frame PSNR.
+    pred_frames = jnp.clip(decode_jit(tokenizer, pred), 0, 255) / 255.0
+    gt_frames = jnp.clip(decode_jit(tokenizer, gt), 0, 255) / 255.0
+    psnr = jnp.stack([
+        compute_psnr(pred_frames[:, t:t + 1], gt_frames[:, t:t + 1]) for t in range(horizon)
+    ])  # (horizon,)
+
+    return {'latent_mse': latent_mse, 'psnr': psnr}
 
 
 # ---------------------------
