@@ -74,7 +74,7 @@ lr_schedule:
   init_lr: 0.0
   lr_end: 0.0
   warmup_ratio: 0.01
-  decay_ratio: 0.38
+  decay_ratio: 0.01
   max_steps: ${max_steps}
 
 optimizer:

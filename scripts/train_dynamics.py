@@ -235,7 +235,7 @@ def run(cfg: DynamicsConfig):
         # effective batch size without OOM, and (unlike optax.MultiSteps) keeps
         # opt_state structurally identical to a plain optimizer so checkpoints
         # stay compatible across changes to this value.
-        grad_accum_steps = 2
+        grad_accum_steps = 4
 
         scaling = ScalingContext.create(
             cfg=cfg,
