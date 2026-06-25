@@ -34,6 +34,7 @@ from dreamer.parallel import build_parallel, MeshRules
 from dreamer.scaling import ScalingContext
 from dreamer.training import (
     run_evaluation,
+    run_qphi_visualization,
     shortcut_forcing_step,
 )
 from dreamer.checkpointing import (
@@ -134,14 +135,9 @@ def train_step(
     # Training step
     step_key = jax.random.fold_in(master_key, step)
 
-    # Qphi: warmup mix (fixed-Gaussian -> Qphi samples) and a SEPARATE rng stream so the
-    # dynamics noise/sigma stream is untouched (baseline reproducibility when disabled).
-    if qphi_enabled:
-        qphi_key = jax.random.fold_in(step_key, 777)
-        warmup = qphi_cfg.warmup_steps
-        qphi_alpha = 1.0 if warmup <= 0 else jnp.clip(step / warmup, 0.0, 1.0)
-    else:
-        qphi_key, qphi_alpha = None, 1.0
+    # Qphi gets a SEPARATE rng stream so the dynamics noise/sigma stream is untouched
+    # (baseline reproducibility when disabled). No warmup: Qphi is injected from step 0.
+    qphi_key = jax.random.fold_in(step_key, 777) if qphi_enabled else None
 
     # --- World-model loss (gradients wrt dynamics only; Qphi passed but not differentiated) ---
     def world_loss_fn(model: Dynamics, qphi_model, latents, actions, mask, context_length):
@@ -161,7 +157,6 @@ def train_step(
             qphi=qphi_model,
             qphi_cfg=qphi_cfg,
             qphi_rng=qphi_key,
-            qphi_alpha=qphi_alpha,
         )
 
         return losses['total'], aux
@@ -197,7 +192,6 @@ def train_step(
         qphi_optimizer.update(qphi, qphi_grads)
         metrics['qphi_loss'] = loss_match
         metrics['qphi_grad_norm'] = optax.global_norm(nnx.state(qphi_grads))
-        metrics['qphi_alpha'] = jnp.asarray(qphi_alpha, dtype=jnp.float32)
     elif qphi_enabled:
         # type=none: fixed-Gaussian forcing, no learned network to train.
         metrics.pop('qphi_e', None)
@@ -308,9 +302,18 @@ def run(cfg: DynamicsConfig):
             qphi = Qphi(qphi_model_cfg, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
             qphi_optimizer = build_qphi_optimizer(qphi, qphi_model_cfg)
             qphi_params = count_parameters_by_component(qphi)["total"]
-            print(f"Qphi enabled: type={qphi_model_cfg.type}, d_e={qphi_model_cfg.d_e}, "
-                  f"rank={qphi_model_cfg.rank}, lam={qphi_model_cfg.lam}, "
-                  f"t_query={qphi_model_cfg.t_query}, params={qphi_params:,}")
+            # Memory footprint is dominated by the low-rank head (~d_model*d_e*rank weights)
+            # and the per-step U activation (B*T*d_e*rank). Surface both so a large latent
+            # (big d_e) doesn't silently blow up GPU memory / eval decode headroom.
+            _de, _r = qphi_model_cfg.d_e, qphi_model_cfg.rank
+            param_gb = qphi_params * 4 / 1e9
+            opt_gb = qphi_params * 8 / 1e9  # adam m + v
+            u_act_mb = (B * avg_T * _de * _r * 4) / 1e6 if _r > 0 else 0.0
+            print(f"Qphi enabled: type={qphi_model_cfg.type}, d_e={_de}, rank={_r}, "
+                  f"lam={qphi_model_cfg.lam}, t_query={qphi_model_cfg.t_query}, "
+                  f"params={qphi_params:,} (~{param_gb:.2f}GB weights + ~{opt_gb:.2f}GB adam); "
+                  f"U activation ~{u_act_mb:.0f}MB/step. "
+                  f"Lower qphi.rank / use type=gaussian_lowrank if memory is tight.")
 
         # Create checkpoint bundle (includes frozen tokenizer for self-contained checkpoints)
         bundle = DynamicsCheckpointBundle(
@@ -360,6 +363,25 @@ def run(cfg: DynamicsConfig):
                         val_actions=val_actions,
                         use_latent_data=use_latent_data,
                         vis_dir=vis_dir, rng=rng,
+                        logger=logger if is_main_process else None,
+                    )
+
+                # Diagnostic: decode the perturbed context z + lam*pert (Qphi only).
+                # Cheap (B=1) and gated on its OWN cadence, independent of the heavy
+                # write_video_every rollout eval — so it works even with write_video_every=0.
+                do_qphi_vis = (
+                    cfg.qphi.enabled and bundle.qphi is not None
+                    and cfg.qphi.vis_every > 0 and step > 0
+                    and step % cfg.qphi.vis_every == 0
+                )
+                if do_qphi_vis:
+                    rng, qvis_key = jax.random.split(rng)
+                    run_qphi_visualization(
+                        cfg, step, bundle.tokenizer, bundle.dynamics, bundle.qphi,
+                        data=input_tensor, actions=actions,
+                        use_latent_data=use_latent_data,
+                        master_key=qvis_key, lam=cfg.qphi.lam, t_query=cfg.qphi.t_query,
+                        vis_dir=vis_dir,
                         logger=logger if is_main_process else None,
                     )
 
@@ -413,7 +435,6 @@ def run(cfg: DynamicsConfig):
                             if "qphi_loss" in metrics_cpu:
                                 log_metrics["qphi/loss"] = metrics_cpu["qphi_loss"]
                                 log_metrics["qphi/grad_norm"] = metrics_cpu["qphi_grad_norm"]
-                                log_metrics["qphi/alpha"] = metrics_cpu["qphi_alpha"]
                         logger.log(
                             step,
                             metrics=log_metrics,

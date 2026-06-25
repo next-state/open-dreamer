@@ -27,6 +27,21 @@ def decode_jit(tokenizer: Tokenizer, z: jax.Array) -> jax.Array:
     frames, _ = tokenizer.decode(z, deterministic=True)
     return frames
 
+
+def decode_chunked(tokenizer: Tokenizer, z: jax.Array, chunk: int = 1) -> jax.Array:
+    """Decode (B, T, ...) latents in batch-chunks to cap peak decoder memory.
+
+    Decoding a full eval batch at high resolution materializes a very large decoder
+    activation (the MLP intermediate is ~B*T*S*4*d_model); for B=4, T=64 at 360x640 that
+    is tens of GB in a single allocation. Splitting over the batch keeps the result
+    bit-identical (samples are independent) while reducing peak memory ~B/chunk.
+    """
+    B = z.shape[0]
+    if chunk <= 0 or B <= chunk:
+        return decode_jit(tokenizer, z)
+    parts = [decode_jit(tokenizer, z[i:i + chunk]) for i in range(0, B, chunk)]
+    return jnp.concatenate(parts, axis=0)
+
 def sample_video(
     tokenizer: Tokenizer,
     dynamics: Dynamics,
@@ -80,8 +95,8 @@ def sample_video(
     latents_ctx, latent_future = latents[:, :-horizon, :, :], latents[:, -horizon:, :, :]
     actions_ctx, actions_future = actions[:, :-horizon], actions[:, -horizon:]
 
-    # Decode GT latents for visualization
-    gt_decoded_frames = decode_jit(tokenizer, latents)
+    # Decode GT latents for visualization (chunked to cap peak decoder memory)
+    gt_decoded_frames = decode_chunked(tokenizer, latents)
     gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
 
     # Rollout
@@ -108,8 +123,8 @@ def sample_video(
         deterministic=True,
     )
 
-    # Decode predicted latents to frames
-    pred_frames = decode_jit(tokenizer, rollout_result['latents'])
+    # Decode predicted latents to frames (chunked to cap peak decoder memory)
+    pred_frames = decode_chunked(tokenizer, rollout_result['latents'])
     pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
     original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
 

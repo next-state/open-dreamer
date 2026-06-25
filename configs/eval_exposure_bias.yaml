@@ -15,6 +15,8 @@ ctx_length: 8               # held-out prompt length
 horizon: 32                 # autoregressive frames to generate + score
 num_steps: 4                # few-step sampler steps (paper uses 4)
 num_batches: 4              # held-out batches to average the curve over
+tau_ctx_target: 1.0         # 1.0 = clean generated context (perturbation-matched models);
+                            # use 0.9 for the vanilla diffusion-forcing baseline
 
 dataset:
   dataloader_cfg:

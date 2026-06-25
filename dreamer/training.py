@@ -24,7 +24,7 @@ from dreamer.configs import DynamicsConfig, HeadsConfig, OptimalTransportConfig
 from dreamer.generation import DenoiseSchedule
 from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
 from dreamer.actions import Actions
-from dreamer.sampler import sample_video, decode_jit
+from dreamer.sampler import sample_video, decode_jit, decode_chunked
 from dreamer.generation import latent_rollout
 from dreamer.utils import _ensure_dir, normalize_with_dataset_stats, apply_border, normalize_latents, unnormalize_latents
 
@@ -361,7 +361,6 @@ def shortcut_forcing_step(
     qphi=None,
     qphi_cfg=None,
     qphi_rng: jax.Array | None = None,
-    qphi_alpha: jnp.ndarray | float = 1.0,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
     Compute shortcut forcing losses (flow + bootstrap) for a batch.
@@ -432,39 +431,42 @@ def shortcut_forcing_step(
     sigma_full = jnp.concatenate([sigma_emp, sigma_self], axis=0)
     sigma_idx_full = jnp.concatenate([sigma_idx_emp, sigma_idx_self], axis=0)
 
-    # --- Corrupt latents: z_tilde = (1 - sigma) * z0 + sigma * z1 ---
+    # --- Diffusion-forcing noised TARGET-INPUT (query/target stream; never perturbed) ---
     z0 = jax.random.normal(key_noise, latents.shape, dtype=latents.dtype)
     z0 = apply_ot_coupling(z0, latents, key_ot, ot_cfg=ot_cfg)
     z_tilde = (1.0 - sigma_full[..., None, None]) * z0 + sigma_full[..., None, None] * latents
 
-    # --- Perturbation matching: inject a learned context perturbation (Qphi) ---
-    # Added at FULL magnitude, sigma-independent (outside the (1-σ)z0+σz interpolation),
-    # so the context error is present regardless of the target's noise level. The flow
-    # regression target stays the clean `latents` (never perturbed). pert is detached:
-    # NO gradient flows from the world-model loss into Qphi (the collapse guard).
+    # --- Perturbation matching: build a separate CLEAN + Qphi context stream (two-stream) ---
+    # The world model attends to `z + lam*pert` (clean latent + a learned, detached
+    # perturbation), conditioned as clean (sigma=1, finest step) — matching the clean
+    # generated context at rollout. The query/target stream above stays purely
+    # diffusion-noised, so the two roles are cleanly separated and the regression target
+    # stays the clean `latents`. pert is detached: NO gradient flows from L_world into Qphi.
     qphi_enabled = qphi is not None and qphi_cfg is not None and qphi_cfg.enabled
     pert_norm = jnp.array(0.0, dtype=latents.dtype)
+    z_kv = kv_step_full = kv_tau_full = None
     if qphi_enabled:
-        key_gauss, key_qsample = jax.random.split(qphi_rng)
-        # Fixed-Gaussian forcing: the warmup starting point and the `type=none` baseline.
-        pert = jax.random.normal(key_gauss, latents.shape, dtype=latents.dtype)
         if qphi_cfg.trainable:
+            # Inject Qphi from step 0 (no warmup). Qphi starts at ~zero perturbation and
+            # grows via the matching loss.
             t_query = jnp.full((B, T), qphi_cfg.t_query, dtype=latents.dtype)
-            pert_learned = jax.lax.stop_gradient(
-                qphi.sample(latents, t_query, key_qsample)
-            ).astype(latents.dtype)
-            alpha = jnp.asarray(qphi_alpha, dtype=latents.dtype)  # warmup mix in [0, 1]
-            pert = (1.0 - alpha) * pert + alpha * pert_learned
+            pert = jax.lax.stop_gradient(qphi.sample(latents, t_query, qphi_rng)).astype(latents.dtype)
+        else:
+            # type=none: fixed-Gaussian forcing (no learned network).
+            pert = jax.random.normal(qphi_rng, latents.shape, dtype=latents.dtype)
         pert = jnp.clip(pert, -qphi_cfg.pert_clip, qphi_cfg.pert_clip)
         pert = jax.lax.stop_gradient(pert)  # MANDATORY collapse guard
-        z_tilde = z_tilde + qphi_cfg.lam * pert
+        z_kv = latents + qphi_cfg.lam * pert
+        kv_step_full = jnp.full((B, T), emax, dtype=jnp.int32)    # clean conditioning
+        kv_tau_full = jnp.full((B, T), k_max, dtype=jnp.int32)    # tau = 1.0
         pert_norm = jnp.mean(jnp.sqrt(jnp.sum(pert[:B_emp] ** 2, axis=(2, 3))))
 
     # --- Forward pass (full batch) ---
     rngs1 = nnx.Rngs(dropout=key_dropout1)
     z_pred_full, (h_states, _) = dynamics_model(
         actions, step_idx_full, sigma_idx_full, z_tilde,
-        context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings, deterministic=False, rngs=rngs1
+        context_length=context_length, time_mask=time_mask, task_embeddings=task_embeddings, deterministic=False, rngs=rngs1,
+        kv_unpacked_enc_tokens=z_kv, kv_step_indices=kv_step_full, kv_tau_indices=kv_tau_full,
     )
     
     # --- Flow loss (empirical rows) ---
@@ -513,6 +515,11 @@ def shortcut_forcing_step(
         time_mask_self = time_mask[B_emp:] if time_mask is not None else None  # assume aligned with batch
         task_embeddings_self = task_embeddings[B_emp:] if task_embeddings is not None else None
 
+        # Same clean + Qphi context stream for the bootstrap rows (None when disabled).
+        z_kv_self = z_kv[B_emp:] if z_kv is not None else None
+        kv_step_self = kv_step_full[B_emp:] if z_kv is not None else None
+        kv_tau_self = kv_tau_full[B_emp:] if z_kv is not None else None
+
         # Half-step metadata
         d_half = d_self / 2.0
         step_idx_half = step_idx_self + 1
@@ -524,7 +531,8 @@ def shortcut_forcing_step(
         # First half-step
         z1_half1, *_ = _bootstrap(
             actions_self, step_idx_half, sigma_idx_self, z_tilde_self,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
+            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True,
+            kv_unpacked_enc_tokens=z_kv_self, kv_step_indices=kv_step_self, kv_tau_indices=kv_tau_self,
         )
         z1_half1 = jax.lax.stop_gradient(z1_half1)
         b_prime = (z1_half1 - z_tilde_self) / jnp.maximum(1.0 - sigma_self[..., None, None], 1e-5)
@@ -534,7 +542,8 @@ def shortcut_forcing_step(
         # Second half-step
         z1_half2, *_ = _bootstrap(
             actions_self, step_idx_half, sigma_idx_plus, z_prime,
-            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True
+            context_length=context_length, time_mask=time_mask_self, task_embeddings=task_embeddings_self, deterministic=True,
+            kv_unpacked_enc_tokens=z_kv_self, kv_step_indices=kv_step_self, kv_tau_indices=kv_tau_self,
         )
         z1_half2 = jax.lax.stop_gradient(z1_half2)
         b_doubleprime = (z1_half2 - z_prime) / jnp.maximum(1.0 - sigma_plus[..., None, None], 1e-5)
@@ -932,11 +941,17 @@ def run_evaluation(
     horizon = T - ctx_length
     k_max = dynamics_online.cfg.k_max
 
+    # Perturbation matching trains the model to handle a learned context error, so the
+    # rollout should use the generated frame *as-is* (no fixed diffusion-forcing re-noise).
+    # tau_ctx=1.0 => clean context. Vanilla DF keeps the usual 0.9.
+    qphi_on = bool(getattr(getattr(cfg, "qphi", None), "enabled", False))
+    tau_ctx_target = 1.0 if qphi_on else 0.9
+
     rollout_specs = [
-        ("online_diffusion", dynamics_online, DenoiseSchedule.init(k_max, k_max)),
-        ("ema_diffusion", dynamics_ema, DenoiseSchedule.init(k_max, k_max)),
-        ("online_shortcut", dynamics_online, DenoiseSchedule.init(4, k_max)),
-        ("ema_shortcut", dynamics_ema, DenoiseSchedule.init(4, k_max)),
+        ("online_diffusion", dynamics_online, DenoiseSchedule.init(k_max, k_max, tau_ctx_target=tau_ctx_target)),
+        ("ema_diffusion", dynamics_ema, DenoiseSchedule.init(k_max, k_max, tau_ctx_target=tau_ctx_target)),
+        ("online_shortcut", dynamics_online, DenoiseSchedule.init(4, k_max, tau_ctx_target=tau_ctx_target)),
+        ("ema_shortcut", dynamics_ema, DenoiseSchedule.init(4, k_max, tau_ctx_target=tau_ctx_target)),
     ]
 
     dataset_std = cfg.dataset.dataset_std[0]
@@ -1101,8 +1116,8 @@ def rollout_error_curve(
     latent_mse = jnp.mean((pred_n - gt_n) ** 2, axis=(0, 2, 3))  # (horizon,)
 
     # Decoded per-frame PSNR.
-    pred_frames = jnp.clip(decode_jit(tokenizer, pred), 0, 255) / 255.0
-    gt_frames = jnp.clip(decode_jit(tokenizer, gt), 0, 255) / 255.0
+    pred_frames = jnp.clip(decode_chunked(tokenizer, pred), 0, 255) / 255.0
+    gt_frames = jnp.clip(decode_chunked(tokenizer, gt), 0, 255) / 255.0
     psnr = jnp.stack([
         compute_psnr(pred_frames[:, t:t + 1], gt_frames[:, t:t + 1]) for t in range(horizon)
     ])  # (horizon,)
@@ -1239,6 +1254,94 @@ def run_x0_visualization(
 
         # Log
         logger.log_image(step, f"{eval_prefix}x0_vis", img_array, caption=f"step {step}")
+
+
+def run_qphi_visualization(
+    cfg,
+    step: int,
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
+    qphi,
+    *,
+    data: jnp.ndarray,
+    actions,
+    use_latent_data: bool,
+    master_key: jax.Array,
+    lam: float,
+    t_query: float,
+    vis_dir: Path,
+    logger,
+    name: str | None = None,
+    max_frames: int = 12,
+):
+    """Decode the *perturbed context* ``z + lam * pert`` as a contact sheet (diagnostic).
+
+    This shows what the world model actually attends to as context under Qphi injection.
+    To expose the effect of the injection operating point, the perturbation is sampled at
+    several signal levels (the configured ``t_query`` plus 0.5 and 0.9); a heavily corrupted
+    top row (small t_query == max noise) vs. an almost-clean bottom row (t_query -> 1) is the
+    visual signature of over-large perturbation (the blurry/static "robust" basin).
+
+    Rows: [clean GT] + [z + lam*pert @ each t_query]. Columns: time. Row labels carry the
+    signal level and the mean per-frame ||pert||.
+    """
+    from PIL import Image, ImageDraw
+    import numpy as np
+
+    B0 = 1
+    T = min(int(data.shape[1]), max_frames)
+    data = data[:B0, :T]
+    actions = actions[:B0, :T] if actions is not None else None
+
+    if use_latent_data:
+        latents = data.astype(dynamics.dtype)
+    else:
+        latents, _ = tokenizer.encode(data, deterministic=True)
+        latents = jax.lax.stop_gradient(latents).astype(dynamics.dtype)
+    z_norm = normalize_latents(latents, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+
+    @nnx.jit
+    def decode_latents(z):
+        z = unnormalize_latents(z, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
+        frames, _ = tokenizer.decode(z, deterministic=True)
+        return jnp.clip(frames, 0, 255).astype(jnp.uint8)
+
+    # The configured operating point first, then a small sweep so the scaling is visible.
+    t_values = []
+    for tv in [float(t_query), 0.5, 0.9]:
+        if tv not in t_values:
+            t_values.append(tv)
+
+    rows = [("GT (clean)", jax.device_get(decode_latents(z_norm))[0])]
+    for i, tv in enumerate(t_values):
+        key = jax.random.fold_in(master_key, i)
+        t = jnp.full((B0, T), tv, dtype=z_norm.dtype)
+        pert = qphi.sample(z_norm, t, key)
+        z_pert = z_norm + lam * pert.astype(z_norm.dtype)
+        pert_norm = float(jnp.mean(jnp.sqrt(jnp.sum(pert ** 2, axis=(2, 3)))))
+        label = f"t={tv:.2f} lam={lam:g} |pert|={pert_norm:.1f}"
+        rows.append((label, jax.device_get(decode_latents(z_pert))[0]))
+
+    H, W = rows[0][1].shape[1], rows[0][1].shape[2]
+    label_h = 16
+    n_rows = len(rows)
+    grid = np.zeros((label_h + n_rows * H, T * W, 3), dtype=np.uint8)
+    for r, (_, frames) in enumerate(rows):
+        for t in range(T):
+            grid[label_h + r * H: label_h + (r + 1) * H, t * W:(t + 1) * W] = frames[t]
+
+    pil_img = Image.fromarray(grid)
+    draw = ImageDraw.Draw(pil_img)
+    for r, (label, _) in enumerate(rows):
+        draw.text((2, label_h + r * H + 2), label, fill=(255, 255, 0))
+    img_array = np.array(pil_img)
+
+    if logger is not None:
+        log_prefix = f"{name}/" if name else ""
+        eval_prefix = f"{log_prefix}eval/"
+        out_dir = _ensure_dir(vis_dir / f"step_{step:06d}" / log_prefix)
+        Image.fromarray(img_array).save(str(out_dir / "qphi_context_vis.png"))
+        logger.log_image(step, f"{eval_prefix}qphi_context_vis", img_array, caption=f"step {step}")
 
 
 def run_attention_visualization(

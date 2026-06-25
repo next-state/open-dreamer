@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt_latent
   - _self_
 
-run_name: pert-matching
+run_name: pert-matching-two-stream
 tokenizer_ckpt: tokenizer
 
 ckpt:
@@ -16,8 +16,8 @@ dataset:
     num_workers: 16
 
     # Alternating batch lengths (paper: "Sequence length" paragraph)
-    short_T: 64
-    long_T: 64
+    short_T: 32
+    long_T: 32
     long_ratio: 0.1  # Fraction of batches that use long_T
 
 dynamics:
@@ -65,13 +65,14 @@ qphi:
   d_model: 256
   depth: 2
   n_heads: 4
-  rank: 16
+  rank: 16              # memory ~ d_model*d_e*rank; lower to 4-8 for large d_e (see logs)
   n_flow_layers: 4
   flow_hidden: 128
-  lam: 1.0
+  lam: 0.1
   t_query: 0.0          # signal-sigma for injection sampling (0 = max-noise operating point)
-  warmup_steps: 2000    # anneal fixed-Gaussian -> Qphi samples
+  s_init: 1e-3          # initial Qphi variance: starts at ~zero perturbation, grows via matching (no warmup)
   pert_clip: 4.0
+  vis_every: 5_000          # decode perturbed context every N steps (cheap, B=1; 0 = off)
   lr: 1e-4
   optimizer: adamw
   weight_decay: 0.0

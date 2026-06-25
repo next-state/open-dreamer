@@ -369,6 +369,7 @@ class GroupedQueryAttention(nnx.Module):
             cache: KVCache | None = None,
             rngs: nnx.Rngs | None = None,
             return_weights: bool = False,
+            kv_x: jnp.ndarray | None = None,
         ):
         """
         https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html
@@ -379,10 +380,17 @@ class GroupedQueryAttention(nnx.Module):
         H = dimensions of each attention head
         K = number of key/value heads
         G = number of groups, which equals to N // K
+
+        kv_x: optional separate key/value source (two-stream cross-attention). When given,
+        Q comes from `x` and K/V from `kv_x` (positionally aligned, so RoPE/causal masking
+        are unchanged). Used by perturbation matching to attend a clean+perturbed context
+        while the query/target path stays diffusion-noised.
         """
+        assert not (self.use_seq_parallel and kv_x is not None), \
+            "two-stream cross-attention is not supported with sequence parallelism"
         q = self.to_q(x)
         q = rearrange(q, "B T (N H) -> B T N H", N=self.num_heads)
-        kv = self.to_kv(x)
+        kv = self.to_kv(x if kv_x is None else kv_x)
         k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
 
         scale = q.shape[-1] ** -0.5
@@ -461,6 +469,26 @@ class GroupedQueryAttention(nnx.Module):
                     mask_attn = jnp.logical_and(mask, cache_mask)
                 else:
                     mask_attn = cache_mask
+            elif kv_x is not None:
+                # TWO-STREAM QUERY CROSS-ATTENTION (training only).
+                # Strictly causal (j < i): the query must NOT attend to its own context
+                # position (which holds the clean target z + lam*pert) or denoising becomes
+                # a trivial copy that fails at inference. Fold in the sliding window and any
+                # incoming block-causal mask, and zero rows with no valid key (e.g. frame 0,
+                # whose own info comes from the residual stream).
+                new_cache = None
+                k_attn, v_attn = k, v
+                Tq = q.shape[1]
+                qi = jnp.arange(Tq)[:, None]
+                kj = jnp.arange(Tq)[None, :]
+                strict = kj < qi
+                if local_window_size is not None:
+                    left = local_window_size[0] if isinstance(local_window_size, (tuple, list)) else local_window_size
+                    strict = strict & ((qi - kj) <= left)
+                strict = strict[None, None]  # (1, 1, Tq, Tq)
+                mask_attn = strict if mask is None else jnp.logical_and(strict, mask)
+                attn_is_causal = False
+                local_window_size = None  # folded into mask_attn
             else:
                 # TRAINING or NON-CAUSAL (SPACE) ATTENTION
                 new_cache = None
@@ -476,6 +504,13 @@ class GroupedQueryAttention(nnx.Module):
                 is_causal=attn_is_causal,
                 local_window_size=local_window_size
             )  # TODO: try setting implementation="cudnn"
+
+            if kv_x is not None:
+                # Zero context for queries with no valid key (otherwise the all-masked
+                # softmax row is an acausal fallback).
+                has_key = jnp.any(mask_attn, axis=-1)            # (B' or 1, 1, Tq)
+                has_key = rearrange(has_key, "b one t -> b t one")[..., None]
+                attn = jnp.where(has_key, attn, 0.0)
 
             if return_weights:
                 G = self.num_heads // self.num_kv_heads
@@ -566,15 +601,21 @@ class TimeSelfAttention(nnx.Module):
         cache: KVCache | None = None,
         rngs: nnx.Rngs | None = None,
         return_weights: bool = False,
+        kv_x: jnp.ndarray | None = None,
     ):
-        # x: (B, T, S, D) -> attention across T, causal
+        # x: (B, T, S, D) -> attention across T, causal. kv_x (optional, same shape) is the
+        # separate key/value source for two-stream cross-attention.
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
 
         if mask is not None and mask.ndim >= 3 and mask.shape[0] == B:
             mask = repeat(mask, 'B ... -> (B S) ...', S=S)
 
-        out, new_cache, attn_weights = nnx.remat(self.attn, static_argnums=(2, 3, 6),)(x, mask, local_window_size, deterministic, cache, rngs, return_weights)
+        if kv_x is None:
+            out, new_cache, attn_weights = nnx.remat(self.attn, static_argnums=(2, 3, 6),)(x, mask, local_window_size, deterministic, cache, rngs, return_weights)
+        else:
+            kv_x = rearrange(kv_x, "B T S D -> (B S) T D")
+            out, new_cache, attn_weights = nnx.remat(self.attn, static_argnums=(2, 3, 6),)(x, mask, local_window_size, deterministic, cache, rngs, return_weights, kv_x)
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
         if attn_weights is not None:
             attn_weights = rearrange(attn_weights, "(B S) N T1 T2 -> B S N T1 T2", B=B, S=S)
@@ -630,6 +671,7 @@ class BlockCausalLayer(nnx.Module):
         self,
         x,
         *,
+        kv_x: jnp.ndarray | None = None,
         space_mask: jnp.ndarray | None = None,
         time_mask: jnp.ndarray | None = None,
         time_local_window_size: int | tuple[int, int] | None = None,
@@ -638,21 +680,46 @@ class BlockCausalLayer(nnx.Module):
         rngs: nnx.Rngs | None = None,
         return_weights: bool = False,
     ):
-        # Attention (time or space, depending on layer_index)
-        y = self.norm(x)
+        """Returns (x, kv_x, new_cache, attn_weights). `kv_x` is None for single-stream.
+
+        Two-stream (kv_x given): the query/target stream `x` cross-attends to the context
+        stream `kv_x` in TIME layers, while `kv_x` self-attends (causally) to evolve its own
+        context representation; SPACE layers and the MLP process each stream independently
+        with shared weights. Caching/return_weights are single-stream only.
+        """
         if self.is_time_layer:
             attn_mask = time_mask
             local_window_size = time_local_window_size
         else:
             attn_mask = space_mask
             local_window_size = None
-        y, new_cache, attn_weights = self.attn(y, mask=attn_mask, local_window_size=local_window_size, deterministic=deterministic, cache=cache, rngs=rngs, return_weights=return_weights)
-        x = x + y
 
-        # MLP
-        y = nnx.remat(self.mlp)(x, deterministic=deterministic, rngs=rngs)
-        x = x + y
-        return x, new_cache, attn_weights
+        if kv_x is None:
+            y, new_cache, attn_weights = self.attn(
+                self.norm(x), mask=attn_mask, local_window_size=local_window_size,
+                deterministic=deterministic, cache=cache, rngs=rngs, return_weights=return_weights)
+            x = x + y
+            x = x + nnx.remat(self.mlp)(x, deterministic=deterministic, rngs=rngs)
+            return x, None, new_cache, attn_weights
+
+        # Two-stream
+        nx = self.norm(x)
+        nkv = self.norm(kv_x)
+        if self.is_time_layer:
+            yq, _, _ = self.attn(nx, mask=attn_mask, local_window_size=local_window_size,
+                                 deterministic=deterministic, cache=None, rngs=rngs, kv_x=nkv)
+            ykv, _, _ = self.attn(nkv, mask=attn_mask, local_window_size=local_window_size,
+                                  deterministic=deterministic, cache=None, rngs=rngs)
+        else:
+            yq, _, _ = self.attn(nx, mask=attn_mask, local_window_size=local_window_size,
+                                 deterministic=deterministic, cache=None, rngs=rngs)
+            ykv, _, _ = self.attn(nkv, mask=attn_mask, local_window_size=local_window_size,
+                                  deterministic=deterministic, cache=None, rngs=rngs)
+        x = x + yq
+        kv_x = kv_x + ykv
+        x = x + nnx.remat(self.mlp)(x, deterministic=deterministic, rngs=rngs)
+        kv_x = kv_x + nnx.remat(self.mlp)(kv_x, deterministic=deterministic, rngs=rngs)
+        return x, kv_x, None, None
 
 class BlockCausalTransformer(nnx.Module):
     """Stack of block-causal transformer layers."""
@@ -700,6 +767,7 @@ class BlockCausalTransformer(nnx.Module):
         self,
         x,
         *,
+        kv_x: jnp.ndarray | None = None,
         space_mask: jnp.ndarray | None = None,
         time_mask: jnp.ndarray | None = None,
         time_local_window_size: int | tuple[int, int] | None = None,
@@ -710,7 +778,9 @@ class BlockCausalTransformer(nnx.Module):
     ) -> Tuple[jax.Array, KVCachesDict | None, list | None]:
         """
         Args:
-            x: (B, T, S, D) input tensor
+            x: (B, T, S, D) query/target stream input tensor
+            kv_x: optional (B, T, S, D) context stream. When given, time layers cross-attend
+                  x -> kv_x (two-stream); incompatible with caches/return_weights.
             space_mask: optional spatial attention mask
             time_mask: optional time attention mask (unused)
             time_local_window_size: optional local window size for time attention (left, right) or int for symmetric
@@ -721,10 +791,15 @@ class BlockCausalTransformer(nnx.Module):
 
         Returns:
             (x, new_caches, all_weights) — all_weights is None when return_weights=False.
+            Only the query stream `x` is returned (the context stream is internal).
         """
+        two_stream = kv_x is not None
+        assert not (two_stream and (caches is not None or return_weights)), \
+            "two-stream is training-only (no KV cache / attention-weight capture)"
         new_caches = {} if caches is not None else None
         all_weights: list | None = [] if return_weights else None
         x0 = x
+        kv_x0 = kv_x
         time_index = 0
 
         for i, layer in enumerate(self.layers):
@@ -732,11 +807,13 @@ class BlockCausalTransformer(nnx.Module):
                 resid_lambda = self.resid_lambdas.value[i].astype(self.dtype)
                 x0_lambda = self.x0_lambdas.value[i].astype(self.dtype)
                 x = resid_lambda * x + x0_lambda * x0
+                if two_stream:
+                    kv_x = resid_lambda * kv_x + x0_lambda * kv_x0
 
             is_time_layer = layer.is_time_layer
             cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
 
-            x, new_cache_i, w_i = layer(x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs, return_weights=return_weights)
+            x, kv_x, new_cache_i, w_i = layer(x, kv_x=kv_x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs, return_weights=return_weights)
             if all_weights is not None:
                 all_weights.append(w_i)
 
@@ -1265,6 +1342,15 @@ class Dynamics(nnx.Module):
             dtype=dtype
         )
 
+    def _spatial_and_shortcut(self, unpacked_enc_tokens, step_indices, tau_indices):
+        """Build the per-frame spatial tokens and shortcut (step/signal) token."""
+        packed = rearrange(unpacked_enc_tokens, "b t (n p) d -> b t n (p d)", p=self.packing_factor)
+        spatial_tokens = self.spatial_proj(packed)  # (B, T, n_spatial, d_model)
+        step_emb = self.step_embed(step_indices.astype(jnp.float32))                  # (B, T, d_model//2)
+        signal_emb = self.signal_embed(tau_indices.astype(jnp.float32) / self.k_max)  # (B, T, d_model//2)
+        shortcut_token = jnp.concatenate([step_emb, signal_emb], axis=-1)[:, :, None, :]
+        return spatial_tokens, shortcut_token
+
     def __call__(
         self,
         actions: Actions,
@@ -1277,7 +1363,10 @@ class Dynamics(nnx.Module):
         task_embeddings: jnp.ndarray | None = None,
         deterministic: bool = True,
         caches: KVCachesDict | None = None,
-        rngs: nnx.Rngs | None = None
+        rngs: nnx.Rngs | None = None,
+        kv_unpacked_enc_tokens: jnp.ndarray | None = None,
+        kv_step_indices: jnp.ndarray | None = None,
+        kv_tau_indices: jnp.ndarray | None = None,
     ) -> Tuple[jax.Array, Tuple[jax.Array | None, KVCachesDict | None]]:
         """
         Args:
@@ -1298,37 +1387,28 @@ class Dynamics(nnx.Module):
         """
         B, T = unpacked_enc_tokens.shape[:2]
 
-        # Pack tokens internally for processing
-        packed_enc_tokens = rearrange(unpacked_enc_tokens, "b t (n p) d -> b t n (p d)", p=self.packing_factor)
-        # Project spatial tokens to d_model
-        spatial_tokens = self.spatial_proj(packed_enc_tokens)  # (B, T, n_spatial, d_model)
-
-        # Encode actions to d_model
-        action_token = self.action_encoder(
-            actions=actions,
-            batch_time_shape=(B, T),
-        )  # (B, T, 1, d_model)
-
-        # Prepare learned register tokens
-        B, T = spatial_tokens.shape[:2]
+        # Shared tokens (same for the query and context streams).
+        action_token = self.action_encoder(actions=actions, batch_time_shape=(B, T))  # (B, T, 1, d_model)
         register_tokens = jnp.broadcast_to(
             self.register_tokens.value.astype(self.dtype)[None, None, ...],  # (1, 1 ,n_register, d_model)
             (B, T, self.n_register, self.d_model),
         )
 
-        # Shortcut embeddings (sinusoidal, concatenated to single token)
-        # step_indices: int log2(K) → float for sinusoidal PE
-        # tau_indices: int τ*k_max → normalize to [0,1] for sinusoidal PE
-        step_emb = self.step_embed(step_indices.astype(jnp.float32))                          # (B, T, d_model//2)
-        signal_emb = self.signal_embed(tau_indices.astype(jnp.float32) / self.k_max)          # (B, T, d_model//2)
-        shortcut_token = jnp.concatenate([step_emb, signal_emb], axis=-1)[:, :, None, :]     # (B, T, 1, d_model)
+        def assemble(spatial_tokens, shortcut_token):
+            toks = [action_token, shortcut_token, spatial_tokens, register_tokens]
+            if task_embeddings is not None:
+                toks.append(task_embeddings)
+            return jnp.concatenate(toks, axis=2)  # (B, T, S, D)
 
-        # Concatenate in declared layout order (`get_token_layout`)
-        tokens = [action_token, shortcut_token, spatial_tokens, register_tokens]
-        if task_embeddings is not None:
-            tokens.append(task_embeddings)
+        # Query/target stream (diffusion-noised input being denoised).
+        spatial_q, shortcut_q = self._spatial_and_shortcut(unpacked_enc_tokens, step_indices, tau_indices)
+        tokens = assemble(spatial_q, shortcut_q)
 
-        tokens = jnp.concatenate(tokens, axis=2)  # (B, T, S, D)
+        # Optional context stream (clean + Qphi perturbation) for two-stream attention.
+        kv_tokens = None
+        if kv_unpacked_enc_tokens is not None:
+            spatial_kv, shortcut_kv = self._spatial_and_shortcut(kv_unpacked_enc_tokens, kv_step_indices, kv_tau_indices)
+            kv_tokens = assemble(spatial_kv, shortcut_kv)
 
         # Make the layout for masking
         n_agent = task_embeddings.shape[2] if task_embeddings is not None else 0
@@ -1342,7 +1422,7 @@ class Dynamics(nnx.Module):
             time_local_window_size = (context_length - 1, 0)
 
         x, new_caches, _ = self.transformer(
-            tokens, space_mask=space_mask,
+            tokens, kv_x=kv_tokens, space_mask=space_mask,
             time_mask=time_mask,
             time_local_window_size=time_local_window_size,
             deterministic=deterministic,

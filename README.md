@@ -101,12 +101,27 @@ Gaussian base + identity-initialised normalizing flow) trained by exact `log_pro
 gated behind `qphi.enabled` — with it `false` (the default) training is bit-for-bit the
 vanilla baseline.
 
+`Qφ` is injected from step 0 with **no warmup schedule**: it is initialised to ~zero
+perturbation (small `qphi.s_init`) and the variance grows from below via the matching loss,
+so the perturbation enters small and increases only as the learned error warrants. When a
+perturbation-matched model is rolled out, the generated frame is used **as-is** (no
+diffusion-forcing re-noise): `run_evaluation` and `eval_exposure_bias.py` set
+`tau_ctx_target=1.0` (clean context) automatically/with a flag.
+
+**Two-stream attention.** The world model runs two aligned streams: a **query/target**
+stream carrying the diffusion-noised input being denoised, and a **context** stream carrying
+`z + λ·pert` (clean latent + the Qφ perturbation), conditioned as clean. In time-attention
+the query **cross-attends strictly causally** to the context (positions `< t`, never its own
+diagonal — so it can't trivially copy the clean target), while the context stream
+self-attends to build its representation. The prediction comes from the query stream. This
+cleanly separates the two roles (the context is clean + Qφ, the target stays σ-noised) at
+~2× dynamics compute; it's gated on `qphi.enabled`, and single-stream (baseline, tokenizer,
+inference) is unchanged. At rollout, set `tau_ctx_target=1.0` so the generated context is
+clean (matching training).
+
 > Note on this repo's σ convention: `σ` is a *signal* level (`σ=1` clean, `σ=0` max noise),
-> inverted vs. the usual diffusion `t`. The perturbation is injected at the max-noise
-> operating point, so `qphi.t_query=0.0` (not 1.0). Implementation is the single-pass
-> approximation: the perturbation is added to every frame's input (which serves as both
-> target-input and context in this block-causal model), with the regression label left
-> clean.
+> inverted vs. the usual diffusion `t`. `qphi.t_query` selects the operating point at which
+> `Qφ` is sampled for injection (in signal-σ).
 
 ```bash
 # Baseline (vanilla diffusion forcing) — identical to leaving qphi out entirely
@@ -122,7 +137,8 @@ python scripts/train_dynamics.py tokenizer_ckpt=... qphi.enabled=true qphi.type=
 ```
 
 Training logs `qphi/pert_norm`, `qphi/e_norm` (matching-sanity / anti-collapse monitors),
-and `qphi/loss`, `qphi/grad_norm`, `qphi/alpha` (warmup mix).
+and `qphi/loss`, `qphi/grad_norm`. Expect `pert_norm` to start near zero and grow toward
+`e_norm` as `Qφ` learns.
 
 **Exposure-bias rollout eval (the payoff metric).** Tune `λ` on this rollout metric, never
 on `qphi/loss` (which is teacher-forced and cannot see the rollout gap). Run it per

@@ -263,26 +263,31 @@ class Qphi(nnx.Module):
             bias_init=nnx.initializers.zeros, rngs=rngs,
         )
 
-        # Diagonal variance head. Bias init ~ softplus^{-1}(1) so s ~= 1 at init
-        # (unit variance in normalised latent space == the fixed-Gaussian start).
-        s_init = float(math.log(math.expm1(1.0)))  # softplus(s_init) == 1
+        # Diagonal variance head. Bias init = softplus^{-1}(s_init - s_floor) so the base
+        # starts at variance ~= cfg.s_init per element, i.e. ~zero perturbation. There is no
+        # warmup: Qphi is injected from step 0 and the variance grows from below via the
+        # matching loss only as the learned error distribution warrants.
+        s0 = max(cfg.s_init - cfg.s_floor, 1e-6)
+        bias0 = float(math.log(math.expm1(s0)))  # softplus(bias0) == s_init - s_floor
         diag_out = 1 if self.is_iso else cfg.d_e
         self.logdiag_head = nnx.Linear(
             cfg.d_model, diag_out, use_bias=True, dtype=self.dtype, param_dtype=param_dtype,
             kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
-            bias_init=nnx.initializers.constant(s_init), rngs=rngs,
+            bias_init=nnx.initializers.constant(bias0), rngs=rngs,
         )
 
         # Low-rank factor head. We CANNOT zero-init U: U=0 is an exact saddle of the
         # Gaussian log-likelihood (d logp / dU = 0 there), so gradient descent would never
-        # develop any anisotropy. Instead use a *tiny* fan-in-scaled init: the initial
-        # U U^T contribution is ~ rank * 1e-3 (a few % of the unit diagonal, so the base
-        # still starts as ~N(0, I)) while the gradient is non-zero so anisotropy can emerge.
+        # develop any anisotropy. Use a tiny init whose energy tracks the diagonal: the
+        # initial diag(U U^T) ~= s_init / 100 (1% of the diagonal, so the perturbation still
+        # starts at ~zero) but is non-zero, so anisotropy grows off the saddle. Scaling with
+        # s_init keeps the saddle-escape gradient proportional to the diagonal scale.
         if self.rank > 0:
+            u_scale = max(cfg.s_init / (100.0 * self.rank), 1e-12)
             self.U_head = nnx.Linear(
                 cfg.d_model, cfg.d_e * self.rank, use_bias=True, dtype=self.dtype, param_dtype=param_dtype,
                 kernel_init=nnx.with_partitioning(
-                    nnx.initializers.variance_scaling(1e-3, "fan_in", "normal"), mesh_rules('mlp')),
+                    nnx.initializers.variance_scaling(u_scale, "fan_in", "normal"), mesh_rules('mlp')),
                 bias_init=nnx.initializers.zeros, rngs=rngs,
             )
 

@@ -198,7 +198,10 @@ class QphiModelConfig:
     mlp_ratio: float = 4.0
 
     # Distribution head.
-    rank: int = 16                        # low-rank factor r << d_e (anisotropy)
+    rank: int = 8                         # low-rank factor r << d_e (anisotropy).
+    # NB: the U head + its activation scale as d_model * d_e * rank and B*T*d_e*rank, so
+    # for a large latent (d_e ~ several thousand) keep rank small (4-8) to bound memory;
+    # use type=gaussian_lowrank to drop the (also d_e-wide) flow if memory is tight.
     n_flow_layers: int = 4                # affine coupling layers (type=flow only)
     flow_hidden: int = 128
     flow_logscale_clamp: float = 2.0      # bound on coupling log-scale (identity at 0)
@@ -207,8 +210,17 @@ class QphiModelConfig:
     # Injection / matching.
     lam: float = 1.0                      # lambda perturbation scale (prior >= 1)
     t_query: float = 0.0                  # signal-sigma for injection sampling (0 = max noise)
-    warmup_steps: int = 2000              # anneal fixed-Gaussian -> Qphi samples
-    pert_clip: float = 4.0                # clamp |pert| during warmup for stability
+    # Initial per-element diagonal variance of the Qphi base. Small => Qphi starts at
+    # ~zero perturbation and grows via the matching loss (NO warmup schedule; injected
+    # from step 0). Must be > s_floor. Smaller is closer to "zero" but grows slower (raise
+    # `lr` if it is not growing). Only used by the learned types (gaussian_iso/lowrank/flow).
+    s_init: float = 1e-3
+    pert_clip: float = 4.0                # static clamp on |pert| (numerical safety guard)
+
+    # Diagnostics: decode the perturbed context z + lam*pert every N steps (0 = off).
+    # This is a CHEAP (B=1) visualization, independent of the heavy `write_video_every`
+    # rollout eval, so it survives `write_video_every=0`.
+    vis_every: int = 0
 
     # Optimizer (kept SEPARATE from the world-model optimizer).
     lr: float = 1e-4

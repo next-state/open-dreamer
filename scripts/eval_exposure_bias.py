@@ -55,7 +55,10 @@ def run(cfg):
 
         ctx_length = int(cfg.ctx_length)
         horizon = int(cfg.horizon)
-        schedule = DenoiseSchedule.init(int(cfg.num_steps), k_max)
+        # tau_ctx_target=1.0 => clean generated context (use for perturbation-matched models);
+        # keep 0.9 for the vanilla diffusion-forcing baseline.
+        schedule = DenoiseSchedule.init(int(cfg.num_steps), k_max, tau_ctx_target=float(cfg.tau_ctx_target))
+        print(f"rollout schedule: num_steps={cfg.num_steps}, tau_ctx_target={cfg.tau_ctx_target}")
 
         # Accumulate the curve over `num_batches` held-out batches.
         latent_mse = np.zeros(horizon, dtype=np.float64)
