@@ -183,8 +183,19 @@ def sample_step_excluding_dmin(
 
 
 # Loss weighting
-def ramp_weight(sigma: jnp.ndarray, min_weight: float = 0.1, max_weight: float = 1.0) -> jnp.ndarray:
-    return (max_weight - min_weight) * sigma + min_weight
+def loss_weight(sigma: jnp.ndarray, scheme: str = "ramp") -> jnp.ndarray:
+    """Per-sample loss weight as a function of signal level sigma (1 = clean, 0 = noise)."""
+    if scheme == "none":
+        # no loss weighting
+        return jnp.ones_like(sigma)
+    elif scheme == "ramp":
+        # linear ramp from the paper: 0.1 at sigma=0 to 1.0 at sigma=1
+        min_weight, max_weight = 0.1, 1.0
+        return (max_weight - min_weight) * sigma + min_weight
+    elif scheme == "v_space":
+        # reweights the x-space MSE to the velocity-space loss
+        return 1.0 / jnp.maximum(1.0 - sigma, 1e-3) ** 2
+    raise ValueError(f"loss_weight: unknown scheme '{scheme}'")
 
 
 def apply_ot_coupling(
@@ -272,26 +283,27 @@ def compute_flow_loss(
     z_pred: jnp.ndarray,
     z_target: jnp.ndarray,
     sigma: jnp.ndarray,
+    weighting: str,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Flow matching loss in x-space (direct prediction of clean latents).
-    
+
     Args:
         z_pred: (B, T, S, D) Predicted clean latents
         z_target: (B, T, S, D) Ground truth clean latents
         sigma: (B, T) Signal levels (used for weighting)
-        per_example: If True, return (B, T) losses; else return scalar
-        
+        weighting: Per-sample loss weighting scheme (function of sigma)
+
     Returns:
         loss: Tuple[jnp.float32, jnp.float32]
-            mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
-            mse_per_token: tuple of scalars. MSE loss 
+            mse_per_step: tuple of scalars. MSE loss weighted by sigma-dependent weight
+            mse_per_token: tuple of scalars. MSE loss
     """
     mse_per_token = (z_pred - z_target) ** 2  # (B, T, S, D)
     mse_per_step = jnp.mean(mse_per_token, axis=(2, 3))  # (B, T)
 
-    # Apply ramp weighting and reduce
-    weights = ramp_weight(sigma)
+    # Apply sigma-dependent weighting and reduce
+    weights = loss_weight(sigma, weighting)
     return jnp.mean(mse_per_step * weights), jnp.mean(mse_per_step), mse_per_step
 
 
@@ -301,6 +313,7 @@ def compute_bootstrap_loss(
     b_prime: jnp.ndarray,
     b_doubleprime: jnp.ndarray,
     sigma: jnp.ndarray,
+    weighting: str,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Bootstrap self-consistency loss for shortcut forcing.
@@ -317,10 +330,11 @@ def compute_bootstrap_loss(
         b_prime: (B, T, S, D) Velocity from first half-step
         b_doubleprime: (B, T, S, D) Velocity from second half-step
         sigma: (B, T) Signal levels
+        weighting: Per-sample loss weighting scheme (function of sigma)
 
     Returns:
         loss: Tuple[jnp.float32, jnp.float32]
-            mse_per_step: tuple of scalars. MSE loss weighted by ramp weight
+            mse_per_step: tuple of scalars. MSE loss weighted by sigma-dependent weight
             mse_per_token: tuple of scalars. MSE loss
     """
     # Target velocity is average of two half-steps (stop gradient, clipped)
@@ -334,8 +348,8 @@ def compute_bootstrap_loss(
     boot_per_token = (z_pred - x_target) ** 2
     boot_per_step = jnp.mean(boot_per_token, axis=(2, 3))  # (B, T)
 
-    # Apply ramp weighting and reduce
-    weights = ramp_weight(sigma)
+    # Apply sigma-dependent weighting and reduce
+    weights = loss_weight(sigma, weighting)
     return jnp.mean(boot_per_step * weights), jnp.mean(boot_per_step)
 
 
@@ -356,7 +370,8 @@ def shortcut_forcing_step(
     time_mask: jnp.ndarray | None = None,
     task_embeddings: jnp.ndarray | None = None,
     bootstrap_model: Dynamics | None = None,
-    ot_cfg: OptimalTransportConfig = OptimalTransportConfig(),
+    ot_cfg: OptimalTransportConfig,
+    weighting: str,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """
     Compute shortcut forcing losses (flow + bootstrap) for a batch.
@@ -441,7 +456,7 @@ def shortcut_forcing_step(
     
     # --- Flow loss (empirical rows) ---
     z_pred_emp = z_pred_full[:B_emp]
-    loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp)
+    loss_flow, flow_mse_unweighted, mse_per_step_emp = compute_flow_loss(z_pred_emp, latents[:B_emp], sigma_emp, weighting)
 
     # Split flow MSE by empirical sample type (image-only rows vs temporal sequence rows).
     n_img_emp = min(max(B_img_emp, 0), B_emp)
@@ -507,7 +522,7 @@ def shortcut_forcing_step(
         boot_target_norm = jnp.mean(jnp.abs(v_target_unclipped))
 
         # Bootstrap loss (computed unconditionally)
-        loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self)
+        loss_boot, boot_mse_unweighted = compute_bootstrap_loss(z_pred_self, z_tilde_self, b_prime, b_doubleprime, sigma_self, weighting)
     
     # --- Combine losses ---
     # Weight by batch composition to keep scale constant

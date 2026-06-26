@@ -57,7 +57,6 @@ bootstrap_start: 100_000  # Number of start steps trained exclusively on flow-ma
 bootstrap_fraction: 0.25  # Fraction of batch used for bootstrap samples
 image_fraction: 0.0  # Fraction of batch to train as images (no temporal attention)
 
-# Optimal transport coupling (minibatch OT)
 ot:
   enabled: true
   epsilon: null
@@ -67,6 +66,7 @@ ot:
   pairing: barycentric
   scale_cost: mean
 
+loss_weighting: v_space  # none | ramp | v_space
 
 lr_schedule:
   schedule_type: wsd  # constant | wsd | cos

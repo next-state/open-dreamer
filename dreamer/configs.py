@@ -374,6 +374,9 @@ class DynamicsConfig(BaseExperimentConfig):
     # Optimal transport coupling (minibatch OT)
     ot: OptimalTransportConfig = field(default_factory=OptimalTransportConfig)
 
+    # Per-sample loss weighting (function of signal level sigma): "none" | "ramp" | "v_space"
+    loss_weighting: str = "ramp"
+
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
 

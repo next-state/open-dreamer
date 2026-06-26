@@ -71,7 +71,7 @@ OmegaConf.register_new_resolver("min", lambda *args: min(args))
 # ---------------------------
 
 @nnx.jit(
-    static_argnames=("k_max", "B_img", "T", "n_splits", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg"),
+    static_argnames=("k_max", "B_img", "T", "n_splits", "context_length", "bootstrap_fraction", "use_latent_data", "ot_cfg", "weighting"),
     donate_argnames=("data", "actions"),
 )
 def train_step(
@@ -92,6 +92,7 @@ def train_step(
     bootstrap_fraction: float,
     use_latent_data: bool,    # True if data is already latents, False if data is videos
     ot_cfg: OptimalTransportConfig,
+    weighting: str,
 ):
     if use_latent_data:
         latents = data
@@ -143,6 +144,7 @@ def train_step(
             task_embeddings=None,  # Not used in dynamics pretraining
             bootstrap_model=dynamics_ema,  # EMA as stable target network for half-steps
             ot_cfg=ot_cfg,
+            weighting=weighting,
         )
 
         return losses['total'], aux
@@ -303,6 +305,7 @@ def run(cfg: DynamicsConfig):
                     bootstrap_fraction=cfg.bootstrap_fraction if step > cfg.bootstrap_start else 0,
                     use_latent_data=use_latent_data,
                     ot_cfg=ot_cfg,
+                    weighting=cfg.loss_weighting,
                 )
 
                 # EMA update
