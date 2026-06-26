@@ -149,23 +149,37 @@ def mouse_movement_to_categorical(dx: Array, dy: Array) -> Array:
     return bins[..., 1] * NUM_CAMERA_BINS + bins[..., 0]
 
 
+def mouse_movement_to_continuous(dx: Array, dy: Array) -> Array:
+    """Convert continuous mouse movement to a bounded 2-D continuous action.
+
+    Applies the same degree-scaling and clipping as the categorical path, but skips
+    the mu-law/binning step and returns normalized deltas instead.
+    """
+    dxy = np.stack([dx, dy], axis=-1).astype(np.float32)
+    dxy_deg = np.clip(dxy * CAMERA_SCALER, -CAMERA_MAXVAL, CAMERA_MAXVAL)
+    return dxy_deg / CAMERA_MAXVAL
+
+
 NUM_BINARY_ACTIONS: Final[int] = len(key_to_index)
 
 
-def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
+def parse_action_dicts(action_dicts: list[dict[str, Any]], mouse_repr: str = "categorical") -> Actions:
     """Convert a list of VPT action dictionaries to an Actions pytree.
-    
+
     Args:
         action_dicts: List of action dicts from VPT JSONL format. Each dict has:
             - mouse: {dx, dy, buttons, newButtons, ...}
             - keyboard: {keys: ["key.keyboard.w", ...], newKeys: [...]}
             - hotbar: int (0-8)
             - isGuiOpen: bool
-            
+        mouse_repr: How to represent mouse movement:
+            - "categorical": (T,) int32 camera action indices [0, 120] (mu-law foveated bins)
+            - "continuous": (T, 2) float32 normalized (dx, dy) in [-1, 1]
+
     Returns:
         Actions pytree with:
             - binary: (T, NUM_BINARY_ACTIONS) int32 array of keyboard/mouse button and wheel states
-            - categorical: (T,) int32 array of camera action indices [0, 120]
+            - categorical / continuous: mouse movement per `mouse_repr` (the other is None)
     """
     T = len(action_dicts)
     
@@ -201,13 +215,15 @@ def parse_action_dicts(action_dicts: list[dict[str, Any]]) -> Actions:
         camera_dx[t] = mouse.get("dx", 0.0)
         camera_dy[t] = mouse.get("dy", 0.0)
     
-    # Convert camera to categorical using mu-law foveated discretization
-    categorical = mouse_movement_to_categorical(
-        np.array(camera_dx), 
-        np.array(camera_dy)
-    )
-    
-    return Actions(
-        binary=np.array(binary),
-        categorical=categorical,
-    )
+    # Convert camera movement to the requested representation
+    if mouse_repr == "categorical":
+        return Actions(
+            binary=np.array(binary),
+            categorical=mouse_movement_to_categorical(np.array(camera_dx), np.array(camera_dy)),
+        )
+    elif mouse_repr == "continuous":
+        return Actions(
+            binary=np.array(binary),
+            continuous=mouse_movement_to_continuous(np.array(camera_dx), np.array(camera_dy)),
+        )
+    raise ValueError(f"parse_action_dicts: unknown mouse_repr '{mouse_repr}'")

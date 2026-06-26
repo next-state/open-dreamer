@@ -63,6 +63,7 @@ def make_tokenization_iterator(
     padding_h: tuple[int, int],
     padding_w: tuple[int, int],
     patch_size: int,
+    mouse_repr: str = "categorical",
 ):
     """Create dataloader for tokenization (sequential, no shuffle, full episodes)."""
     all_shards = sorted(Path(input_dir).glob("shard-*.array_record"))
@@ -94,6 +95,7 @@ def make_tokenization_iterator(
             padding_w=padding_w,
             patch_size=patch_size,
             full_episode=True,
+            mouse_repr=mouse_repr,
         ),
         grain.transforms.Batch(batch_size=batch_size, drop_remainder=True),
     ]
@@ -277,6 +279,7 @@ def run(cfg: DictConfig):
             padding_h=cfg.dataset.padding_H,
             padding_w=cfg.dataset.padding_W,
             patch_size=cfg.dataset.patch_size,
+            mouse_repr=cfg.dataset.mouse_repr,
         )
 
         # Build async prefetch pipeline: CPU buffer → device transfer → device buffer

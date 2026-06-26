@@ -253,6 +253,7 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
         decoder_threads: int = 1,
         cast_to_float32: bool = True,
         return_actions: bool = False,
+        mouse_repr: str = "categorical",
     ):
         """Initialize Minecraft VPT processor.
 
@@ -267,6 +268,7 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
             full_episode: If True, return full episode without slicing (for tokenization)
             decoder_threads: Number of decoding threads per worker process
             cast_to_float32: Whether to cast decoded video to float32
+            mouse_repr: Mouse movement representation: "continuous" ([dx, dy]) or "categorical" (mu-law bins)
         """
         self.seq_len = seq_len
         self.padding_h = tuple(padding_h) if isinstance(padding_h, list) else padding_h
@@ -275,6 +277,7 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
         self.decoder_threads = max(1, int(decoder_threads))
         self.cast_to_float32 = bool(cast_to_float32)
         self.return_actions = return_actions
+        self.mouse_repr = mouse_repr
         
 
         # Validate padding alignment with patch_size
@@ -307,14 +310,14 @@ class ProcessMinecraftEpisodeAndSlice(grain.transforms.RandomMap):
 
         if self.full_episode:
             video = vr.get_batch(list(range(episode_len))).asnumpy()
-            actions = parse_action_dicts(data.get("actions")).to_dict()
+            actions = parse_action_dicts(data.get("actions"), mouse_repr=self.mouse_repr).to_dict()
         else:
             max_start = episode_len - self.seq_len
             start = int(rng.integers(0, max_start + 1))
             frame_indices = list(range(start, start + self.seq_len))
             video = vr.get_batch(frame_indices).asnumpy()
             if self.return_actions:
-                all_actions = parse_action_dicts(data.get("actions"))
+                all_actions = parse_action_dicts(data.get("actions"), mouse_repr=self.mouse_repr)
                 actions = all_actions[start:start + self.seq_len]
             else:
                 actions = Actions(binary=None, categorical=None, continuous=None) # TODO: might be better to pass None at this point, but i'm keeping it in not to break any backward compatibility

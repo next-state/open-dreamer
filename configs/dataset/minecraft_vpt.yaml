@@ -30,6 +30,7 @@ patch_size: 16
 num_binary_actions: 27  # keyboard + mouse buttons + wheel direction
 categorical_action_dim: 121  # mouse actions
 continuous_action_dim: 0
+mouse_repr: categorical  # don't forget to set the corresponding categorical_action_dim and continuous_action_dim!
 
 dataset_mean: [0.2241, 0.2348, 0.2086]
 dataset_std: [0.1809, 0.1874, 0.2282]

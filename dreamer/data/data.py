@@ -62,6 +62,22 @@ def build_iterator(
     use_latent_data = cfg.data_type == "latent"
     dataset_type = "latent" if use_latent_data else cfg.name
 
+    if cfg.name.startswith("minecraft_vpt"):
+        if cfg.mouse_repr == "categorical" and cfg.categorical_action_dim <= 0:
+            raise ValueError(
+                "mouse_repr='categorical' requires categorical_action_dim > 0 "
+                f"(got {cfg.categorical_action_dim}); the mouse action would be dropped."
+            )
+        if cfg.mouse_repr == "continuous" and cfg.continuous_action_dim <= 0:
+            raise ValueError(
+                "mouse_repr='continuous' requires continuous_action_dim > 0 "
+                f"(got {cfg.continuous_action_dim}); the mouse action would be dropped."
+            )
+        if cfg.mouse_repr not in ("categorical", "continuous"):
+            raise ValueError(
+                f"Unknown mouse_repr '{cfg.mouse_repr}'; expected 'categorical' or 'continuous'."
+            )
+
     array_record_paths = build_dataset_paths(
         cfg.array_record_path,
         dataset_type=dataset_type,
@@ -107,6 +123,7 @@ def build_iterator(
                 padding_w=cfg.padding_W,
                 patch_size=cfg.patch_size,
                 return_actions=return_actions,
+                mouse_repr=cfg.mouse_repr,
             )
         ]
     else:

@@ -10,6 +10,7 @@ num_max_samples: -1
 num_binary_actions: 27
 categorical_action_dim: 121
 continuous_action_dim: 0
+mouse_repr: categorical  # don't forget to set the corresponding categorical_action_dim and continuous_action_dim!
 
 dataloader_cfg:
   B: ???
