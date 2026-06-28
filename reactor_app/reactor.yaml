@@ -1,10 +1,7 @@
 model:
-  name: world-model
-  display-name: OpenDreamer World Model
+  name: minerl
+  display-name: MineRL Minecraft
 
 runtime:
-  import: pipeline:WorldModelPipeline
+  import: pipeline:MineRLPipeline
   config: config.yaml
-  # Relative paths resolve against this reactor.yaml. Overridden by
-  # $REACTOR_WEIGHTS_PATH at runtime if set.
-  weights_path: ../jelly

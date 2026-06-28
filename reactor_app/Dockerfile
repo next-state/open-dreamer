@@ -30,18 +30,33 @@
 #
 # To layer CUDA / NVIDIA GPU support on top, see
 # containers/reactor-runtime-base/README.md.
-FROM --platform=linux/amd64 reactortechnologies/reactor-runtime-base:2.7.1
-
-# Build context is the project root (set by reactor_app/build.sh) so we can
-# install the `dreamer` package from pyproject.toml alongside reactor_app/.
+FROM --platform=linux/amd64 reactortechnologies/reactor-runtime-base:2.7.1-0
 
 WORKDIR /app
 
-# --- Project install -----------------------------------------------------
-# Copy pyproject.toml first so dep installs don't invalidate on source edits.
-COPY pyproject.toml uv.lock* README.md /app/
-COPY dreamer /app/dreamer
-RUN pip install --no-cache-dir -e .
+ENV JAVA_HOME=/opt/java
+ENV PATH=/opt/java/bin:$PATH
+
+# --- MineRL system/runtime dependencies ---------------------------------
+# MineRL builds and launches a Minecraft/Malmo runtime. Its installer needs a
+# JDK and the runtime needs a display; Xvfb provides one in headless containers.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git patch xauth xvfb \
+    && (apt-get install -y --no-install-recommends openjdk-8-jdk \
+        || apt-get install -y --no-install-recommends openjdk-11-jdk \
+        || apt-get install -y --no-install-recommends openjdk-17-jdk \
+        || apt-get install -y --no-install-recommends default-jdk) \
+    && detected_java_home="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")" \
+    && ln -s "$detected_java_home" "$JAVA_HOME" \
+    && java -version \
+    && javac -version \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- App install ---------------------------------------------------------
+COPY reactor_app/requirements.txt /app/reactor_app/requirements.txt
+RUN pip install --no-cache-dir -r /app/reactor_app/requirements.txt \
+    && pip install --no-cache-dir --no-deps \
+        "minerl @ git+https://github.com/minerllabs/minerl@cdeae668c2f334e3c9117adf651b5a94436b45f8"
 
 # --- Reactor workspace ---------------------------------------------------
 COPY reactor_app /app/reactor_app
@@ -50,5 +65,5 @@ COPY reactor_app /app/reactor_app
 WORKDIR /app/reactor_app
 
 # --- Entrypoint ----------------------------------------------------------
-ENTRYPOINT ["/usr/bin/tini", "--", "python", "-m", "reactor_runtime.serve"]
+ENTRYPOINT ["/usr/bin/tini", "--", "xvfb-run", "-a", "python", "-m", "reactor_runtime.serve"]
 CMD ["run"]

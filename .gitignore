@@ -233,3 +233,7 @@ migration/
 .claude/
 CLAUDE.md
 .hydra/
+
+jelly
+latents
+tokenizer

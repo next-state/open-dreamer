@@ -4,22 +4,22 @@ A real-time video model built with Reactor Runtime.
 
 ## Run it locally
 
-```bash
-reactor run
-```
-
-`reactor run` builds the workspace's `Dockerfile` (if no cached image
-exists) and starts the container locally. The runtime listens on
-`http://localhost:8080`; connect with a WebRTC client at the URL printed
-on startup. Pass `--rebuild` to force a fresh `docker build`, or
-`--port 9000` to map the runtime onto a different host port.
-
-To forward flags to the runtime entrypoint inside the container, append
-them after the model — `reactor run` passes them through verbatim:
+MineRL builds and launches Minecraft/Malmo, so the serving environment needs a
+JDK before `minerl` is installed. On headless Linux, run under Xvfb or use the
+included Dockerfile, which installs Java/Xvfb and starts Reactor with
+`xvfb-run`.
 
 ```bash
-reactor run --runtime _redis --model.batch_size=8
+cd /home/ubuntu/dreamer4-jax-private
+reactor_app/build.sh --progress=plain
+docker run --rm --network host \
+  -e WEBRTC_PORT_RANGE="40000:40050" \
+  reactor-local/reactor_app:dev \
+  run --host 0.0.0.0 --port 8080 --webrtc-port-range 40000:40050
 ```
+
+The runtime listens on `http://localhost:8080`. Host networking is intentional:
+WebRTC ICE candidates need to advertise host-reachable addresses and UDP ports.
 
 ## Project structure
 
@@ -38,20 +38,27 @@ on top.
 
 ## Iterating
 
-`reactor run` reuses cached images by default, so a re-run after editing
-`pipeline.py` will skip the build step. Force a rebuild after changing
-`requirements.txt` or anything else baked into the image:
+Rebuild after editing `pipeline.py`, `requirements.txt`, or Docker-baked files:
 
 ```bash
-reactor run --rebuild
+reactor_app/build.sh --progress=plain
+```
+
+For a direct host run, use a MineRL-compatible Python environment after Java is
+available. Do not install MineRL into the root JAX environment unless you are
+okay with its old NumPy/Gym pins replacing the JAX stack's versions. Then
+launch:
+
+```bash
+WEBRTC_PORT_RANGE="40000:40050" python -m reactor_runtime.serve run --path reactor_app
 ```
 
 ## How it works
 
-- **`MyOutput`** declares the video track the model sends to clients.
-- **`MyState`** declares parameters clients can change in real-time. Each field auto-generates a `set_<field>` event — no handler code needed.
-- **`inference()`** is a generator that yields frames in batches. Read `self.state` to pick up the latest client values.
-- **`load()`** runs once at startup — put weight loading here.
+- **`MineRLOutput`** declares the video track sent to clients.
+- **`MineRLState`** stores per-client keyboard, mouse, seed, and reset state.
+- **`inference()`** owns a MineRL Gym environment, steps it with live input, and yields `obs["pov"]` frames.
+- **`load()`** reads the env id, frame rate, and camera tuning from `config.yaml`.
 
 ## Next steps
 
