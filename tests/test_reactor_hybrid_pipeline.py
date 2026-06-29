@@ -1,13 +1,25 @@
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "reactor_app"))
+
+reactor_runtime = ModuleType("reactor_runtime")
+reactor_runtime.get_weights_path = lambda: Path("/tmp")
+reactor_interface = ModuleType("reactor_runtime.interface")
+reactor_interface.InputState = object
+reactor_interface.Output = object
+reactor_interface.ReactorPipeline = object
+reactor_interface.Video = object
+reactor_interface.connected = lambda func: func
+reactor_interface.event = lambda name, description="": lambda func: func
+sys.modules.setdefault("reactor_runtime", reactor_runtime)
+sys.modules.setdefault("reactor_runtime.interface", reactor_interface)
 
 import pipeline as hybrid_pipeline  # noqa: E402
 from pipeline import WorldModelPipeline, WorldModelState  # noqa: E402
@@ -30,16 +42,17 @@ class _FakeDynamics:
 
 
 class _Tokenizer:
-    def encode(self, frame, *, deterministic=True):
+    def encode(self, frame, *, deterministic=True, caches=None):
         assert deterministic is True
         assert frame.shape == (1, 1, 4, 5, 3)
-        return jnp.ones((1, 1, 2, 2), dtype=jnp.float32), None
+        assert caches == ("enc",)
+        return jnp.ones((1, 1, 2, 2), dtype=jnp.float32), None, ("enc", "encoded")
 
     def decode(self, latent, *, caches=None, deterministic=True):
         assert deterministic is True
         assert latent.shape == (1, 1, 2, 2)
-        assert caches == ("tok",)
-        return latent, caches + ("decoded",)
+        assert caches == ("dec",)
+        return latent, ("dec", "decoded")
 
 
 def _observe_test_inputs():
@@ -53,7 +66,7 @@ def _observe_test_inputs():
     return schedule, frame, hybrid_pipeline._noop_action(), rng
 
 
-def test_observe_frame_uses_uncached_tokenizer_encode_and_cached_decode():
+def test_observe_frame_uses_cached_tokenizer_encode_and_decode():
     schedule, frame, action, rng = _observe_test_inputs()
 
     dynamics_cache, tokenizer_cache, _rng = hybrid_pipeline._observe_frame(
@@ -63,12 +76,12 @@ def test_observe_frame_uses_uncached_tokenizer_encode_and_cached_decode():
         frame,
         action,
         ("dyn",),
-        ("tok",),
+        {"encoder": ("enc",), "decoder": ("dec",)},
         rng,
     )
 
     assert dynamics_cache == ("dyn", "dynamics")
-    assert tokenizer_cache == ("tok", "decoded")
+    assert tokenizer_cache == {"encoder": ("enc", "encoded"), "decoder": ("dec", "decoded")}
 
 
 class _FakeActionSpace:
@@ -163,7 +176,7 @@ def _make_pipeline(monkeypatch, env):
     return pipeline, observed_dynamics_caches, generated_dynamics_caches, generated_tokenizer_caches, generated_rngs
 
 
-def test_hybrid_starts_in_minerl_and_generates_from_old_empty_world_model_inputs(monkeypatch):
+def test_hybrid_starts_in_minerl_and_generates_from_observed_world_model_inputs(monkeypatch):
     env = _FakeEnv()
     pipeline, observed_caches, generated_caches, generated_tokenizer_caches, generated_rngs = _make_pipeline(monkeypatch, env)
     generator = pipeline.inference()
@@ -178,9 +191,9 @@ def test_hybrid_starts_in_minerl_and_generates_from_old_empty_world_model_inputs
     assert env.reset_count == 1
     assert env.actions == []
     assert observed_caches == [("empty_dyn",)]
-    assert generated_caches == [("empty_dyn",)]
-    assert generated_tokenizer_caches == [("empty_tok",)]
-    np.testing.assert_array_equal(generated_rngs[0], hybrid_pipeline.jax.random.split(hybrid_pipeline.jax.random.PRNGKey(123))[1])
+    assert generated_caches == [("empty_dyn", "observed")]
+    assert generated_tokenizer_caches == [("empty_tok", "observed")]
+    np.testing.assert_array_equal(generated_rngs[0], hybrid_pipeline.jax.random.split(hybrid_pipeline.jax.random.PRNGKey(999))[1])
 
 
 def test_hybrid_toggle_back_resumes_minerl_from_real_env(monkeypatch):
@@ -199,7 +212,10 @@ def test_hybrid_toggle_back_resumes_minerl_from_real_env(monkeypatch):
     assert resumed.main_video[0, 0, 0] == 0
     assert stepped.main_video[0, 0, 0] == 1
     assert len(env.actions) == 1
-    assert observed_caches[-2:] == [("empty_dyn",), ("empty_dyn", "observed")]
+    assert observed_caches[-2:] == [
+        ("empty_dyn", "observed", "generated"),
+        ("empty_dyn", "observed", "generated", "observed"),
+    ]
 
 
 def test_new_scene_resets_mode_and_requests_reset():

@@ -259,11 +259,7 @@ def next_frame(
     )
     
     # Decoder call
-    frame, tokenizer_cache_updated = tokenizer.decode(
-        latent,
-        caches=tokenizer_cache,
-        deterministic=True,
-    )
+    frame, tokenizer_cache_updated = tokenizer.decode(latent, caches=tokenizer_cache, deterministic=True)
     
     # Clip to valid range (keep as JAX array)
     # frame shape: (B, 1, H, W, C)

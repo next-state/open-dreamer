@@ -302,7 +302,7 @@ def run(cfg: DictConfig):
         # JIT-compile encode function
         @nnx.jit
         def encode_batch(videos):
-            latents, _ = tokenizer.encode(
+            latents, _, _ = tokenizer.encode(
                 videos,
                 deterministic=True,
                 rngs=nnx.Rngs(0),

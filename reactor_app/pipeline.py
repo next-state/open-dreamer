@@ -2,7 +2,7 @@
 Hybrid MineRL + Dreamer world-model Reactor pipeline.
 
 The session starts in the real MineRL environment. Each real frame is encoded
-and used to advance the Dreamer dynamics and decoder KV caches. The existing
+and used to advance the Dreamer dynamics and tokenizer KV caches. The existing
 frontend toggle then switches generation to the warmed world model.
 """
 
@@ -106,24 +106,6 @@ def _mesh_context(mesh: Any) -> AbstractContextManager[Any]:
     return mesh
 
 
-def _create_tokenizer_static_caches(
-    tokenizer: Tokenizer,
-    *,
-    batch_size: int,
-    window_size: int,
-    dtype: Any,
-):
-    """Create tokenizer caches the same way the old pure-WM pipeline did."""
-    create_caches = tokenizer.create_static_caches
-    caches = create_caches(batch_size=batch_size, window_size=window_size, dtype=dtype)
-
-    # A legacy tokenizer API returned (encoder_cache, decoder_cache), and the
-    # old pipeline unpacked only the decoder cache for world-model generation.
-    if isinstance(caches, (list, tuple)) and len(caches) == 2:
-        return caches[1]
-    return caches
-
-
 def _observe_frame(
     tokenizer,
     dynamics,
@@ -134,9 +116,9 @@ def _observe_frame(
     tokenizer_cache: Any,
     rng: jax.Array,
 ):
-    """Advance dynamics and tokenizer decoder caches from one real observed frame."""
+    """Advance dynamics and tokenizer encoder/decoder caches from one real observed frame."""
     frame = jnp.asarray(frame, dtype=jnp.float32)[None, None, ...]
-    latent, _aux = tokenizer.encode(frame, deterministic=True)
+    latent, _aux, encoder_cache = tokenizer.encode(frame, deterministic=True, caches=tokenizer_cache["encoder"])
     latent_norm = normalize_latents(latent, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
     batch_size = latent_norm.shape[0]
@@ -148,9 +130,9 @@ def _observe_frame(
     latent_noised = latent_norm * schedule.tau_ctx + (1.0 - schedule.tau_ctx) * jax.random.normal(rng_ctx, shape=latent_norm.shape, dtype=latent_norm.dtype)
 
     _pred, (_h, dynamics_cache_updated) = dynamics(action, step_indices, tau_indices, latent_noised, deterministic=True, caches=dynamics_cache)
-    _decoded, tokenizer_cache_updated = tokenizer.decode(latent, caches=tokenizer_cache, deterministic=True)
+    _decoded, decoder_cache = tokenizer.decode(latent, caches=tokenizer_cache["decoder"], deterministic=True)
 
-    return dynamics_cache_updated, tokenizer_cache_updated, rng
+    return dynamics_cache_updated, {"encoder": encoder_cache, "decoder": decoder_cache}, rng
 
 
 class WorldModelPipeline(ReactorPipeline):
@@ -203,9 +185,10 @@ class WorldModelPipeline(ReactorPipeline):
             assert isinstance(tok_cfg.decoder.context_length, int) and tok_cfg.decoder.context_length > 0
 
             self._empty_dynamics_cache = self._dynamics.create_static_caches(batch_size=1, n_latents=n_latents, window_size=dyn_cfg.context_length, n_agent=0, dtype=dyn_cfg.dtype)
-            self._empty_tokenizer_cache = _create_tokenizer_static_caches(
-                self._tokenizer,
+            self._empty_tokenizer_cache = self._tokenizer.create_tokenizer_static_caches(
                 batch_size=1,
+                H=int(tok_cfg.decoder.H),
+                W=int(tok_cfg.decoder.W),
                 window_size=tok_cfg.decoder.context_length,
                 dtype=tok_cfg.decoder.dtype,
             )
@@ -213,7 +196,8 @@ class WorldModelPipeline(ReactorPipeline):
             schedule = self._schedule
 
             def _next_frame_fn(tokenizer, dynamics, action, latent_shape, dynamics_cache, tokenizer_cache, rng, task_embedding=None):
-                return next_frame(tokenizer, dynamics, schedule, action, latent_shape, dynamics_cache, tokenizer_cache, rng, task_embedding)
+                frame, h, dynamics_cache, decoder_cache, rng = next_frame(tokenizer, dynamics, schedule, action, latent_shape, dynamics_cache, tokenizer_cache["decoder"], rng, task_embedding)
+                return frame, h, dynamics_cache, {"encoder": tokenizer_cache["encoder"], "decoder": decoder_cache}, rng
 
             def _observe_frame_fn(tokenizer, dynamics, frame, action, dynamics_cache, tokenizer_cache, rng):
                 return _observe_frame(tokenizer, dynamics, schedule, frame, action, dynamics_cache, tokenizer_cache, rng)
@@ -268,64 +252,38 @@ class WorldModelPipeline(ReactorPipeline):
                     self._obs = self._reset_env(self._env, self.state._seed)
                     sent_initial_frame = False
                     was_world_model = False
-
+                
                 use_world_model = bool(self.state._use_policy)
 
-                if was_world_model and not use_world_model:
+                if not use_world_model:
                     # rng = jax.random.PRNGKey(self.state._seed)
-                    # dynamics_cache = self._empty_dynamics_cache
-                    # tokenizer_cache = self._empty_tokenizer_cache
+                    minerl_action = self._build_minerl_action(self._env)
+                    self._obs, _reward, terminated, truncated, _info = self._step_env(self._env, minerl_action)
                     frame = self._frame_from_obs(self._obs)
-                    _, _, rng = self._observe_real_frame(frame, _noop_action(), dynamics_cache, tokenizer_cache, rng)
-                    # jax.block_until_ready((dynamics_cache, tokenizer_cache, rng))
-                    self._consume_pulsed_inputs()
-                    last_frame_at = self._sleep_until_next_frame(last_frame_at)
-                    was_world_model = False
-                    yield WorldModelOutput(main_video=frame)
-                    continue
+                    # dynamics_cache, tokenizer_cache, rng = self._observe_real_frame(frame, _noop_action(), dynamics_cache, tokenizer_cache, rng)
 
-                if not sent_initial_frame:
-                    frame = self._frame_from_obs(self._obs)
-                    _, _, rng = self._observe_real_frame(frame, _noop_action(), dynamics_cache, tokenizer_cache, rng)
-                    # jax.block_until_ready((dynamics_cache, tokenizer_cache, rng))
-                    sent_initial_frame = True
-                    last_frame_at = time.monotonic()
-                    yield WorldModelOutput(main_video=frame)
-                    continue
 
                 action = _build_world_model_action(self.state._keyboard, self.state._mouse)
 
                 if use_world_model:
-                    # if not was_world_model:
-                    #     rng = jax.random.PRNGKey(self.state._seed)
-                    #     dynamics_cache = self._empty_dynamics_cache
-                    #     tokenizer_cache = self._empty_tokenizer_cache
                     rng, key = jax.random.split(rng)
-                    frame_jax, _h, dynamics_cache, tokenizer_cache, rng = self._next_frame_jit(self._tokenizer, self._dynamics, action, self._latent_shape, dynamics_cache, tokenizer_cache, key)
-                    jax.block_until_ready((frame_jax, dynamics_cache, tokenizer_cache, rng))
-                    self._consume_pulsed_inputs()
-                    last_frame_at = self._sleep_until_next_frame(last_frame_at)
-                    was_world_model = True
+                    action = _build_world_model_action(self.state._keyboard, self.state._mouse)
+
+                    frame_jax, _h, dynamics_cache, tokenizer_cache, rng = self._next_frame_jit(
+                        self._tokenizer, self._dynamics, action,
+                        self._latent_shape, dynamics_cache, tokenizer_cache, key,
+                    )
+
 
                     frame = np.asarray(frame_jax[0, 0])
                     if frame.dtype != np.uint8:
                         frame = np.clip(frame, 0, 255).astype(np.uint8)
-                    yield WorldModelOutput(main_video=np.ascontiguousarray(frame))
-                    continue
 
-                minerl_action = self._build_minerl_action(self._env)
-                self._obs, _reward, terminated, truncated, _info = self._step_env(self._env, minerl_action)
-                if terminated or truncated:
-                    self._obs = self._reset_env(self._env, self.state._seed)
-                    action = _noop_action()
+                # consume accumulated mouse delta + scroll-wheel pulse
+                self.state._mouse["dx"] = 0.0
+                self.state._mouse["dy"] = 0.0
+                self.state._mouse["dwheel"] = 0.0
 
-                frame = self._frame_from_obs(self._obs)
-                dynamics_cache, tokenizer_cache, rng = self._observe_real_frame(frame, action, dynamics_cache, tokenizer_cache, rng)
-                jax.block_until_ready((dynamics_cache, tokenizer_cache, rng))
-
-                self._consume_pulsed_inputs()
-                last_frame_at = self._sleep_until_next_frame(last_frame_at)
-                was_world_model = False
                 yield WorldModelOutput(main_video=frame)
 
     def _observe_real_frame(

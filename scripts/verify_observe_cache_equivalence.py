@@ -4,7 +4,7 @@ This is a CPU-friendly diagnostic for reactor_app.pipeline._observe_frame.
 It extracts an MP4 payload from an ArrayRecord shard, decodes a short frame
 sequence, then compares:
 
-1. one batched dynamics/decoder cache update over T frames
+1. one batched tokenizer/dynamics/decoder cache update over T frames
 2. T calls to the same single-frame observed-frame path used by Reactor
 
 The dynamics observation noise is precomputed from the same per-frame split
@@ -176,10 +176,7 @@ def _observe_sequence_batched(
     noise: jax.Array,
 ) -> tuple[Any, Any]:
     frames = jnp.asarray(frames, dtype=jnp.float32)[None, ...]
-    latent, _aux = tokenizer.encode(
-        frames,
-        deterministic=True,
-    )
+    latent, _aux, encoder_cache = tokenizer.encode(frames, deterministic=True, caches=tokenizer_cache["encoder"])
     latent_norm = normalize_latents(latent, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
     batch_size, num_frames = latent_norm.shape[:2]
     step_indices = jnp.full((batch_size, num_frames), schedule.step_idx_ctx, dtype=jnp.int32)
@@ -194,8 +191,8 @@ def _observe_sequence_batched(
         deterministic=True,
         caches=dynamics_cache,
     )
-    _decoded, tokenizer_cache = tokenizer.decode(latent, caches=tokenizer_cache, deterministic=True)
-    return dynamics_cache, tokenizer_cache
+    _decoded, decoder_cache = tokenizer.decode(latent, caches=tokenizer_cache["decoder"], deterministic=True)
+    return dynamics_cache, {"encoder": encoder_cache, "decoder": decoder_cache}
 
 
 def _tree_max_abs_diff(a: Any, b: Any) -> float:
@@ -252,8 +249,10 @@ def main() -> None:
             n_agent=0,
             dtype=jnp.float32,
         )
-        tokenizer_cache_batched = tokenizer.create_static_caches(
+        tokenizer_cache_batched = tokenizer.create_tokenizer_static_caches(
             batch_size=1,
+            H=args.image_size,
+            W=args.image_size,
             window_size=context_length,
             dtype=jnp.float32,
         )
