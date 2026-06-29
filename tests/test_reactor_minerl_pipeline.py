@@ -6,7 +6,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "reactor_app"))
 
-from pipeline import MineRLPipeline, MineRLState  # noqa: E402
+from pipeline_minerl import MineRLPipeline, MineRLState  # noqa: E402
 
 
 class _FakeActionSpace:

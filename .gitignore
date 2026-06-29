@@ -7,6 +7,23 @@ slurm_outs/
 wandb/
 run_job.sh
 logs
+data
+
+# Next.js / frontend
+frontend/**/.next/
+frontend/**/node_modules/
+frontend/**/out/
+frontend/**/.vercel/
+frontend/**/coverage/
+frontend/**/next-env.d.ts
+frontend/**/*.tsbuildinfo
+frontend/**/.pnp
+frontend/**/.pnp.*
+frontend/**/.yarn/*
+!frontend/**/.yarn/patches/
+!frontend/**/.yarn/plugins/
+!frontend/**/.yarn/releases/
+!frontend/**/.yarn/versions/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

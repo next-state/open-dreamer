@@ -18,6 +18,7 @@ import grain
 import numpy as np
 
 from ..actions import Actions, parse_action_dicts
+from .cursor import render_cursor_on_frames
 from .serialization import deserialize_msgpack_record
 
 try:

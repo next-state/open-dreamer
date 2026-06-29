@@ -6,4 +6,4 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-exec docker build -f "$HERE/Dockerfile" -t "reactor-local/$(basename "$HERE"):dev" "$ROOT" "$@"
+exec docker build -f "$HERE/Dockerfile" -t "reactor-local/$(basename "$HERE"):dev" "$@" "$ROOT"

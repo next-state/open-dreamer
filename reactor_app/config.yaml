@@ -1,7 +1,12 @@
-# MineRL environment settings. Passed to MineRLPipeline.load() as a dict.
+# Hybrid MineRL + Dreamer world-model settings.
 
 env_id: MineRLBasaltFindCave-v0
 fps: 20
 camera_sensitivity: 0.15
 max_camera_degrees: 20
 warmup_env: true
+world_model_warmup_steps: 2
+minerl_runtime_dir: /tmp/reactor_minerl
+
+num_steps: 4
+tau_ctx_target: 0.9

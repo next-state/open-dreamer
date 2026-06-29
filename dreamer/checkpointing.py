@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
-from typing import ClassVar, Self
+from typing import TYPE_CHECKING, ClassVar, Self
 
 import jax
 import orbax.checkpoint as ocp
@@ -31,12 +31,14 @@ from dreamer.models import (
     TaskEmbedder,
     Tokenizer,
 )
-from dreamer.training import RMSLossNormalizer
 from dreamer.parallel import MeshRules
 from jax.experimental import multihost_utils
 
 from dreamer.utils import from_dict
 
+
+if TYPE_CHECKING:
+    from dreamer.training import RMSLossNormalizer
 
 
 class NoOpCheckpointManager(ocp.CheckpointManager):
@@ -135,7 +137,8 @@ class CheckpointBundle:
         if model_names is not None:
             registry = {k: v for k, v in registry.items() if k in model_names}
 
-        with ocp.CheckpointManager(checkpoint_path) as checkpoint_manager:
+        item_names = tuple(dict.fromkeys((*registry.keys(), "meta")))
+        with ocp.CheckpointManager(checkpoint_path, item_names=item_names) as checkpoint_manager:
             step = checkpoint_manager.latest_step()
             if step is None:
                 raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")

@@ -1,7 +1,8 @@
 model:
-  name: minerl
-  display-name: MineRL Minecraft
+  name: world-model
+  display-name: MineRL + Dreamer World Model
 
 runtime:
-  import: pipeline:MineRLPipeline
+  import: pipeline:WorldModelPipeline
   config: config.yaml
+  weights_path: ../jelly

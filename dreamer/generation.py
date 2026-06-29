@@ -239,7 +239,7 @@ def next_frame(
         action: Single action to condition on where the time dimension is squeezed (B, ...)
         latent_shape: Shape of latent (B, 1, n_spatial, D_s)
         dynamics_cache: KV cache for dynamics model from previous steps
-        tokenizer_cache: KV cache for tokenizer decoder from previous steps
+        tokenizer_cache: KV cache for the tokenizer decoder from previous steps.
         rng: Random key
         task_embedding: Optional task embedding (currently unused)
         
@@ -402,5 +402,3 @@ def latent_rollout(
         'context_hidden': h_seq,
         'ode_diags': ode_diags,
     }
-
-

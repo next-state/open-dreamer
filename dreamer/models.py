@@ -20,6 +20,12 @@ from .parallel import MeshRules
 from .actions import Actions
 
 
+def _nnx_list(items):
+    if hasattr(nnx, "List"):
+        return nnx.List(items)
+    return list(items)
+
+
 # ============================================================================
 # KV Cache
 # ============================================================================
@@ -119,7 +125,7 @@ class KVCache:
         return k_ordered, v_ordered, final_mask
 
 
-KVCachesDict = Dict[int, KVCache]  # Type alias for KV cache dictionaries
+KVCachesDict = Dict[int, KVCache]  # Type alias for transformer KV cache dictionaries
 
 
 def create_transformer_caches(
@@ -684,7 +690,7 @@ class BlockCausalTransformer(nnx.Module):
             )
 
         # Create layers
-        self.layers = nnx.List([
+        self.layers = _nnx_list([
             BlockCausalLayer(
                 dim=d_model, num_heads=n_heads, num_kv_heads=n_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
@@ -802,7 +808,14 @@ class Encoder(nnx.Module):
         self.mask_and_replace = MAEReplacer(D=cfg.d_model, p_min=cfg.mae_p_min, p_max=cfg.mae_p_max, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
         self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_latents, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
-    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+    def __call__(
+            self,
+            videos,
+            *,
+            deterministic: bool = True,
+            rngs: nnx.Rngs | None = None,
+            mae_p_max: jnp.ndarray | None = None
+        ):
         # Videos in the [0, 255] range
         B, T, H, W, C = videos.shape
 
@@ -855,6 +868,9 @@ class Decoder(nnx.Module):
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
         self.context_length = cfg.context_length
+        self.d_model = cfg.d_model
+        self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads
         self.H = cfg.H
         self.W = cfg.W
         self.dataset_mean = cfg.dataset_mean
@@ -885,6 +901,19 @@ class Decoder(nnx.Module):
             (Modality.LATENT, self.n_latents),
             (Modality.IMAGE, self.n_patches)
         ))
+
+    def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
+        """Creates concrete, zero-filled decoder KV cache buffers for JIT compilation."""
+        layout = self.get_token_layout()
+
+        return create_transformer_caches(
+            layer_is_time=[layer.is_time_layer for layer in self.transformer.layers],
+            flattened_batch_size=batch_size * layout.S,
+            window_size=window_size,
+            num_kv_heads=self.n_kv_heads,
+            head_dim=self.d_model // self.n_heads,
+            dtype=dtype
+        )
 
     def __call__(
             self,
@@ -920,6 +949,7 @@ class Decoder(nnx.Module):
         out_frames = unnormalize_with_dataset_stats(out_normalized_frames, mean=self.dataset_mean, std=self.dataset_std)
         return out_frames, new_caches
 
+
 class Tokenizer(nnx.Module):
     """Complete tokenizer (encoder + decoder)."""
 
@@ -935,26 +965,32 @@ class Tokenizer(nnx.Module):
         recon, _ = self.decoder(z, deterministic=deterministic, rngs=rngs)
         return recon, aux
 
-    def encode(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
+    def encode(
+            self,
+            videos,
+            *,
+            deterministic: bool = True,
+            rngs: nnx.Rngs | None = None,
+            mae_p_max: jnp.ndarray | None = None
+        ):
         # Always returns unpacked: (B, T, n_latents, d_bottleneck)
         return self.encoder(videos, deterministic=deterministic, rngs=rngs, mae_p_max=mae_p_max)
 
     def decode(self, z, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None):
         # Always expects unpacked: (B, T, n_latents, d_bottleneck)
-        frames, caches = self.decoder(z, deterministic=deterministic, caches=caches, rngs=rngs)
-        return frames, caches
+        return self.decoder(z, deterministic=deterministic, caches=caches, rngs=rngs)
 
-    def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
-        """Creates concrete, zero-filled KV cache buffers for JIT compilation."""
-        layout = self.decoder.get_token_layout()
-
-        return create_transformer_caches(
-            layer_is_time=[layer.is_time_layer for layer in self.decoder.transformer.layers],
-            flattened_batch_size=batch_size * layout.S,
+    def create_static_caches(
+            self,
+            batch_size: int,
+            window_size: int = 1024,
+            dtype=jnp.float32,
+        ) -> KVCachesDict:
+        """Creates concrete, zero-filled decoder KV cache buffers for JIT compilation."""
+        return self.decoder.create_static_caches(
+            batch_size=batch_size,
             window_size=window_size,
-            num_kv_heads=self.cfg.decoder.n_kv_heads,
-            head_dim=self.cfg.decoder.d_model // self.cfg.decoder.n_heads,
-            dtype=dtype
+            dtype=dtype,
         )
 
     def num_scaling_params(self) -> int:
@@ -1027,7 +1063,7 @@ class ActionEncoder(nnx.Module):
 
         # Embed binary actions
         if num_binary_actions > 0:
-            self.binary_embeds_list = nnx.List([
+            binary_embeds = [
                 nnx.Embed(
                     2, d_model,
                     dtype=dtype, param_dtype=param_dtype,
@@ -1035,7 +1071,8 @@ class ActionEncoder(nnx.Module):
                     rngs=rngs
                 )
                 for _ in range(num_binary_actions)
-            ])  # num_binary_actions * (B, T, d_model)
+            ]
+            self.binary_embeds_list = _nnx_list(binary_embeds)  # num_binary_actions * (B, T, d_model)
         else:
             self.binary_embeds_list = None
 

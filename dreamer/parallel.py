@@ -27,9 +27,6 @@ def _int_env(*names: str, default: int | None = None) -> int | None:
 
 def maybe_init_distributed() -> None:
     """Initialize JAX multi-process runtime when launched across hosts."""
-    if jax.distributed.is_initialized():
-        return
-
     coordinator = os.environ.get("JAX_COORDINATOR_ADDRESS")
     world = _int_env(
         "JAX_PROCESS_COUNT",
@@ -50,6 +47,10 @@ def maybe_init_distributed() -> None:
     ompi_env = "OMPI_MCA_orte_hnp_uri" in os.environ
     should_init = bool(coordinator) or (world is not None and world > 1) or slurm_env or ompi_env
     if not should_init:
+        return
+
+    is_initialized = getattr(jax.distributed, "is_initialized", None)
+    if is_initialized is not None and is_initialized():
         return
 
     if coordinator:
