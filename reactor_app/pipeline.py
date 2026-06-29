@@ -123,13 +123,10 @@ def _observe_frame(
 
     batch_size = latent_norm.shape[0]
     action = action[:, None, ...]
-    step_indices = jnp.full((batch_size, 1), schedule.step_idx_ctx, dtype=jnp.int32)
-    tau_indices = jnp.full((batch_size, 1), schedule.tau_idx_ctx, dtype=jnp.int32)
+    step_indices = jnp.full((batch_size, 1), schedule.emax, dtype=jnp.int32)
+    tau_indices = jnp.full((batch_size, 1), schedule.k_max, dtype=jnp.int32)
 
-    rng, rng_ctx = jax.random.split(rng)
-    latent_noised = latent_norm * schedule.tau_ctx + (1.0 - schedule.tau_ctx) * jax.random.normal(rng_ctx, shape=latent_norm.shape, dtype=latent_norm.dtype)
-
-    _pred, (_h, dynamics_cache_updated) = dynamics(action, step_indices, tau_indices, latent_noised, deterministic=True, caches=dynamics_cache)
+    _pred, (_h, dynamics_cache_updated) = dynamics(action, step_indices, tau_indices, latent_norm, deterministic=True, caches=dynamics_cache)
     _decoded, decoder_cache = tokenizer.decode(latent, caches=tokenizer_cache["decoder"], deterministic=True)
 
     return dynamics_cache_updated, {"encoder": encoder_cache, "decoder": decoder_cache}, rng
@@ -147,6 +144,8 @@ class WorldModelPipeline(ReactorPipeline):
         self._camera_sensitivity = float(config.get("camera_sensitivity", 0.15))
         self._max_camera_degrees = float(config.get("max_camera_degrees", 20.0))
         self._minerl_runtime_dir = str(config.get("minerl_runtime_dir", "/tmp/reactor_minerl"))
+        self._allow_frame_resize = bool(config.get("allow_frame_resize", False))
+        self._warned_frame_resize = False
         self._env = None
         self._obs = None
 
@@ -255,25 +254,21 @@ class WorldModelPipeline(ReactorPipeline):
                 
                 use_world_model = bool(self.state._use_policy)
 
+                action = _build_world_model_action(self.state._keyboard, self.state._mouse)
                 if not use_world_model:
                     # rng = jax.random.PRNGKey(self.state._seed)
                     minerl_action = self._build_minerl_action(self._env)
                     self._obs, _reward, terminated, truncated, _info = self._step_env(self._env, minerl_action)
                     frame = self._frame_from_obs(self._obs)
-                    # dynamics_cache, tokenizer_cache, rng = self._observe_real_frame(frame, _noop_action(), dynamics_cache, tokenizer_cache, rng)
+                    dynamics_cache, tokenizer_cache, rng = self._observe_real_frame(frame, action, dynamics_cache, tokenizer_cache, rng)
 
-
-                action = _build_world_model_action(self.state._keyboard, self.state._mouse)
 
                 if use_world_model:
                     rng, key = jax.random.split(rng)
-                    action = _build_world_model_action(self.state._keyboard, self.state._mouse)
-
                     frame_jax, _h, dynamics_cache, tokenizer_cache, rng = self._next_frame_jit(
                         self._tokenizer, self._dynamics, action,
                         self._latent_shape, dynamics_cache, tokenizer_cache, key,
                     )
-
 
                     frame = np.asarray(frame_jax[0, 0])
                     if frame.dtype != np.uint8:
@@ -304,12 +299,35 @@ class WorldModelPipeline(ReactorPipeline):
         if frame.ndim != 3 or frame.shape[-1] != target_c:
             raise RuntimeError(f"Cannot adapt MineRL frame shape {frame.shape} to model shape {self._model_frame_shape}")
 
+        height, width, _channels = frame.shape
+        pad_h = target_h - height
+        pad_w = target_w - width
+        if width == target_w and pad_w == 0 and 0 < pad_h <= 32:
+            top = pad_h // 2
+            bottom = pad_h - top
+            padded = np.pad(frame, ((top, bottom), (0, 0), (0, 0)), mode="constant", constant_values=0)
+            return np.ascontiguousarray(padded.astype(np.uint8, copy=False))
+
+        if not self._allow_frame_resize:
+            raise RuntimeError(
+                f"MineRL frame shape {frame.shape} is incompatible with model shape {self._model_frame_shape}. "
+                "The world model was trained on high-resolution VPT frames padded to the tokenizer size; "
+                "silently resizing low-resolution MineRL frames corrupts the KV cache. Use a VPT-compatible "
+                "high-resolution observation source, or set allow_frame_resize=true only for diagnostics."
+            )
+
         try:
             import cv2
 
+            if not self._warned_frame_resize:
+                print(f"[reactor_app] WARNING resizing observed frames from {frame.shape} to {self._model_frame_shape}; this is likely out-of-distribution for cache warmup")
+                self._warned_frame_resize = True
             resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
             return np.ascontiguousarray(resized.astype(np.uint8, copy=False))
         except ModuleNotFoundError:
+            if not self._warned_frame_resize:
+                print(f"[reactor_app] WARNING resizing observed frames from {frame.shape} to {self._model_frame_shape}; this is likely out-of-distribution for cache warmup")
+                self._warned_frame_resize = True
             resized = jax.image.resize(jnp.asarray(frame, dtype=jnp.float32), (target_h, target_w, target_c), method="bilinear")
             return np.ascontiguousarray(np.clip(np.asarray(resized), 0, 255).astype(np.uint8))
 
