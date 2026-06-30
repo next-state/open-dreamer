@@ -19,11 +19,12 @@ from .configs import (
 from .parallel import MeshRules
 from .actions import Actions
 
-
+# compatibility for reactor runtime. The reactor runtime has to use the older Flax version that does not have nnx.List
 def _nnx_list(items):
     if hasattr(nnx, "List"):
         return nnx.List(items)
     return list(items)
+
 
 
 
