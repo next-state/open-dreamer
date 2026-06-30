@@ -118,7 +118,7 @@ def _observe_frame(
 ):
     """Advance dynamics and tokenizer encoder/decoder caches from one real observed frame."""
     frame = jnp.asarray(frame, dtype=jnp.float32)[None, None, ...]
-    latent, _aux, encoder_cache = tokenizer.encode(frame, deterministic=True, caches=tokenizer_cache["encoder"])
+    latent, _, encoder_cache = tokenizer.encode(frame, deterministic=True, caches=tokenizer_cache["encoder"])
     latent_norm = normalize_latents(latent, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
     batch_size = latent_norm.shape[0]
@@ -126,8 +126,8 @@ def _observe_frame(
     step_indices = jnp.full((batch_size, 1), schedule.emax, dtype=jnp.int32)
     tau_indices = jnp.full((batch_size, 1), schedule.k_max, dtype=jnp.int32)
 
-    _pred, (_h, dynamics_cache_updated) = dynamics(action, step_indices, tau_indices, latent_norm, deterministic=True, caches=dynamics_cache)
-    _decoded, decoder_cache = tokenizer.decode(latent, caches=tokenizer_cache["decoder"], deterministic=True)
+    _, (_, dynamics_cache_updated) = dynamics(action, step_indices, tau_indices, latent_norm, deterministic=True, caches=dynamics_cache)
+    _, decoder_cache = tokenizer.decode(latent, caches=tokenizer_cache["decoder"], deterministic=True)
 
     return dynamics_cache_updated, {"encoder": encoder_cache, "decoder": decoder_cache}, rng
 
@@ -442,51 +442,8 @@ class WorldModelPipeline(ReactorPipeline):
         return np.ascontiguousarray(frame)
 
     @event(name="send_keyboard_state", description="Set currently-held keys")
-    def send_keyboard_state(
-        self,
-        w: bool = False,
-        a: bool = False,
-        s: bool = False,
-        d: bool = False,
-        space: bool = False,
-        shift: bool = False,
-        ctrl: bool = False,
-        e: bool = False,
-        q: bool = False,
-        f: bool = False,
-        n1: bool = False,
-        n2: bool = False,
-        n3: bool = False,
-        n4: bool = False,
-        n5: bool = False,
-        n6: bool = False,
-        n7: bool = False,
-        n8: bool = False,
-        n9: bool = False,
-        f3: bool = False,
-    ):
-        self.state._keyboard = {
-            "w": w,
-            "a": a,
-            "s": s,
-            "d": d,
-            "space": space,
-            "shift": shift,
-            "ctrl": ctrl,
-            "e": e,
-            "q": q,
-            "f": f,
-            "f3": f3,
-            "1": n1,
-            "2": n2,
-            "3": n3,
-            "4": n4,
-            "5": n5,
-            "6": n6,
-            "7": n7,
-            "8": n8,
-            "9": n9,
-        }
+    def send_keyboard_state(self, w: bool = False, a: bool = False, s: bool = False, d: bool = False, space: bool = False, shift: bool = False, ctrl: bool = False, e: bool = False, q: bool = False, f: bool = False, n1: bool = False, n2: bool = False, n3: bool = False, n4: bool = False, n5: bool = False, n6: bool = False, n7: bool = False, n8: bool = False, n9: bool = False, f3: bool = False):
+        self.state._keyboard = {"w": w, "a": a, "s": s, "d": d, "space": space, "shift": shift, "ctrl": ctrl, "e": e, "q": q, "f": f, "f3": f3, "1": n1, "2": n2, "3": n3, "4": n4, "5": n5, "6": n6, "7": n7, "8": n8, "9": n9}
 
     @event(name="send_mouse_state", description="Set mouse buttons; accumulate camera delta")
     def send_mouse_state(

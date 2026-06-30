@@ -7,8 +7,6 @@
 
 setuptools
 numpy<2
-jax>=0.4.38,<0.5
-jaxlib>=0.4.38,<0.5
 flax>=0.10.0,<0.11
 orbax-checkpoint>=0.8.0,<0.12
 optax>=0.2.4,<0.3

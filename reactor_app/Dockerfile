@@ -54,7 +54,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # --- App install ---------------------------------------------------------
-ARG JAX_PACKAGE=jax[cpu]>=0.4.38,<0.5
+ARG JAX_PACKAGE=jax[cuda12]>=0.4.38,<0.5
 COPY reactor_app/requirements.txt /app/reactor_app/requirements.txt
 RUN pip install --no-cache-dir "$JAX_PACKAGE" \
     && pip install --no-cache-dir -r /app/reactor_app/requirements.txt \
