@@ -31,14 +31,13 @@ from dreamer.models import (
     TaskEmbedder,
     Tokenizer,
 )
+from dreamer.training import RMSLossNormalizer
 from dreamer.parallel import MeshRules
 from jax.experimental import multihost_utils
 
 from dreamer.utils import from_dict
 
 
-if TYPE_CHECKING:
-    from dreamer.training import RMSLossNormalizer
 
 
 class NoOpCheckpointManager(ocp.CheckpointManager):

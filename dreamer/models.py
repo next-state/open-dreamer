@@ -2,7 +2,7 @@ import einops
 import jax.numpy as jnp
 from flax import nnx
 import jax
-from typing import Tuple, Any, Dict, Sequence
+from typing import Tuple, Any, Dict, NamedTuple, Sequence
 from einops import rearrange, repeat
 import math
 from .utils import (
@@ -24,6 +24,7 @@ def _nnx_list(items):
     if hasattr(nnx, "List"):
         return nnx.List(items)
     return list(items)
+
 
 
 # ============================================================================
@@ -126,7 +127,13 @@ class KVCache:
 
 
 KVCachesDict = Dict[int, KVCache]  # Type alias for transformer KV cache dictionaries
-TokenizerKVCachesDict = Dict[str, KVCachesDict | None]  # "encoder" / "decoder" cache namespaces
+
+
+class TokenizerCaches(NamedTuple):
+    """Namespaced KV caches for the tokenizer encoder and decoder."""
+
+    encoder: KVCachesDict | None
+    decoder: KVCachesDict | None
 
 
 def create_transformer_caches(
@@ -970,12 +977,12 @@ class Tokenizer(nnx.Module):
         self.encoder = Encoder(cfg.encoder, mesh_rules=mesh_rules, rngs=rngs)
         self.decoder = Decoder(cfg.decoder, mesh_rules=mesh_rules, rngs=rngs)
 
-    def __call__(self, videos, *, deterministic: bool = True, caches: TokenizerKVCachesDict | None = None, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
-        encoder_caches = caches.get("encoder") if caches is not None else None
-        decoder_caches = caches.get("decoder") if caches is not None else None
+    def __call__(self, videos, *, deterministic: bool = True, caches: TokenizerCaches | None = None, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
+        encoder_caches = caches.encoder if caches is not None else None
+        decoder_caches = caches.decoder if caches is not None else None
         z, aux, encoder_caches = self.encoder(videos, deterministic=deterministic, caches=encoder_caches, rngs=rngs, mae_p_max=mae_p_max)
         recon, decoder_caches = self.decoder(z, deterministic=deterministic, caches=decoder_caches, rngs=rngs)
-        return recon, aux, {"encoder": encoder_caches, "decoder": decoder_caches}
+        return recon, aux, TokenizerCaches(encoder=encoder_caches, decoder=decoder_caches)
 
     def encode(self, videos, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
         # Always returns unpacked: (B, T, n_latents, d_bottleneck)
@@ -985,38 +992,21 @@ class Tokenizer(nnx.Module):
         # Always expects unpacked: (B, T, n_latents, d_bottleneck)
         return self.decoder(z, deterministic=deterministic, caches=caches, rngs=rngs)
 
-    def create_encoder_static_caches(self, batch_size: int, H: int, W: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
-        """Creates concrete, zero-filled encoder KV cache buffers for JIT compilation."""
-        return self.encoder.create_static_caches(batch_size=batch_size, H=H, W=W, window_size=window_size, dtype=dtype)
-
-    def create_decoder_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
-        """Creates concrete, zero-filled decoder KV cache buffers for JIT compilation."""
-        return self.decoder.create_static_caches(batch_size=batch_size, window_size=window_size, dtype=dtype)
-
     def create_static_caches(
-            self,
-            batch_size: int,
-            window_size: int = 1024,
-            dtype=jnp.float32,
-        ) -> KVCachesDict:
-        """Creates decoder KV caches. Kept for backward compatibility."""
-        return self.create_decoder_static_caches(batch_size=batch_size, window_size=window_size, dtype=dtype)
-
-    def create_tokenizer_static_caches(
             self,
             batch_size: int,
             H: int,
             W: int,
             window_size: int = 1024,
             dtype=jnp.float32,
-        ) -> TokenizerKVCachesDict:
+        ) -> TokenizerCaches:
         """Creates namespaced encoder and decoder KV cache buffers."""
         encoder_window_size = self.encoder.context_length if self.encoder.context_length is not None else window_size
 
-        return {
-            "encoder": self.create_encoder_static_caches(batch_size=batch_size, H=H, W=W, window_size=encoder_window_size, dtype=dtype),
-            "decoder": self.create_decoder_static_caches(batch_size=batch_size, window_size=window_size, dtype=dtype),
-        }
+        return TokenizerCaches(
+            encoder=self.encoder.create_static_caches(batch_size=batch_size, H=H, W=W, window_size=encoder_window_size, dtype=dtype),
+            decoder=self.decoder.create_static_caches(batch_size=batch_size, window_size=window_size, dtype=dtype),
+        )
 
     def num_scaling_params(self) -> int:
         """Total params for scaling law analysis (Chinchilla-style, includes all)."""

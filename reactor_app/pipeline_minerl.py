@@ -115,8 +115,8 @@ class MineRLPipeline(ReactorPipeline):
         except ModuleNotFoundError as exc:
             missing = exc.name or "minerl"
             raise RuntimeError(
-                f"Missing dependency {missing!r}. Install `reactor_app/requirements.txt` "
-                "into the Python environment used to launch Reactor. MineRL also needs "
+                f"Missing dependency {missing!r}. Install the Reactor app dependencies from "
+                "`reactor_app/pyproject.toml` into the Python environment used to launch Reactor. MineRL also needs "
                 "a JDK available before it can build/install."
             ) from exc
 

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dreamer.models import Tokenizer
+from dreamer.models import Tokenizer, TokenizerCaches
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -113,12 +113,12 @@ def _observe_frame(
     frame: jax.Array,
     action: Actions,
     dynamics_cache: Any,
-    tokenizer_cache: Any,
+    tokenizer_cache: TokenizerCaches,
     rng: jax.Array,
-):
+) -> tuple[Any, TokenizerCaches, jax.Array]:
     """Advance dynamics and tokenizer encoder/decoder caches from one real observed frame."""
     frame = jnp.asarray(frame, dtype=jnp.float32)[None, None, ...]
-    latent, _, encoder_cache = tokenizer.encode(frame, deterministic=True, caches=tokenizer_cache["encoder"])
+    latent, _, encoder_cache = tokenizer.encode(frame, deterministic=True, caches=tokenizer_cache.encoder)
     latent_norm = normalize_latents(latent, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)
 
     batch_size = latent_norm.shape[0]
@@ -127,9 +127,9 @@ def _observe_frame(
     tau_indices = jnp.full((batch_size, 1), schedule.k_max, dtype=jnp.int32)
 
     _, (_, dynamics_cache_updated) = dynamics(action, step_indices, tau_indices, latent_norm, deterministic=True, caches=dynamics_cache)
-    _, decoder_cache = tokenizer.decode(latent, caches=tokenizer_cache["decoder"], deterministic=True)
+    _, decoder_cache = tokenizer.decode(latent, caches=tokenizer_cache.decoder, deterministic=True)
 
-    return dynamics_cache_updated, {"encoder": encoder_cache, "decoder": decoder_cache}, rng
+    return dynamics_cache_updated, TokenizerCaches(encoder=encoder_cache, decoder=decoder_cache), rng
 
 
 class WorldModelPipeline(ReactorPipeline):
@@ -184,7 +184,7 @@ class WorldModelPipeline(ReactorPipeline):
             assert isinstance(tok_cfg.decoder.context_length, int) and tok_cfg.decoder.context_length > 0
 
             self._empty_dynamics_cache = self._dynamics.create_static_caches(batch_size=1, n_latents=n_latents, window_size=dyn_cfg.context_length, n_agent=0, dtype=dyn_cfg.dtype)
-            self._empty_tokenizer_cache = self._tokenizer.create_tokenizer_static_caches(
+            self._empty_tokenizer_cache = self._tokenizer.create_static_caches(
                 batch_size=1,
                 H=int(tok_cfg.decoder.H),
                 W=int(tok_cfg.decoder.W),
@@ -195,8 +195,8 @@ class WorldModelPipeline(ReactorPipeline):
             schedule = self._schedule
 
             def _next_frame_fn(tokenizer, dynamics, action, latent_shape, dynamics_cache, tokenizer_cache, rng, task_embedding=None):
-                frame, h, dynamics_cache, decoder_cache, rng = next_frame(tokenizer, dynamics, schedule, action, latent_shape, dynamics_cache, tokenizer_cache["decoder"], rng, task_embedding)
-                return frame, h, dynamics_cache, {"encoder": tokenizer_cache["encoder"], "decoder": decoder_cache}, rng
+                frame, h, dynamics_cache, decoder_cache, rng = next_frame(tokenizer, dynamics, schedule, action, latent_shape, dynamics_cache, tokenizer_cache.decoder, rng, task_embedding)
+                return frame, h, dynamics_cache, TokenizerCaches(encoder=tokenizer_cache.encoder, decoder=decoder_cache), rng
 
             def _observe_frame_fn(tokenizer, dynamics, frame, action, dynamics_cache, tokenizer_cache, rng):
                 return _observe_frame(tokenizer, dynamics, schedule, frame, action, dynamics_cache, tokenizer_cache, rng)
@@ -286,7 +286,7 @@ class WorldModelPipeline(ReactorPipeline):
         frame: np.ndarray,
         action: Actions,
         dynamics_cache: Any,
-        tokenizer_cache: Any,
+        tokenizer_cache: TokenizerCaches,
         rng: jax.Array,
     ):
         model_frame = self._resize_frame_for_model(frame)
@@ -343,7 +343,7 @@ class WorldModelPipeline(ReactorPipeline):
             import minerl  # noqa: F401 - importing registers MineRL env IDs.
         except ModuleNotFoundError as exc:
             missing = exc.name or "minerl"
-            raise RuntimeError(f"Missing dependency {missing!r}. Install `reactor_app/requirements.txt` into the Python environment used to launch Reactor. MineRL also needs a JDK available before it can build/install.") from exc
+            raise RuntimeError(f"Missing dependency {missing!r}. Install the Reactor app dependencies from `reactor_app/pyproject.toml` into the Python environment used to launch Reactor. MineRL also needs a JDK available before it can build/install.") from exc
 
         self._prepare_minerl_runtime_dir()
         return gym.make(self._env_id)

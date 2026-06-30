@@ -37,6 +37,7 @@ WORKDIR /app
 ENV JAVA_HOME=/opt/java
 ENV PATH=/opt/java/bin:$PATH
 ENV PYTHONPATH=/app
+ENV UV_CACHE_DIR=/tmp/uv-cache
 
 # --- MineRL system/runtime dependencies ---------------------------------
 # MineRL builds and launches a Minecraft/Malmo runtime. Its installer needs a
@@ -54,15 +55,20 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # --- App install ---------------------------------------------------------
-ARG JAX_PACKAGE=jax[cuda12]>=0.4.38,<0.5
-COPY reactor_app/requirements.txt /app/reactor_app/requirements.txt
-RUN pip install --no-cache-dir "$JAX_PACKAGE" \
-    && pip install --no-cache-dir -r /app/reactor_app/requirements.txt \
-    && pip install --no-cache-dir --no-deps \
+# Install Reactor app deps into the runtime-base venv without pruning the
+# pre-baked Reactor/GStreamer packages that ship with the base image.
+COPY pyproject.toml README.md /app/
+COPY dreamer /app/dreamer
+COPY reactor_app/pyproject.toml /app/reactor_app/pyproject.toml
+RUN pip install --no-cache-dir uv \
+    && uv pip install --python /opt/venv/bin/python --no-cache \
+        --requirements /app/reactor_app/pyproject.toml \
+    && uv pip install --python /opt/venv/bin/python --no-cache --no-deps \
+        --editable /app \
+    && uv pip install --python /opt/venv/bin/python --no-cache --no-deps \
         "minerl @ git+https://github.com/minerllabs/minerl@cdeae668c2f334e3c9117adf651b5a94436b45f8"
 
 # --- Reactor workspace ---------------------------------------------------
-COPY dreamer /app/dreamer
 COPY reactor_app /app/reactor_app
 
 # reactor.yaml is in the workspace subdir, so cd there before serving.

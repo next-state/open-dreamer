@@ -24,14 +24,12 @@ The runtime listens on `http://localhost:8080`. Host networking is intentional:
 WebRTC ICE candidates need to advertise host-reachable addresses and UDP ports.
 The local frontend connects to the `world-model` Reactor model name.
 
-The default image installs CPU JAX. On this machine the committed original
-world-model loop measured `0.124 FPS` steady-state on CPU, and the current
-hybrid loop measured `0.126 FPS` for the same direct world-model path. To test
-GPU throughput on a host with the NVIDIA container runtime, build and run with
-CUDA JAX instead:
+The image installs the Reactor app dependencies from `reactor_app/pyproject.toml`
+with `uv`, including CUDA JAX. On a host with the NVIDIA container runtime,
+build and run with GPU access:
 
 ```bash
-reactor_app/build.sh --progress=plain --build-arg 'JAX_PACKAGE=jax[cuda12]>=0.4.38,<0.5'
+reactor_app/build.sh --progress=plain
 docker run --rm --gpus all --network host \
   -e WEBRTC_PORT_RANGE="40000:40050" \
   -v /home/ubuntu/dreamer4-jax-private/jelly:/app/jelly:ro \
@@ -88,11 +86,10 @@ docker run --rm -i \
     --repo-root /workspace
 ```
 
-For a GPU run, rebuild with CUDA JAX, run with `--gpus all`, and remove
-`JAX_PLATFORMS=cpu`:
+For a GPU run, run with `--gpus all` and remove `JAX_PLATFORMS=cpu`:
 
 ```bash
-reactor_app/build.sh --progress=plain --build-arg 'JAX_PACKAGE=jax[cuda12]>=0.4.38,<0.5'
+reactor_app/build.sh --progress=plain
 docker run --rm -i --gpus all \
   -e REACTOR_WEIGHTS_PATH=/workspace/jelly \
   -v /home/ubuntu/dreamer4-jax-private:/workspace:ro \
@@ -118,17 +115,17 @@ docker run --rm -i --gpus all \
 | `benchmark_world_model_fps.py` | Raw Dreamer `next_frame` FPS diagnostic and original/current comparison |
 | `reactor.yaml` | Combined model registration spec (`model:`) and runtime entry point (`runtime:`) |
 | `config.yaml` | Model hyperparameters (passed to `load()` as a dict) |
-| `requirements.txt` | Extra Python dependencies installed on top of the runtime base image |
-| `Dockerfile` | Workspace image (`reactor-runtime-base` + your `requirements.txt` + your code) |
+| `pyproject.toml` | Reactor app dependency spec installed by `uv` inside the image |
+| `Dockerfile` | Workspace image (`reactor-runtime-base` + Reactor app deps + your code) |
 | `.dockerignore` | Files excluded from the image build context |
 
-The runtime itself ships pre-installed in the `reactor-runtime-base`
-image — `requirements.txt` is just for any extra deps your model needs
-on top.
+The runtime itself ships pre-installed in the `reactor-runtime-base` image.
+The Dockerfile installs app dependencies into that existing venv with
+`uv pip install`, without pruning the base image's Reactor/GStreamer packages.
 
 ## Iterating
 
-Rebuild after editing `pipeline.py`, `requirements.txt`, or Docker-baked files:
+Rebuild after editing `pipeline.py`, `reactor_app/pyproject.toml`, or Docker-baked files:
 
 ```bash
 reactor_app/build.sh --progress=plain
