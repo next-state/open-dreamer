@@ -96,7 +96,7 @@ def train_step(
     if use_latent_data:
         latents = data
     else:
-        latents, _ = tokenizer.encode(data, deterministic=True)
+        latents, _, _ = tokenizer.encode(data, deterministic=True)
         latents = jax.lax.stop_gradient(latents)
 
     latents = latents.astype(dynamics.dtype)
@@ -347,4 +347,3 @@ def main(cfg: DynamicsConfig):
 
 if __name__ == "__main__":
     main()
-

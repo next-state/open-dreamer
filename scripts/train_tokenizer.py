@@ -98,7 +98,7 @@ def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | 
 
     def loss_fn(model: Tokenizer):
         rngs = nnx.Rngs(mae=mae_key, dropout=dropout_key)
-        pred, (mae_mask, keep_prob) = model(videos, deterministic=False, rngs=rngs, mae_p_max=mae_p_max)
+        pred, (mae_mask, keep_prob), _ = model(videos, deterministic=False, rngs=rngs, mae_p_max=mae_p_max)
 
         pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
         target_norm = normalize_with_dataset_stats(videos, mean=dataset_mean, std=dataset_std)
@@ -154,8 +154,8 @@ def viz_step_jit(model: Tokenizer, model_ema: Tokenizer, videos, *, mae_key, dro
     """Visualization step with NNX model."""
     online_rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
     ema_rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
-    recon, (mask, _) = model(videos, deterministic=False, rngs=online_rngs, mae_p_max=mae_p_max)
-    recon_ema, _ = model_ema(videos, deterministic=False, rngs=ema_rngs, mae_p_max=mae_p_max)
+    recon, (mask, _), _ = model(videos, deterministic=False, rngs=online_rngs, mae_p_max=mae_p_max)
+    recon_ema, _, _ = model_ema(videos, deterministic=False, rngs=ema_rngs, mae_p_max=mae_p_max)
 
     masked = videos * (1.0 - mask)
     recon_masked = masked + recon * mask

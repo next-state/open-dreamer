@@ -225,10 +225,10 @@ def next_frame(
     action: Actions,
     latent_shape: Tuple,
     dynamics_cache: Any,
-    tokenizer_cache: Any,
+    decoder_cache: KVCachesDict | None,
     rng: jax.Array,
     task_embedding: jax.Array | None = None,
-) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, Any, jax.Array]:
+) -> Tuple[jax.Array, jax.Array | None, KVCachesDict | None, KVCachesDict | None, jax.Array]:
     """
     Generate next frame using dynamics model and decode to pixels.
 
@@ -239,12 +239,12 @@ def next_frame(
         action: Single action to condition on where the time dimension is squeezed (B, ...)
         latent_shape: Shape of latent (B, 1, n_spatial, D_s)
         dynamics_cache: KV cache for dynamics model from previous steps
-        tokenizer_cache: KV cache for tokenizer decoder from previous steps
+        decoder_cache: KV cache for the tokenizer decoder from previous steps.
         rng: Random key
         task_embedding: Optional task embedding (currently unused)
         
     Returns:
-        Tuple of (frame as jax.Array, h_last, updated dynamics cache, updated tokenizer cache, updated rng)
+        Tuple of (frame as jax.Array, h_last, updated dynamics cache, updated decoder cache, updated rng)
     """
     # Generate next latent using τ-ladder denoising
     latent, h_last, dynamics_cache_updated, rng, _ = next_latent(
@@ -259,17 +259,13 @@ def next_frame(
     )
     
     # Decoder call
-    frame, tokenizer_cache_updated = tokenizer.decode(
-        latent,
-        caches=tokenizer_cache,
-        deterministic=True,
-    )
+    frame, decoder_cache_updated = tokenizer.decode(latent, caches=decoder_cache, deterministic=True)
     
     # Clip to valid range (keep as JAX array)
     # frame shape: (B, 1, H, W, C)
     frame = jnp.clip(frame, 0, 255).astype(jnp.uint8)
     
-    return frame, h_last, dynamics_cache_updated, tokenizer_cache_updated, rng
+    return frame, h_last, dynamics_cache_updated, decoder_cache_updated, rng
 
 
 def latent_rollout(
@@ -402,5 +398,3 @@ def latent_rollout(
         'context_hidden': h_seq,
         'ode_diags': ode_diags,
     }
-
-

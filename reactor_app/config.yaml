@@ -1,5 +1,12 @@
-# World model hyperparameters. Passed to WorldModelPipeline.load() as a dict.
+# Hybrid MineRL + Dreamer world-model settings.
 
-# Denoising
+env_id: MineRLBasaltFindCave-v0
+fps: 20
+camera_sensitivity: 0.15
+max_camera_degrees: 20
+warmup_env: true
+world_model_warmup_steps: 2
+minerl_runtime_dir: /tmp/reactor_minerl
+
 num_steps: 4
 tau_ctx_target: 0.9

@@ -278,7 +278,7 @@ def train_step(
     packing_factor = dynamics.cfg.packing_factor
     
     # Encode context frames
-    z_ctx, _ = tokenizer.encode(
+    z_ctx, _, _ = tokenizer.encode(
         videos[:, :T_ctx],
         deterministic=True,
         packing_factor=packing_factor,

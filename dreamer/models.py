@@ -2,7 +2,7 @@ import einops
 import jax.numpy as jnp
 from flax import nnx
 import jax
-from typing import Tuple, Any, Dict, Sequence
+from typing import Tuple, Any, Dict, NamedTuple, Sequence
 from einops import rearrange, repeat
 import math
 from .utils import (
@@ -18,6 +18,14 @@ from .configs import (
 )
 from .parallel import MeshRules
 from .actions import Actions
+
+# compatibility for reactor runtime. The reactor runtime has to use the older Flax version that does not have nnx.List
+def _nnx_list(items):
+    if hasattr(nnx, "List"):
+        return nnx.List(items)
+    return list(items)
+
+
 
 
 # ============================================================================
@@ -119,7 +127,14 @@ class KVCache:
         return k_ordered, v_ordered, final_mask
 
 
-KVCachesDict = Dict[int, KVCache]  # Type alias for KV cache dictionaries
+KVCachesDict = Dict[int, KVCache]  # Type alias for transformer KV cache dictionaries
+
+
+class TokenizerCaches(NamedTuple):
+    """Namespaced KV caches for the tokenizer encoder and decoder."""
+
+    encoder: KVCachesDict | None
+    decoder: KVCachesDict | None
 
 
 def create_transformer_caches(
@@ -474,7 +489,7 @@ class GroupedQueryAttention(nnx.Module):
                 mask=mask_attn,
                 scale=scale,
                 is_causal=attn_is_causal,
-                local_window_size=local_window_size
+                local_window_size=None
             )  # TODO: try setting implementation="cudnn"
 
             if return_weights:
@@ -684,7 +699,7 @@ class BlockCausalTransformer(nnx.Module):
             )
 
         # Create layers
-        self.layers = nnx.List([
+        self.layers = _nnx_list([
             BlockCausalLayer(
                 dim=d_model, num_heads=n_heads, num_kv_heads=n_kv_heads,
                 dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
@@ -776,6 +791,7 @@ class Encoder(nnx.Module):
     """Vision encoder with MAE masking."""
 
     def __init__(self, cfg: EncoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.cfg = cfg
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
         self.context_length = cfg.context_length
@@ -802,7 +818,24 @@ class Encoder(nnx.Module):
         self.mask_and_replace = MAEReplacer(D=cfg.d_model, p_min=cfg.mae_p_min, p_max=cfg.mae_p_max, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
         self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_latents, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
 
-    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+    def get_token_layout(self, H: int, W: int) -> TokenLayout:
+        n_patches = (H // self.patch_size) * (W // self.patch_size)
+        return TokenLayout(((Modality.LATENT, self.n_latents), (Modality.IMAGE, n_patches)))
+
+    def create_static_caches(self, batch_size: int, H: int, W: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
+        """Creates concrete, zero-filled encoder KV cache buffers for JIT compilation."""
+        layout = self.get_token_layout(H, W)
+
+        return create_transformer_caches(
+            layer_is_time=[layer.is_time_layer for layer in self.transformer.layers],
+            flattened_batch_size=batch_size * layout.S,
+            window_size=window_size,
+            num_kv_heads=self.cfg.n_kv_heads,
+            head_dim=self.cfg.d_model // self.cfg.n_heads,
+            dtype=dtype,
+        )
+
+    def __call__(self, videos, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
         # Videos in the [0, 255] range
         B, T, H, W, C = videos.shape
 
@@ -827,22 +860,19 @@ class Encoder(nnx.Module):
         latents = repeat(self.latents_enc.value.astype(proj_patches.dtype), "... -> b t ...", b=B, t=T)
         tokens = jnp.concatenate([latents, proj_patches_masked], axis=2)  # (B, T, S=(Np+Nl), D)
 
-        layout = TokenLayout((
-            (Modality.LATENT, self.n_latents),
-            (Modality.IMAGE, patch_tokens.shape[-2]),
-        ))
+        layout = self.get_token_layout(H, W)
         space_mask = layout.build_space_mask("encoder")  # (1, 1, q_len, k_len)
 
         # Feed tokens into transformer
         time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
-        encoded_tokens, _, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, rngs=rngs)
+        encoded_tokens, new_caches, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, caches=caches, rngs=rngs)
 
         # Project latent tokens to bottleneck and tanh
         latent_tokens = encoded_tokens[:, :, :self.n_latents]
         proj_tokens = nnx.tanh(self.bottleneck_proj(latent_tokens))
 
-        # Always return unpacked: (B, T, n_latents, d_bottleneck)
-        return proj_tokens, (frame_mask, keep_prob)
+        # new_caches is None unless a KV cache was provided.
+        return proj_tokens, (frame_mask, keep_prob), new_caches
 
 
 class Decoder(nnx.Module):
@@ -852,9 +882,13 @@ class Decoder(nnx.Module):
     """
 
     def __init__(self, cfg: DecoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.cfg = cfg
         self.n_latents = cfg.n_latents
         self.patch_size = cfg.patch_size
         self.context_length = cfg.context_length
+        self.d_model = cfg.d_model
+        self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads
         self.H = cfg.H
         self.W = cfg.W
         self.dataset_mean = cfg.dataset_mean
@@ -885,6 +919,19 @@ class Decoder(nnx.Module):
             (Modality.LATENT, self.n_latents),
             (Modality.IMAGE, self.n_patches)
         ))
+
+    def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
+        """Creates concrete, zero-filled decoder KV cache buffers for JIT compilation."""
+        layout = self.get_token_layout()
+
+        return create_transformer_caches(
+            layer_is_time=[layer.is_time_layer for layer in self.transformer.layers],
+            flattened_batch_size=batch_size * layout.S,
+            window_size=window_size,
+            num_kv_heads=self.cfg.n_kv_heads,
+            head_dim=self.cfg.d_model // self.cfg.n_heads,
+            dtype=dtype,
+        )
 
     def __call__(
             self,
@@ -920,6 +967,7 @@ class Decoder(nnx.Module):
         out_frames = unnormalize_with_dataset_stats(out_normalized_frames, mean=self.dataset_mean, std=self.dataset_std)
         return out_frames, new_caches
 
+
 class Tokenizer(nnx.Module):
     """Complete tokenizer (encoder + decoder)."""
 
@@ -930,31 +978,35 @@ class Tokenizer(nnx.Module):
         self.encoder = Encoder(cfg.encoder, mesh_rules=mesh_rules, rngs=rngs)
         self.decoder = Decoder(cfg.decoder, mesh_rules=mesh_rules, rngs=rngs)
 
-    def __call__(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
-        z, aux = self.encoder(videos, deterministic=deterministic, rngs=rngs, mae_p_max=mae_p_max)
-        recon, _ = self.decoder(z, deterministic=deterministic, rngs=rngs)
-        return recon, aux
+    def __call__(self, videos, *, deterministic: bool = True, caches: TokenizerCaches | None = None, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
+        encoder_caches = caches.encoder if caches is not None else None
+        decoder_caches = caches.decoder if caches is not None else None
+        z, aux, encoder_caches = self.encoder(videos, deterministic=deterministic, caches=encoder_caches, rngs=rngs, mae_p_max=mae_p_max)
+        recon, decoder_caches = self.decoder(z, deterministic=deterministic, caches=decoder_caches, rngs=rngs)
+        return recon, aux, TokenizerCaches(encoder=encoder_caches, decoder=decoder_caches)
 
-    def encode(self, videos, *, deterministic: bool = True, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
+    def encode(self, videos, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
         # Always returns unpacked: (B, T, n_latents, d_bottleneck)
-        return self.encoder(videos, deterministic=deterministic, rngs=rngs, mae_p_max=mae_p_max)
+        return self.encoder(videos, deterministic=deterministic, caches=caches, rngs=rngs, mae_p_max=mae_p_max)
 
     def decode(self, z, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None):
         # Always expects unpacked: (B, T, n_latents, d_bottleneck)
-        frames, caches = self.decoder(z, deterministic=deterministic, caches=caches, rngs=rngs)
-        return frames, caches
+        return self.decoder(z, deterministic=deterministic, caches=caches, rngs=rngs)
 
-    def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
-        """Creates concrete, zero-filled KV cache buffers for JIT compilation."""
-        layout = self.decoder.get_token_layout()
+    def create_static_caches(
+            self,
+            batch_size: int,
+            H: int,
+            W: int,
+            window_size: int = 1024,
+            dtype=jnp.float32,
+        ) -> TokenizerCaches:
+        """Creates namespaced encoder and decoder KV cache buffers."""
+        encoder_window_size = self.encoder.context_length if self.encoder.context_length is not None else window_size
 
-        return create_transformer_caches(
-            layer_is_time=[layer.is_time_layer for layer in self.decoder.transformer.layers],
-            flattened_batch_size=batch_size * layout.S,
-            window_size=window_size,
-            num_kv_heads=self.cfg.decoder.n_kv_heads,
-            head_dim=self.cfg.decoder.d_model // self.cfg.decoder.n_heads,
-            dtype=dtype
+        return TokenizerCaches(
+            encoder=self.encoder.create_static_caches(batch_size=batch_size, H=H, W=W, window_size=encoder_window_size, dtype=dtype),
+            decoder=self.decoder.create_static_caches(batch_size=batch_size, window_size=window_size, dtype=dtype),
         )
 
     def num_scaling_params(self) -> int:
@@ -1027,7 +1079,7 @@ class ActionEncoder(nnx.Module):
 
         # Embed binary actions
         if num_binary_actions > 0:
-            self.binary_embeds_list = nnx.List([
+            binary_embeds = [
                 nnx.Embed(
                     2, d_model,
                     dtype=dtype, param_dtype=param_dtype,
@@ -1035,7 +1087,8 @@ class ActionEncoder(nnx.Module):
                     rngs=rngs
                 )
                 for _ in range(num_binary_actions)
-            ])  # num_binary_actions * (B, T, d_model)
+            ]
+            self.binary_embeds_list = _nnx_list(binary_embeds)  # num_binary_actions * (B, T, d_model)
         else:
             self.binary_embeds_list = None
 
