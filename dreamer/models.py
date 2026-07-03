@@ -353,11 +353,13 @@ class GroupedQueryAttention(nnx.Module):
         self.rope_theta = rope_theta
         self.use_bias = use_bias
         self.use_rmsnorm_scale = use_rmsnorm_scale
-        self.use_seq_parallel = use_seq_parallel
         dtype = to_jnp_dtype(dtype)
         param_dtype = to_jnp_dtype(param_dtype)
         self.dtype = dtype
 
+        if use_seq_parallel:
+            raise NotImplementedError("Sequence parallel not implemented for GQA")
+        
         assert self.dim % self.num_heads == 0
         assert self.num_heads % self.num_kv_heads == 0
 
@@ -409,102 +411,52 @@ class GroupedQueryAttention(nnx.Module):
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
             scale = 1.0
 
-        # Sequence parallel path: all-gather K,V across sequence axis for training
-        if self.use_seq_parallel and cache is None:
-            # Get sequence axis info from the mesh
-            seq_axis_size = jax.lax.psum(1, axis_name='seq')
-            seq_axis_idx = jax.lax.axis_index('seq')
+        # RoPE
+        start_pos = cache.index if cache is not None else 0
+        q, k = self.rope(q, k, start_pos=start_pos)
 
-            T_local = k.shape[1]
-            T_global = T_local * seq_axis_size
+        # KV cache
+        if self.is_causal and cache is not None:
+            # CACHED INFERENCE MODE
+            new_cache = cache.update(k, v)
 
-            # Global position offset for RoPE
-            global_start_pos = seq_axis_idx * T_local
-            q, k = self.rope(q, k, start_pos=global_start_pos)
+            T = q.shape[1]
+            k_attn, v_attn, cache_mask = new_cache.get_ordered_kv(query_len=T)
 
-            # All-gather K, V across sequence axis
-            # tiled=True means the results are concatenated along the axis rather than stacked
-            k_full = jax.lax.all_gather(k, axis_name='seq', axis=1, tiled=True)
-            v_full = jax.lax.all_gather(v, axis_name='seq', axis=1, tiled=True)
-
-            # Build causal mask for local Q vs full K
-            # q_pos: positions of local queries in global sequence
-            # k_pos: positions of all keys (0 to T_global-1)
-            q_pos = jnp.arange(T_local) + global_start_pos
-            k_pos = jnp.arange(T_global)
-            causal_mask = q_pos[:, None] >= k_pos[None, :]  # (T_local, T_global)
-            causal_mask = causal_mask[None, None, :, :]  # (1, 1, T_local, T_global)
-
-            # Combine with any input mask if provided
+            attn_is_causal = False  # Handled manually by cache_mask
             if mask is not None:
-                causal_mask = jnp.logical_and(mask, causal_mask)
-
-            # SDPA with explicit causal mask (is_causal=False since we handle it)
-            attn = jax.nn.dot_product_attention(
-                q, k_full, v_full,
-                mask=causal_mask,
-                scale=scale,
-                is_causal=False,  # Handled by our custom mask
-            )
-            new_cache = None
-
-            if return_weights:
-                G = self.num_heads // self.num_kv_heads
-                k_exp = jnp.repeat(k_full, G, axis=2)  # (B, S, N, H)
-                logits = jnp.einsum('B T N H, B S N H -> B N T S', q, k_exp) * scale
-                logits = jnp.where(causal_mask, logits, jnp.finfo(logits.dtype).min)
-                attn_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+                mask_attn = jnp.logical_and(mask, cache_mask)
             else:
-                attn_weights = None
-
+                mask_attn = cache_mask
         else:
-            # Standard non-SP path
-            # RoPE
-            start_pos = cache.index if cache is not None else 0
-            q, k = self.rope(q, k, start_pos=start_pos)
+            # TRAINING or NON-CAUSAL (SPACE) ATTENTION
+            new_cache = None
+            k_attn, v_attn = k, v
+            mask_attn = mask
+            attn_is_causal = self.is_causal and (mask is None)
 
-            # KV cache
-            if self.is_causal and cache is not None:
-                # CACHED INFERENCE MODE
-                new_cache = cache.update(k, v)
+        # SDPA
+        attn = jax.nn.dot_product_attention(
+            q, k_attn, v_attn,
+            mask=mask_attn,
+            scale=scale,
+            is_causal=attn_is_causal,
+            local_window_size=local_window_size if cache is None else None
+        )  
 
-                T = q.shape[1]
-                k_attn, v_attn, cache_mask = new_cache.get_ordered_kv(query_len=T)
-
-                attn_is_causal = False  # Handled manually by cache_mask
-                if mask is not None:
-                    mask_attn = jnp.logical_and(mask, cache_mask)
-                else:
-                    mask_attn = cache_mask
-            else:
-                # TRAINING or NON-CAUSAL (SPACE) ATTENTION
-                new_cache = None
-                k_attn, v_attn = k, v
-                mask_attn = mask
-                attn_is_causal = self.is_causal and (mask is None)
-
-            # SDPA
-            attn = jax.nn.dot_product_attention(
-                q, k_attn, v_attn,
-                mask=mask_attn,
-                scale=scale,
-                is_causal=attn_is_causal,
-                local_window_size=local_window_size if cache is None else None
-            )  
-
-            if return_weights:
-                G = self.num_heads // self.num_kv_heads
-                k_exp = jnp.repeat(k_attn, G, axis=2)  # (B, S, N, H)
-                logits = jnp.einsum('B T N H, B S N H -> B N T S', q, k_exp) * scale
-                if mask_attn is not None:
-                    logits = jnp.where(mask_attn, logits, jnp.finfo(logits.dtype).min)
-                elif attn_is_causal:
-                    T_q, T_k = q.shape[1], k_attn.shape[1]
-                    causal = jnp.tril(jnp.ones((T_q, T_k), dtype=jnp.bool_))
-                    logits = jnp.where(causal[None, None], logits, jnp.finfo(logits.dtype).min)
-                attn_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-            else:
-                attn_weights = None
+        if return_weights:
+            G = self.num_heads // self.num_kv_heads
+            k_exp = jnp.repeat(k_attn, G, axis=2)  # (B, S, N, H)
+            logits = jnp.einsum('B T N H, B S N H -> B N T S', q, k_exp) * scale
+            if mask_attn is not None:
+                logits = jnp.where(mask_attn, logits, jnp.finfo(logits.dtype).min)
+            elif attn_is_causal:
+                T_q, T_k = q.shape[1], k_attn.shape[1]
+                causal = jnp.tril(jnp.ones((T_q, T_k), dtype=jnp.bool_))
+                logits = jnp.where(causal[None, None], logits, jnp.finfo(logits.dtype).min)
+            attn_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+        else:
+            attn_weights = None
 
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
