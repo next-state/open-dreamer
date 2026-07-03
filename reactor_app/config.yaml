@@ -10,3 +10,15 @@ minerl_runtime_dir: /tmp/reactor_minerl
 
 num_steps: 4
 tau_ctx_target: 0.9
+
+# Pre-generated Minecraft world saves the client can teleport into, addressed
+# by their position in this list (index 0, 1, ...). Loading one is a world-file
+# copy + load (seconds) instead of full procedural generation (minutes). Paths
+# are relative to this workspace directory. Regenerate with generate_worlds.py.
+# Missing folders are skipped at load time, leaving procedural ("new_scene")
+# generation available.
+worlds:
+  - name: plains
+    path: worlds/plains
+  - name: forest
+    path: worlds/forest
