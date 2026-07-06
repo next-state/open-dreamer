@@ -9,6 +9,8 @@ interface GameViewProps {
 export function GameView({ className }: GameViewProps) {
   return (
     <ReactorView
+      track="main_video"
+      videoObjectFit="cover"
       className={`h-full w-full bg-black rounded-2xl overflow-hidden ${className || ""}`}
     />
   );

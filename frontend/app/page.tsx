@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ReactorProvider, useReactor } from "@reactor-team/js-sdk";
 import { ReactorStatus } from "@/components/ReactorStatus";
 import { KeyboardController } from "@/components/KeyboardController";
@@ -133,10 +133,26 @@ function GameInterface() {
     connect: state.connect,
   }));
   const [isLocked, setIsLocked] = useState(false);
+  const retriesRef = useRef(0);
 
-  // Auto-connect on mount and auto-reconnect if the session ever drops.
+  // Auto-connect on mount and auto-reconnect if the session drops — but with
+  // exponential backoff so a failing connection doesn't hammer start_session.
+  // First attempt is immediate; failures back off 2s, 4s, ... capped at 15s.
+  // A successful connection ("ready") resets the backoff.
   useEffect(() => {
-    if (status === "disconnected") connect();
+    if (status === "ready") {
+      retriesRef.current = 0;
+      return;
+    }
+    if (status !== "disconnected" && status !== "error") return;
+
+    const attempt = retriesRef.current;
+    const delay = attempt === 0 ? 0 : Math.min(2000 * 2 ** (attempt - 1), 15000);
+    const timer = setTimeout(() => {
+      retriesRef.current += 1;
+      connect();
+    }, delay);
+    return () => clearTimeout(timer);
   }, [status, connect]);
 
   const playable = status === "ready";
@@ -148,7 +164,9 @@ function GameInterface() {
         {/* Outer glow, sits behind the canvas */}
         <div className="absolute inset-0 game-glow rounded-2xl" />
 
-        <div className="relative h-full w-full rounded-2xl overflow-hidden">
+        <div className="relative h-full w-full rounded-2xl overflow-hidden bg-black">
+          {/* KeyboardController renders the video (GameView) and owns the
+              click-to-pointer-lock target, so it must be the top layer. */}
           <KeyboardController enabled={playable} onLockChange={setIsLocked} />
 
           {/* Top chrome — overlays the top of the game so backdrop blur
@@ -185,7 +203,11 @@ function GameInterface() {
 export default function Home() {
   return (
     <div className="app-backdrop relative h-screen w-screen overflow-hidden">
-      <ReactorProvider modelName="world-model" local>
+      <ReactorProvider
+        modelName="world-model"
+        local
+        apiUrl={process.env.NEXT_PUBLIC_REACTOR_URL ?? "http://localhost:8096"}
+      >
         <GameInterface />
       </ReactorProvider>
     </div>
