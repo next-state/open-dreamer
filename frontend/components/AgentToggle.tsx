@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { useReactor } from "@reactor-team/js-sdk";
+import { useCallback, useState } from "react";
+import { useReactor, useReactorMessage } from "@reactor-team/js-sdk";
 
 interface AgentToggleProps {
   className?: string;
@@ -14,6 +14,16 @@ export function AgentToggle({ className }: AgentToggleProps) {
   }));
 
   const [useWorldModel, setUseWorldModel] = useState(false);
+
+  // Mirror the backend's actual mode so the toggle stays in sync with
+  // backend-driven switches (image seeding flips to World; new_scene to MineRL).
+  useReactorMessage(
+    useCallback((message: { type?: string; data?: { use_policy?: boolean } }) => {
+      if (message?.type === "world_status" && typeof message.data?.use_policy === "boolean") {
+        setUseWorldModel(message.data.use_policy);
+      }
+    }, [])
+  );
 
   const isConnected = status === "ready" || status === "waiting";
 

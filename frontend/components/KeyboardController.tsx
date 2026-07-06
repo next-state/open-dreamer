@@ -287,10 +287,6 @@ export function KeyboardController({
 
   const hasActiveInput = activeKeys.length > 0 || activeButtons.length > 0;
 
-  const overlay = enabled
-    ? { title: "Click to enter", sub: "ESC to release" }
-    : { title: "Connecting…", sub: "Spinning up the world" };
-
   return (
     <div
       ref={containerRef}
@@ -310,16 +306,17 @@ export function KeyboardController({
         }}
       />
 
-      {/* Click-to-play overlay — floating headline + sub, no chrome. */}
-      {!isLocked && (
+      {/* Click-to-play overlay — only once playable (the page owns the
+          "preparing" screen for the connecting / world-generating states). */}
+      {enabled && !isLocked && (
         <div
           className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-6 rounded-2xl bg-black/30 backdrop-blur-md backdrop-saturate-75"
           style={{ textShadow: "0 2px 24px rgba(0,0,0,0.7)" }}
         >
           <div className="text-white text-3xl sm:text-4xl font-semibold tracking-tight">
-            {overlay.title}
+            Click to enter
           </div>
-          <div className="text-white/65 text-sm sm:text-base">{overlay.sub}</div>
+          <div className="text-white/65 text-sm sm:text-base">ESC to release</div>
         </div>
       )}
 

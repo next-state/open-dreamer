@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { ReactorProvider, useReactor } from "@reactor-team/js-sdk";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ReactorProvider, useReactor, useReactorMessage } from "@reactor-team/js-sdk";
 import { ReactorStatus } from "@/components/ReactorStatus";
 import { KeyboardController } from "@/components/KeyboardController";
 import { AgentToggle } from "@/components/AgentToggle";
 import { NewSceneButton } from "@/components/NewSceneButton";
+import { ImageConditioning } from "@/components/ImageConditioning";
 
 function Wordmark() {
   return (
@@ -135,6 +136,20 @@ function GameInterface() {
   const [isLocked, setIsLocked] = useState(false);
   const retriesRef = useRef(0);
 
+  // World-loading state, driven by the model's `world_status` message, so we
+  // can show a loading screen instead of a frozen (black) frame while a world
+  // is generated (initial connect or "new dream"). Assume loading until the
+  // model tells us otherwise, so we never flash a black frame before the first
+  // status arrives.
+  const [worldLoading, setWorldLoading] = useState(true);
+  useReactorMessage(
+    useCallback((message: { type?: string; data?: { loading?: boolean } }) => {
+      if (message?.type === "world_status") {
+        setWorldLoading(!!message.data?.loading);
+      }
+    }, [])
+  );
+
   // Auto-connect on mount and auto-reconnect if the session drops — but with
   // exponential backoff so a failing connection doesn't hammer start_session.
   // First attempt is immediate; failures back off 2s, 4s, ... capped at 15s.
@@ -155,8 +170,14 @@ function GameInterface() {
     return () => clearTimeout(timer);
   }, [status, connect]);
 
-  const playable = status === "ready";
+  // "Preparing" spans the whole not-yet-playable window: the WebRTC connection
+  // coming up AND the world being generated. Only truly playable once connected
+  // and the world is ready.
+  const connected = status === "ready";
+  const preparing = !connected || worldLoading;
+  const playable = connected && !worldLoading;
   const chromeFade = isLocked ? "opacity-0 pointer-events-none" : "opacity-100";
+  const preparingLabel = !connected ? "Connecting…" : "Dreaming up a world…";
 
   return (
     <main className="absolute inset-0 flex items-center justify-center px-4 sm:px-8 py-10 sm:py-14">
@@ -166,8 +187,21 @@ function GameInterface() {
 
         <div className="relative h-full w-full rounded-2xl overflow-hidden bg-black">
           {/* KeyboardController renders the video (GameView) and owns the
-              click-to-pointer-lock target, so it must be the top layer. */}
+              click-to-pointer-lock target, so it must be the top layer.
+              Only enabled once fully playable (connected + world ready). */}
           <KeyboardController enabled={playable} onLockChange={setIsLocked} />
+
+          {/* Preparing screen — one overlay for the whole not-ready window:
+              connecting AND world generation (initial connect or "new dream").
+              Covers the frozen/black frame so the UI stays in sync. z-30. */}
+          {preparing && (
+            <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 rounded-2xl bg-black/70 backdrop-blur-md">
+              <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/25 border-t-white/90" />
+              <div className="text-white text-lg font-semibold tracking-tight">
+                {preparingLabel}
+              </div>
+            </div>
+          )}
 
           {/* Top chrome — overlays the top of the game so backdrop blur
               has actual frames to diffuse. */}
@@ -186,6 +220,8 @@ function GameInterface() {
               <div className="flex items-center gap-1">
                 <NewSceneButton />
                 <span className="w-px h-5 bg-white/10 mx-1" />
+                <ImageConditioning />
+                <span className="w-px h-5 bg-white/10 mx-1" />
                 <AgentToggle />
               </div>
               <div className="h-px w-full bg-white/10 hidden md:block" />
@@ -194,6 +230,21 @@ function GameInterface() {
               </div>
             </div>
           </footer>
+
+          {/* Subtle always-on controls hint while playing (the full deck fades
+              out when pointer-locked, so keep a minimal legend visible). */}
+          {isLocked && (
+            <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 z-20 hidden md:flex flex-wrap items-center justify-center gap-x-3 gap-y-1 rounded-full bg-black/35 backdrop-blur px-3 py-1 text-[10px] font-mono text-white/55">
+              <span><Kbd>WASD</Kbd> move</span>
+              <span>mouse look</span>
+              <span><Kbd>LMB</Kbd> break</span>
+              <span><Kbd>RMB</Kbd> place</span>
+              <span><Kbd>Space</Kbd> jump</span>
+              <span><Kbd>Shift</Kbd> sneak</span>
+              <span><Kbd>E</Kbd> inv</span>
+              <span><Kbd>Esc</Kbd> release</span>
+            </div>
+          )}
         </div>
       </div>
     </main>
