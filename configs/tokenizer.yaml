@@ -3,7 +3,7 @@ defaults:
   - dataset: minecraft_vpt
   - _self_
 
-run_name: tokenizer-big
+run_name: tokenizer
 use_wandb: false
 
 dataset:
@@ -70,7 +70,7 @@ tokenizer:
     dataset_std: ${dataset.dataset_std}
 
 mae_finetune: false
-max_steps: 300_000
+max_steps: 10_000
 tokenizer_loss_type: mse  # mse | mae
 freeze_encoder: false
 mae_finetune_p_max_start: 0.9

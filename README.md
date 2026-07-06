@@ -1,128 +1,268 @@
-# Dreamer 4 World Models, in pure JAX
+# Dreamer 4 JAX World Model
 
-This repo is an unofficial implementation of the **[Dreamer 4](https://danijar.com/project/dreamer4/)** world model and RL agent from *“Training Agents Inside of Scalable World Models”* in pure JAX. This repo is designed to be educational and serve as a starting point for those interested in world models, RL, and Jax. 
+**What is this?** An unofficial JAX/Flax NNX implementation of the Dreamer 4 world-model stack from [Training Agents Inside of Scalable World Models](https://danijar.com/project/dreamer4/). This checkout currently covers the world model: causal video tokenizer, offline dataset tokenization, action-conditioned latent dynamics training, and FVD evaluation. It does not yet include the full Dreamer 4 agent/RL training pipeline.
 
-![dreamer4](docs/architecture.png)
+**Why should I care?** If you want to train or modify scalable action-conditioned video world models in JAX, this repo gives you the core pieces without a large framework around them: Grain + ArrayRecord data loading, Hydra configs, Orbax checkpoints, mixed precision, JAX sharding, and readable training scripts.
 
-At this stage, the entire world model + RL pipeline has been implemented and tested on recorded trajectory datasets like CoinRun. The authors are extending the codebase to solve harder tasks and eventually, Minecraft.  
-
-> [!NOTE]
-> We are looking for support - in terms of compute, advising, or feature development. Please get in touch if interested!
-
-
-- [Website](https://danijar.com/project/dreamer4/)
-- [Twitter](https://x.com/danijarh/status/1973072288351396320)
-
-## Demo
-
-At a high level, Dreamer 4 first trains an action-conditioned video diffusion model of the environment. Here, we show that the world model has learned to accurately predict environment dynamics from recorded trajectories.
-<figure>
-    <img src="docs/imagination-cropped.gif">
-</figure>
-
-
-Then, the agent is trained with RL in the world model. The reward is the proximity to the center of the image. We can see that the agent successfully learns to hover near the center.
-<figure>
-    <img src="docs/rl-cropped.gif">
-</figure>
-
-
-
-## Repo Structure
-- **Core library (`dreamer/`)**
-  - `models.py` -- Space-time axial attention, causal tokenizer, interactive dynamics model, agent / reward / value heads.
-  - `data.py` -- Recorded trajectory data loading (ArrayRecord format) 
-  - `imagination.py` -- JIT-fused imagination / diffusion-style rollout code used for fast RL in latent space.
-  - `sampler.py` - non-JIT sampling helpers for debugging / visualization.
-  - `utils.py` -- training state helpers, checkpointing wrappers (Orbax), logging helpers.
-- **Training & evaluation scripts (`scripts/`)**
-  - `train_tokenizer.py` -- Trains the causal tokenizer (masked autoencoder over video).
-  - `train_dynamics.py` -- Trains the interactive dynamics model on top of the frozen tokenizer.
-  - `train_heads.py` -- Adds behavior cloning and reward prediction heads on the world model (agent tokens + reward head).
-  - `train_policy.py` -- Runs Dreamer‑style RL purely in imagination using the learned world model and heads (PMPO-style update).
-- **Docs & logs**
-  - `docs/` -- Figures, videos, and notes from development (e.g., reconstructions, imagination rollouts).
-
-This repo is intentionally built to be easy to modify. If you want to understand or change the algorithm, start from the training scripts under `scripts/` and follow the calls into `dreamer/`.
-
-## Setup
-
-We use `uv` to manage the environment and dependencies (see `pyproject.toml` / `uv.lock`):
+**How do I install it?**
 
 ```bash
-uv sync      # creates .venv and installs packages
-source .venv/bin/activate # activate venv
-uv pip install -e . # install this project as an editable package
+uv sync
+uv pip install -e .
+source .venv/bin/activate
+uv pip install -e .
 ```
 
-The code should run on any relatively recent GPU, but all logic should also run (more slowly) on CPU.
+The project targets Python 3.11 and CUDA 12 JAX. A recent NVIDIA GPU is strongly recommended; CPU execution is useful only for small smoke tests.
 
-## Training Pipeline
-Dreamer 4 follows a 4-stage training pipeline.
-- **Phase 1**: Train a causal tokenizer (MAE-style) on videos.
-- **Phase 2**: Train an interactive dynamics model in latent space of the tokenizer.
-- **Phase 3**: Add agent tokens, BC / reward heads with behavior cloning and reward prediction.
-- **Phase 4**: Train a policy on imagination trajectories from the dynamics model.
-
-The default experiments use recorded trajectory datasets in ArrayRecord format (e.g., CoinRun episodes).
-
-To run the training pipeline, edit the configs in each script's `__main__` block and execute:
+**How do I use it?** Create fixed-length MP4 ArrayRecord shards, train the tokenizer, tokenize the dataset into latent ArrayRecords, copy the latent mean/std into the latent dataset config, then train the dynamics model.
 
 ```bash
-# Phase 1: Train the causal tokenizer
-python scripts/train_tokenizer.py
-
-# Phase 2: Train the dynamics model (requires tokenizer checkpoint)
-python scripts/train_dynamics.py tokenizer_ckpt=./logs/tokenizer/checkpoints
-
-# Phase 3: Train BC/reward heads (requires tokenizer + dynamics checkpoints)
-python scripts/train_heads.py tokenizer_ckpt=./logs/tokenizer/checkpoints dynamics_ckpt=./logs/train_dynamics/checkpoints
-
-# Phase 4: Train policy in imagination (requires BC/reward checkpoint)
-python scripts/train_policy.py heads_ckpt=./logs/heads/checkpoints
+uv run python scripts/train_tokenizer.py dataset.array_record_path=/path/to/mp4-arrayrecords
+uv run python scripts/tokenize_minecraft_dataset.py tokenizer_ckpt=logs/tokenizer-big/checkpoints dataset.array_record_path=/path/to/mp4-arrayrecords output_dir=/path/to/latents
+uv run python scripts/train_dynamics.py tokenizer_ckpt=logs/tokenizer-big/checkpoints dataset.array_record_path=/path/to/latents dataset.dataloader_cfg.short_T=64 dataset.dataloader_cfg.long_T=256
 ```
 
-All scripts save checkpoints under `logs/{run_name}/checkpoints/` by default. You can also enable wandb logging by adding `use_wandb=True` to the launch command. We use hydra to manage the configurations in `/configs`.
+**How can I contribute?** Keep changes focused on the world-model pipeline, update the relevant config/docs when behavior changes, and include the commands or logs you used to verify the change. Useful areas are dataset converters, correctness fixes, FVD/evaluation, sharding/performance work, reproducible training recipes, and documentation.
 
-## Experimental Results
-A log of the training process.
+## Current Scope
 
-#### MAE training
-The MAE, after training, should have around 40 PSNR, and the visualizations should show perfect reconstruction from masked inputs.
+Implemented:
 
+- Causal video tokenizer trained as a masked or full-frame autoencoder.
+- Minecraft/VPT-style MP4 ArrayRecord loading with keyboard/mouse action parsing.
+- Tokenization script that writes latent ArrayRecord shards and latent statistics.
+- Interactive dynamics model trained over tokenizer latents and shifted actions.
+- Sampling/FVD evaluation for trained dynamics checkpoints.
 
-<figure>
-    <img src="docs/step_75900.png">
-  <figcaption>Ground Truth, Masked Input, Reconstructions</figcaption>
-</figure>
+Not implemented in this checkout:
 
-#### Dynamics training
-The dynamics model is trained. It should get around ~30 PSNR in the autoregressive generations using diffusion, and ~29 PSNR using shortcut. The generations should look almost pixel perfect.
+- Agent tokens, behavior cloning heads, reward/value heads, and RL in imagination.
+- A complete raw-video-to-MP4-ArrayRecord conversion script for your own dataset.
 
-<figure>
-    <img src="docs/dynamics_training.png">
-  <figcaption>Dynamics model training curves. </figcaption>
-</figure>
+## Repository Layout
 
-#### Reward / BC training
-Agent tokens, Reward / BC heads are trained on top of the dynamics model, and the dynamics model is finetuned to prevent collapse.
-<figure>
-    <img src="docs/bc_rew_training.png">
-  <figcaption>Reward / BC / Dynamics model losses. </figcaption>
-</figure>
+```text
+.
+├── dreamer/                 # Core models, training helpers, data, sampling, FVD
+│   ├── data/                # Grain/ArrayRecord pipelines and serialization
+│   ├── fvd/                 # FVD feature extraction and scoring
+│   ├── models.py            # Tokenizer and dynamics model definitions
+│   ├── training.py          # Training and evaluation helpers
+│   ├── generation.py        # Denoising schedules and rollout utilities
+│   └── checkpointing.py     # Orbax checkpoint bundles
+├── scripts/
+│   ├── train_tokenizer.py
+│   ├── tokenize_minecraft_dataset.py
+│   ├── train_dynamics.py
+│   └── eval_fvd.py
+├── configs/
+│   ├── dataset/             # Raw-video and latent dataset configs
+│   ├── tokenizer.yaml
+│   ├── tokenize.yaml
+│   ├── dynamics.yaml
+│   └── eval_fvd.yaml
+├── docs/                    # Paper notes, figures, and development notes
+├── frontend/                # Experimental interactive frontend
+└── reactor_app/             # Experimental Reactor sidecar
+```
 
-#### RL in imagination
-The policy is trained with RL on imagination rollouts from the dynamics model.
-<figure>
-    <img src="docs/rl_training.png">
-  <figcaption>RL training curves. The returns increase and the policy stays in the center. </figcaption>
-</figure>
+## Install
 
+Install [`uv`](https://docs.astral.sh/uv/) first, then from the repository root:
 
+```bash
+uv sync
+source .venv/bin/activate
+uv pip install -e .
+```
 
-## References and Acknowledgements
-This implementation references:
-- **Dreamer 4**: [“Training Agents Inside of Scalable World Models”](https://danijar.com/project/dreamer4/)
-- **Jasmine** ["Jasmine: A simple, performant and scalable JAX-based world modeling codebase"](https://github.com/p-doom/jasmine)
+Optional logging:
 
-The authors would like to thank Danijar and the Jasmine team (Mihir, Franz, Alfred) for their advice. 
+```bash
+wandb login
+```
+
+The dependency lock installs `jax[cuda12]`. If your machine needs a different JAX build, install the correct wheel for your CUDA/accelerator setup after `uv sync`.
+
+## Dataset
+
+The main workflow assumes Minecraft/VPT-style raw records:
+
+- Files are named `shard-*.array_record`.
+- Each ArrayRecord entry is a pickled Python dict.
+- Each entry contains a fixed-length MP4 episode. Fixed length matters because tokenization batches full episodes.
+
+Expected raw record shape:
+
+```python
+{
+    "video": mp4_bytes,                  # bytes for one MP4 clip
+    "video_shape": (T, H, W, C),          # used for length filtering
+    "actions": [action_dict_0, ...],      # VPT-style action dicts, length T
+    "source": "optional-id-or-path",
+}
+```
+
+For a simple first run, make every record exactly 256 frames. Then use dynamics settings such as `short_T=64` and `long_T=256`.
+
+Frame and shape constraints:
+
+- `long_T` must be no larger than the number of frames in each record.
+- Dynamics requires `long_T % short_T == 0`.
+- Evaluation requires `ctx_length + horizon` frames and, when chunking FVD, `horizon % fvd_chunk_size == 0`.
+- `H + padding_H[0] + padding_H[1]` and `W + padding_W[0] + padding_W[1]` must be divisible by `patch_size`.
+- Global batch size `B` must be divisible by `jax.process_count()`.
+
+Raw video settings live in [configs/dataset/minecraft_vpt.yaml](configs/dataset/minecraft_vpt.yaml). Update at least:
+
+```yaml
+array_record_path: /path/to/mp4-arrayrecords
+index_max: 1500
+H: 360
+W: 640
+padding_H: [4, 4]
+padding_W: [0, 0]
+patch_size: 16
+dataset_mean: [0.2241, 0.2348, 0.2086]
+dataset_std: [0.1809, 0.1874, 0.2282]
+```
+
+`dataset_mean` and `dataset_std` are pixel statistics for normalized video values. If you change the raw dataset, recompute them and put them in the raw dataset config before tokenizer training.
+
+## Train The Tokenizer
+
+The tokenizer learns the latent representation used by the dynamics model. The default config is [configs/tokenizer.yaml](configs/tokenizer.yaml).
+
+```bash
+ulimit -n 50000
+uv run python scripts/train_tokenizer.py \
+  run_name=tokenizer-big \
+  dataset.array_record_path=/path/to/mp4-arrayrecords \
+  dataset.index_max=1500 \
+  dataset.dataloader_cfg.B=8 \
+  dataset.dataloader_cfg.short_T=16 \
+  dataset.dataloader_cfg.long_T=16
+```
+
+Outputs go to `logs/<run_name>/` by default:
+
+- `checkpoints/` contains tokenizer and optimizer checkpoints.
+- `vis/` contains reconstruction images when `visualize_every > 0`.
+
+Tokenizer training can use shorter windows than the full raw episode length. For example, fixed 256-frame records can still train with 16-frame windows, then be tokenized as full 256-frame latent episodes.
+
+## Tokenize The Dataset
+
+After tokenizer training, encode each MP4 episode into tokenizer latents:
+
+```bash
+uv run python scripts/tokenize_minecraft_dataset.py \
+  tokenizer_ckpt=logs/tokenizer-big/checkpoints \
+  dataset.array_record_path=/path/to/mp4-arrayrecords \
+  dataset.index_max=1500 \
+  dataset.dataloader_cfg.B=8 \
+  output_dir=/path/to/tokenized_data \
+  records_per_shard=5000
+```
+
+This writes:
+
+```text
+/path/to/tokenized_data/
+  shard-00000.array_record
+  shard-00001.array_record
+  metadata/latent_stats.npz
+```
+
+Print the latent statistics:
+
+```bash
+python - <<'PY'
+import numpy as np
+stats = np.load("/path/to/tokenized_data/metadata/latent_stats.npz")
+print("latent_mean:", stats["mean"].tolist())
+print("latent_std:", stats["std"].tolist())
+print("num_samples:", int(stats["num_samples"]))
+print("num_videos:", int(stats["num_videos"]))
+PY
+```
+
+Copy `latent_mean` and `latent_std` into [configs/dataset/minecraft_vpt_latent.yaml](configs/dataset/minecraft_vpt_latent.yaml), and point `array_record_path` at the tokenized output directory.
+
+## Train The Dynamics Model
+
+The dynamics model trains on latent ArrayRecords and shifted actions. The default config is [configs/dynamics.yaml](configs/dynamics.yaml), which imports [configs/dataset/minecraft_vpt_latent.yaml](configs/dataset/minecraft_vpt_latent.yaml).
+
+```bash
+uv run python scripts/train_dynamics.py \
+  run_name=dynamics-pre-final \
+  tokenizer_ckpt=logs/tokenizer-big/checkpoints \
+  dataset.array_record_path=/path/to/tokenized_data \
+  dataset.index_max=89 \
+  dataset.dataloader_cfg.B=8 \
+  dataset.dataloader_cfg.short_T=64 \
+  dataset.dataloader_cfg.long_T=256 \
+  dataset.dataloader_cfg.long_ratio=0.1
+```
+
+For 256-frame tokenized records, `short_T=64` and `long_T=256` satisfy the packing constraint. If your records are shorter, reduce `long_T`; if you change `long_T`, keep `short_T` as a divisor.
+
+## Evaluate
+
+Generate videos and compute FVD from a dynamics checkpoint:
+
+```bash
+uv run python scripts/eval_fvd.py \
+  dynamics_ckpt=logs/dynamics-pre-final/checkpoints \
+  dataset.array_record_path=/path/to/mp4-arrayrecords \
+  num_videos=256 \
+  ctx_length=4 \
+  horizon=240 \
+  fvd_chunk_size=16
+```
+
+Use `mode=generate` to only save MP4s and `mode=evaluate` to compute FVD from previously generated videos.
+
+## Configuration
+
+Configs are Hydra/OmegaConf YAML files under `configs/`. You can edit YAML files or override values from the command line:
+
+```bash
+uv run python scripts/train_dynamics.py \
+  max_steps=200000 \
+  parallel_strategy=fsdp \
+  logger.use_wandb=true \
+  logger.wandb_project=dreamer4-jax
+```
+
+Useful config files:
+
+- [configs/tokenizer.yaml](configs/tokenizer.yaml) - tokenizer architecture and training.
+- [configs/tokenize.yaml](configs/tokenize.yaml) - offline tokenization.
+- [configs/dynamics.yaml](configs/dynamics.yaml) - dynamics architecture and training.
+- [configs/eval_fvd.yaml](configs/eval_fvd.yaml) - rollout and FVD settings.
+- [configs/dataset/minecraft_vpt.yaml](configs/dataset/minecraft_vpt.yaml) - raw MP4 dataset settings.
+- [configs/dataset/minecraft_vpt_latent.yaml](configs/dataset/minecraft_vpt_latent.yaml) - tokenized latent dataset settings.
+
+## Contributing
+
+Before opening a PR:
+
+1. Make sure the README and relevant config comments still match the code.
+2. Run the smallest command that exercises your change.
+3. Include the command, hardware assumptions, and any important metrics in the PR.
+4. Do not add new framework layers unless they remove real complexity from the training path.
+
+High-value contributions:
+
+- Raw dataset converters that emit the MP4 ArrayRecord schema above.
+- Small regression tests or smoke tests for data loading, tokenization, and checkpoint restore.
+- Multi-host and sharding fixes.
+- Evaluation scripts and reproducible config recipes.
+- Documentation for known-good runs.
+
+## References
+
+- Dreamer 4: [Training Agents Inside of Scalable World Models](https://danijar.com/project/dreamer4/)
+- Jasmine: [A simple, performant and scalable JAX-based world modeling codebase](https://github.com/p-doom/jasmine)

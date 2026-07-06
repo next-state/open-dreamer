@@ -4,7 +4,7 @@ defaults:
 name: minecraft_vpt
 data_type: video
 
-array_record_path: /alloc/data/arrayrecords-mp4
+array_record_path: null
 index_max: 1500
 num_max_samples: -1
 

@@ -1,7 +1,7 @@
 import os
 import jax
 from dataclasses import dataclass
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from typing import Literal
 
 
@@ -82,12 +82,12 @@ def build_parallel(strategy: Literal["data", "fsdp", "tp", "sp"]) -> tuple[Mesh,
     n = len(jax.devices())
 
     if strategy == "data":
-        mesh = jax.make_mesh((n, 1), ('data', 'model'))
+        mesh = jax.make_mesh((n, 1), ('data', 'model'), axis_types=(AxisType.Auto, AxisType.Auto))
         sharding = NamedSharding(mesh, P('data', None))
         rules = MeshRules(embed=None, mlp='model', attn='model', data='data')
 
     elif strategy == "fsdp":
-        mesh = jax.make_mesh((n, 1), ('data', 'model'))
+        mesh = jax.make_mesh((n, 1), ('data', 'model'), axis_types=(AxisType.Auto, AxisType.Auto))
         sharding = NamedSharding(mesh, P('data', None))
         # Keep embedding-like parameters replicated under FSDP.
         # Small vocab / token tables (e.g. binary action embeddings) are not
@@ -96,12 +96,12 @@ def build_parallel(strategy: Literal["data", "fsdp", "tp", "sp"]) -> tuple[Mesh,
         rules = MeshRules(embed=None, mlp='data', attn='data', data='data')
 
     elif strategy == "tp":
-        mesh = jax.make_mesh((1, n), ('data', 'model'))
+        mesh = jax.make_mesh((1, n), ('data', 'model'), axis_types=(AxisType.Auto, AxisType.Auto))
         sharding = NamedSharding(mesh, P('data', None))
         rules = MeshRules(embed='model', mlp='model', attn='model', data=None)
 
     elif strategy == "sp":
-        mesh = jax.make_mesh((1, n, 1), ('data', 'seq', 'model'))
+        mesh = jax.make_mesh((1, n, 1), ('data', 'seq', 'model'), axis_types=(AxisType.Auto, AxisType.Auto, AxisType.Auto))
         sharding = NamedSharding(mesh, P('data', 'seq', None, None))
         rules = MeshRules(embed=None, mlp='model', attn='model', data='data', seq='seq')
 
