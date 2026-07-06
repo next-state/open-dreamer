@@ -11,7 +11,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
-RUNTIME_VERSION="${RUNTIME_VERSION:-2.7.1-0}"
+RUNTIME_VERSION="${RUNTIME_VERSION:-2.9.0-0}"
 IMAGE_VERSION="${IMAGE_VERSION:-dev}"
 
 exec docker build \

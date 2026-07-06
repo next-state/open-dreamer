@@ -20,7 +20,7 @@
 # package). `reactor_app/build.sh` wires the context and args:
 #   reactor_app/build.sh --progress=plain
 
-ARG RUNTIME_VERSION=2.7.1-0
+ARG RUNTIME_VERSION=2.9.0-0
 
 FROM --platform=linux/amd64 reactortechnologies/reactor-runtime-base:${RUNTIME_VERSION}
 
