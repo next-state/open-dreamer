@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Self
+from typing import ClassVar, Self
 
 import jax
 import orbax.checkpoint as ocp
@@ -19,21 +19,13 @@ from omegaconf import OmegaConf
 from dreamer.configs import (
     CheckpointConfig,
     DynamicsModelConfig,
-    PolicyHeadModelConfig,
-    RewardHeadModelConfig,
-    TaskEmbedderModelConfig,
     TokenizerModelConfig,
 )
 from dreamer.models import (
     Dynamics,
-    PolicyHeadMTP,
-    RewardHeadMTP,
-    TaskEmbedder,
     Tokenizer,
 )
-from dreamer.training import RMSLossNormalizer
 from dreamer.parallel import MeshRules
-from jax.experimental import multihost_utils
 
 from dreamer.utils import from_dict
 
@@ -279,31 +271,3 @@ class DynamicsCheckpointBundle(CheckpointBundle):
     dynamics_ema: Dynamics
     tokenizer: Tokenizer
     dynamics_optimizer: nnx.Optimizer | None = None
-
-
-@dataclass
-class HeadsCheckpointBundle(CheckpointBundle):
-    """Bundle for heads checkpoint save/restore.
-
-    Note: tokenizer is included but frozen (not trained). Including it makes
-    checkpoints self-contained for downstream usage (e.g., inference, visualization).
-    """
-
-    _model_registry: ClassVar[dict[str, tuple[type, type]]] = {
-        "tokenizer": (TokenizerModelConfig, Tokenizer),
-        "dynamics": (DynamicsModelConfig, Dynamics),
-        "task_embedder": (TaskEmbedderModelConfig, TaskEmbedder),
-        "policy_head": (PolicyHeadModelConfig, PolicyHeadMTP),
-        "reward_head": (RewardHeadModelConfig, RewardHeadMTP),
-    }
-
-    tokenizer: Tokenizer
-    dynamics: Dynamics
-    task_embedder: TaskEmbedder
-    policy_head: PolicyHeadMTP
-    reward_head: RewardHeadMTP
-    dynamics_optimizer: nnx.Optimizer | None = None
-    task_embedder_optimizer: nnx.Optimizer | None = None
-    policy_optimizer: nnx.Optimizer | None = None
-    reward_optimizer: nnx.Optimizer | None = None
-    loss_normalizer: RMSLossNormalizer | None = None

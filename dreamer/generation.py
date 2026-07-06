@@ -4,7 +4,7 @@ import einops
 import jax
 import jax.numpy as jnp
 from typing import Any, Tuple
-from .models import KVCachesDict, Dynamics, PolicyHeadMTP, Tokenizer
+from .models import KVCachesDict, Dynamics, Tokenizer
 from .actions import Actions
 from .utils import normalize_latents, unnormalize_latents
 from tqdm import tqdm
@@ -270,14 +270,12 @@ def next_frame(
 
 def latent_rollout(
     dynamics: Dynamics,
-    policy: PolicyHeadMTP | Actions,
+    actions_future: Actions,
     schedule: DenoiseSchedule,
     latents_ctx: jax.Array,
     actions_ctx: Actions,
     num_steps: int,
     rng: jax.Array,
-    initial_task_embedding: jax.Array | None = None,
-    deterministic: bool = False,
     use_kv_cache: bool = True,
 ):
     """
@@ -285,14 +283,12 @@ def latent_rollout(
 
     Args:
         dynamics: Dynamics NNX model.
-        policy: Policy NNX model or sequence of actions.
+        actions_future: Ground-truth future actions to condition the rollout on.
         schedule: DenoiseSchedule.
         latents_ctx: (B, T_ctx, n_spatial, D_s) Context latents.
         actions_ctx: Context actions.
         num_steps: Number of steps to unroll.
         rng: Random number generator key
-        initial_task_embedding: Optional (B, T_ctx, n_agent, D) agent tokens for context.
-        deterministic: Whether to sample deterministic actions from the policy.
         use_kv_cache: Whether to use KV caching in dynamics for faster rollout.
         
     Returns:
@@ -307,30 +303,22 @@ def latent_rollout(
 
     # Scan loop for rollout
     def scan_step(carry, step_idx):
-        h_t, caches_t, rng = carry
+        caches_t, rng = carry
 
-        # Sample action
-        rng, rng_policy = jax.random.split(rng)
-        
-        if isinstance(policy, Actions):
-            action = policy[:, step_idx]  # (B, ...)
-        else:
-            all_actions = policy.sample(h_t, deterministic=deterministic, rng=rng_policy)  # (B, T, L, ...)
-            action = all_actions[:, 0, 0, ...]  # (B, ...) - use first predicted action
+        action = actions_future[:, step_idx]  # (B, ...)
         
         # Predict next latent (denoising)
         latent_next, h_next, caches_next, rng, diag = next_latent(
-            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=task_embedding
+            dynamics, schedule, action, latent_shape, rng, caches=caches_t, task_embedding=None
         )
         
-        return (h_next, caches_next, rng), (latent_next[:, 0], action, h_next, diag) # latent_next[:, 0] to remove time dimension
+        return (caches_next, rng), (latent_next[:, 0], action, h_next, diag) # latent_next[:, 0] to remove time dimension
 
 
     if use_kv_cache:
         # Initialize caches and process context
         window_size = min(T_ctx + num_steps, dynamics.cfg.context_length)
-        n_agents = policy.cfg.L if isinstance(policy, PolicyHeadMTP) else 0
-        caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=n_agents, dtype=latents_ctx.dtype)
+        caches = dynamics.create_static_caches(batch_size=B, n_latents=n_spatial, window_size=window_size, n_agent=0, dtype=latents_ctx.dtype)
 
         # Run dynamics on context to prefill caches and get last hidden state
         # Use clean signal for ground truth context
@@ -339,17 +327,13 @@ def latent_rollout(
         
         _, (h_seq, caches) = dynamics(
             actions_ctx, step_idx_prefill, tau_idx_prefill, latents_ctx,
-            task_embeddings=initial_task_embedding, caches=caches, deterministic=True
+            task_embeddings=None, caches=caches, deterministic=True
         )
-
-        # h_seq: (B, T_ctx, n_agent, D). We need the state at the last context step.
-        task_embedding = initial_task_embedding[:, -1:] if isinstance(initial_task_embedding, jax.Array) else None
-        h_last = h_seq[:, -1:] if isinstance(h_seq, jax.Array) else None  # (B, 1, n_agent, D)
 
         # Run scan
         _, (rollout_latents, rollout_actions, rollout_hidden, rollout_diags) = jax.lax.scan(
             scan_step,
-            (h_last, caches, rng),
+            (caches, rng),
             jnp.arange(num_steps)
         )
 
@@ -368,12 +352,9 @@ def latent_rollout(
         
         # Not Implemented:
         h_seq, rollout_hidden = None, None
-        if not isinstance(policy, Actions):
-                raise NotImplementedError
-
         pred_latents = []
         for step_idx in tqdm(range(num_steps)):
-            action = policy[:, step_idx]
+            action = actions_future[:, step_idx]
 
             # Predict next latent
             latent_next, _, _, rng, diag = next_latent(

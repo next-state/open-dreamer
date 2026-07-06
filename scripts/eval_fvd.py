@@ -135,8 +135,6 @@ def generate_videos(cfg):
                 horizon=horizon,
                 schedule_config=schedule_config,
                 rng=eval_rng,
-                policy=None,
-                task_embedder=None,
                 latents=val_data if use_latent_data else None,
             )
 

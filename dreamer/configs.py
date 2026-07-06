@@ -170,57 +170,6 @@ class DynamicsModelConfig:
     latent_std: tuple[float, ...] | None = None
 
 
-@dataclass(frozen=False)
-class TaskEmbedderModelConfig:
-    """Model configuration for task embedder."""
-    d_model: int = 128
-    n_agent: int = 4
-    use_ids: bool = True
-    n_tasks: int = 128
-    d_task: int = 64
-    use_bias: bool = False
-    dtype: str = "float32"
-    param_dtype: str = "float32"
-
-
-@dataclass(frozen=False)
-class PolicyHeadModelConfig:
-    """Model configuration for policy head (MTP)."""
-    d_model: int = 128
-    action_dim: int = 16
-    L: int = 4
-    kind: str = "categorical"
-    mlp_ratio: float = 2.0
-    dropout_rate: float = 0.0
-    swiglu: bool = True
-    parity_2over3: bool = False
-    use_bias: bool = False
-    dtype: str = "float32"
-    param_dtype: str = "float32"
-
-    # action conditioning
-    num_binary_actions: int = 0
-    categorical_action_dim: int = 0
-    continuous_action_dim: int = 0
-
-
-@dataclass(frozen=False)
-class RewardHeadModelConfig:
-    """Model configuration for reward head (MTP)."""
-    d_model: int = 128
-    L: int = 4
-    num_bins: int = 101
-    log_low: float = -5.0
-    log_high: float = 3.0
-    mlp_ratio: float = 2.0
-    dropout_rate: float = 0.0
-    swiglu: bool = True
-    parity_2over3: bool = False
-    use_bias: bool = False
-    dtype: str = "float32"
-    param_dtype: str = "float32"
-
-
 # ---- Experiment Configs ----
 
 @dataclass(frozen=False)
@@ -350,7 +299,6 @@ class TokenizerConfig(BaseExperimentConfig):
     # EMA model
     ema_decay: float = 0.999
     ema_dtype: str = "bfloat16"
-
     # LR schedule
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
 
@@ -389,93 +337,3 @@ class DynamicsConfig(BaseExperimentConfig):
     # EMA model
     ema_decay: float = 0.999
     ema_dtype: str = "bfloat16"
-
-
-@dataclass(frozen=False)
-class HeadsConfig(BaseExperimentConfig):
-    dynamics_ckpt: str = ""  # checkpoint from train_dynamics.py
-
-    # Model configs (for initialization - stored in checkpoint meta)
-    task_embedder: TaskEmbedderModelConfig = field(default_factory=TaskEmbedderModelConfig)
-    policy_head: PolicyHeadModelConfig = field(default_factory=PolicyHeadModelConfig)
-    reward_head: RewardHeadModelConfig = field(default_factory=RewardHeadModelConfig)
-
-    # Training hyperparameters
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
-    dynamics_loss_weight: float = 0.1
-
-    # Learning rate schedules (one per component)
-    lr_schedule_policy: LRScheduleConfig = field(default_factory=lambda: LRScheduleConfig(lr=1e-4))
-    lr_schedule_reward: LRScheduleConfig = field(default_factory=lambda: LRScheduleConfig(lr=1e-4))
-    lr_schedule_dynamics: LRScheduleConfig = field(default_factory=lambda: LRScheduleConfig(lr=1e-5))
-
-    # Optimizer config (shared across all components)
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-
-    # Eval media toggle
-    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
-
-    # Loss weighting (to balance scales across different loss components)
-    loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
-    loss_weight_policy: float = 0.3      # weight for policy CE loss (nats)
-    loss_weight_reward: float = 0.3      # weight for reward CE loss (nats)
-
-
-@dataclass(frozen=False)
-class RLConfig(BaseExperimentConfig):
-    heads_ckpt: str = ""  # checkpoint from train_heads.py
-    action_dim: int = 4
-
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    qk_norm_type: str | None = None
-    rope_theta: float = 10000.0
-    packing_factor: int = 2
-    n_register: int = 4
-    n_agent: int = 1
-    agent_space_mode: str = "wm_agent"
-
-    # schedule
-    k_max: int = 8
-
-    # train
-    log_every: int = 5_000
-    lr: float = 3e-4
-
-    # eval media toggle
-    write_video_every: int = 10_000
-    visualize_every: int = 25_000
-
-    # RL-specific
-    L: int = 2
-    num_reward_bins: int = 101
-    reward_log_low: float = -3.0
-    reward_log_high: float = 3.0
-    num_value_bins: int = 101
-    n_tasks: int = 128
-    use_task_ids: bool = True
-
-    # RL hyperparameters
-    gamma: float = 0.997
-    lambda_: float = 0.95
-    horizon: int = 32
-    context_length: int = 16
-    imagination_d: float = 1.0 / 4
-    alpha: float = 0.5
-    beta: float = 0.3
-
-    # Evaluation
-    eval_every: int = 50_000
-    eval_episodes: int = 4
-    eval_horizon: int = 32
-    eval_batch_size: int = 4
-    max_eval_examples_to_plot: int = 4

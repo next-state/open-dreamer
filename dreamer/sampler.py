@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from dreamer.models import Tokenizer, Dynamics, PolicyHeadMTP, TaskEmbedder
+from dreamer.models import Tokenizer, Dynamics
 from dreamer.actions import Actions
 from .generation import DenoiseSchedule, latent_rollout
 
@@ -35,8 +35,6 @@ def sample_video(
     horizon: int,
     schedule_config: DenoiseSchedule,
     rng: jax.Array,
-    policy: PolicyHeadMTP | None = None,
-    task_embedder: TaskEmbedder | None = None,
     latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
 ) -> Tuple[jax.Array, jax.Array, jax.Array | None]:
     """
@@ -50,10 +48,6 @@ def sample_video(
         horizon: Number of future frames to predict
         schedule_config: DenoiseSchedule with rollout parameters
         rng: Random key
-        policy: Optional policy model. If provided, actions are sampled from the policy
-                during rollout instead of using ground truth future actions.
-        task_embedder: Optional task embedder. Required when policy is provided to generate
-                agent tokens for the dynamics model.
         latents: Optional pre-tokenized latents (B, T, n_latents, d_bottleneck). If provided,
                 skips tokenizer encoding. Latents should already be unpacked.
 
@@ -67,45 +61,30 @@ def sample_video(
         # Pre-tokenized latent path
         # Latents are already unpacked
         latents = latents.astype(jnp.bfloat16)
-        B, T = latents.shape[:2]
     else:
         assert frames is not None
         # Video path - encode frames
-        B, T, H, W, C = frames.shape
 
         # Encode frames to clean latents (returns unpacked)
         latents = encode_jit(tokenizer, frames)
 
     # Split context vs future
-    latents_ctx, latent_future = latents[:, :-horizon, :, :], latents[:, -horizon:, :, :]
+    latents_ctx = latents[:, :-horizon, :, :]
     actions_ctx, actions_future = actions[:, :-horizon], actions[:, -horizon:]
 
     # Decode GT latents for visualization
     gt_decoded_frames = decode_jit(tokenizer, latents)
     gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
 
-    # Rollout
-    # Use policy if provided, otherwise use ground truth future actions
-    # When using a policy, we need agent tokens for the dynamics model to produce hidden states
-    T_ctx = latents_ctx.shape[1]
-    if policy is not None:
-        assert task_embedder is not None, "task_embedder is required when policy is provided"
-        task = jnp.zeros((B,), dtype=jnp.int32)  # Use task ID 0 for all samples
-        initial_agent_tokens = task_embedder(task=task, B=B, T=T_ctx)
-    else:
-        initial_agent_tokens = None
-
     # Use latent_rollout for both paths (frames already encoded to latents above)
     rollout_result = latent_rollout(
         dynamics,
-        policy=actions_future if policy is None else policy,
+        actions_future=actions_future,
         schedule=schedule_config,
         latents_ctx=latents_ctx,
         actions_ctx=actions_ctx,
         num_steps=horizon,
         rng=rng,
-        initial_task_embedding=initial_agent_tokens,
-        deterministic=True,
     )
 
     # Decode predicted latents to frames
