@@ -251,8 +251,14 @@ class WorldModelPipeline(ReactorPipeline):
             self._next_frame_jit = nnx.jit(_next_frame_fn, static_argnames=("latent_shape",))
             self._observe_frame_jit = nnx.jit(_observe_frame_fn)
 
+            # XLA's first several calls into each jitted path pay
+            # compilation/autotuning before reaching steady state, so drive
+            # enough warmup iterations here (load() blocks readiness) that the
+            # first frames a real client sees are already fast. Both paths are
+            # warmed: world-model rollout (_next_frame_jit) and real-frame
+            # observation (_observe_frame_jit).
             rng = jax.random.PRNGKey(0)
-            warmup_steps = max(2, int(config.get("world_model_warmup_steps", 2)))
+            warmup_steps = max(10, int(config.get("world_model_warmup_steps", 10)))
             warmup_dynamics_cache = self._empty_dynamics_cache
             warmup_tokenizer_cache = self._empty_tokenizer_cache
             for _ in range(warmup_steps):
@@ -260,8 +266,11 @@ class WorldModelPipeline(ReactorPipeline):
                 _frame, _h, warmup_dynamics_cache, warmup_tokenizer_cache, rng = self._next_frame_jit(self._tokenizer, self._dynamics, _noop_action(), self._latent_shape, warmup_dynamics_cache, warmup_tokenizer_cache, key)
                 jax.block_until_ready((_frame, warmup_dynamics_cache, warmup_tokenizer_cache, rng))
             zero_frame = jnp.zeros(self._model_frame_shape, dtype=jnp.uint8)
-            _dc2, _tc2, rng = self._observe_frame_jit(self._tokenizer, self._dynamics, zero_frame, _noop_action(), self._empty_dynamics_cache, self._empty_tokenizer_cache, rng)
-            jax.block_until_ready((_dc2, _tc2))
+            obs_dynamics_cache = self._empty_dynamics_cache
+            obs_tokenizer_cache = self._empty_tokenizer_cache
+            for _ in range(warmup_steps):
+                obs_dynamics_cache, obs_tokenizer_cache, rng = self._observe_frame_jit(self._tokenizer, self._dynamics, zero_frame, _noop_action(), obs_dynamics_cache, obs_tokenizer_cache, rng)
+                jax.block_until_ready((obs_dynamics_cache, obs_tokenizer_cache, rng))
             self._warmup_rng = rng
 
     @connected
@@ -292,6 +301,14 @@ class WorldModelPipeline(ReactorPipeline):
         was_world_model = False
         last_frame_at = 0.0
 
+        # Heartbeat: periodically report that frames are being produced so we
+        # can confirm the stream is live from the container logs.
+        total_frames = 0
+        window_frames = 0
+        loop_started_at = time.monotonic()
+        last_log_at = loop_started_at
+        print("[reactor_app] inference loop started; emitting frames", flush=True)
+
         with _mesh_context(self._mesh):
             while True:
                 if self.state._reset_requested:
@@ -318,6 +335,12 @@ class WorldModelPipeline(ReactorPipeline):
                     # rng = jax.random.PRNGKey(self.state._seed)
                     minerl_action = self._build_minerl_action(self._env)
                     self._obs, _reward, terminated, truncated, _info = self._step_env(self._env, minerl_action)
+                    if terminated or truncated:
+                        # The MineRL episode ended (death / ESC / any residual
+                        # cap). Re-reset the same world so streaming continues;
+                        # otherwise the next step() raises and crashes run().
+                        reset_seed = None if self._active_world_index >= 0 else self.state._seed
+                        self._obs = self._reset_env(self._env, reset_seed)
                     frame = self._frame_from_obs(self._obs)
                     dynamics_cache, tokenizer_cache, rng = self._observe_real_frame(frame, action, dynamics_cache, tokenizer_cache, rng)
 
@@ -337,6 +360,22 @@ class WorldModelPipeline(ReactorPipeline):
                 self.state._mouse["dx"] = 0.0
                 self.state._mouse["dy"] = 0.0
                 self.state._mouse["dwheel"] = 0.0
+
+                total_frames += 1
+                window_frames += 1
+                now = time.monotonic()
+                if now - last_log_at >= 2.0:
+                    fps = window_frames / (now - last_log_at)
+                    mode = "world-model" if use_world_model else "minerl"
+                    fshape = getattr(frame, "shape", None)
+                    print(
+                        f"[reactor_app] streaming: +{window_frames} frames "
+                        f"({fps:.1f} fps) mode={mode} total={total_frames} "
+                        f"frame_shape={fshape}",
+                        flush=True,
+                    )
+                    window_frames = 0
+                    last_log_at = now
 
                 yield WorldModelOutput(main_video=frame)
 
@@ -436,6 +475,13 @@ class WorldModelPipeline(ReactorPipeline):
         pipeline = self
 
         class _CachedWorldFindCave(FindCaveEnvSpec):
+            def __init__(self):
+                super().__init__()
+                # Interactive sessions run indefinitely; the default 3-minute
+                # Basalt episode cap would reset the world (a visible jump) and,
+                # if unhandled, crash on the next step. Effectively disable it.
+                self.max_episode_steps = 10**9
+
             def create_server_world_generators(self):
                 path = pipeline._current_world_path()
                 if path is not None:

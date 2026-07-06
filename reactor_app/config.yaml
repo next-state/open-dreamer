@@ -5,7 +5,7 @@ fps: 20
 camera_sensitivity: 0.15
 max_camera_degrees: 20
 warmup_env: true
-world_model_warmup_steps: 2
+world_model_warmup_steps: 10
 minerl_runtime_dir: /tmp/reactor_minerl
 
 num_steps: 4
