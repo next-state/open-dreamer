@@ -8,9 +8,11 @@ frontend toggle then switches generation to the warmed world model.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,10 +31,12 @@ from flax import nnx
 
 from reactor_runtime import get_weights_path
 from reactor_runtime.interface import (
+    Idle,
     InputState,
     ModelMessage,
     Output,
     ReactorPipeline,
+    UploadedFile,
     Video,
     connected,
     event,
@@ -56,14 +60,17 @@ class WorldModelOutput(Output):
 
 
 @dataclass
-class WorldsAvailable(ModelMessage):
-    """Announce the cached worlds a client can switch into.
+class WorldStatus(ModelMessage):
+    """Stream the model's live state so the UI stays in sync.
 
-    ``worlds`` is the ordered list of world names; a client switches into
-    one by its position in this list via the ``load_world`` event.
+    ``loading`` is True while a world is being generated (initial connect or a
+    "new dream"). ``use_policy`` is True when the model is rolling out the world
+    model (vs. observing the real MineRL env), so the client's mode toggle
+    reflects backend-driven switches (e.g. seeding from an image).
     """
 
-    worlds: list
+    loading: bool
+    use_policy: bool = False
 
 
 @dataclass
@@ -162,45 +169,27 @@ class WorldModelPipeline(ReactorPipeline):
         self._env_spec = None
         self._obs = None
 
-        # Pre-generated Minecraft world saves the client can teleport into by
-        # index. Loading one is a world-file copy + load (seconds) instead of
-        # full procedural generation (minutes). ``-1`` means "generate a fresh
-        # procedural world" (the original random behaviour).
-        self._worlds = self._load_world_manifest(config)
-        self._active_world_index = -1
-        self._pending_world_index = -1
+        # True while a world is being generated; surfaced to the client via
+        # WorldStatus so the UI can show a loading screen instead of a frozen
+        # (black) frame.
+        self._world_loading = False
+
+        # Optional client-uploaded image (uint8 H,W,3, already resized to the
+        # model frame) to seed the world model from instead of the live env.
+        self._pending_conditioning = None
+        self._conditioning_observe_steps = max(1, int(config.get("conditioning_observe_steps", 8)))
+
+        # Generating a Minecraft world blocks for seconds. Run it off the
+        # inference thread so the loop can keep yielding Idle meanwhile, which
+        # keeps the runtime's dynamic-FPS estimate sane (a multi-second blocking
+        # yield would otherwise be clocked as one frame and tank the FPS).
+        self._reset_executor = ThreadPoolExecutor(max_workers=1)
 
         self._load_world_model(config)
 
         if bool(config.get("warmup_env", True)):
             self._env = self._make_env()
             self._obs = self._reset_env(self._env, int.from_bytes(os.urandom(4), "big"))
-
-    def _load_world_manifest(self, config: dict[str, Any]) -> list[dict[str, str]]:
-        """Resolve the configured cached worlds into ``{name, path}`` entries.
-
-        Paths are resolved relative to this workspace directory. Missing world
-        folders are dropped with a warning so the model still serves procedural
-        worlds when a save has not been shipped yet.
-        """
-        base_dir = Path(__file__).resolve().parent
-        worlds: list[dict[str, str]] = []
-        for entry in config.get("worlds", []) or []:
-            name = str(entry.get("name", "")).strip()
-            raw_path = str(entry.get("path", "")).strip()
-            if not name or not raw_path:
-                print(f"[reactor_app] WARNING skipping malformed world entry {entry!r}")
-                continue
-            path = Path(raw_path)
-            if not path.is_absolute():
-                path = base_dir / path
-            if not path.is_dir():
-                print(f"[reactor_app] WARNING cached world {name!r} not found at {path}; skipping")
-                continue
-            worlds.append({"name": name, "path": str(path)})
-        if worlds:
-            print(f"[reactor_app] cached worlds: {[w['name'] for w in worlds]}")
-        return worlds
 
     def _load_world_model(self, config: dict[str, Any]) -> None:
         ckpt_path = str(get_weights_path())
@@ -281,18 +270,38 @@ class WorldModelPipeline(ReactorPipeline):
         self.state._keyboard = {}
         self.state._mouse = {"left": False, "right": False, "middle": False, "dx": 0.0, "dy": 0.0, "dwheel": 0.0}
         self.state._seed = int.from_bytes(os.urandom(4), "big")
-        self.state._reset_requested = False
+        # Generate a fresh world for this session. Routing the initial world
+        # through the reset path (off-thread + Idle + loading overlay) means the
+        # first connection shows a loading screen instead of a black frozen
+        # frame, and the slow generation isn't clocked into the FPS estimate.
+        # Mark loading immediately (before the inference loop starts the reset)
+        # so the client shows "preparing" from the moment it connects.
+        self._world_loading = True
+        self.state._reset_requested = True
 
-        # Let the client build a world picker: index into this list is the
-        # handle passed back via the ``load_world`` event.
-        if self._worlds:
-            await self.send(WorldsAvailable(worlds=[w["name"] for w in self._worlds]))
+        # Stream world-loading state to the client for the loading overlay.
+        asyncio.create_task(self._world_status_loop())
+
+    async def _world_status_loop(self) -> None:
+        """Continuously publish world-loading state until disconnect.
+
+        Re-sent every tick (not just on change) so the client can't miss it —
+        a single send on connect can land before the data channel is ready.
+        """
+        while self.connected.is_set():
+            state = self.state
+            use_policy = bool(getattr(state, "_use_policy", False)) if state is not None else False
+            try:
+                await self.send(
+                    WorldStatus(loading=bool(getattr(self, "_world_loading", False)), use_policy=use_policy)
+                )
+            except Exception:
+                return
+            await asyncio.sleep(0.3)
 
     def inference(self):
         if self._env is None:
             self._env = self._make_env()
-        if self._obs is None:
-            self._obs = self._reset_env(self._env, self.state._seed)
 
         rng = jax.random.PRNGKey(self.state._seed)
         dynamics_cache = self._empty_dynamics_cache
@@ -307,27 +316,63 @@ class WorldModelPipeline(ReactorPipeline):
         window_frames = 0
         loop_started_at = time.monotonic()
         last_log_at = loop_started_at
+        reset_future = None
+        reseed_left = 0
+        conditioning_img = None
         print("[reactor_app] inference loop started; emitting frames", flush=True)
 
         with _mesh_context(self._mesh):
             while True:
-                if self.state._reset_requested:
-                    # Apply the pending world selection before the reset so the
-                    # env spec's world generator (evaluated during reset) loads
-                    # the chosen save (or falls back to procedural generation).
-                    self._active_world_index = self._pending_world_index
+                if self.state._reset_requested and reset_future is None and reseed_left == 0:
+                    self.state._use_policy = False
+                    self.state._reset_requested = False
                     rng = jax.random.PRNGKey(self.state._seed)
                     dynamics_cache = self._empty_dynamics_cache
                     tokenizer_cache = self._empty_tokenizer_cache
-                    self.state._use_policy = False
-                    self.state._reset_requested = False
-                    # No seed when loading a cached save (a seed regenerates the
-                    # world); a seed for a fresh procedural world.
-                    reset_seed = None if self._active_world_index >= 0 else self.state._seed
-                    self._obs = self._reset_env(self._env, reset_seed)
+                    self._world_loading = True
                     sent_initial_frame = False
                     was_world_model = False
-                
+                    if self._pending_conditioning is not None:
+                        # Seed the world model from an uploaded image: no MineRL
+                        # generation, just observe the image into the caches and
+                        # then roll out from it.
+                        conditioning_img = self._pending_conditioning
+                        self._pending_conditioning = None
+                        reseed_left = self._conditioning_observe_steps
+                    else:
+                        # Kick the slow world generation onto a worker thread and
+                        # yield Idle until it finishes, so the loading time isn't
+                        # clocked into the FPS estimate.
+                        reset_future = self._reset_executor.submit(self._reset_env, self._env, self.state._seed)
+
+                if reset_future is not None:
+                    # World still initializing: yield Idle (near-zero compute)
+                    # so the runtime keeps ticking and doesn't clock the long
+                    # reset as one giant frame.
+                    if not reset_future.done():
+                        yield Idle
+                        continue
+                    try:
+                        self._obs = reset_future.result()
+                    except Exception as exc:  # noqa: BLE001 - surface + keep serving
+                        print(f"[reactor_app] world reset failed: {exc!r}", flush=True)
+                    reset_future = None
+                    self._world_loading = False
+
+                if reseed_left > 0:
+                    # Observe the uploaded image into the caches, one step per
+                    # loop iteration (yield Idle so it isn't clocked as a frame).
+                    dynamics_cache, tokenizer_cache, rng = self._observe_real_frame(
+                        conditioning_img, _noop_action(), dynamics_cache, tokenizer_cache, rng
+                    )
+                    reseed_left -= 1
+                    if reseed_left == 0:
+                        conditioning_img = None
+                        self.state._use_policy = True  # roll out from the image
+                        self._world_loading = False
+                    yield Idle
+                    continue
+
                 use_world_model = bool(self.state._use_policy)
 
                 action = _build_world_model_action(self.state._keyboard, self.state._mouse)
@@ -337,10 +382,9 @@ class WorldModelPipeline(ReactorPipeline):
                     self._obs, _reward, terminated, truncated, _info = self._step_env(self._env, minerl_action)
                     if terminated or truncated:
                         # The MineRL episode ended (death / ESC / any residual
-                        # cap). Re-reset the same world so streaming continues;
-                        # otherwise the next step() raises and crashes run().
-                        reset_seed = None if self._active_world_index >= 0 else self.state._seed
-                        self._obs = self._reset_env(self._env, reset_seed)
+                        # cap). Re-reset so streaming continues; otherwise the
+                        # next step() raises and crashes run().
+                        self._obs = self._reset_env(self._env, self.state._seed)
                     frame = self._frame_from_obs(self._obs)
                     dynamics_cache, tokenizer_cache, rng = self._observe_real_frame(frame, action, dynamics_cache, tokenizer_cache, rng)
 
@@ -445,7 +489,7 @@ class WorldModelPipeline(ReactorPipeline):
 
         self._prepare_minerl_runtime_dir()
 
-        spec = self._build_cached_world_spec()
+        spec = self._build_env_spec()
         if spec is not None:
             self._env_spec = spec
             # ``EnvSpec.make()`` routes through the Basalt entry point, so the
@@ -454,58 +498,24 @@ class WorldModelPipeline(ReactorPipeline):
             return spec.make()
         return gym.make(self._env_id)
 
-    def _build_cached_world_spec(self):
-        """Build a FindCave spec whose world generator follows the selection.
+    def _build_env_spec(self):
+        """Build the FindCave spec, lifting the 3-minute Basalt episode cap.
 
-        MineRL re-invokes ``create_server_world_generators`` on every
-        ``env.reset()``, so the generator is chosen live: a selected cached
-        world loads its save via ``FileWorldGenerator``; otherwise a fresh
-        procedural world is generated via ``DefaultWorldGenerator``.
-
-        Only the default FindCave task is specialised; any other ``env_id``
-        falls back to the stock ``gym.make`` path (returns ``None``).
+        Interactive sessions run indefinitely; the default cap would reset the
+        world (a visible jump) mid-session. Any other ``env_id`` falls back to
+        the stock ``gym.make`` path (returns ``None``).
         """
         if self._env_id != "MineRLBasaltFindCave-v0":
             return None
 
         from minerl.herobraine.env_specs.basalt_specs import FindCaveEnvSpec
-        from minerl.herobraine.env_specs.human_controls import HumanControlEnvSpec
-        from minerl.herobraine.hero import handlers
 
-        pipeline = self
-
-        class _CachedWorldFindCave(FindCaveEnvSpec):
+        class _UncappedFindCave(FindCaveEnvSpec):
             def __init__(self):
                 super().__init__()
-                # Interactive sessions run indefinitely; the default 3-minute
-                # Basalt episode cap would reset the world (a visible jump) and,
-                # if unhandled, crash on the next step. Effectively disable it.
                 self.max_episode_steps = 10**9
 
-            def create_server_world_generators(self):
-                path = pipeline._current_world_path()
-                if path is not None:
-                    return [handlers.FileWorldGenerator(filename=path, destroy_after_use=True)]
-                return [handlers.DefaultWorldGenerator(force_reset=True)]
-
-            def create_agent_start(self):
-                path = pipeline._current_world_path()
-                if path is None:
-                    return super().create_agent_start()
-                # Loading a saved world: spawn at the world's own spawn point.
-                # PreferredSpawnBiome would trigger a biome search that regenerates
-                # chunks and defeats the file load, so it is intentionally omitted.
-                base = HumanControlEnvSpec.create_agent_start(self)
-                return base + [handlers.SimpleInventoryAgentStart([]), handlers.DoneOnDeath()]
-
-        return _CachedWorldFindCave()
-
-    def _current_world_path(self) -> str | None:
-        """Return the save folder for the active world, or ``None`` for random."""
-        idx = self._active_world_index
-        if idx is None or idx < 0 or idx >= len(self._worlds):
-            return None
-        return self._worlds[idx]["path"]
+        return _UncappedFindCave()
 
     def _prepare_minerl_runtime_dir(self) -> None:
         runtime_dir = getattr(self, "_minerl_runtime_dir", "/tmp/reactor_minerl")
@@ -514,9 +524,7 @@ class WorldModelPipeline(ReactorPipeline):
         os.makedirs("logs", exist_ok=True)
 
     def _reset_env(self, env: Any, seed: int | None):
-        # A seed forces MineRL to procedurally (re)generate the world, which
-        # overrides FileWorldGenerator. When loading a cached save, pass
-        # ``seed=None`` so the mission carries no seed and the save is loaded.
+        # A seed selects the procedurally generated world.
         if seed is None:
             reset_result = env.reset()
         else:
@@ -639,24 +647,28 @@ class WorldModelPipeline(ReactorPipeline):
     def switch_to_policy(self, enable: bool = True):
         self.state._use_policy = bool(enable)
 
-    @event(name="new_scene", description="Reset into a fresh procedural world, KV caches, and mode")
+    @event(name="new_scene", description="Generate a fresh world, reset KV caches and mode")
     def new_scene(self, seed: int = -1):
         self.state._seed = int(seed) if seed >= 0 else int.from_bytes(os.urandom(4), "big")
-        self._pending_world_index = -1
+        self._pending_conditioning = None
         self.state._use_policy = False
         self.state._reset_requested = True
 
-    @event(name="load_world", description="Switch into a pre-generated cached world by index")
-    def load_world(self, index: int = 0, seed: int = -1):
-        if not self._worlds:
-            print("[reactor_app] load_world ignored: no cached worlds configured")
+    @event(name="set_conditioning_image", description="Seed the world model from an uploaded image")
+    def set_conditioning_image(self, image: UploadedFile):
+        import io
+
+        from PIL import Image as PILImage
+
+        try:
+            pil = PILImage.open(io.BytesIO(image.data)).convert("RGB")
+        except Exception as exc:  # noqa: BLE001 - reject a bad upload, keep serving
+            print(f"[reactor_app] set_conditioning_image: bad image {exc!r}", flush=True)
             return
-        index = int(index)
-        if index < 0 or index >= len(self._worlds):
-            print(f"[reactor_app] load_world ignored: index {index} out of range (0..{len(self._worlds) - 1})")
-            return
-        self.state._seed = int(seed) if seed >= 0 else int.from_bytes(os.urandom(4), "big")
-        self._pending_world_index = index
+        target_h, target_w, _ = self._model_frame_shape
+        pil = pil.resize((target_w, target_h))
+        arr = np.ascontiguousarray(np.asarray(pil, dtype=np.uint8))
+        self._pending_conditioning = arr
         self.state._use_policy = False
         self.state._reset_requested = True
 

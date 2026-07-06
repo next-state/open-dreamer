@@ -109,10 +109,8 @@ docker run --rm -i --gpus all \
 
 | File | Purpose |
 |------|---------|
-| `pipeline.py` | Hybrid **ReactorPipeline**: MineRL env, Dreamer cache warmup, cached worlds, and world-model rollout |
+| `pipeline.py` | Hybrid **ReactorPipeline**: MineRL env, Dreamer cache warmup, and world-model rollout |
 | `pipeline_minerl.py` | Standalone MineRL-only pipeline kept for debugging |
-| `generate_worlds.py` | Offline generator for the cached Minecraft world saves under `worlds/` |
-| `worlds/` | Committed pre-generated Minecraft world saves, selected at runtime by index |
 | `benchmark_pipeline_random_actions.py` | Random-action foreground FPS gate for `WorldModelPipeline.inference()` |
 | `benchmark_world_model_fps.py` | Raw Dreamer `next_frame` FPS diagnostic and original/current comparison |
 | `reactor.yaml` | Combined model registration spec (`model:`) and runtime entry point (`runtime:`) |
@@ -150,83 +148,18 @@ WEBRTC_PORT_RANGE="40000:40050" uv run python -m reactor_runtime.serve run --pat
 - **`inference()`** starts in MineRL, observes each real frame into the Dreamer
   dynamics/decoder caches synchronously, then uses `switch_to_policy` to
   continue from the world model with the warmed caches.
-- **`new_scene`** resets MineRL, clears caches, and returns to MineRL mode.
+- **`new_scene`** generates a fresh world, clears caches, and returns to MineRL
+  mode.
 
-## Cached worlds
+## World generation is off-thread
 
-Generating a brand-new random Minecraft world is slow: MineRL's
-`DefaultWorldGenerator(force_reset=True)` regenerates the whole world on every
-reset. To make scene switches fast, the app ships **pre-generated world saves**
-and loads them via MineRL's `FileWorldGenerator` (a world-file copy + load,
-seconds).
-
-Worlds are listed, in order, in `config.yaml`:
-
-```yaml
-worlds:
-  - name: plains
-    path: worlds/plains
-  - name: nether
-    path: worlds/nether
-```
-
-The **index** into this list is the switch handle. On connect the model sends a
-`worlds_available` message (`{ "worlds": ["plains", "nether"] }`) so the client
-can build a picker, and the client switches worlds with the `load_world` event:
-
-```jsonc
-{ "type": "load_world", "data": { "index": 1 } }   // -> nether
-```
-
-`load_world` clears the Dreamer KV caches and returns to real-MineRL mode with
-the chosen world loaded; the frontend then toggles `switch_to_policy` to hand
-off to the world model as usual. `new_scene` still generates a fresh procedural
-world (index `-1`). Missing world folders are skipped at load time, so the model
-keeps serving procedural worlds when a save has not been shipped yet.
-
-### How the load works (important)
-
-MineRL only loads a saved world when the mission carries **no seed** — a seed in
-the mission token makes Malmo procedurally regenerate the world and silently
-ignore the `FileWorldGenerator`. The pipeline therefore resets **without a
-seed** when a cached world is active (and with a seed only for procedural
-`new_scene` worlds). The cached spec also drops `PreferredSpawnBiome` when
-loading a save, because a biome search would relocate the agent and regenerate
-chunks. The env is created once and switches worlds by re-resetting the same
-instance.
-
-### What a cached world controls
-
-Everything the Minecraft save file carries: terrain, structures, spawn point,
-time of day, weather, and inventory. The world is fixed by the generation seed
-and then frozen into the save.
-
-Nether (and other non-overworld) starts are **not** supported at the pinned
-MineRL commit: there is no chat/teleport action, and the Malmo agent always
-joins in the overworld regardless of the saved player dimension. All cached
-worlds are overworld scenes. A true nether start would need a newer MineRL
-(with `ChatAction`) or a custom Malmo dimension handler.
-
-### Regenerating worlds
-
-`generate_worlds.py` runs MineRL, generates a world from a seed, and copies the
-save into `worlds/<name>/`. It only renders Minecraft (no model inference), so
-run it **without `--gpus`** (the NVIDIA GL stack crashes Xvfb's GLX; Mesa
-software GL is used instead):
-
-```bash
-reactor_app/build.sh --progress=plain
-docker run --rm \
-  -e DISPLAY=:99 -e LIBGL_ALWAYS_SOFTWARE=1 \
-  -v /home/ubuntu/davide/dreamer4-jax-private:/workspace \
-  -w /workspace/reactor_app \
-  --entrypoint bash reactor-local/reactor_app:dev -c \
-  'Xvfb :99 -screen 0 1024x768x24 +extension GLX +render -nolisten tcp & \
-   sleep 3; python generate_worlds.py --name plains --seed 1 --steps 60'
-```
-
-Commit the resulting `worlds/<name>/` folders (a few MB each) and add them to
-`config.yaml`; the Dockerfile bakes them into the image via `COPY reactor_app`.
+Generating a Minecraft world blocks for a few seconds. The initial world (on
+connect) and every `new_scene` run the reset on a worker thread while the
+inference loop yields `Idle`, so the long generation isn't clocked into the
+runtime's dynamic-FPS estimate (which would otherwise throttle the first chunk).
+While a world is generating the model sends a `world_status` message
+(`{ "loading": true|false }`) so the client can show a loading screen instead of
+a frozen frame.
 
 ## Next steps
 
