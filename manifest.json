@@ -1,11 +1,8 @@
 {
-    "reactor-runtime": "0.0.4",
-    "class": "reactor.reactor_hybrid:HybridVideoModel",
-    "model_name": "hybrid-coinrun",
+    "reactor-runtime": "1.4",
+    "class": "reactor_code.world_model:WorldModelVideoModel",
+    "model_name": "world-model",
     "model_version": "1.0.0",
-    "args": {
-        "fps": 15,
-        "size": [64, 64]
-    },
+    "args": {},
     "weights": []
 }

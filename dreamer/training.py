@@ -1045,7 +1045,7 @@ def vis_dynamics_step(
     if use_latent_data:
         latents = data
     else:
-        latents, _ = tokenizer.encode(data, deterministic=True)
+        latents, _, _ = tokenizer.encode(data, deterministic=True)
         latents = jax.lax.stop_gradient(latents)
 
     latents = latents.astype(dynamics.dtype)
@@ -1189,7 +1189,7 @@ def run_attention_visualization(
     if use_latent_data:
         latents = sample_data.astype(dynamics.dtype)
     else:
-        latents, _ = tokenizer.encode(sample_data, deterministic=True)
+        latents, _, _ = tokenizer.encode(sample_data, deterministic=True)
         latents = jax.lax.stop_gradient(latents).astype(dynamics.dtype)
 
     latents = normalize_latents(latents, dynamics.cfg.latent_mean, dynamics.cfg.latent_std)

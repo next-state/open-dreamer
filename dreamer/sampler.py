@@ -19,7 +19,7 @@ from .generation import DenoiseSchedule, latent_rollout
 # is a no-op in eager mode (jax#17422), so eager activations get mis-laid-out and frames look corrupt.
 @nnx.jit
 def encode_jit(tokenizer: Tokenizer, frames: jax.Array) -> jax.Array:
-    latents, _ = tokenizer.encode(frames, deterministic=True)
+    latents, _, _ = tokenizer.encode(frames, deterministic=True)
     return latents
 
 @nnx.jit

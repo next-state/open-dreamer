@@ -157,7 +157,7 @@ def encode_and_train_step(
     """
     # Phase 1: Encode (tokenizer frozen)
     rngs = nnx.Rngs(mae=tokenizer_key)
-    latents, _ = tokenizer.encode(videos, deterministic=True, rngs=rngs)
+    latents, _, _ = tokenizer.encode(videos, deterministic=True, rngs=rngs)
 
     # Phase 2: Train
     metrics = train_step(
