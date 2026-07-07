@@ -2412,7 +2412,7 @@ wheels = [
 [[package]]
 name = "tiny-dreamer-4"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "array-record" },
     { name = "awscli" },

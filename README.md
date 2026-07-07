@@ -7,13 +7,12 @@
 **How do I install it?**
 
 ```bash
+pip install uv
 uv sync
-uv pip install -e .
 source .venv/bin/activate
-uv pip install -e .
 ```
 
-The project targets Python 3.11 and CUDA 12 JAX. A recent NVIDIA GPU is strongly recommended; CPU execution is useful only for small smoke tests.
+The project targets Python 3.11 and CUDA 12 JAX. 
 
 **How do I use it?** Create fixed-length MP4 ArrayRecord shards, train the tokenizer, tokenize the dataset into latent ArrayRecords, copy the latent mean/std into the latent dataset config, then train the dynamics model.
 
@@ -72,15 +71,8 @@ Not implemented in this checkout:
 Install [`uv`](https://docs.astral.sh/uv/) first, then from the repository root:
 
 ```bash
+pip install uv
 uv sync
-source .venv/bin/activate
-uv pip install -e .
-```
-
-Optional logging:
-
-```bash
-wandb login
 ```
 
 The dependency lock installs `jax[cuda12]`. If your machine needs a different JAX build, install the correct wheel for your CUDA/accelerator setup after `uv sync`.
