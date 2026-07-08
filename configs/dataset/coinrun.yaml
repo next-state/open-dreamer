@@ -1,33 +1,73 @@
+# CoinRun ArrayRecord dataset config. This is a smaller non-Minecraft dataset
+# path used by the generic video dataloader branch.
+
 defaults:
   - _self_
 
+# Dataset name used by the loader to choose the CoinRun transform path.
 name: coinrun
 
+# Raw video mode. The iterator reads encoded CoinRun frame records and returns
+# pixel frames.
+data_type: video
+
+# Directory or file path discovered by extension. Unlike Minecraft/VPT, CoinRun
+# does not require `index_max` contiguous shard generation.
 array_record_path: datasets/coinrun_episodes/train
 
+# Optional cap on records exposed to the sampler. `-1` means all records.
+num_max_samples: -1
+
 dataloader_cfg:
+  # Global batch size across all JAX processes. Must be divisible by
+  # `jax.process_count()`.
   B: 512
+
+  # Grain workers for host-side record loading.
   num_workers: 16
+
+  # Host-side prefetch depth.
   prefetch_buffer_size: 10
+
+  # Device-side prefetch depth.
   device_prefetch_buffer_size: 1
+
+  # CoinRun examples are fixed 64-step windows here.
   short_T: 64
   long_T: 64
+
+  # No alternating long batches because short_T == long_T.
   long_ratio: 0.0
+
+  # Reserved for resumed or curriculum dataloader schedules. The current
+  # iterator does not use this field directly.
   start_step: 0
 
+  # Batch dtype after preprocessing.
+  dtype: bfloat16
+
+# Raw frame dimensions.
 H: 64
 W: 64
 C: 3
 
+# Padding must make H and W divisible by `patch_size`.
 padding_H: [0, 0]
 padding_W: [0, 0]
+
+# Spatial tokenizer patch size.
 patch_size: 8
 
+# CoinRun uses categorical actions in this config.
 num_binary_actions: 0
-categorical_action_dim: 16  # keyboard actions # TODO: do binary as convention, so that game can be played in reactor frontend
+categorical_action_dim: 16
 continuous_action_dim: 0
 
+# Pixel normalization stats for values in [0, 1]. The std is sqrt(1/12), the
+# standard deviation of a uniform distribution.
 dataset_mean: [0.5, 0.5, 0.5]
 dataset_std: [0.288675, 0.288675, 0.288675]
 
+# Probability of biasing sampled windows toward nonzero reward timesteps. Must
+# be in [0, 1].
 p_include_reward: 0.5

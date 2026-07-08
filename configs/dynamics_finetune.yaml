@@ -1,10 +1,24 @@
+# Optional config for dynamics finetuning:
+# `uv run scripts/train_dynamics.py --config-name dynamics_finetune`.
+# Inherits `configs/dynamics.yaml`.
+
 defaults:
   - dynamics
   - _self_
 
+# Separate run directory for finetuning outputs.
 run_name: dynamics_finetune
 
-# Finetune on long batches only
+# Legacy placeholder for "long batches only" experiments. The current
+# `train_dynamics.py` data path reads `dataset.dataloader_cfg.long_ratio`; set
+# that to 1.0 below when you want every batch to be a true long sequence.
 long_batch_ratio: 1.0
 
-# TODO: change lr_schedule and max_steps for finetuning
+dataset:
+  dataloader_cfg:
+    # Force the dual iterator to sample long episodes for every batch. Must stay
+    # in [0, 1].
+    long_ratio: 1.0
+
+# TODO: choose finetuning-specific `lr_schedule` and `max_steps` once the target
+# checkpoint and dataset size are known.

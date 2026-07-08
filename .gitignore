@@ -7,6 +7,7 @@ slurm_outs/
 wandb/
 run_job.sh
 logs
+/data/
 
 # Next.js / frontend
 frontend/**/.next/

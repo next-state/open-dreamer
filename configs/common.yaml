@@ -1,40 +1,91 @@
+# Shared settings inherited by training configs such as tokenizer.yaml and
+# dynamics.yaml. Script-specific configs override any values they need.
+
+# Hydra composes this file directly. Keep `_self_` so values in this file are
+# included before script-specific overrides.
 defaults:
   - _self_
 
+# Human-readable run identifier. Training scripts write to `logs/${run_name}`
+# unless the script config overrides `hydra.run.dir`.
 run_name: ???
+
+# Convenience switch forwarded into `logger.use_wandb`. Set true only after
+# `logger.wandb_project` and, if needed, `logger.wandb_entity` are valid.
 use_wandb: false
+
+# Required dataset config object. Script configs usually fill this with a
+# defaults entry such as `dataset: minecraft_vpt`.
 dataset: ???
+
+# Optional scaling-law helpers used by `ScalingContext`.
+# Leave both at 0.0 for normal fixed-step training.
+# `scaling_tokens_per_param > 0` asks the scaling helper to derive a token budget
+# from parameter count; `scaling_flops_budget > 0` asks it to derive max steps
+# from a FLOP budget. Do not set both unless the scaling code path supports the
+# exact combination you want.
 scaling_tokens_per_param: 0.0
 scaling_flops_budget: 0.0
 
-# Checkpointing
+# Checkpointing. Saved checkpoints live under `${hydra.run.dir}/checkpoints`.
 ckpt:
+  # Number of recent checkpoints to retain. Use 0 to disable checkpoint writes.
   max_to_keep: 1
+
+  # Save every N training steps. Larger values reduce I/O; smaller values make
+  # preempted jobs cheaper to resume.
   save_interval_steps: 10_000
+
+  # Used by Orbax to force a final checkpoint near the end of training. Keep
+  # this tied to top-level `max_steps`.
   max_steps: ${max_steps}
 
-# Logging
+# Logging. The local logger always writes metrics; Weights & Biases is optional.
 logger:
+  # Mirrors top-level run_name so downstream loggers see the composed name.
   run_name: ${run_name}
+
+  # Mirrors top-level use_wandb. If false, wandb fields are ignored.
   use_wandb: ${use_wandb}
+
+  # Optional W&B entity/team. Null lets wandb use its configured default account.
   wandb_entity: Null
+
+  # W&B project name used only when `use_wandb` is true.
   wandb_project: tiny_dreamer_4
+
+  # Metric logging interval in training steps. Very small values can slow runs.
   log_every: 100
+
+  # Lets the logger know the expected training horizon for progress metadata.
   max_steps: ${max_steps}
+
+  # Enables extra gradient metrics. Useful for debugging, but it adds device
+  # work and host transfers.
   log_gradients: false
 
-# Precision
+# Activation/compute dtype for model execution and batches. `bfloat16` is the
+# expected GPU setting; use `float32` mainly for debugging or unsupported devices.
 dtype: bfloat16
+
+# Parameter storage dtype. `float32` is the stable default for training.
 param_dtype: float32
+
+# EMA parameter dtype. Keeping this tied to `param_dtype` avoids precision
+# surprises between online and EMA checkpoints.
 ema_dtype: ${param_dtype}
 
-# Parallel
-parallel_strategy: data  # data | fsdp | tp | sp
+# Parallel mesh strategy for scripts that call `build_parallel`.
+# Valid values: `data`, `fsdp`, `tp`, `sp`.
+# Note: train_tokenizer.py currently forces data parallelism in code despite
+# this field; dynamics, tokenization, and FVD evaluation use it.
+parallel_strategy: data
 
-# Random seed
+# Random seed for JAX RNGs and deterministic dataloader sampling.
 seed: 0
 
-# Hydra
+# Hydra output directory. Training helpers create `checkpoints/` and `vis/`
+# below this directory.
 hydra:
   run:
     dir: logs/${run_name}

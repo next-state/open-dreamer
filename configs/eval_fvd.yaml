@@ -1,37 +1,73 @@
+# Config for `uv run scripts/eval_fvd.py`.
+# The script has two stages: generate MP4 rollouts, then load those MP4s and
+# compute FVD with I3D features.
+
 defaults:
+  # Use raw video by default so FVD can compare predictions to original frames.
+  # You may switch to `dataset: minecraft_vpt_latent`, but then originals are
+  # unavailable and FVD uses decoded latents as the reference.
   - dataset: minecraft_vpt
   - _self_
 
-# Path to dynamics checkpoint (contains both dynamics + tokenizer)
+# Required dynamics checkpoint. It can be either the run directory containing a
+# `checkpoints/` subdirectory or the `checkpoints/` directory itself. The
+# checkpoint must contain dynamics weights and the tokenizer.
 dynamics_ckpt: ???
 
+# RNG seed for dataloader sampling and generation.
 seed: 0
+
+# Device mesh for generation. Valid values: `data`, `fsdp`, `tp`, `sp`.
 parallel_strategy: data
 
-# Mode: "both" runs generate then evaluate, "generate" only saves videos,
-# "evaluate" only computes FVD from previously saved videos
+# Evaluation mode:
+# - `both`: generate MP4s, then compute FVD from them.
+# - `generate`: only write MP4s to `video_dir`.
+# - `evaluate`: only compute FVD from MP4s already in `video_dir`.
 mode: both
 
-# Rollout type: one of ema_shortcut, ema_diffusion, online_shortcut, online_diffusion
-# - ema/online: which model weights to use
-# - shortcut (4 steps) vs diffusion (k_max steps)
+# Which dynamics weights and sampler to use:
+# - `ema_*` uses EMA dynamics weights; `online_*` uses current weights.
+# - `*_shortcut` uses 4 denoising steps; `*_diffusion` uses `dynamics.k_max`.
 rollout_type: ema_diffusion
 
-# Generation settings
+# Number of videos to generate. The script processes complete batches, so the
+# final number may round up to a multiple of `dataset.dataloader_cfg.B`.
 num_videos: 256
-ctx_length: 4
-horizon: 240  # has to be divisible by fvd_chunk_size if pred_frames_only is true
 
-# Video I/O
+# Number of ground-truth context frames given to the dynamics model before
+# predicting future frames. Must be >= 1.
+ctx_length: 4
+
+# Number of future frames to predict. The dataset loader needs records with at
+# least `ctx_length + horizon` frames.
+horizon: 240
+
+# Directory for generated MP4s. Files are written under
+# `${video_dir}/${rollout_type}/`.
 video_dir: logs/eval_fvd_videos
 
-# FVD evaluation settings
+# Batch size for I3D feature extraction during FVD. Lower if evaluation runs out
+# of memory.
 i3d_bs: 32
-pred_frames_only: true  # if true, FVD only over predicted frames (exclude context)
-fvd_chunk_size: 16  # split videos into chunks of this many frames for FVD
+
+# If true, drop the first `ctx_length` frames before FVD so the score covers only
+# predicted frames. If false, score context + prediction together.
+pred_frames_only: true
+
+# Optional FVD chunk length. When set, the evaluated video length after optional
+# context trimming must be divisible by this value, and each chunk must contain
+# at least 10 frames for I3D.
+fvd_chunk_size: 16
 
 dataset:
   dataloader_cfg:
+    # FVD generation performs decoding/sampling in the main process; 0 avoids
+    # extra worker startup and makes debugging simpler.
     num_workers: 0
+
+    # Global generation batch size. Must be divisible by `jax.process_count()`.
     B: 8
+
+    # The data iterator must provide context + target frames for each sample.
     long_T: ${sum:${ctx_length},${horizon}}

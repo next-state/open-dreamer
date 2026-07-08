@@ -1,38 +1,111 @@
+# Raw Minecraft/VPT-style MP4 ArrayRecord dataset.
+# Records are pickled dicts with `video`, `video_shape`, `actions`, and optional
+# `source`; see `dreamer/data/README.md` for the full schema.
+
 defaults:
   - _self_
 
+# Dataset name used by the loader to choose the Minecraft/VPT transform path.
+# Keep this as `minecraft_vpt` unless you also add a matching loader branch.
 name: minecraft_vpt
+
+# Raw video mode. The iterator decodes MP4 bytes and returns pixel frames.
 data_type: video
 
+# Directory containing contiguous shards named `shard-00000.array_record`,
+# `shard-00001.array_record`, and so on. Set this before running tokenizer
+# training, tokenization, or raw-video FVD evaluation.
 array_record_path: null
+
+# Number of contiguous shards to load from `array_record_path`. This is a shard
+# count, not a sample count, and must be > 0 for Minecraft/VPT datasets.
 index_max: 1500
+
+# Optional cap on ArrayRecord entries exposed to the sampler. `-1` means use all
+# records in the selected shards. Positive values are mainly for smoke tests.
 num_max_samples: -1
 
 dataloader_cfg:
+  # Global batch size across all JAX processes. Must be divisible by
+  # `jax.process_count()`. Lower this first when running out of memory.
   B: 8
+
+  # Grain worker processes used for host-side MP4 decoding and preprocessing.
+  # Increase for faster CPU input pipelines; reduce if shared memory or file
+  # descriptors become a bottleneck.
   num_workers: 4
+
+  # Number of host batches prefetched ahead of the training loop.
   prefetch_buffer_size: 3
+
+  # Number of already-device-put batches prefetched. Larger values can improve
+  # throughput but consume extra device memory.
   device_prefetch_buffer_size: 1
+
+  # Required by training configs. For raw video training, each sampled record
+  # must contain at least this many frames. Tokenization ignores this because it
+  # always reads full episodes.
   short_T: ???
+
+  # Required by training/eval configs. Must be no larger than the number of
+  # frames in each selected record.
   long_T: ???
+
+  # Used only by the dual iterator in dynamics training. Fraction of batches
+  # drawn as true long sequences instead of packed short chunks.
   long_ratio: 0.1
+
+  # Reserved for resumed or curriculum dataloader schedules. The current
+  # iterator does not use this field directly.
   start_step: 0
+
+  # Batch dtype after preprocessing. `bfloat16` is the normal accelerator value.
   dtype: bfloat16
 
+# Raw frame height before padding.
 H: 360
+
+# Raw frame width before padding.
 W: 640
+
+# Number of color channels in decoded video. The tokenizer assumes RGB.
 C: 3
 
+# Padding applied as [top, bottom]. `H + padding_H[0] + padding_H[1]` must be
+# divisible by `patch_size`.
 padding_H: [4, 4]
+
+# Padding applied as [left, right]. `W + padding_W[0] + padding_W[1]` must be
+# divisible by `patch_size`.
 padding_W: [0, 0]
+
+# Spatial tokenizer patch size. Must divide the padded frame height and width.
 patch_size: 16
 
-num_binary_actions: 27  # keyboard + mouse buttons + wheel direction
-categorical_action_dim: 121  # mouse actions
-continuous_action_dim: 0
-mouse_repr: categorical  # don't forget to set the corresponding categorical_action_dim and continuous_action_dim!
+# Number of binary action channels parsed from VPT actions.
+num_binary_actions: 27
 
+# Number of categorical mouse/action classes. With `mouse_repr: categorical`,
+# this must be > 0 and match the parser/model expectation.
+categorical_action_dim: 121
+
+# Number of continuous action channels. With `mouse_repr: continuous`, this must
+# be > 0. It is 0 for the categorical mouse setup.
+continuous_action_dim: 0
+
+# Mouse representation used by the VPT action parser. Valid values are
+# `categorical` and `continuous`; the corresponding action dimension above must
+# be nonzero.
+mouse_repr: categorical
+
+# Per-channel pixel mean used when normalizing raw video. Recompute whenever the
+# raw video distribution changes.
 dataset_mean: [0.2241, 0.2348, 0.2086]
+
+# Per-channel pixel standard deviation used with `dataset_mean`. Values must be
+# positive.
 dataset_std: [0.1809, 0.1874, 0.2282]
 
+# Reward-biased slicing probability for CoinRun-style datasets. Minecraft/VPT
+# records do not currently use rewards, so keep this at 0.0 here.
 p_include_reward: 0.0
