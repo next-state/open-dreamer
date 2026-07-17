@@ -1,0 +1,91 @@
+/* Placeholder palette inspired by https://francesco215.github.io/Bayes-bandit/ */
+
+:root {
+  --font-size-base: 14px;
+  --background: #ffffff;
+  --surface: #f4f5f7;
+  --text: #121212;
+  --text-muted: #4a4f55;
+  --border: #cfd4d8;
+
+  --primary: #2b6caf;
+  --primary-hover: #2f79cc;
+  --primary-soft: rgba(122, 166, 255, 0.22);
+  --accent: #f07a26;
+  --accent-soft: rgba(240, 122, 38, 0.12);
+
+  --series-blue: #7aa6ff;
+  --series-purple: #7e6ad7;
+  --series-pink: #d63b76;
+  --series-orange: #f07a26;
+  --series-yellow: #f1b840;
+
+  /* Shared tokens for the space-layer visualization. */
+  --space-layer-background: var(--background);
+  --space-layer-surface: var(--surface);
+  --space-layer-text: var(--text);
+  --space-layer-text-muted: var(--text-muted);
+  --space-layer-border: var(--border);
+  --space-layer-primary: var(--primary);
+  --space-layer-primary-hover: var(--primary-hover);
+  --space-layer-primary-soft: var(--primary-soft);
+  --space-layer-highlight: var(--accent);
+  --space-layer-highlight-soft: var(--accent-soft);
+  --space-layer-series-blue: var(--series-blue);
+  --space-layer-series-purple: var(--series-purple);
+  --space-layer-series-pink: var(--series-pink);
+  --space-layer-series-orange: var(--series-orange);
+  --space-layer-series-yellow: var(--series-yellow);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  padding: 1rem;
+  color: var(--text);
+  background: var(--background);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: var(--font-size-base);
+}
+
+main {
+  width: 100%;
+  max-width: 1280px;
+  margin-inline: auto;
+}
+
+.form-label {
+  display: grid;
+  gap: 0.35rem;
+  width: fit-content;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.form-select {
+  min-width: 12rem;
+  padding: 0.45rem 2rem 0.45rem 0.65rem;
+  color: var(--text);
+  background-color: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  font: inherit;
+}
+
+.text-small {
+  font-size: max(11px, calc(var(--font-size-base) - 2px));
+}
+
+@media (max-width: 640px) {
+  body {
+    padding: 0.75rem;
+  }
+}

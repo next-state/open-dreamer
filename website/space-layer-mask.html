@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Space Layer Mask</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<div id="space-layer-block-mask" class="space-layer-vis">
+  <div class="space-layer-canvas">
+  <div class="viz-controls">
+    <label class="form-label" for="space-layer-mode">
+      Masking mode
+      <select id="space-layer-mode" class="form-select">
+        <option value="dynamics" selected>Dynamics</option>
+        <option value="encoder">Tokenizer encoder</option>
+        <option value="decoder">Tokenizer decoder</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="space-layer-layout">
+    <section aria-labelledby="space-layer-connectivity-heading">
+      <h3 id="space-layer-connectivity-heading">Grouped connectivity</h3>
+      <svg id="space-layer-connectivity" class="space-layer-chart" viewBox="0 0 680 420" role="img" aria-labelledby="space-layer-connectivity-title space-layer-connectivity-desc">
+        <title id="space-layer-connectivity-title">Key-to-query connectivity grouped by modality</title>
+        <desc id="space-layer-connectivity-desc">Horizontal query and key sequences whose block lengths represent token counts. One arrow is drawn for each allowed modality-block pair.</desc>
+      </svg>
+    </section>
+
+    <section aria-labelledby="space-layer-matrix-heading">
+      <h3 id="space-layer-matrix-heading">Block Q–K mask</h3>
+      <svg id="space-layer-matrix" class="space-layer-chart" viewBox="0 0 560 520" role="img" aria-labelledby="space-layer-matrix-title space-layer-matrix-desc">
+        <title id="space-layer-matrix-title">Query-key mask grouped by modality</title>
+        <desc id="space-layer-matrix-desc">Rows are query modality blocks and columns are key modality blocks. Filled rectangles are allowed connections; their sizes reflect the number of tokens in each block.</desc>
+      </svg>
+    </section>
+  </div>
+
+  <div id="space-layer-status" class="space-layer-status text-small" aria-live="polite"></div>
+  </div>
+</div>
+
+<style>
+  #space-layer-block-mask {
+    --sl-background: var(--space-layer-background, #ffffff);
+    --sl-surface: var(--space-layer-surface, #f4f5f7);
+    --sl-text: var(--space-layer-text, #121212);
+    --sl-text-muted: var(--space-layer-text-muted, #4a4f55);
+    --sl-border: var(--space-layer-border, #cfd4d8);
+    --sl-primary: var(--space-layer-primary, #2b6caf);
+    --sl-primary-hover: var(--space-layer-primary-hover, #2f79cc);
+    --sl-primary-soft: var(--space-layer-primary-soft, rgba(122, 166, 255, 0.22));
+    --sl-highlight: var(--space-layer-highlight, #f07a26);
+    --sl-highlight-soft: var(--space-layer-highlight-soft, rgba(240, 122, 38, 0.12));
+    --sl-series-blue: var(--space-layer-series-blue, #7aa6ff);
+    --sl-series-purple: var(--space-layer-series-purple, #7e6ad7);
+    --sl-series-pink: var(--space-layer-series-pink, #d63b76);
+    --sl-series-orange: var(--space-layer-series-orange, #f07a26);
+    --sl-series-yellow: var(--space-layer-series-yellow, #f1b840);
+
+    --background: var(--sl-background);
+    --foreground: var(--sl-text);
+    --muted: var(--sl-surface);
+    --muted-foreground: var(--sl-text-muted);
+    --border: var(--sl-border);
+    --input: var(--sl-border);
+    --ring: var(--sl-primary);
+
+    width: 100%;
+    color: var(--sl-text);
+    color-scheme: light;
+  }
+
+  #space-layer-block-mask .space-layer-canvas {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 1rem;
+    color: var(--sl-text);
+    background: var(--sl-background);
+  }
+
+  #space-layer-block-mask .viz-controls {
+    margin-block-end: 0.75rem;
+  }
+
+  #space-layer-block-mask .space-layer-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1.12fr) minmax(0, 0.88fr);
+    gap: 1rem;
+    align-items: start;
+  }
+
+  #space-layer-block-mask section {
+    min-width: 0;
+  }
+
+  #space-layer-block-mask h3 {
+    margin-block: 0 0.35rem;
+  }
+
+  #space-layer-block-mask .space-layer-chart {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+
+  #space-layer-block-mask .sl-sequence-label,
+  #space-layer-block-mask .sl-axis-title,
+  #space-layer-block-mask .sl-axis-label,
+  #space-layer-block-mask .sl-block-label,
+  #space-layer-block-mask .sl-legend-label {
+    fill: var(--sl-text);
+    font-size: calc(var(--font-size-base) * 1.4);
+    font-weight: 500;
+    pointer-events: none;
+    user-select: none;
+  }
+
+  #space-layer-block-mask .sl-block rect {
+    fill: var(--sl-color);
+    fill-opacity: 1;
+    stroke: var(--sl-border);
+    stroke-width: 1.25;
+    transition: fill 140ms ease, fill-opacity 140ms ease, opacity 140ms ease, stroke 140ms ease, stroke-width 140ms ease;
+  }
+
+  #space-layer-block-mask .sl-block {
+    cursor: default;
+  }
+
+  #space-layer-block-mask .sl-edge {
+    fill: none;
+    stroke: var(--sl-text-muted);
+    stroke-width: 1.25;
+    opacity: 0.35;
+    pointer-events: stroke;
+    transition: opacity 140ms ease, stroke 140ms ease, stroke-width 140ms ease;
+  }
+
+  #space-layer-block-mask .sl-cell {
+    stroke: var(--sl-text-muted);
+    stroke-width: 1;
+    transition: fill 140ms ease, opacity 140ms ease, stroke 140ms ease, stroke-width 140ms ease, fill-opacity 140ms ease;
+  }
+
+  #space-layer-block-mask .sl-cell.is-allowed {
+    fill: var(--sl-border);
+    fill-opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-cell.is-blocked {
+    fill: var(--sl-surface);
+    fill-opacity: 0.13;
+  }
+
+  #space-layer-block-mask .sl-mark {
+    cursor: default;
+  }
+
+  #space-layer-block-mask .sl-block.is-dimmed rect,
+  #space-layer-block-mask .sl-cell.is-dimmed {
+    fill: var(--sl-background);
+    fill-opacity: 1;
+    opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-block.is-dimmed rect {
+    stroke: var(--sl-border);
+  }
+
+  #space-layer-block-mask .sl-cell.is-dimmed {
+    stroke: var(--sl-text-muted);
+  }
+
+  #space-layer-block-mask .sl-block-label {
+    transition: fill 140ms ease, opacity 140ms ease;
+  }
+
+  #space-layer-block-mask .sl-block.is-dimmed .sl-block-label {
+    fill: var(--sl-text-muted);
+    opacity: 0.4;
+  }
+
+  #space-layer-block-mask .sl-edge.is-dimmed {
+    stroke: var(--sl-border);
+    opacity: 0.18;
+  }
+
+  #space-layer-block-mask .sl-edge.is-active {
+    stroke: var(--sl-active-color, var(--sl-color));
+    stroke-width: 3;
+    opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-block.is-active rect,
+  #space-layer-block-mask .sl-block.is-related rect {
+    stroke: var(--sl-border);
+    stroke-width: 1.25;
+    fill-opacity: 1;
+    opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-cell.is-active {
+    fill: var(--sl-active-color, var(--sl-color));
+    stroke: var(--sl-text-muted);
+    stroke-width: 1;
+    fill-opacity: 1;
+    opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-cell.is-related {
+    fill: var(--sl-active-color, var(--sl-color));
+    stroke: var(--sl-text-muted);
+    stroke-width: 1;
+    fill-opacity: 1;
+    opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-block.is-blocked-endpoint rect,
+  #space-layer-block-mask .sl-cell.is-blocked.is-active {
+    stroke: var(--sl-border);
+  }
+
+  #space-layer-block-mask .sl-axis-label.is-active {
+    fill: var(--sl-text);
+  }
+
+  #space-layer-block-mask .sl-edge.is-pair-active {
+    stroke: var(--sl-highlight);
+  }
+
+  #space-layer-block-mask .sl-cell.is-pair-active {
+    fill: var(--sl-highlight);
+    fill-opacity: 1;
+    stroke: var(--sl-highlight);
+    stroke-width: 3;
+    opacity: 1;
+  }
+
+  #space-layer-block-mask .space-layer-status {
+    min-height: 1.5em;
+    margin-block-start: 0.35rem;
+    color: var(--sl-text-muted);
+  }
+
+  @media (max-width: 640px) {
+    #space-layer-block-mask .space-layer-layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    #space-layer-block-mask .sl-block rect,
+    #space-layer-block-mask .sl-edge,
+    #space-layer-block-mask .sl-cell {
+      transition: none;
+    }
+  }
+</style>
+
+<script>
+(() => {
+  const root = document.getElementById('space-layer-block-mask');
+  if (!root || root.dataset.initialized === 'true') return;
+  root.dataset.initialized = 'true';
+
+  const connectivitySvg = root.querySelector('#space-layer-connectivity');
+  const matrixSvg = root.querySelector('#space-layer-matrix');
+  const modeSelect = root.querySelector('#space-layer-mode');
+  const status = root.querySelector('#space-layer-status');
+  const NS = 'http://www.w3.org/2000/svg';
+
+  const modes = {
+    dynamics: {
+      summary: 'A query reads keys at the same or a lower hierarchy level.',
+      groups: [
+        { id: 'action', label: 'Action', short: 'A', count: 1, level: 0, color: 'var(--sl-series-blue)' },
+        { id: 'shortcut', label: 'Shortcut', short: 'C', count: 1, level: 1, color: 'var(--sl-series-purple)' },
+        { id: 'spatial', label: 'Spatial', short: 'Z', count: 6, level: 1, color: 'var(--sl-series-pink)' },
+        { id: 'register', label: 'Register', short: 'R', count: 2, level: 1, color: 'var(--sl-series-orange)' },
+        { id: 'agent', label: 'Agent', short: 'G', count: 1, level: 2, color: 'var(--sl-series-yellow)' }
+      ],
+      allowed: (query, key) => query.level >= key.level
+    },
+    encoder: {
+      summary: 'Latent queries read every key; image queries read image keys only.',
+      groups: [
+        { id: 'latent', label: 'Latent', short: 'L', count: 3, color: 'var(--sl-series-blue)' },
+        { id: 'image', label: 'Image', short: 'I', count: 7, color: 'var(--sl-series-purple)' }
+      ],
+      allowed: (query, key) => query.id === 'latent' || query.id === key.id
+    },
+    decoder: {
+      summary: 'Latent queries read latent keys; image queries read latent and image keys.',
+      groups: [
+        { id: 'latent', label: 'Latent', short: 'L', count: 3, color: 'var(--sl-series-blue)' },
+        { id: 'image', label: 'Image', short: 'I', count: 7, color: 'var(--sl-series-purple)' }
+      ],
+      allowed: (query, key) => query.id === key.id || key.id === 'latent'
+    }
+  };
+
+  let currentMode = modes.dynamics;
+
+  function svgElement(tag, attributes = {}) {
+    const element = document.createElementNS(NS, tag);
+    Object.entries(attributes).forEach(([name, value]) => element.setAttribute(name, value));
+    return element;
+  }
+
+  function appendText(parent, text, attributes = {}) {
+    const element = svgElement('text', attributes);
+    element.textContent = text;
+    parent.appendChild(element);
+    return element;
+  }
+
+  function preserveAccessibleNodes(svg) {
+    const title = svg.querySelector('title');
+    const desc = svg.querySelector('desc');
+    svg.replaceChildren();
+    if (title) svg.appendChild(title);
+    if (desc) svg.appendChild(desc);
+  }
+
+  function blockWidth(group) {
+    return group.count * 42;
+  }
+
+  function blockLayout(groups, canvasWidth) {
+    const gap = 8;
+    const totalWidth = groups.reduce((sum, group) => sum + blockWidth(group), 0) + gap * (groups.length - 1);
+    let x = (canvasWidth - totalWidth) / 2;
+    return groups.map(group => {
+      const width = blockWidth(group);
+      const positioned = { ...group, x, width, center: x + width / 2 };
+      x += width + gap;
+      return positioned;
+    });
+  }
+
+  function distributedAnchor(block, index, count) {
+    if (count <= 1) return block.center;
+    const inset = Math.min(12, block.width * 0.1);
+    const availableWidth = block.width - inset * 2;
+    const span = Math.min(8 * (count - 1), availableWidth);
+    return block.center - span / 2 + span * index / (count - 1);
+  }
+
+  function makeMarker(defs, id, color) {
+    const marker = svgElement('marker', {
+      id,
+      viewBox: '0 0 8 8',
+      refX: '7',
+      refY: '4',
+      markerWidth: '7',
+      markerHeight: '7',
+      orient: 'auto-start-reverse',
+      markerUnits: 'userSpaceOnUse'
+    });
+    marker.appendChild(svgElement('path', { d: 'M 0 0 L 8 4 L 0 8 z', fill: color }));
+    defs.appendChild(marker);
+  }
+
+  function drawBlock(parent, group, side, y, height) {
+    const wrapper = svgElement('g', {
+      class: 'sl-block sl-mark',
+      'data-side': side,
+      'data-group': group.id,
+      style: `--sl-color: ${group.color}`
+    });
+    const title = svgElement('title');
+    title.textContent = `${group.label}, ${group.count} ${group.count === 1 ? 'token' : 'tokens'}`;
+    wrapper.appendChild(title);
+    wrapper.appendChild(svgElement('rect', {
+      x: group.x,
+      y,
+      width: group.width,
+      height,
+      rx: '7',
+      ry: '7'
+    }));
+    const visibleLabel = group.width >= 100 ? group.label : group.short;
+    appendText(wrapper, `${visibleLabel} ×${group.count}`, {
+      class: 'sl-block-label',
+      x: group.center,
+      y: y + height / 2,
+      'text-anchor': 'middle',
+      'dominant-baseline': 'middle'
+    });
+    parent.appendChild(wrapper);
+  }
+
+  function drawConnectivity() {
+    preserveAccessibleNodes(connectivitySvg);
+    const groups = blockLayout(currentMode.groups, 680);
+    const keysForQuery = new Map(currentMode.groups.map(query => [
+      query.id,
+      currentMode.groups.filter(key => currentMode.allowed(query, key))
+    ]));
+    const queriesForKey = new Map(currentMode.groups.map(key => [
+      key.id,
+      currentMode.groups.filter(query => currentMode.allowed(query, key))
+    ]));
+    const queryY = 58;
+    const keyY = 310;
+    const blockHeight = 52;
+
+    const defs = svgElement('defs');
+    makeMarker(defs, 'space-arrow', 'var(--sl-text-muted)');
+    currentMode.groups.forEach(group => makeMarker(defs, `space-arrow-active-${group.id}`, group.color));
+    makeMarker(defs, 'space-arrow-pair', 'var(--sl-highlight)');
+    connectivitySvg.appendChild(defs);
+
+    appendText(connectivitySvg, 'Q', {
+      class: 'sl-sequence-label',
+      x: '22',
+      y: queryY + blockHeight / 2,
+      'dominant-baseline': 'middle'
+    });
+    appendText(connectivitySvg, 'K', {
+      class: 'sl-sequence-label',
+      x: '22',
+      y: keyY + blockHeight / 2,
+      'dominant-baseline': 'middle'
+    });
+
+    const edges = svgElement('g', { 'aria-hidden': 'true' });
+    currentMode.groups.forEach((query, queryIndex) => {
+      currentMode.groups.forEach((key, keyIndex) => {
+        if (!currentMode.allowed(query, key)) return;
+        const queryBlock = groups[queryIndex];
+        const keyBlock = groups[keyIndex];
+        const sourcePeers = queriesForKey.get(key.id);
+        const targetPeers = keysForQuery.get(query.id);
+        const sourceX = distributedAnchor(keyBlock, sourcePeers.findIndex(peer => peer.id === query.id), sourcePeers.length);
+        const targetX = distributedAnchor(queryBlock, targetPeers.findIndex(peer => peer.id === key.id), targetPeers.length);
+        const path = svgElement('path', {
+          class: 'sl-edge sl-mark',
+          'data-q': query.id,
+          'data-k': key.id,
+          d: `M ${sourceX} ${keyY} L ${targetX} ${queryY + blockHeight}`,
+          'marker-end': 'url(#space-arrow)',
+          style: `--sl-color: ${query.color}`
+        });
+        const title = svgElement('title');
+        title.textContent = `${key.label} keys can send information to ${query.label} queries`;
+        path.appendChild(title);
+        edges.appendChild(path);
+      });
+    });
+    connectivitySvg.appendChild(edges);
+
+    const blocks = svgElement('g');
+    groups.forEach(group => drawBlock(blocks, group, 'q', queryY, blockHeight));
+    groups.forEach(group => drawBlock(blocks, group, 'k', keyY, blockHeight));
+    connectivitySvg.appendChild(blocks);
+
+    const legend = svgElement('g', { 'aria-hidden': 'true' });
+    const legendItemWidth = currentMode.groups.length > 4 ? 124 : 160;
+    const legendWidth = legendItemWidth * currentMode.groups.length;
+    const legendStart = (680 - legendWidth) / 2;
+    currentMode.groups.forEach((group, index) => {
+      const x = legendStart + index * legendItemWidth;
+      legend.appendChild(svgElement('rect', {
+        x,
+        y: '393',
+        width: '12',
+        height: '12',
+        rx: '3',
+        fill: group.color,
+        'fill-opacity': '1'
+      }));
+      appendText(legend, `${group.short}  ${group.label}`, {
+        class: 'sl-legend-label',
+        x: x + 18,
+        y: '399',
+        'dominant-baseline': 'middle'
+      });
+    });
+    connectivitySvg.appendChild(legend);
+  }
+
+  function proportionalLayout(groups, start, size) {
+    const totalTokens = groups.reduce((sum, group) => sum + group.count, 0);
+    let cursor = start;
+    return groups.map(group => {
+      const extent = size * group.count / totalTokens;
+      const positioned = { ...group, start: cursor, extent, center: cursor + extent / 2 };
+      cursor += extent;
+      return positioned;
+    });
+  }
+
+  function drawMatrix() {
+    preserveAccessibleNodes(matrixSvg);
+    const plotX = 112;
+    const plotY = 44;
+    const plotSize = 390;
+    const columns = proportionalLayout(currentMode.groups, plotX, plotSize);
+    const rows = proportionalLayout(currentMode.groups, plotY, plotSize);
+
+    appendText(matrixSvg, 'Keys K', {
+      class: 'sl-axis-title',
+      x: plotX + plotSize / 2,
+      y: plotY + plotSize + 60,
+      'text-anchor': 'middle'
+    });
+    appendText(matrixSvg, 'Queries Q', {
+      class: 'sl-axis-title',
+      x: '18',
+      y: plotY + plotSize / 2,
+      transform: `rotate(-90 18 ${plotY + plotSize / 2})`,
+      'text-anchor': 'middle'
+    });
+
+    columns.forEach(column => {
+      appendText(matrixSvg, column.short, {
+        class: 'sl-axis-label',
+        'data-axis': 'k',
+        'data-group': column.id,
+        x: column.center,
+        y: plotY + plotSize + 26,
+        'text-anchor': 'middle'
+      });
+    });
+    rows.forEach(row => {
+      appendText(matrixSvg, row.short, {
+        class: 'sl-axis-label',
+        'data-axis': 'q',
+        'data-group': row.id,
+        x: plotX - 20,
+        y: row.center,
+        'text-anchor': 'middle',
+        'dominant-baseline': 'middle'
+      });
+    });
+
+    const cells = svgElement('g');
+    rows.forEach((row, queryIndex) => {
+      columns.forEach((column, keyIndex) => {
+        const query = currentMode.groups[queryIndex];
+        const key = currentMode.groups[keyIndex];
+        const allowed = currentMode.allowed(query, key);
+        const cell = svgElement('rect', {
+          class: `sl-cell sl-mark ${allowed ? 'is-allowed' : 'is-blocked'}`,
+          'data-q': query.id,
+          'data-k': key.id,
+          'data-allowed': String(allowed),
+          x: column.start,
+          y: row.start,
+          width: column.extent,
+          height: row.extent,
+          style: `--sl-color: ${query.color}`
+        });
+        const title = svgElement('title');
+        title.textContent = allowed
+          ? `${query.label} queries can read ${key.label} keys`
+          : `${query.label} queries cannot read ${key.label} keys`;
+        cell.appendChild(title);
+        cells.appendChild(cell);
+      });
+    });
+    matrixSvg.appendChild(cells);
+  }
+
+  function groupById(id) {
+    return currentMode.groups.find(group => group.id === id);
+  }
+
+  function allMarks() {
+    return root.querySelectorAll('.sl-mark');
+  }
+
+  function resetHighlight() {
+    root.querySelectorAll('.is-dimmed, .is-active, .is-related, .is-blocked-endpoint, .is-pair-active').forEach(element => {
+      element.classList.remove('is-dimmed', 'is-active', 'is-related', 'is-blocked-endpoint', 'is-pair-active');
+      element.style.removeProperty('--sl-active-color');
+      if (element.classList.contains('sl-edge')) element.setAttribute('marker-end', 'url(#space-arrow)');
+    });
+    status.textContent = currentMode.summary;
+  }
+
+  function dimAllMarks() {
+    allMarks().forEach(mark => mark.classList.add('is-dimmed'));
+  }
+
+  function activate(element, related = false, markerGroupId = null) {
+    if (!element) return;
+    element.classList.remove('is-dimmed');
+    element.classList.add(related ? 'is-related' : 'is-active');
+    if (element.classList.contains('sl-edge')) {
+      element.setAttribute('marker-end', `url(#space-arrow-active-${markerGroupId || element.dataset.q})`);
+    }
+  }
+
+  function selectAll(selector) {
+    return Array.from(root.querySelectorAll(selector));
+  }
+
+  function highlightQuery(queryId) {
+    resetHighlight();
+    dimAllMarks();
+    const query = groupById(queryId);
+    const allowedKeys = currentMode.groups.filter(key => currentMode.allowed(query, key));
+    selectAll(`.sl-block[data-side="q"][data-group="${queryId}"]`).forEach(element => activate(element));
+    selectAll(`.sl-edge[data-q="${queryId}"]`).forEach(element => {
+      const sourceKey = groupById(element.dataset.k);
+      element.style.setProperty('--sl-active-color', sourceKey.color);
+      activate(element, false, sourceKey.id);
+    });
+    selectAll(`.sl-cell[data-q="${queryId}"][data-allowed="true"]`).forEach(element => {
+      element.style.setProperty('--sl-active-color', groupById(element.dataset.k).color);
+      activate(element);
+    });
+    allowedKeys.forEach(key => {
+      selectAll(`.sl-block[data-side="k"][data-group="${key.id}"]`).forEach(element => activate(element, true));
+    });
+    const axis = root.querySelector(`.sl-axis-label[data-axis="q"][data-group="${queryId}"]`);
+    if (axis) axis.classList.add('is-active');
+    status.textContent = `${query.label} queries read ${allowedKeys.map(key => key.label).join(', ')} keys.`;
+  }
+
+  function highlightKey(keyId) {
+    resetHighlight();
+    dimAllMarks();
+    const key = groupById(keyId);
+    const allowedQueries = currentMode.groups.filter(query => currentMode.allowed(query, key));
+    selectAll(`.sl-block[data-side="k"][data-group="${keyId}"]`).forEach(element => activate(element));
+    selectAll(`.sl-edge[data-k="${keyId}"]`).forEach(element => {
+      const destinationQuery = groupById(element.dataset.q);
+      element.style.setProperty('--sl-active-color', destinationQuery.color);
+      activate(element, false, destinationQuery.id);
+    });
+    selectAll(`.sl-cell[data-k="${keyId}"][data-allowed="true"]`).forEach(element => {
+      element.style.setProperty('--sl-active-color', groupById(element.dataset.q).color);
+      activate(element);
+    });
+    allowedQueries.forEach(query => {
+      selectAll(`.sl-block[data-side="q"][data-group="${query.id}"]`).forEach(element => activate(element, true));
+    });
+    const axis = root.querySelector(`.sl-axis-label[data-axis="k"][data-group="${keyId}"]`);
+    if (axis) axis.classList.add('is-active');
+    status.textContent = `${key.label} keys are read by ${allowedQueries.map(query => query.label).join(', ')} queries.`;
+  }
+
+  function highlightPair(queryId, keyId, useOrange) {
+    resetHighlight();
+    dimAllMarks();
+    const query = groupById(queryId);
+    const key = groupById(keyId);
+    const allowed = currentMode.allowed(query, key);
+    const queryBlock = root.querySelector(`.sl-block[data-side="q"][data-group="${queryId}"]`);
+    const keyBlock = root.querySelector(`.sl-block[data-side="k"][data-group="${keyId}"]`);
+    const cell = root.querySelector(`.sl-cell[data-q="${queryId}"][data-k="${keyId}"]`);
+    activate(queryBlock);
+    activate(keyBlock);
+    activate(cell);
+    if (useOrange) cell.classList.add('is-pair-active');
+    if (allowed) {
+      const edge = root.querySelector(`.sl-edge[data-q="${queryId}"][data-k="${keyId}"]`);
+      activate(edge);
+      if (useOrange) {
+        edge.classList.add('is-pair-active');
+        edge.setAttribute('marker-end', 'url(#space-arrow-pair)');
+      }
+      status.textContent = `Allowed: ${key.label} keys send information to ${query.label} queries.`;
+    } else {
+      queryBlock.classList.add('is-blocked-endpoint');
+      keyBlock.classList.add('is-blocked-endpoint');
+      status.textContent = `Blocked: ${query.label} queries cannot read ${key.label} keys.`;
+    }
+    selectAll(`.sl-axis-label[data-axis="q"][data-group="${queryId}"], .sl-axis-label[data-axis="k"][data-group="${keyId}"]`).forEach(label => label.classList.add('is-active'));
+  }
+
+  function attachInteractions() {
+    root.querySelectorAll('.sl-block').forEach(block => {
+      block.addEventListener('pointerenter', () => {
+        const side = block.dataset.side;
+        const group = block.dataset.group;
+        if (side === 'q') highlightQuery(group);
+        else highlightKey(group);
+      });
+      block.addEventListener('pointerleave', resetHighlight);
+    });
+
+    root.querySelectorAll('.sl-edge').forEach(edge => {
+      edge.addEventListener('pointerenter', () => highlightPair(edge.dataset.q, edge.dataset.k, false));
+      edge.addEventListener('pointerleave', resetHighlight);
+    });
+
+    root.querySelectorAll('.sl-cell').forEach(cell => {
+      cell.addEventListener('pointerenter', () => highlightPair(cell.dataset.q, cell.dataset.k, true));
+      cell.addEventListener('pointerleave', resetHighlight);
+    });
+  }
+
+  function render() {
+    currentMode = modes[modeSelect.value];
+    drawConnectivity();
+    drawMatrix();
+    attachInteractions();
+    resetHighlight();
+  }
+
+  modeSelect.addEventListener('change', render);
+  render();
+})();
+</script>
+</main>
+</body>
+</html>

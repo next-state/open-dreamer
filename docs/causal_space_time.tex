@@ -1,0 +1,93 @@
+\documentclass[tikz,border=8pt]{standalone}
+
+\usepackage{amsmath}
+\usetikzlibrary{arrows.meta,backgrounds,calc,fit,positioning}
+
+\begin{document}
+\begin{tikzpicture}[
+  >=Latex,
+  token/.style={
+    draw,
+    rounded corners=1.5pt,
+    minimum width=13mm,
+    minimum height=8mm,
+    inner sep=2pt,
+    font=\small
+  },
+  timestep/.style={
+    draw,
+    rounded corners=2pt,
+    inner xsep=8mm,
+    inner ysep=6mm
+  },
+  flow/.style={->, line width=0.7pt},
+  axis/.style={->, line width=0.8pt}
+]
+
+% The ordinary causal sequence.
+\node[token] (linear-am1) {$a_{t-1}$};
+\node[token, right=7mm of linear-am1] (linear-st) {$s_t$};
+\node[token, right=7mm of linear-st] (linear-pit) {$\pi_t$};
+\node[token, right=7mm of linear-pit] (linear-at) {$a_t$};
+\node[token, right=7mm of linear-at] (linear-st1) {$s_{t+1}$};
+\node[token, right=7mm of linear-st1] (linear-pit1) {$\pi_{t+1}$};
+\node[token, right=7mm of linear-pit1] (linear-at1) {$a_{t+1}$};
+
+\draw[flow] (linear-am1) -- (linear-st);
+\draw[flow] (linear-st) -- (linear-pit);
+\draw[flow] (linear-pit) -- (linear-at);
+\draw[flow] (linear-at) -- (linear-st1);
+\draw[flow] (linear-st1) -- (linear-pit1);
+\draw[flow] (linear-pit1) -- (linear-at1);
+
+\node[above=4mm of linear-at, font=\small]
+  {Causal sequence};
+
+% The same sequence folded into model-timestep columns.
+\node[token, below=31mm of linear-st] (am2) {$a_{t-2}$};
+\node[token, below=7mm of am2] (sm1) {$s_{t-1}$};
+\node[token, below=7mm of sm1] (pim1) {$\pi_{t-1}$};
+
+\node[token, right=31mm of am2] (am1) {$a_{t-1}$};
+\node[token, below=7mm of am1] (st) {$s_t$};
+\node[token, below=7mm of st] (pit) {$\pi_t$};
+
+\node[token, right=31mm of am1] (at) {$a_t$};
+\node[token, below=7mm of at] (st1) {$s_{t+1}$};
+\node[token, below=7mm of st1] (pit1) {$\pi_{t+1}$};
+
+% Spatial information flow inside each model timestep.
+\draw[flow] (am2) -- (sm1);
+\draw[flow] (sm1) -- (pim1);
+\draw[flow] (am1) -- (st);
+\draw[flow] (st) -- (pit);
+\draw[flow] (at) -- (st1);
+\draw[flow] (st1) -- (pit1);
+
+% The policy output becomes the action entering the following timestep.
+\draw[flow] (pim1.north east) -- (am1.south west);
+\draw[flow] (pit.north east) -- (at.south west);
+
+% Timestep boxes are drawn behind their contents.
+\begin{scope}[on background layer]
+  \node[timestep, fit=(am2)(sm1)(pim1),
+        label={[font=\small]above:$t-1$}] (box-m1) {};
+  \node[timestep, fit=(am1)(st)(pit),
+        label={[font=\small]above:$t$}] (box-t) {};
+  \node[timestep, fit=(at)(st1)(pit1),
+        label={[font=\small]above:$t+1$}] (box-p1) {};
+\end{scope}
+
+% Attention axes.
+\draw[axis]
+  ($(box-m1.north west)+(0,11mm)$)
+  -- node[above, font=\small] {causal temporal attention}
+  ($(box-p1.north east)+(0,11mm)$);
+
+\draw[axis]
+  ($(box-m1.north west)+(-12mm,0)$)
+  -- node[midway, above, rotate=-90, font=\small] {spatial attention}
+  ($(box-m1.south west)+(-12mm,0)$);
+
+\end{tikzpicture}
+\end{document}
