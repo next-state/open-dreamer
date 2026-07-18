@@ -1,9 +1,41 @@
-\documentclass[tikz,border=8pt]{standalone}
+\documentclass[tikz,border=8pt,multi=tikzpicture]{standalone}
 
 \usepackage{amsmath}
 \usetikzlibrary{arrows.meta,backgrounds,calc,fit,positioning}
 
 \begin{document}
+
+% Page 1: the ordinary causal sequence.
+\begin{tikzpicture}[
+  >=Latex,
+  token/.style={
+    draw,
+    rounded corners=1.5pt,
+    minimum width=13mm,
+    minimum height=8mm,
+    inner sep=2pt,
+    font=\small
+  },
+  flow/.style={->, line width=0.7pt}
+]
+\node[token] (linear-am1) {$a_{t-1}$};
+\node[token, right=7mm of linear-am1] (linear-st) {$s_t$};
+\node[token, right=7mm of linear-st] (linear-pit) {$\pi_t$};
+\node[token, right=7mm of linear-pit] (linear-at) {$a_t$};
+\node[token, right=7mm of linear-at] (linear-st1) {$s_{t+1}$};
+\node[token, right=7mm of linear-st1] (linear-pit1) {$\pi_{t+1}$};
+\node[token, right=7mm of linear-pit1] (linear-at1) {$a_{t+1}$};
+
+\draw[flow] (linear-am1) -- (linear-st);
+\draw[flow] (linear-st) -- (linear-pit);
+\draw[flow] (linear-pit) -- (linear-at);
+\draw[flow] (linear-at) -- (linear-st1);
+\draw[flow] (linear-st1) -- (linear-pit1);
+\draw[flow] (linear-pit1) -- (linear-at1);
+
+\end{tikzpicture}
+
+% Page 2: the same sequence folded into model-timestep columns.
 \begin{tikzpicture}[
   >=Latex,
   token/.style={
@@ -23,28 +55,7 @@
   flow/.style={->, line width=0.7pt},
   axis/.style={->, line width=0.8pt}
 ]
-
-% The ordinary causal sequence.
-\node[token] (linear-am1) {$a_{t-1}$};
-\node[token, right=7mm of linear-am1] (linear-st) {$s_t$};
-\node[token, right=7mm of linear-st] (linear-pit) {$\pi_t$};
-\node[token, right=7mm of linear-pit] (linear-at) {$a_t$};
-\node[token, right=7mm of linear-at] (linear-st1) {$s_{t+1}$};
-\node[token, right=7mm of linear-st1] (linear-pit1) {$\pi_{t+1}$};
-\node[token, right=7mm of linear-pit1] (linear-at1) {$a_{t+1}$};
-
-\draw[flow] (linear-am1) -- (linear-st);
-\draw[flow] (linear-st) -- (linear-pit);
-\draw[flow] (linear-pit) -- (linear-at);
-\draw[flow] (linear-at) -- (linear-st1);
-\draw[flow] (linear-st1) -- (linear-pit1);
-\draw[flow] (linear-pit1) -- (linear-at1);
-
-\node[above=4mm of linear-at, font=\small]
-  {Causal sequence};
-
-% The same sequence folded into model-timestep columns.
-\node[token, below=31mm of linear-st] (am2) {$a_{t-2}$};
+\node[token] (am2) {$a_{t-2}$};
 \node[token, below=7mm of am2] (sm1) {$s_{t-1}$};
 \node[token, below=7mm of sm1] (pim1) {$\pi_{t-1}$};
 
@@ -90,4 +101,5 @@
   ($(box-m1.south west)+(-12mm,0)$);
 
 \end{tikzpicture}
+
 \end{document}

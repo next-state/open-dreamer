@@ -96,7 +96,7 @@
         <li>The search space</li>
       </ul>
       <p>
-        Our main objective was to reproduce the Dreamer4 paper. That gave us the search space: basically whatever method and architecture they used inside of that paper, and it gave us the goal: making a minecraft world model. As starting point we chose a simpler game than can be trained on a single graphics card: coinrun
+        Our main objective was to reproduce the Dreamer4 paper <d-cite key="hafner2025dreamer4"></d-cite>. That gave us the search space: basically whatever method and architecture they used inside of that paper, and it gave us the goal: making a minecraft world model. As starting point we chose a simpler game than can be trained on a single graphics card: coinrun
       </p>
   </div>
   <p>
@@ -136,13 +136,13 @@
     <li><strong>Causal Time Layer:</strong> where information propagates between different frames</li>
   </ul>
   <h3>
-      Tokenizer (Autoencoder)
+      The Tokenizer (Autoencoder)
   </h3>
   <p>
       If you have ever trained a VAE in the past, you know how terrible of an experience that is. Most of the time the wisest thing to do is to give up and take an off-the-shelf one.
   </p>
   <p>
-      In this project we’ve trained a transformer-based Masked Autoencoder with 100x compression, and we probably could have aimed higher
+      In this project we’ve trained a transformer-based Masked Autoencoder with 100x compression, and we probably could have aimed higher.
   </p>
   <p>
       This architecture is really cool because:
@@ -152,11 +152,57 @@
     <li>There is no need for the KL and adversarial loss</li>
     <li>It’s very fast to train</li>
     <li>It’s scalable</li>
+    <li>All of the above make it easier to train compared to the typical VAE</li>
   </ul>
+  <h3>The Dynamics Model (World Model)</h3>
+  <p>
+      World models fundamentally work by doing “next frame prediction”. Each frame is generated as an image conditioned on the previous ones. The dynamics model is trained with diffusion forcing with flow matching and shortcut models. 
+  </p>
   </div>
   <figure class="l-gutter l-gutter-large">
       <img src="website/maetok-autoencoder-platformer.svg">
       <figcaption>Figure 3: Tokenizer architecture</figcaption>
   </figure>
+  <figure>
+      <img src="website/diffusion-forcing.svg">
+      <figcaption>Figure 4: Diffusion forcing training (left) and inference (right)</figcaption>
+  </figure>
+  <p>
+      Other than predicting just the next frame, we worked on predicting the next action as well.
+      Typically, the rollout alternates between the world and the agent. Given the previous action, the dynamics predicts the next state; the policy observes that state and samples the next action:
+  </p>
+  <figure class="l-body-outset">
+      <img src="website/causal-sequence.svg" alt="Causal rollout sequence: the previous action produces the current state, the policy reads that state and produces the next action, and the cycle repeats.">
+      <figcaption>Figure 5: A rollout alternates between predicting the next state and sampling the next action.</figcaption>
+  </figure>
+  <p>
+      Evaluating the transition and policy as separate modules would require repeatedly moving between them. It would also prevent them from sharing the same representation and transformer parameters. Instead, we would like to process all timesteps in parallel during training and reuse the same computation for both the world and the agent.
+  </p>
+  <p>
+      This architecture folds the sequence into blocks:
+  </p>
+  $$
+  B_t = (a_{t-1}, s_t, \pi_t)
+  $$
+  <p>
+      Within each block, spatial attention implements $(a_{t-1} \to s_t \to \pi_t)$
+  </p>
+  <figure class="l-body-outset">
+      <img src="website/causal-space-time.svg" alt="The causal rollout folded into three timestep columns. Spatial attention runs down each column from the previous action to the state and policy, while causal temporal attention runs from left to right. Each policy produces the action entering the next column.">
+      <figcaption>Figure 6: Folding the rollout into timestep blocks. Spatial attention operates within each block, while causal temporal attention connects blocks across time.</figcaption>
+  </figure>
+  <p>
+      What does $s_t$ contain? The state is the part generated through diffusion—or, more precisely, the model diffuses its latent spatial tokens. The state computation therefore includes:
+  </p>
+  <ul>
+      <li>a noise-level token describing how corrupted the current latent is;</li>
+      <li>a shortcut step-size index describing how far the model should advance in one denoising step, following Shortcut Models <d-cite key="frans2024onestep"></d-cite>;</li>
+      <li>spatial latent tokens representing the visual state;</li>
+      <li>register tokens, which provide shared workspace for internal computation. <d-cite key="darcet2023registers"></d-cite></li>
+  </ul>
+  <p>
+      Together, these tokens let each space layer turn the previous action and a noisy latent into the next clean latent state.
+  </p>
+
 </d-article>
 <d-bibliography src="website/bibliography.bib"></d-bibliography>
