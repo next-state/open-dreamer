@@ -10,17 +10,6 @@
 <main>
 <div id="space-layer-block-mask" class="space-layer-vis">
   <div class="space-layer-canvas">
-  <div class="viz-controls">
-    <label class="form-label" for="space-layer-mode">
-      Masking mode
-      <select id="space-layer-mode" class="form-select">
-        <option value="dynamics" selected>Dynamics</option>
-        <option value="encoder">Tokenizer encoder</option>
-        <option value="decoder">Tokenizer decoder</option>
-      </select>
-    </label>
-  </div>
-
   <div class="space-layer-layout">
     <section aria-labelledby="space-layer-connectivity-heading">
       <h3 id="space-layer-connectivity-heading">Grouped connectivity</h3>
@@ -44,6 +33,11 @@
 </div>
 
 <style>
+  html,
+  body {
+    min-height: 0;
+  }
+
   #space-layer-block-mask {
     --sl-background: var(--space-layer-background, #ffffff);
     --sl-surface: var(--space-layer-surface, #f4f5f7);
@@ -80,10 +74,6 @@
     padding: 1rem;
     color: var(--sl-text);
     background: var(--sl-background);
-  }
-
-  #space-layer-block-mask .viz-controls {
-    margin-block-end: 0.75rem;
   }
 
   #space-layer-block-mask .space-layer-layout {
@@ -270,41 +260,20 @@
 
   const connectivitySvg = root.querySelector('#space-layer-connectivity');
   const matrixSvg = root.querySelector('#space-layer-matrix');
-  const modeSelect = root.querySelector('#space-layer-mode');
   const status = root.querySelector('#space-layer-status');
   const NS = 'http://www.w3.org/2000/svg';
 
-  const modes = {
-    dynamics: {
-      summary: 'A query reads keys at the same or a lower hierarchy level.',
-      groups: [
-        { id: 'action', label: 'Action', short: 'A', count: 1, level: 0, color: 'var(--sl-series-blue)' },
-        { id: 'shortcut', label: 'Shortcut', short: 'C', count: 1, level: 1, color: 'var(--sl-series-purple)' },
-        { id: 'spatial', label: 'Spatial', short: 'Z', count: 6, level: 1, color: 'var(--sl-series-pink)' },
-        { id: 'register', label: 'Register', short: 'R', count: 2, level: 1, color: 'var(--sl-series-orange)' },
-        { id: 'agent', label: 'Agent', short: 'G', count: 1, level: 2, color: 'var(--sl-series-yellow)' }
-      ],
-      allowed: (query, key) => query.level >= key.level
-    },
-    encoder: {
-      summary: 'Latent queries read every key; image queries read image keys only.',
-      groups: [
-        { id: 'latent', label: 'Latent', short: 'L', count: 3, color: 'var(--sl-series-blue)' },
-        { id: 'image', label: 'Image', short: 'I', count: 7, color: 'var(--sl-series-purple)' }
-      ],
-      allowed: (query, key) => query.id === 'latent' || query.id === key.id
-    },
-    decoder: {
-      summary: 'Latent queries read latent keys; image queries read latent and image keys.',
-      groups: [
-        { id: 'latent', label: 'Latent', short: 'L', count: 3, color: 'var(--sl-series-blue)' },
-        { id: 'image', label: 'Image', short: 'I', count: 7, color: 'var(--sl-series-purple)' }
-      ],
-      allowed: (query, key) => query.id === key.id || key.id === 'latent'
-    }
+  const dynamicsMask = {
+    summary: 'A query reads keys at the same or a lower hierarchy level.',
+    groups: [
+      { id: 'action', label: 'Action', short: 'A', count: 1, level: 0, color: 'var(--sl-series-blue)' },
+      { id: 'shortcut', label: 'Shortcut', short: 'C', count: 1, level: 1, color: 'var(--sl-series-purple)' },
+      { id: 'spatial', label: 'Spatial', short: 'Z', count: 6, level: 1, color: 'var(--sl-series-pink)' },
+      { id: 'register', label: 'Register', short: 'R', count: 2, level: 1, color: 'var(--sl-series-orange)' },
+      { id: 'agent', label: 'Agent', short: 'G', count: 1, level: 2, color: 'var(--sl-series-yellow)' }
+    ],
+    allowed: (query, key) => query.level >= key.level
   };
-
-  let currentMode = modes.dynamics;
 
   function svgElement(tag, attributes = {}) {
     const element = document.createElementNS(NS, tag);
@@ -397,14 +366,14 @@
 
   function drawConnectivity() {
     preserveAccessibleNodes(connectivitySvg);
-    const groups = blockLayout(currentMode.groups, 680);
-    const keysForQuery = new Map(currentMode.groups.map(query => [
+    const groups = blockLayout(dynamicsMask.groups, 680);
+    const keysForQuery = new Map(dynamicsMask.groups.map(query => [
       query.id,
-      currentMode.groups.filter(key => currentMode.allowed(query, key))
+      dynamicsMask.groups.filter(key => dynamicsMask.allowed(query, key))
     ]));
-    const queriesForKey = new Map(currentMode.groups.map(key => [
+    const queriesForKey = new Map(dynamicsMask.groups.map(key => [
       key.id,
-      currentMode.groups.filter(query => currentMode.allowed(query, key))
+      dynamicsMask.groups.filter(query => dynamicsMask.allowed(query, key))
     ]));
     const queryY = 58;
     const keyY = 310;
@@ -412,7 +381,7 @@
 
     const defs = svgElement('defs');
     makeMarker(defs, 'space-arrow', 'var(--sl-text-muted)');
-    currentMode.groups.forEach(group => makeMarker(defs, `space-arrow-active-${group.id}`, group.color));
+    dynamicsMask.groups.forEach(group => makeMarker(defs, `space-arrow-active-${group.id}`, group.color));
     makeMarker(defs, 'space-arrow-pair', 'var(--sl-highlight)');
     connectivitySvg.appendChild(defs);
 
@@ -430,9 +399,9 @@
     });
 
     const edges = svgElement('g', { 'aria-hidden': 'true' });
-    currentMode.groups.forEach((query, queryIndex) => {
-      currentMode.groups.forEach((key, keyIndex) => {
-        if (!currentMode.allowed(query, key)) return;
+    dynamicsMask.groups.forEach((query, queryIndex) => {
+      dynamicsMask.groups.forEach((key, keyIndex) => {
+        if (!dynamicsMask.allowed(query, key)) return;
         const queryBlock = groups[queryIndex];
         const keyBlock = groups[keyIndex];
         const sourcePeers = queriesForKey.get(key.id);
@@ -461,10 +430,10 @@
     connectivitySvg.appendChild(blocks);
 
     const legend = svgElement('g', { 'aria-hidden': 'true' });
-    const legendItemWidth = currentMode.groups.length > 4 ? 124 : 160;
-    const legendWidth = legendItemWidth * currentMode.groups.length;
+    const legendItemWidth = dynamicsMask.groups.length > 4 ? 124 : 160;
+    const legendWidth = legendItemWidth * dynamicsMask.groups.length;
     const legendStart = (680 - legendWidth) / 2;
-    currentMode.groups.forEach((group, index) => {
+    dynamicsMask.groups.forEach((group, index) => {
       const x = legendStart + index * legendItemWidth;
       legend.appendChild(svgElement('rect', {
         x,
@@ -501,8 +470,8 @@
     const plotX = 112;
     const plotY = 44;
     const plotSize = 390;
-    const columns = proportionalLayout(currentMode.groups, plotX, plotSize);
-    const rows = proportionalLayout(currentMode.groups, plotY, plotSize);
+    const columns = proportionalLayout(dynamicsMask.groups, plotX, plotSize);
+    const rows = proportionalLayout(dynamicsMask.groups, plotY, plotSize);
 
     appendText(matrixSvg, 'Keys K', {
       class: 'sl-axis-title',
@@ -543,9 +512,9 @@
     const cells = svgElement('g');
     rows.forEach((row, queryIndex) => {
       columns.forEach((column, keyIndex) => {
-        const query = currentMode.groups[queryIndex];
-        const key = currentMode.groups[keyIndex];
-        const allowed = currentMode.allowed(query, key);
+        const query = dynamicsMask.groups[queryIndex];
+        const key = dynamicsMask.groups[keyIndex];
+        const allowed = dynamicsMask.allowed(query, key);
         const cell = svgElement('rect', {
           class: `sl-cell sl-mark ${allowed ? 'is-allowed' : 'is-blocked'}`,
           'data-q': query.id,
@@ -569,7 +538,7 @@
   }
 
   function groupById(id) {
-    return currentMode.groups.find(group => group.id === id);
+    return dynamicsMask.groups.find(group => group.id === id);
   }
 
   function allMarks() {
@@ -582,7 +551,7 @@
       element.style.removeProperty('--sl-active-color');
       if (element.classList.contains('sl-edge')) element.setAttribute('marker-end', 'url(#space-arrow)');
     });
-    status.textContent = currentMode.summary;
+    status.textContent = dynamicsMask.summary;
   }
 
   function dimAllMarks() {
@@ -606,7 +575,7 @@
     resetHighlight();
     dimAllMarks();
     const query = groupById(queryId);
-    const allowedKeys = currentMode.groups.filter(key => currentMode.allowed(query, key));
+    const allowedKeys = dynamicsMask.groups.filter(key => dynamicsMask.allowed(query, key));
     selectAll(`.sl-block[data-side="q"][data-group="${queryId}"]`).forEach(element => activate(element));
     selectAll(`.sl-edge[data-q="${queryId}"]`).forEach(element => {
       const sourceKey = groupById(element.dataset.k);
@@ -629,7 +598,7 @@
     resetHighlight();
     dimAllMarks();
     const key = groupById(keyId);
-    const allowedQueries = currentMode.groups.filter(query => currentMode.allowed(query, key));
+    const allowedQueries = dynamicsMask.groups.filter(query => dynamicsMask.allowed(query, key));
     selectAll(`.sl-block[data-side="k"][data-group="${keyId}"]`).forEach(element => activate(element));
     selectAll(`.sl-edge[data-k="${keyId}"]`).forEach(element => {
       const destinationQuery = groupById(element.dataset.q);
@@ -653,7 +622,7 @@
     dimAllMarks();
     const query = groupById(queryId);
     const key = groupById(keyId);
-    const allowed = currentMode.allowed(query, key);
+    const allowed = dynamicsMask.allowed(query, key);
     const queryBlock = root.querySelector(`.sl-block[data-side="q"][data-group="${queryId}"]`);
     const keyBlock = root.querySelector(`.sl-block[data-side="k"][data-group="${keyId}"]`);
     const cell = root.querySelector(`.sl-cell[data-q="${queryId}"][data-k="${keyId}"]`);
@@ -700,15 +669,22 @@
   }
 
   function render() {
-    currentMode = modes[modeSelect.value];
     drawConnectivity();
     drawMatrix();
     attachInteractions();
     resetHighlight();
   }
 
-  modeSelect.addEventListener('change', render);
   render();
+
+  const resizeFrame = () => {
+    if (window.frameElement) {
+      const contentHeight = Math.ceil(document.body.getBoundingClientRect().height);
+      window.frameElement.style.height = `${contentHeight}px`;
+    }
+  };
+  window.addEventListener('load', resizeFrame);
+  new ResizeObserver(resizeFrame).observe(document.documentElement);
 })();
 </script>
 </main>

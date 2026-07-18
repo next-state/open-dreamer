@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1924" height="530" viewBox="0 0 1924 530" role="img" aria-labelledby="title desc">
+  <title id="title">Reconstructed iso-FLOPs scaling analysis</title>
+  <desc id="desc">A vector reconstruction of the supplied graph, arranged as one horizontal row. It shows four iso-FLOPs loss curves, compute-optimal model size, and compute-optimal training tokens. Values were inferred from the raster image and are approximate.</desc>
+  <metadata><![CDATA[
+{
+  "provenance": "Reverse-engineered from Screenshot 2026-07-15 at 13.08.18.png",
+  "precision_note": "Values are inferred from plot pixels. Optimal N and D were cross-checked with C=6*N*D and the displayed tokens-per-parameter summary.",
+  "compute_budgets_flops": [1e16, 3e16, 6e16, 1e17],
+  "run_parameter_counts_estimated": [1.67e5, 1.13e6, 3.67e6, 8.63e6, 1.66e7, 2.87e7],
+  "negative_psnr_estimated": {
+    "1e16": [-21.24, -22.01, -19.43, -16.08, -6.72, -6.54],
+    "3e16": [-21.90, -23.88, -23.01, -21.23, -18.22, -14.42],
+    "6e16": [-21.61, -24.63, -24.76, -24.42, -21.05, -18.03],
+    "1e17": [-22.20, -25.17, -25.24, -26.14, -23.73, -20.20]
+  },
+  "compute_optimal": [
+    {"C": 1e16, "N": 554526.017, "D": 3005569829.5, "D_per_N": 5420.07},
+    {"C": 3e16, "N": 984423.350, "D": 5079115604.1, "D_per_N": 5159.483},
+    {"C": 6e16, "N": 1546255.103, "D": 6467238155.6, "D_per_N": 4182.517},
+    {"C": 1e17, "N": 2019504.864, "D": 8252847993.3, "D_per_N": 4086.57}
+  ],
+  "displayed_power_laws": {"N_exponent": 0.56, "D_exponent": 0.44},
+  "displayed_summary": {"runs": 24, "mean_D_per_N": 4712.16, "sample_std_D_per_N": 676.54, "median_D_per_N": 4686.57, "min_D_per_N": 4086.57, "max_D_per_N": 5420.07}
+}
+  ]]></metadata>
+
+  <defs>
+    <style><![CDATA[
+      .txt { font-family: Arial, Helvetica, sans-serif; fill: #222; }
+      .title { font-size: 24px; font-weight: 600; text-anchor: middle; }
+      .label { font-size: 20px; font-weight: 500; }
+      .tick { font-size: 18px; fill: #333; }
+      .tick tspan { font-size: 12px; }
+      .legend { font-size: 17px; }
+      .axis { stroke: #252525; stroke-width: 1.25; fill: none; }
+      .grid { stroke: #d8d8d8; stroke-width: 1; opacity: .52; }
+      .minor { stroke: #555; stroke-width: .7; opacity: .68; }
+      .fit { fill: none; stroke-width: 2.5; stroke-dasharray: 8 6; opacity: .74; }
+      .pt { stroke: #f7f7f7; stroke-width: .8; opacity: .96; }
+      .legendbox { fill: #fff; fill-opacity: .92; stroke: #c7c7c7; stroke-width: 1; }
+      .mono { font-family: "Courier New", Courier, monospace; }
+    ]]></style>
+    <clipPath id="clipIso"><rect x="78" y="30" width="527" height="435"/></clipPath>
+    <clipPath id="clipModel"><rect x="665" y="30" width="526" height="435"/></clipPath>
+    <clipPath id="clipTokens"><rect x="78" y="539" width="527" height="437"/></clipPath>
+    <path id="star" d="M0,-9 L2.2,-3 L8.7,-2.8 L3.6,1.3 L5.3,7.6 L0,4 L-5.3,7.6 L-3.6,1.3 L-8.7,-2.8 L-2.2,-3 Z"/>
+  </defs>
+
+  <rect width="1924" height="530" fill="#fff"/>
+
+  <!-- Top-left: Iso-FLOPs Curves -->
+  <g id="iso-flops">
+    <text class="txt title" x="341.5" y="24">Iso-FLOPs Curves</text>
+
+    <g aria-hidden="true">
+      <line class="grid" x1="78" y1="39" x2="605" y2="39"/>
+      <line class="grid" x1="78" y1="117" x2="605" y2="117"/>
+      <line class="grid" x1="78" y1="194" x2="605" y2="194"/>
+      <line class="grid" x1="78" y1="272" x2="605" y2="272"/>
+      <line class="grid" x1="78" y1="350" x2="605" y2="350"/>
+      <line class="grid" x1="78" y1="428" x2="605" y2="428"/>
+      <line class="grid" x1="99" y1="30" x2="99" y2="465"/>
+      <line class="grid" x1="280" y1="30" x2="280" y2="465"/>
+      <line class="grid" x1="462" y1="30" x2="462" y2="465"/>
+    </g>
+
+    <g clip-path="url(#clipIso)">
+      <path class="fit" stroke="#6a3478" d="M 99.0,351.7 L 119.9,364.5 L 140.8,375.1 L 161.7,383.6 L 182.6,389.9 L 203.6,394.1 L 224.5,396.2 L 245.4,396.1 L 266.3,393.9 L 287.2,389.5 L 308.1,383.0 L 329.0,374.3 L 349.9,363.5 L 370.9,350.5 L 391.8,335.4 L 412.7,318.1 L 433.6,298.7 L 454.5,277.2 L 475.4,253.5 L 496.3,227.7 L 517.2,199.7 L 538.2,169.6 L 559.1,137.3 L 580.0,102.9"/>
+      <path class="fit" stroke="#5b88a6" d="M 99.0,352.3 L 119.9,367.0 L 140.8,380.0 L 161.7,391.1 L 182.6,400.4 L 203.6,407.8 L 224.5,413.5 L 245.4,417.4 L 266.3,419.4 L 287.2,419.6 L 308.1,418.0 L 329.0,414.6 L 349.9,409.4 L 370.9,402.3 L 391.8,393.4 L 412.7,382.8 L 433.6,370.3 L 454.5,356.0 L 475.4,339.8 L 496.3,321.9 L 517.2,302.1 L 538.2,280.6 L 559.1,257.2 L 580.0,232.0"/>
+      <path class="fit" stroke="#4ebf8f" d="M 99.0,343.8 L 119.9,360.8 L 140.8,376.1 L 161.7,389.6 L 182.6,401.4 L 203.6,411.5 L 224.5,419.9 L 245.4,426.5 L 266.3,431.4 L 287.2,434.5 L 308.1,436.0 L 329.0,435.6 L 349.9,433.6 L 370.9,429.8 L 391.8,424.3 L 412.7,417.1 L 433.6,408.1 L 454.5,397.4 L 475.4,384.9 L 496.3,370.8 L 517.2,354.9 L 538.2,337.2 L 559.1,317.8 L 580.0,296.7"/>
+      <path class="fit" stroke="#f4d94c" d="M 99.0,353.5 L 119.9,369.2 L 140.8,383.3 L 161.7,396.1 L 182.6,407.4 L 203.6,417.2 L 224.5,425.7 L 245.4,432.6 L 266.3,438.2 L 287.2,442.2 L 308.1,444.9 L 329.0,446.1 L 349.9,445.8 L 370.9,444.1 L 391.8,441.0 L 412.7,436.4 L 433.6,430.4 L 454.5,422.9 L 475.4,414.0 L 496.3,403.6 L 517.2,391.8 L 538.2,378.6 L 559.1,363.9 L 580.0,347.8"/>
+
+      <!-- Digitized observations; each circle carries the recovered values. -->
+      <g fill="#6a3478">
+        <circle class="pt" cx="139.4" cy="369.5" r="5" data-c="1e16" data-n="1.67e5" data-negative-psnr="-21.24"><title>C=1e16, N≈1.67e5, negative PSNR≈-21.24</title></circle>
+        <circle class="pt" cx="289.5" cy="381.4" r="5" data-c="1e16" data-n="1.13e6" data-negative-psnr="-22.01"><title>C=1e16, N≈1.13e6, negative PSNR≈-22.01</title></circle>
+        <circle class="pt" cx="382.6" cy="341.3" r="5" data-c="1e16" data-n="3.67e6" data-negative-psnr="-19.43"><title>C=1e16, N≈3.67e6, negative PSNR≈-19.43</title></circle>
+        <circle class="pt" cx="449.8" cy="289.2" r="5" data-c="1e16" data-n="8.63e6" data-negative-psnr="-16.08"><title>C=1e16, N≈8.63e6, negative PSNR≈-16.08</title></circle>
+        <circle class="pt" cx="501.5" cy="143.5" r="5" data-c="1e16" data-n="1.66e7" data-negative-psnr="-6.72"><title>C=1e16, N≈1.66e7, negative PSNR≈-6.72</title></circle>
+        <circle class="pt" cx="544.5" cy="140.7" r="5" data-c="1e16" data-n="2.87e7" data-negative-psnr="-6.54"><title>C=1e16, N≈2.87e7, negative PSNR≈-6.54</title></circle>
+      </g>
+      <g fill="#5b88a6">
+        <circle class="pt" cx="139.5" cy="379.8" r="5" data-c="3e16" data-n="1.67e5" data-negative-psnr="-21.90"><title>C=3e16, N≈1.67e5, negative PSNR≈-21.90</title></circle>
+        <circle class="pt" cx="289.6" cy="410.6" r="5" data-c="3e16" data-n="1.13e6" data-negative-psnr="-23.88"><title>C=3e16, N≈1.13e6, negative PSNR≈-23.88</title></circle>
+        <circle class="pt" cx="382.5" cy="397.0" r="5" data-c="3e16" data-n="3.67e6" data-negative-psnr="-23.01"><title>C=3e16, N≈3.67e6, negative PSNR≈-23.01</title></circle>
+        <circle class="pt" cx="449.9" cy="369.4" r="5" data-c="3e16" data-n="8.63e6" data-negative-psnr="-21.23"><title>C=3e16, N≈8.63e6, negative PSNR≈-21.23</title></circle>
+        <circle class="pt" cx="501.0" cy="322.5" r="5" data-c="3e16" data-n="1.66e7" data-negative-psnr="-18.22"><title>C=3e16, N≈1.66e7, negative PSNR≈-18.22</title></circle>
+        <circle class="pt" cx="544.5" cy="263.4" r="5" data-c="3e16" data-n="2.87e7" data-negative-psnr="-14.42"><title>C=3e16, N≈2.87e7, negative PSNR≈-14.42</title></circle>
+      </g>
+      <g fill="#4ebf8f">
+        <circle class="pt" cx="140.4" cy="375.2" r="5" data-c="6e16" data-n="1.67e5" data-negative-psnr="-21.61"><title>C=6e16, N≈1.67e5, negative PSNR≈-21.61</title></circle>
+        <circle class="pt" cx="289.6" cy="422.3" r="5" data-c="6e16" data-n="1.13e6" data-negative-psnr="-24.63"><title>C=6e16, N≈1.13e6, negative PSNR≈-24.63</title></circle>
+        <circle class="pt" cx="383.1" cy="424.3" r="5" data-c="6e16" data-n="3.67e6" data-negative-psnr="-24.76"><title>C=6e16, N≈3.67e6, negative PSNR≈-24.76</title></circle>
+        <circle class="pt" cx="449.7" cy="419.0" r="5" data-c="6e16" data-n="8.63e6" data-negative-psnr="-24.42"><title>C=6e16, N≈8.63e6, negative PSNR≈-24.42</title></circle>
+        <circle class="pt" cx="501.4" cy="366.6" r="5" data-c="6e16" data-n="1.66e7" data-negative-psnr="-21.05"><title>C=6e16, N≈1.66e7, negative PSNR≈-21.05</title></circle>
+        <circle class="pt" cx="544.5" cy="319.5" r="5" data-c="6e16" data-n="2.87e7" data-negative-psnr="-18.03"><title>C=6e16, N≈2.87e7, negative PSNR≈-18.03</title></circle>
+      </g>
+      <g fill="#f4d94c">
+        <circle class="pt" cx="139.4" cy="384.4" r="5" data-c="1e17" data-n="1.67e5" data-negative-psnr="-22.20"><title>C=1e17, N≈1.67e5, negative PSNR≈-22.20</title></circle>
+        <circle class="pt" cx="289.9" cy="430.6" r="5" data-c="1e17" data-n="1.13e6" data-negative-psnr="-25.17"><title>C=1e17, N≈1.13e6, negative PSNR≈-25.17</title></circle>
+        <circle class="pt" cx="382.4" cy="431.7" r="5" data-c="1e17" data-n="3.67e6" data-negative-psnr="-25.24"><title>C=1e17, N≈3.67e6, negative PSNR≈-25.24</title></circle>
+        <circle class="pt" cx="449.8" cy="445.7" r="5" data-c="1e17" data-n="8.63e6" data-negative-psnr="-26.14"><title>C=1e17, N≈8.63e6, negative PSNR≈-26.14</title></circle>
+        <circle class="pt" cx="501.3" cy="408.3" r="5" data-c="1e17" data-n="1.66e7" data-negative-psnr="-23.73"><title>C=1e17, N≈1.66e7, negative PSNR≈-23.73</title></circle>
+        <circle class="pt" cx="544.4" cy="353.3" r="5" data-c="1e17" data-n="2.87e7" data-negative-psnr="-20.20"><title>C=1e17, N≈2.87e7, negative PSNR≈-20.20</title></circle>
+      </g>
+
+      <polygon points="238,387 240.2,393 246.7,393.2 241.6,397.3 243.3,403.6 238,400 232.7,403.6 234.4,397.3 229.3,393.2 235.8,393" fill="#6a3478" stroke="#111" stroke-width="1.5" data-c="1e16" data-optimal-n="554526.017"/>
+      <polygon points="278,412 280.2,418 286.7,418.2 281.6,422.3 283.3,428.6 278,425 272.7,428.6 274.4,422.3 269.3,418.2 275.8,418" fill="#5b88a6" stroke="#111" stroke-width="1.5" data-c="3e16" data-optimal-n="984423.350"/>
+      <polygon points="315,429 317.2,435 323.7,435.2 318.6,439.3 320.3,445.6 315,442 309.7,445.6 311.4,439.3 306.3,435.2 312.8,435" fill="#4ebf8f" stroke="#111" stroke-width="1.5" data-c="6e16" data-optimal-n="1546255.103"/>
+      <polygon points="336,437 338.2,443 344.7,443.2 339.6,447.3 341.3,453.6 336,450 330.7,453.6 332.4,447.3 327.3,443.2 333.8,443" fill="#f4d94c" stroke="#111" stroke-width="1.5" data-c="1e17" data-optimal-n="2019504.864"/>
+    </g>
+
+    <rect class="axis" x="78" y="30" width="527" height="435"/>
+    <g class="txt tick" text-anchor="end">
+      <text x="69" y="43">0</text><text x="69" y="121">−5</text><text x="69" y="198">−10</text>
+      <text x="69" y="276">−15</text><text x="69" y="354">−20</text><text x="69" y="432">−25</text>
+    </g>
+    <g class="txt tick" text-anchor="middle">
+      <text x="99" y="486">10<tspan baseline-shift="super" font-size="9">5</tspan></text>
+      <text x="280" y="486">10<tspan baseline-shift="super" font-size="9">6</tspan></text>
+      <text x="462" y="486">10<tspan baseline-shift="super" font-size="9">7</tspan></text>
+    </g>
+    <text class="txt label" x="341.5" y="505" text-anchor="middle">Parameters (N)</text>
+    <text class="txt label" x="35" y="247" text-anchor="middle" transform="rotate(-90 35 247)">Negative PSNR (lower is better)</text>
+
+    <g id="iso-legend">
+      <rect class="legendbox" x="490" y="35" width="110" height="80" rx="1"/>
+      <text class="txt legend" x="545" y="49" text-anchor="middle">Compute Budget</text>
+      <circle cx="518" cy="60" r="4.5" fill="#6a3478"/><text class="txt legend" x="537" y="64">C=1e+16</text>
+      <circle cx="518" cy="76" r="4.5" fill="#5b88a6"/><text class="txt legend" x="537" y="80">C=3e+16</text>
+      <circle cx="518" cy="92" r="4.5" fill="#4ebf8f"/><text class="txt legend" x="537" y="96">C=6e+16</text>
+      <circle cx="518" cy="108" r="4.5" fill="#f4d94c"/><text class="txt legend" x="537" y="112">C=1e+17</text>
+    </g>
+  </g>
+
+  <!-- Top-right: Compute-Optimal Model Size -->
+  <g id="optimal-model-size">
+    <text class="txt title" x="928" y="24">Compute-Optimal Model Size</text>
+    <line class="grid" x1="665" y1="255" x2="1191" y2="255"/>
+    <line class="grid" x1="808" y1="30" x2="808" y2="465"/>
+    <line class="grid" x1="1047" y1="30" x2="1047" y2="465"/>
+    <g clip-path="url(#clipModel)">
+      <path d="M689 448 L1168 50" fill="none" stroke="#ff1717" stroke-width="2.5" stroke-dasharray="9 5"/>
+      <g fill="#4286aa" stroke="#9d1119" stroke-width="1.5">
+        <circle cx="808.0" cy="341.0" r="5.5" data-c="1e16" data-n="554526.017"><title>C=1e16 FLOPs, optimal N≈554526</title></circle>
+        <circle cx="922.3" cy="261.6" r="5.5" data-c="3e16" data-n="984423.350"><title>C=3e16 FLOPs, optimal N≈984423</title></circle>
+        <circle cx="993.9" cy="186.9" r="5.5" data-c="6e16" data-n="1546255.103"><title>C=6e16 FLOPs, optimal N≈1546255</title></circle>
+        <circle cx="1047.6" cy="147.4" r="5.5" data-c="1e17" data-n="2019504.864"><title>C=1e17 FLOPs, optimal N≈2019505</title></circle>
+      </g>
+    </g>
+    <rect class="axis" x="665" y="30" width="526" height="435"/>
+    <g class="txt tick" text-anchor="middle">
+      <text x="808" y="486">10<tspan baseline-shift="super" font-size="9">16</tspan></text>
+      <text x="1047" y="486">10<tspan baseline-shift="super" font-size="9">17</tspan></text>
+    </g>
+    <text class="txt tick" x="657" y="259" text-anchor="end">10<tspan baseline-shift="super" font-size="9">6</tspan></text>
+    <text class="txt label" x="928" y="505" text-anchor="middle">Compute Budget (FLOPs)</text>
+    <text class="txt label" x="626" y="247" text-anchor="middle" transform="rotate(-90 626 247)">Optimal Parameters (N)</text>
+    <g>
+      <rect class="legendbox" x="671" y="35" width="112" height="25"/>
+      <line x1="678" y1="46" x2="704" y2="46" stroke="#ff1717" stroke-width="2.5" stroke-dasharray="9 5"/>
+      <text class="txt legend" x="712" y="50">N ∝ C^0.56</text>
+    </g>
+  </g>
+
+  <!-- Bottom-left: Compute-Optimal Training Tokens -->
+  <g id="optimal-training-tokens" transform="translate(1240 -509)">
+    <text class="txt title" x="341.5" y="533">Compute-Optimal Training Tokens</text>
+    <line class="grid" x1="78" y1="623" x2="605" y2="623"/>
+    <line class="grid" x1="78" y1="935" x2="605" y2="935"/>
+    <line class="grid" x1="223" y1="539" x2="223" y2="976"/>
+    <line class="grid" x1="462" y1="539" x2="462" y2="976"/>
+    <g clip-path="url(#clipTokens)">
+      <path d="M102 955 L581 558" fill="none" stroke="#ff1717" stroke-width="2.5" stroke-dasharray="9 5"/>
+      <g fill="#2ca34a" stroke="#8d1517" stroke-width="1.5">
+        <circle cx="222.6" cy="861.4" r="5.5" data-c="1e16" data-d="3005569829.5"><title>C=1e16 FLOPs, optimal D≈3.006e9 tokens</title></circle>
+        <circle cx="336.1" cy="749.4" r="5.5" data-c="3e16" data-d="5079115604.1"><title>C=3e16 FLOPs, optimal D≈5.079e9 tokens</title></circle>
+        <circle cx="408.5" cy="707.7" r="5.5" data-c="6e16" data-d="6467238155.6"><title>C=6e16 FLOPs, optimal D≈6.467e9 tokens</title></circle>
+        <circle cx="462.6" cy="660.4" r="5.5" data-c="1e17" data-d="8252847993.3"><title>C=1e17 FLOPs, optimal D≈8.253e9 tokens</title></circle>
+      </g>
+    </g>
+    <rect class="axis" x="78" y="539" width="527" height="437"/>
+    <g class="txt tick" text-anchor="middle">
+      <text x="223" y="996">10<tspan baseline-shift="super" font-size="9">16</tspan></text>
+      <text x="462" y="996">10<tspan baseline-shift="super" font-size="9">17</tspan></text>
+    </g>
+    <g class="txt tick" text-anchor="end">
+      <text x="69" y="939">2 × 10<tspan baseline-shift="super" font-size="9">9</tspan></text>
+      <text x="69" y="860">3 × 10<tspan baseline-shift="super" font-size="9">9</tspan></text>
+      <text x="69" y="804">4 × 10<tspan baseline-shift="super" font-size="9">9</tspan></text>
+      <text x="69" y="726">6 × 10<tspan baseline-shift="super" font-size="9">9</tspan></text>
+      <text x="69" y="627">10<tspan baseline-shift="super" font-size="9">10</tspan></text>
+    </g>
+    <text class="txt label" x="341.5" y="1015" text-anchor="middle">Compute Budget (FLOPs)</text>
+    <text class="txt label" x="21" y="757" text-anchor="middle" transform="rotate(-90 21 757)">Optimal Training Tokens (D)</text>
+    <g>
+      <rect class="legendbox" x="84" y="544" width="114" height="25"/>
+      <line x1="91" y1="555" x2="117" y2="555" stroke="#ff1717" stroke-width="2.5" stroke-dasharray="9 5"/>
+      <text class="txt legend" x="125" y="559">D ∝ C^0.44</text>
+    </g>
+  </g>
+
+</svg>

@@ -31,7 +31,7 @@
 
 <d-title>
   <h1>How to train a frontier-level world model</h1>
-  <p>subtitle</p>
+  <p>Sponsored by Reactor</p>
 </d-title>
 
 <d-byline>
@@ -142,7 +142,7 @@
       If you have ever trained a VAE in the past, you know how terrible of an experience that is. Most of the time the wisest thing to do is to give up and take an off-the-shelf one.
   </p>
   <p>
-      In this project we’ve trained a transformer-based Masked Autoencoder with 100x compression, and we probably could have aimed higher.
+      In this project we’ve trained a transformer-based Masked Autoencoder <d-cite key="chen2025maetok"></d-cite> with 100x compression, and we probably could have aimed higher.
   </p>
   <p>
       This architecture is really cool because:
@@ -203,6 +203,26 @@
   <p>
       Together, these tokens let each space layer turn the previous action and a noisy latent into the next clean latent state.
   </p>
+  <figure class="l-page">
+      <iframe src="website/space-layer-mask.html" title="Interactive visualization of the space-layer attention mask" width="100%" height="520" loading="lazy" style="display: block; border: 0;"></iframe>
+  </figure>
+  <div>
+  <h2>Coinrun experiments</h2>
+  
+  <p>
+    As mentioned before, our first experiments were in coinrun.<br><br>
+    We first trained the tokenizer and we’ve also done some scaling experiments and interestingly the compute optimal number of parameters and number of data points scale as the square root of compute!
+  </p>
+  <figure>
+      <img src="website/compute_scaling_reconstructed.svg" alt="Iso-FLOPs curves and fitted compute-optimal scaling laws for Coinrun" width="100%">
+      <figcaption>Figure 9: Coinrun compute-scaling results. Iso-FLOPs curves identify the optimal model size for each compute budget; the fitted scaling laws show that optimal model size scales as N ∝ C<sup>0.56</sup>, while optimal training tokens scale as D ∝ C<sup>0.44</sup>.</figcaption>
+  </figure>
+  </div>
+  
+  <figure class="l-gutter l-gutter-large">
+      <img src="website/coinrun-tokenizer.jpg" alt="Coinrun experiments" width="100%">
+      <figcaption>Figure 8: Masked tokenizer output in coinrun. The first row represents the ground truth image, the seond row the masked image, the third row represents the masked image with the reconstructed patches inserted and the forth image represents the full decoder reconstruction given the patched input</figcaption>
+  </figure>
 
 </d-article>
 <d-bibliography>
@@ -238,6 +258,14 @@
   journal={arXiv preprint arXiv:2509.24527},
   year={2025},
   url={https://arxiv.org/abs/2509.24527}
+}
+
+@article{chen2025maetok,
+  title={Masked Autoencoders Are Effective Tokenizers for Diffusion Models},
+  author={Chen, Hao and Han, Yujin and Chen, Fangyi and Li, Xiang and Wang, Yidong and Wang, Jindong and Wang, Ze and Liu, Zicheng and Zou, Difan and Raj, Bhiksha},
+  journal={arXiv preprint arXiv:2502.03444},
+  year={2025},
+  url={https://arxiv.org/abs/2502.03444}
 }
   </script>
 </d-bibliography>
