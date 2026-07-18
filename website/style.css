@@ -217,6 +217,23 @@ d-article figure.side {
   }
 }
 
+/* Direct article children use Distill's grid instead of float positioning. */
+@media (min-width: 768px) {
+  d-article > figure.l-body.side {
+    grid-column: text;
+    justify-self: end;
+    width: 50%;
+    margin-right: 0;
+  }
+
+  d-article > figure.l-middle.side {
+    grid-column: middle;
+    justify-self: end;
+    width: 50%;
+    margin-right: 0;
+  }
+}
+
 d-article p {
   clear: left;
 }
