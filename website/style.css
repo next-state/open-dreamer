@@ -56,6 +56,14 @@ body {
   font-size: var(--font-size-base);
 }
 
+blockquote {
+  margin: 1.2em 0;
+  padding: 0.2em 0 0.2em 1em;
+  border-left: 3px solid var(--accent);
+  color: var(--text);
+  font-style: italic;
+}
+
 main {
   width: 100%;
   max-width: 1280px;
@@ -87,5 +95,334 @@ main {
 @media (max-width: 640px) {
   body {
     padding: 0.75rem;
+  }
+}
+
+#colab-hero {
+  margin-right: 20px;
+  display: block;
+  align-self: center;
+  text-align: center;
+  width: 170px;
+  height: 16px;
+  cursor: pointer
+}
+#colab-hero:hover {
+  background-color: rgb(231, 237, 244);
+}
+.colab-root {
+  display: inline-block;
+  background: rgba(255, 255, 255, 0.75);
+  padding: 15px 8px;
+  border-radius: 4px;
+  font-size: 12px !important;
+  text-decoration: none;
+  color: rgb(87, 87, 87);
+  border: none;
+  font-weight: 300;
+  border: solid 1px rgba(0, 0, 0, 0.08);
+  border-bottom-color: rgba(0, 0, 0, 0.08);
+  border-bottom-color: rgba(0, 0, 0, 0.15);
+  text-transform: uppercase;
+  line-height: 16px;
+}
+span.colab-span {
+  background-image: url(https://distill.pub/2020/growing-ca/images/colab.svg);
+  background-repeat: no-repeat;
+  background-size: 20px;
+  background-position-y: 2px;
+  display: inline-block;
+  padding-left: 24px;
+  border-radius: 4px;
+  text-decoration: none;
+}
+
+span.git-span {
+  background-image: url(https://upload.wikimedia.org/wikipedia/commons/9/91/Octicons-mark-github.svg);
+  background-repeat: no-repeat;
+  background-size: 15px;
+  background-position-y: 0px;
+  display: inline-block;
+  padding-left: 18px;
+  border-radius: 4px;
+  text-decoration: none;
+}
+span.mail-span {
+  background-image: url(website/other/email.svg);
+  background-repeat: no-repeat;
+  background-size: 15px;
+  background-position-y: 0px;
+  display: inline-block;
+  padding-left: 18px;
+  border-radius: 4px;
+  text-decoration: none;
+}
+
+p.definition_text {
+  border-left: 6px solid #ccc;
+  padding: 0.01em 16px;
+}
+
+p.theorem_text {
+  border-left: 6px solid #ccc;
+  padding: 0.01em 16px;
+}
+
+div.proof_text {
+  border-left: 3px solid #ccc;
+  padding: 0.01em 16px;
+}
+
+span.value {
+  display: inline-block;
+  width: 25px;
+}
+
+/* Float-based side figures, compatible with Distill's v1 layout names. */
+d-article figure.side {
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0 0 1em;
+  padding: 0;
+}
+
+@media (min-width: 768px) {
+  d-article figure.side {
+    float: right;
+    position: relative;
+    margin-left: 1.5em;
+  }
+
+  d-article figure.l-body.side {
+    width: 50%;
+  }
+
+  d-article figure.l-middle.side {
+    width: calc(50% + 61px);
+    margin-right: -61px;
+  }
+}
+
+@media (min-width: 1000px) {
+  d-article figure.l-middle.side {
+    width: calc(50% + 66px);
+    margin-right: -66px;
+  }
+}
+
+@media (min-width: 1180px) {
+  d-article figure.l-middle.side {
+    width: calc(50% + 92px);
+    margin-right: -92px;
+  }
+}
+
+d-article p {
+  clear: left;
+}
+
+/* table of contents */
+@media (max-width: 1000px) {
+  d-contents {
+    justify-self: start;
+    align-self: start;
+    grid-column-start: 2;
+    grid-column-end: 6;
+    padding-bottom: 0.5em;
+    margin-bottom: 1em;
+    padding-left: 0.25em;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+    border-bottom-width: 1px;
+    border-bottom-style: solid;
+    border-bottom-color: rgba(0, 0, 0, 0.1);
+  }
+}
+
+@media (min-width: 1000px) {
+  d-contents {
+    align-self: start;
+    grid-column-start: 1;
+    grid-column-end: 4;
+    justify-self: end;
+    padding-right: 3em;
+    padding-left: 2em;
+    border-right: 1px solid rgba(0, 0, 0, 0.1);
+    border-right-width: 1px;
+    border-right-style: solid;
+    border-right-color: rgba(0, 0, 0, 0.1);
+  }
+}
+
+@media (min-width: 1180px) {
+  d-contents {
+    grid-column-start: 1;
+    grid-column-end: 4;
+    justify-self: end;
+    padding-right: 3em;
+    padding-left: 2em;
+    border-right: 1px solid rgba(0, 0, 0, 0.1);
+    border-right-width: 1px;
+    border-right-style: solid;
+    border-right-color: rgba(0, 0, 0, 0.1);
+  }
+}
+
+d-contents nav h3 {
+  margin-top: 0;
+  margin-bottom: 1em;
+}
+
+d-contents nav a {
+  color: rgba(0, 0, 0, 0.8);
+  border-bottom: none;
+  text-decoration: none;
+}
+
+d-contents li {
+  list-style-type: none;
+}
+
+d-contents ul {
+  padding-left: 1em;
+}
+
+d-contents nav ul li {
+  margin-bottom: 0.25em;
+}
+
+d-contents nav a:hover {
+  text-decoration: underline solid rgba(0, 0, 0, 0.6);
+}
+
+d-contents nav ul {
+  margin-top: 0;
+  margin-bottom: 6px;
+}
+
+d-contents nav > div {
+  display: block;
+  outline: none;
+  margin-bottom: 0.5em;
+}
+
+d-contents nav > div > a {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+d-contents nav > div > a:hover,
+d-contents nav > ul > li > a:hover {
+  text-decoration: none;
+}
+
+canvas {
+  margin-right: auto;
+  margin-left: auto;
+  display: block;
+}
+
+.graph-container {
+  display: flex;
+  align-items: center;
+}
+.squar {
+  background-color: #6db4e2; /* Blue color */
+  width: 40px;
+  height: 40px;
+}
+.highlight {
+  stroke: #fe6100;
+  stroke-width: 2px;
+  fill: none;
+}
+
+figure {
+  margin-bottom: 1em;
+}
+
+details h2::before {
+  content: '▶ ';
+  display: inline-block;
+  width: 40px;
+}
+
+details[open] h2::before {
+  content: '▼ ';
+}
+
+details summary.custom_spoiler::-webkit-details-marker {
+  display:none;
+}
+
+details h3.topo::before{
+  content:'▶ ';
+  display: 'block-inline';
+  position: 'absolute';
+  width: '40px';
+}
+details[open] h3.topo::before{
+  content:'▼ ';
+  display: 'block-inline';
+  position: 'absolute';
+}
+
+/* this makes sure that the style of the d-section when inside a sumary doesn't fuck up */
+summary d-section {
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+
+@media (min-width: 1000px) {
+  .date-doi {
+    width: 200px;
+  }
+  p.affiliation{
+    width: 300px;
+  }
+  p.author{
+    width: 200px;
+  }
+}
+
+svg#graph {
+  overflow: visible !important;
+}
+
+.citation-short{
+  background: rgba(0, 0, 0, 0.02);
+  border: 1px solid rgba(0,0,0,0.1);
+  padding-top: 20px ;
+  border-radius: 3px;
+}
+
+d-article ul {
+  margin-top: 0.0em;
+  margin-bottom: 1.em;
+}
+
+d-article ul li {
+  margin-bottom: 0.0em;
+}
+
+
+/* For l-gutter class */
+@media (max-width: 767px) {
+  .l-gutter {
+    width: 100%;
+  }
+  .l-gutter-large {
+    width: 100%;
+  }
+}
+
+@media (min-width: 768px) {
+  figcaption.l-gutter {
+    width: 150%;
+  }
+  .l-gutter-large {
+    width: 220%;
+    max-width: 560px;
   }
 }
