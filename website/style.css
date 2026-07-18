@@ -340,6 +340,13 @@ figure {
   margin-bottom: 1em;
 }
 
+.video-figure video {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #000;
+}
+
 details h2::before {
   content: '▶ ';
   display: inline-block;
