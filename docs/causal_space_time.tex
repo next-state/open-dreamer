@@ -1,6 +1,7 @@
 \documentclass[tikz,border=8pt,multi=tikzpicture]{standalone}
 
 \usepackage{amsmath}
+\usepackage{bm}
 \usepackage[T1]{fontenc}
 \usepackage[scaled=0.95]{helvet}
 \usetikzlibrary{arrows.meta,backgrounds,calc,fit,positioning}
@@ -17,6 +18,7 @@
 \definecolor{agentColor}{HTML}{F07A26}
 
 \newcommand{\diagramlabel}[1]{{\sffamily\small\color{diagramText}#1}}
+\newcommand{\tokenmath}[1]{{\normalsize$\bm{#1}$}}
 
 \begin{document}
 
@@ -38,13 +40,13 @@
   agent/.style={token, fill=agentColor},
   flow/.style={->, draw=diagramMuted, line width=0.7pt}
 ]
-\node[action] (linear-am1) {$a_{t-1}$};
-\node[state, right=7mm of linear-am1] (linear-st) {$s_t$};
-\node[agent, right=7mm of linear-st] (linear-pit) {$\pi_t$};
-\node[action, right=7mm of linear-pit] (linear-at) {$a_t$};
-\node[state, right=7mm of linear-at] (linear-st1) {$s_{t+1}$};
-\node[agent, right=7mm of linear-st1] (linear-pit1) {$\pi_{t+1}$};
-\node[action, right=7mm of linear-pit1] (linear-at1) {$a_{t+1}$};
+\node[action] (linear-am1) {\tokenmath{a_{t-1}}};
+\node[state, right=7mm of linear-am1] (linear-st) {\tokenmath{s_t}};
+\node[agent, right=7mm of linear-st] (linear-pit) {\tokenmath{\pi_t}};
+\node[action, right=7mm of linear-pit] (linear-at) {\tokenmath{a_t}};
+\node[state, right=7mm of linear-at] (linear-st1) {\tokenmath{s_{t+1}}};
+\node[agent, right=7mm of linear-st1] (linear-pit1) {\tokenmath{\pi_{t+1}}};
+\node[action, right=7mm of linear-pit1] (linear-at1) {\tokenmath{a_{t+1}}};
 
 \draw[flow] (linear-am1) -- (linear-st);
 \draw[flow] (linear-st) -- (linear-pit);
@@ -83,17 +85,17 @@
   temporal axis/.style={->, draw=diagramPrimary, line width=0.9pt},
   spatial axis/.style={->, draw=stateColor, line width=0.9pt}
 ]
-\node[action] (am2) {$a_{t-2}$};
-\node[state, below=7mm of am2] (sm1) {$s_{t-1}$};
-\node[agent, below=7mm of sm1] (pim1) {$\pi_{t-1}$};
+\node[action] (am2) {\tokenmath{a_{t-2}}};
+\node[state, below=7mm of am2] (sm1) {\tokenmath{s_{t-1}}};
+\node[agent, below=7mm of sm1] (pim1) {\tokenmath{\pi_{t-1}}};
 
-\node[action, right=31mm of am2] (am1) {$a_{t-1}$};
-\node[state, below=7mm of am1] (st) {$s_t$};
-\node[agent, below=7mm of st] (pit) {$\pi_t$};
+\node[action, right=31mm of am2] (am1) {\tokenmath{a_{t-1}}};
+\node[state, below=7mm of am1] (st) {\tokenmath{s_t}};
+\node[agent, below=7mm of st] (pit) {\tokenmath{\pi_t}};
 
-\node[action, right=31mm of am1] (at) {$a_t$};
-\node[state, below=7mm of at] (st1) {$s_{t+1}$};
-\node[agent, below=7mm of st1] (pit1) {$\pi_{t+1}$};
+\node[action, right=31mm of am1] (at) {\tokenmath{a_t}};
+\node[state, below=7mm of at] (st1) {\tokenmath{s_{t+1}}};
+\node[agent, below=7mm of st1] (pit1) {\tokenmath{\pi_{t+1}}};
 
 % Spatial information flow inside each model timestep.
 \draw[flow] (am2) -- (sm1);
@@ -110,11 +112,11 @@
 % Timestep boxes are drawn behind their contents.
 \begin{scope}[on background layer]
   \node[timestep, fit=(am2)(sm1)(pim1),
-        label={[text=diagramText,font=\small]above:$t-1$}] (box-m1) {};
+        label={[text=diagramText]above:{\tokenmath{t-1}}}] (box-m1) {};
   \node[timestep, fit=(am1)(st)(pit),
-        label={[text=diagramText,font=\small]above:$t$}] (box-t) {};
+        label={[text=diagramText]above:{\tokenmath{t}}}] (box-t) {};
   \node[timestep, fit=(at)(st1)(pit1),
-        label={[text=diagramText,font=\small]above:$t+1$}] (box-p1) {};
+        label={[text=diagramText]above:{\tokenmath{t+1}}}] (box-p1) {};
 \end{scope}
 
 % Attention axes.
