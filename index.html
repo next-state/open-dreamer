@@ -279,8 +279,12 @@
           To solve this, we trained a very simple RL agent to collect trajectories, and then we trained a dynamics model first and then we trained a simple policy with a behaviour cloning objective.<d-footnote>The repository that we release doesn't have the behaviour cloning and RL code. This is because we didn't do it for minecraft and we didn't feel it made sense to release it.</d-footnote>
       </p>
       <p>
-          This showed that our pipeline was working end-to-end and we able to move on to scale thing up for minecraft!
+          While far from optimal, we can see the policy learns to run and jump towards the right to get the coin. This showed that our pipeline was working end-to-end and we able to move on to scale thing up for minecraft
       </p>
+      <figure>
+          <img src="website/behaviour-cloning.gif">
+          <figcaption>Figure 11: Some short examples of the behaviour cloning policy</figcaption>
+      </figure>
   </div>
   <h2>Scaling up</h2>
   <div>
@@ -360,20 +364,38 @@
   </p>
   <div> 
   <figure class="l-body side greentext-figure">
-      <pre class="greentext">
-&gt;train world model
-&gt;loss goes down
-&gt;generation quality goes down too
-&gt;distress.jpg
-&gt;spend two weeks fixing it
-&gt;finally looks good
-&gt;relief.jpg
-&gt;scale up
-&gt;loss improves even more
-&gt;generation quality becomes abstract art
-&gt;repeat for six months</pre>
+      <div class="fourchan-post">
+        <div class="fourchan-post-header">
+          <span class="fourchan-post-menu">⋮</span>
+          <strong>Anonymous</strong>
+          <span>07/19/26(Sun)20:06:43 No.420691337</span>
+        </div>
+        <div class="fourchan-post-body">
+          <div class="fourchan-post-image">
+            <img src="website/hollow-inside.jpg" alt="A hollow, exhausted face">
+            <span>15 KB JPG</span>
+          </div>
+          <div class="greentext">
+            &gt;train world model<br>
+            &gt;loss goes down<br>
+            &gt;generation quality goes down too<br>
+            &gt;distress.jpg<br>
+            &gt;spend two weeks fixing it<br>
+            &gt;finally looks good<br>
+            &gt;relief.jpg<br>
+            &gt;scale up<br>
+            &gt;loss improves even more<br>
+            &gt;generation quality becomes abstract art<br>
+            &gt;repeat for six months
+          </div>
+        </div>
+        <div class="fourchan-post-footer">
+          <span>1 Reply</span>
+          <span>View Thread</span>
+        </div>
+      </div>
 
-      <figcaption>Figure 11: The world model training loop, as experienced.</figcaption>
+      <figcaption>Figure 13: The world model training loop, as experienced.</figcaption>
   </figure>
   <p>
       Stability issues haunted this project from beginning to end. More than any other challenge, they consumed the largest share of our time.
@@ -394,7 +416,7 @@
   </p>
   <figure class="l-body">
       <img src="website/optimizer-comparison.svg" alt="" width="100%">
-      <figcaption>Figure: Training loss comparison between Muon <d-cite key="jordan2024muon"></d-cite> and LaProp <d-cite key="liuziyin2020laprop"></d-cite>.</figcaption>
+      <figcaption>Figure 14: Training loss comparison between Muon <d-cite key="jordan2024muon"></d-cite> and LaProp <d-cite key="liuziyin2020laprop"></d-cite>.</figcaption>
   </figure>
 
   <h4>Exponential Moving Average</h4>
@@ -411,7 +433,7 @@
           <a href="website/comparison.mov">view the comparison video</a>
           instead.
       </video>
-      <figcaption>Video: Comparison of the model outputs.</figcaption>
+      <figcaption>Figure 15: Comparison of the model outputs.</figcaption>
   </figure>
 
   <h4>Mixed precision Training</h4>
@@ -424,20 +446,20 @@
 
   <h4>Loss weighting</h4>
   <p>
-      Flow matching models are usually trained to directly predict the velocity field, however v-pred actually sandbags world models
+      Flow matching models are usually trained to directly predict the velocity field to denoise the input v-prediction. Recently, researchers have found that directly predicting the clean data from noisy inputs x-prediction with v-space loss results in higher quality generation <d-cite key="li2025back"></d-cite>
   </p>
   <p>
-      With x-pred instead, given the same context the output of the should be roughly similar regardless of the noise present in the last frame.
+      World models also have an extra inductive bias in favour of x-prediction: Since all context frames are in x-space, it would only be natural to ask the nn to predict the next frame in x-space as well.
+  </p>
+  <p>
   </p>
   <figure class="l-page">
       <img src="website/xpred-vpred-noise-comparison.svg" alt="">
-      <figcaption></figcaption>
+      <figcaption>Figure 16: With x-pred given the same context the output of the should be roughly similar regardless of the noise present in the last frame.</figcaption>
+      
   </figure>
   <p>
-      However since we are still working with flow-matching we decided to opt for a v-space loss with x-space prediction.
-  </p>
-  <p>
-      Thankfully this reduces to just a loss weighting term similar to the one in the dreamer 4 paper&ndash; but with a square term at the denominator
+      In practice doing x-prediction with v-space loss reduces to just a loss weighting term similar to the one in the dreamer 4 paper&ndash; but with a square term at the denominator
       $$
       L_v = \frac{||x -\hat x ||^2}{(1-\tau)^2}
       $$
@@ -593,6 +615,16 @@
   archivePrefix={arXiv},
   primaryClass={stat.ML},
   url={https://www.gpeyre.com/ot4ml/}
+}
+
+@misc{li2025back,
+  title={Back to Basics: Let Denoising Generative Models Denoise},
+  author={Tianhong Li and Kaiming He},
+  year={2025},
+  eprint={2511.13720},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2511.13720}
 }
   </script>
 </d-bibliography>
