@@ -11,24 +11,30 @@
 <div id="space-layer-block-mask" class="space-layer-vis">
   <div class="space-layer-canvas">
   <div class="space-layer-layout">
-    <section aria-labelledby="space-layer-connectivity-heading">
-      <h3 id="space-layer-connectivity-heading">Grouped connectivity</h3>
-      <svg id="space-layer-connectivity" class="space-layer-chart" viewBox="0 0 680 420" role="img" aria-labelledby="space-layer-connectivity-title space-layer-connectivity-desc">
+    <figure class="space-layer-panel" aria-labelledby="space-layer-connectivity-caption">
+      <svg id="space-layer-connectivity" class="space-layer-chart" viewBox="0 0 680 470" role="img" aria-labelledby="space-layer-connectivity-title space-layer-connectivity-desc">
         <title id="space-layer-connectivity-title">Key-to-query connectivity grouped by modality</title>
         <desc id="space-layer-connectivity-desc">Horizontal query and key sequences whose block lengths represent token counts. One arrow is drawn for each allowed modality-block pair.</desc>
       </svg>
-    </section>
+      <div class="space-layer-legend text-small" aria-label="Token groups">
+        <span class="space-layer-legend-item"><span class="space-layer-swatch" style="--sl-color: var(--sl-series-blue)"></span><span class="space-layer-symbol">A</span> action</span>
+        <span class="space-layer-legend-item"><span class="space-layer-swatch" style="--sl-color: var(--sl-series-purple)"></span><span class="space-layer-symbol">τ</span> denoising step</span>
+        <span class="space-layer-legend-item"><span class="space-layer-swatch" style="--sl-color: var(--sl-series-pink)"></span><span class="space-layer-symbol">X</span> spatial</span>
+        <span class="space-layer-legend-item"><span class="space-layer-swatch" style="--sl-color: var(--sl-series-orange)"></span><span class="space-layer-symbol">R</span> register</span>
+        <span class="space-layer-legend-item"><span class="space-layer-swatch" style="--sl-color: var(--sl-series-yellow)"></span><span class="space-layer-symbol">π</span> agent</span>
+      </div>
+      <figcaption id="space-layer-connectivity-caption">(a) Allowed information flow between token groups.</figcaption>
+    </figure>
 
-    <section aria-labelledby="space-layer-matrix-heading">
-      <h3 id="space-layer-matrix-heading">Block Q–K mask</h3>
+    <figure class="space-layer-panel" aria-labelledby="space-layer-matrix-caption">
       <svg id="space-layer-matrix" class="space-layer-chart" viewBox="0 0 560 520" role="img" aria-labelledby="space-layer-matrix-title space-layer-matrix-desc">
         <title id="space-layer-matrix-title">Query-key mask grouped by modality</title>
         <desc id="space-layer-matrix-desc">Rows are query modality blocks and columns are key modality blocks. Filled rectangles are allowed connections; their sizes reflect the number of tokens in each block.</desc>
       </svg>
-    </section>
+      <figcaption id="space-layer-matrix-caption">(b) The same connectivity written as a query–key mask.</figcaption>
+    </figure>
   </div>
 
-  <div id="space-layer-status" class="space-layer-status text-small" aria-live="polite"></div>
   </div>
 </div>
 
@@ -83,12 +89,43 @@
     align-items: start;
   }
 
-  #space-layer-block-mask section {
+  #space-layer-block-mask .space-layer-panel {
     min-width: 0;
+    margin: 0;
   }
 
-  #space-layer-block-mask h3 {
-    margin-block: 0 0.35rem;
+  #space-layer-block-mask .space-layer-panel figcaption {
+    margin-block-start: 0.35rem;
+    color: var(--sl-text-muted);
+    font-size: 12px;
+    line-height: 1.5em;
+  }
+
+  #space-layer-block-mask .space-layer-legend {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0.3rem 0.9rem;
+    margin-block-start: 0.35rem;
+    color: var(--sl-text);
+  }
+
+  #space-layer-block-mask .space-layer-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    white-space: nowrap;
+  }
+
+  #space-layer-block-mask .space-layer-swatch {
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: 0.2rem;
+    background: var(--sl-color);
+  }
+
+  #space-layer-block-mask .space-layer-symbol {
+    font-weight: 500;
   }
 
   #space-layer-block-mask .space-layer-chart {
@@ -100,9 +137,7 @@
 
   #space-layer-block-mask .sl-sequence-label,
   #space-layer-block-mask .sl-axis-title,
-  #space-layer-block-mask .sl-axis-label,
-  #space-layer-block-mask .sl-block-label,
-  #space-layer-block-mask .sl-legend-label {
+  #space-layer-block-mask .sl-axis-label {
     fill: var(--sl-text);
     font-size: calc(var(--font-size-base) * 1.4);
     font-weight: 500;
@@ -166,15 +201,6 @@
     stroke: var(--sl-text-muted);
   }
 
-  #space-layer-block-mask .sl-block-label {
-    transition: fill 140ms ease, opacity 140ms ease;
-  }
-
-  #space-layer-block-mask .sl-block.is-dimmed .sl-block-label {
-    fill: var(--sl-text-muted);
-    opacity: 0.4;
-  }
-
   #space-layer-block-mask .sl-edge.is-dimmed {
     stroke: var(--sl-border);
     opacity: 0.18;
@@ -231,15 +257,23 @@
     opacity: 1;
   }
 
-  #space-layer-block-mask .space-layer-status {
-    min-height: 1.5em;
-    margin-block-start: 0.35rem;
-    color: var(--sl-text-muted);
-  }
-
   @media (max-width: 640px) {
     #space-layer-block-mask .space-layer-layout {
       grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  @media (max-width: 360px) {
+    #space-layer-block-mask .sl-sequence-label,
+    #space-layer-block-mask .sl-axis-title,
+    #space-layer-block-mask .sl-axis-label {
+      font-size: calc(var(--font-size-base) * 2.1);
+    }
+  }
+
+  @media (min-width: 1024px) {
+    #space-layer-block-mask .space-layer-panel figcaption {
+      font-size: 13px;
     }
   }
 
@@ -260,17 +294,60 @@
 
   const connectivitySvg = root.querySelector('#space-layer-connectivity');
   const matrixSvg = root.querySelector('#space-layer-matrix');
-  const status = root.querySelector('#space-layer-status');
   const NS = 'http://www.w3.org/2000/svg';
 
   const dynamicsMask = {
-    summary: 'A query reads keys at the same or a lower hierarchy level.',
     groups: [
-      { id: 'action', label: 'Action', short: 'A', count: 1, level: 0, color: 'var(--sl-series-blue)' },
-      { id: 'shortcut', label: 'Shortcut', short: 'C', count: 1, level: 1, color: 'var(--sl-series-purple)' },
-      { id: 'spatial', label: 'Spatial', short: 'Z', count: 6, level: 1, color: 'var(--sl-series-pink)' },
-      { id: 'register', label: 'Register', short: 'R', count: 2, level: 1, color: 'var(--sl-series-orange)' },
-      { id: 'agent', label: 'Agent', short: 'G', count: 1, level: 2, color: 'var(--sl-series-yellow)' }
+      {
+        id: 'action',
+        label: 'action',
+        short: 'A',
+        count: 1,
+        level: 0,
+        color: 'var(--sl-series-blue)',
+        queryInsight: 'Action queries combine the control inputs for this timestep without looking ahead into the state those controls are meant to influence.',
+        keyInsight: 'Action keys are visible to every later group, allowing the denoiser and agent to condition on what was done.'
+      },
+      {
+        id: 'denoising-step',
+        label: 'denoising step',
+        short: 'τ',
+        count: 1,
+        level: 1,
+        color: 'var(--sl-series-purple)',
+        queryInsight: 'The denoising-step query combines the signal level and requested shortcut step size with the state it governs.',
+        keyInsight: 'The denoising-step key tells state tokens how noisy X is and how far this pass should move it toward a clean latent.'
+      },
+      {
+        id: 'spatial',
+        label: 'spatial',
+        short: 'X',
+        count: 6,
+        level: 1,
+        color: 'var(--sl-series-pink)',
+        queryInsight: 'Spatial queries turn the noisy visual latents into a coherent next-state representation using the action, denoising condition, within-frame context, and registers.',
+        keyInsight: 'Spatial keys carry the noisy visual state that the layer denoises and that the agent uses to choose behavior.'
+      },
+      {
+        id: 'register',
+        label: 'register',
+        short: 'R',
+        count: 2,
+        level: 1,
+        color: 'var(--sl-series-orange)',
+        queryInsight: 'Register queries gather global features from the state into a shared scratch space, helping distant spatial tokens stay coordinated.',
+        keyInsight: 'Register keys redistribute shared global context to the denoiser and expose that context to the agent.'
+      },
+      {
+        id: 'agent',
+        label: 'agent',
+        short: 'π',
+        count: 1,
+        level: 2,
+        color: 'var(--sl-series-yellow)',
+        queryInsight: 'The task-conditioned agent query reads the completed state to predict the next action, reward, and value; nothing in the world model can read back from it.',
+        keyInsight: 'Agent keys are private to the agent group. Keeping π hidden from world-model tokens prevents task or policy information from leaking into predicted dynamics.'
+      }
     ],
     allowed: (query, key) => query.level >= key.level
   };
@@ -353,14 +430,6 @@
       rx: '7',
       ry: '7'
     }));
-    const visibleLabel = group.width >= 100 ? group.label : group.short;
-    appendText(wrapper, `${visibleLabel} ×${group.count}`, {
-      class: 'sl-block-label',
-      x: group.center,
-      y: y + height / 2,
-      'text-anchor': 'middle',
-      'dominant-baseline': 'middle'
-    });
     parent.appendChild(wrapper);
   }
 
@@ -376,7 +445,7 @@
       dynamicsMask.groups.filter(query => dynamicsMask.allowed(query, key))
     ]));
     const queryY = 58;
-    const keyY = 310;
+    const keyY = 350;
     const blockHeight = 52;
 
     const defs = svgElement('defs');
@@ -429,29 +498,6 @@
     groups.forEach(group => drawBlock(blocks, group, 'k', keyY, blockHeight));
     connectivitySvg.appendChild(blocks);
 
-    const legend = svgElement('g', { 'aria-hidden': 'true' });
-    const legendItemWidth = dynamicsMask.groups.length > 4 ? 124 : 160;
-    const legendWidth = legendItemWidth * dynamicsMask.groups.length;
-    const legendStart = (680 - legendWidth) / 2;
-    dynamicsMask.groups.forEach((group, index) => {
-      const x = legendStart + index * legendItemWidth;
-      legend.appendChild(svgElement('rect', {
-        x,
-        y: '393',
-        width: '12',
-        height: '12',
-        rx: '3',
-        fill: group.color,
-        'fill-opacity': '1'
-      }));
-      appendText(legend, `${group.short}  ${group.label}`, {
-        class: 'sl-legend-label',
-        x: x + 18,
-        y: '399',
-        'dominant-baseline': 'middle'
-      });
-    });
-    connectivitySvg.appendChild(legend);
   }
 
   function proportionalLayout(groups, start, size) {
@@ -545,13 +591,17 @@
     return root.querySelectorAll('.sl-mark');
   }
 
+  function setFigureCaption(description) {
+    window.parent.postMessage({ type: 'figure-7-caption', description }, '*');
+  }
+
   function resetHighlight() {
     root.querySelectorAll('.is-dimmed, .is-active, .is-related, .is-blocked-endpoint, .is-pair-active').forEach(element => {
       element.classList.remove('is-dimmed', 'is-active', 'is-related', 'is-blocked-endpoint', 'is-pair-active');
       element.style.removeProperty('--sl-active-color');
       if (element.classList.contains('sl-edge')) element.setAttribute('marker-end', 'url(#space-arrow)');
     });
-    status.textContent = dynamicsMask.summary;
+    setFigureCaption(null);
   }
 
   function dimAllMarks() {
@@ -569,6 +619,54 @@
 
   function selectAll(selector) {
     return Array.from(root.querySelectorAll(selector));
+  }
+
+  function pairInsight(query, key, allowed) {
+    if (!allowed) {
+      if (query.id === 'action') {
+        return 'Causality keeps action queries from inspecting the state or agent outputs that follow the action.';
+      }
+      if (key.id === 'agent') {
+        return 'World-model tokens cannot read π. Task and policy information can influence future states only after it becomes the next action A.';
+      }
+      return 'This connection is excluded to preserve the within-timestep causal order.';
+    }
+
+    if (query.id === 'action') {
+      return 'Action components can combine into one control representation without seeing the state they will influence.';
+    }
+    if (query.id === 'agent') {
+      const insights = {
+        action: 'The agent relates the current state to the action that led into it.',
+        'denoising-step': 'The agent can account for the current noise level when it reads noisy states during training.',
+        spatial: 'The task-conditioned agent reads the visual state to predict policy, reward, and value.',
+        register: 'The agent consumes the global features assembled in the world model’s shared workspace.',
+        agent: 'Agent tokens combine task context and coordinate their policy, reward, and value readouts.'
+      };
+      return insights[key.id];
+    }
+    if (key.id === 'action') {
+      return 'The state update is action-conditioned: what the agent did can change the predicted next frame.';
+    }
+
+    const stateInsights = {
+      'denoising-step': {
+        'denoising-step': 'The conditioning token retains the signal level and requested shortcut step size for this pass.',
+        spatial: 'The denoising condition is contextualized by the noisy latent it governs.',
+        register: 'Shared registers provide global state context to the denoising condition.'
+      },
+      spatial: {
+        'denoising-step': 'The denoiser learns how noisy X is and how far this pass should move it toward a clean state.',
+        spatial: 'Spatial latents exchange within-frame information so distant parts of the scene remain coherent.',
+        register: 'Registers provide global scratch space that coordinates details across spatial tokens.'
+      },
+      register: {
+        'denoising-step': 'Registers know the denoising target for the current pass.',
+        spatial: 'Registers gather a global summary from the latent scene.',
+        register: 'Registers refine the shared intermediate features used across the state.'
+      }
+    };
+    return stateInsights[query.id][key.id];
   }
 
   function highlightQuery(queryId) {
@@ -591,7 +689,7 @@
     });
     const axis = root.querySelector(`.sl-axis-label[data-axis="q"][data-group="${queryId}"]`);
     if (axis) axis.classList.add('is-active');
-    status.textContent = `${query.label} queries read ${allowedKeys.map(key => key.label).join(', ')} keys.`;
+    setFigureCaption(`${query.short} ${query.label} — ${query.queryInsight}`);
   }
 
   function highlightKey(keyId) {
@@ -614,7 +712,7 @@
     });
     const axis = root.querySelector(`.sl-axis-label[data-axis="k"][data-group="${keyId}"]`);
     if (axis) axis.classList.add('is-active');
-    status.textContent = `${key.label} keys are read by ${allowedQueries.map(query => query.label).join(', ')} queries.`;
+    setFigureCaption(`${key.short} ${key.label} — ${key.keyInsight}`);
   }
 
   function highlightPair(queryId, keyId, useOrange) {
@@ -637,34 +735,43 @@
         edge.classList.add('is-pair-active');
         edge.setAttribute('marker-end', 'url(#space-arrow-pair)');
       }
-      status.textContent = `Allowed: ${key.label} keys send information to ${query.label} queries.`;
+      setFigureCaption(`${query.short} reads ${key.short} — ${pairInsight(query, key, true)}`);
     } else {
       queryBlock.classList.add('is-blocked-endpoint');
       keyBlock.classList.add('is-blocked-endpoint');
-      status.textContent = `Blocked: ${query.label} queries cannot read ${key.label} keys.`;
+      setFigureCaption(`${query.short} cannot read ${key.short} — ${pairInsight(query, key, false)}`);
     }
     selectAll(`.sl-axis-label[data-axis="q"][data-group="${queryId}"], .sl-axis-label[data-axis="k"][data-group="${keyId}"]`).forEach(label => label.classList.add('is-active'));
   }
 
   function attachInteractions() {
-    root.querySelectorAll('.sl-block').forEach(block => {
-      block.addEventListener('pointerenter', () => {
-        const side = block.dataset.side;
-        const group = block.dataset.group;
-        if (side === 'q') highlightQuery(group);
-        else highlightKey(group);
-      });
-      block.addEventListener('pointerleave', resetHighlight);
-    });
+    let hoveredMark = null;
 
-    root.querySelectorAll('.sl-edge').forEach(edge => {
-      edge.addEventListener('pointerenter', () => highlightPair(edge.dataset.q, edge.dataset.k, false));
-      edge.addEventListener('pointerleave', resetHighlight);
-    });
+    const showMarkDescription = mark => {
+      if (mark.classList.contains('sl-block')) {
+        if (mark.dataset.side === 'q') highlightQuery(mark.dataset.group);
+        else highlightKey(mark.dataset.group);
+      } else if (mark.classList.contains('sl-edge')) {
+        highlightPair(mark.dataset.q, mark.dataset.k, false);
+      } else if (mark.classList.contains('sl-cell')) {
+        highlightPair(mark.dataset.q, mark.dataset.k, true);
+      }
+    };
 
-    root.querySelectorAll('.sl-cell').forEach(cell => {
-      cell.addEventListener('pointerenter', () => highlightPair(cell.dataset.q, cell.dataset.k, true));
-      cell.addEventListener('pointerleave', resetHighlight);
+    const updateHoveredMark = event => {
+      const mark = event.target.closest?.('.sl-mark') || null;
+      if (mark === hoveredMark) return;
+      hoveredMark = mark;
+      if (mark) showMarkDescription(mark);
+      else resetHighlight();
+    };
+
+    root.addEventListener('mouseover', updateHoveredMark);
+    root.addEventListener('mousemove', updateHoveredMark);
+    root.addEventListener('click', updateHoveredMark);
+    root.addEventListener('mouseleave', () => {
+      hoveredMark = null;
+      resetHighlight();
     });
   }
 

@@ -20,6 +20,25 @@
         ],
         throwOnError: false
       });
+
+      const figure7Frame = document.querySelector('iframe[src="website/space-layer-mask.html"]');
+      const figure7Caption = document.getElementById('figure-7-caption');
+      if (figure7Frame && figure7Caption) {
+        const defaultFigure7Caption = figure7Caption.textContent.trim();
+        const restoreFigure7Caption = () => {
+          figure7Caption.textContent = defaultFigure7Caption;
+        };
+        figure7Frame.addEventListener('mouseleave', restoreFigure7Caption);
+        window.addEventListener('message', event => {
+          if (event.origin !== window.location.origin || event.source !== figure7Frame.contentWindow) return;
+          if (event.data?.type !== 'figure-7-caption') return;
+          if (typeof event.data.description === 'string') {
+            figure7Caption.textContent = `Figure 7: ${event.data.description}`;
+          } else {
+            restoreFigure7Caption();
+          }
+        });
+      }
     });
   </script>
 
@@ -207,8 +226,8 @@
   </p>
   <figure class="l-page">
       <iframe src="website/space-layer-mask.html" title="Interactive visualization of the space-layer attention mask" width="100%" height="520" loading="lazy" style="display: block; border: 0;"></iframe>
+      <figcaption id="figure-7-caption" aria-live="polite">Figure 7: Space-layer attention in one dynamics timestep. The previous action A conditions the denoising step τ, spatial latents X, and shared registers R; the agent token π reads the resulting state to predict behavior. World-model tokens cannot read π, so task and policy information can affect future states only through the next action.</figcaption>
   </figure>
-  <figcation>figure 7: </figcation>
   <div>
   <h2>Coinrun experiments</h2>
 
@@ -265,21 +284,6 @@
   </div>
   <h2>Scaling up</h2>
   <div>
-      <figure class="l-body side greentext-figure">
-          <pre class="greentext">&gt;train world model
-&gt;loss goes down
-&gt;generation quality goes down too
-&gt;distress.jpg
-&gt;spend two weeks fixing it
-&gt;finally looks good
-&gt;relief.jpg
-&gt;scale up
-&gt;loss improves even more
-&gt;generation quality becomes abstract art
-&gt;repeat for six months</pre>
-
-          <figcaption>Figure 11: The world model training loop, as experienced.</figcaption>
-      </figure>
       <p>
           From this point on, debugging became much harder, and scaling from a working CoinRun model to Minecraft consumed most of our time. By documenting the failure modes and fixes, we hope to make this phase substantially faster for you.
       </p>
@@ -354,6 +358,23 @@
   <p>
       We believe this section will be the most valuable for practitioners, as it focuses on the problems that repeatedly blocked our progress and the lessons we learned while overcoming them.
   </p>
+  <div> 
+  <figure class="l-body side greentext-figure">
+      <pre class="greentext">
+&gt;train world model
+&gt;loss goes down
+&gt;generation quality goes down too
+&gt;distress.jpg
+&gt;spend two weeks fixing it
+&gt;finally looks good
+&gt;relief.jpg
+&gt;scale up
+&gt;loss improves even more
+&gt;generation quality becomes abstract art
+&gt;repeat for six months</pre>
+
+      <figcaption>Figure 11: The world model training loop, as experienced.</figcaption>
+  </figure>
   <p>
       Stability issues haunted this project from beginning to end. More than any other challenge, they consumed the largest share of our time.
   </p>
@@ -363,7 +384,7 @@
   <p>
       Let&rsquo;s start from the simplest to hardest ones.
   </p>
-
+</div>
   <h4>Optimizers</h4>
   <p>
       We&rsquo;ve found it very cumbersome to work with the Adam-family of optimizers, they would spike at random and those loss spikes would get more and more frequent with time. By contrast Muon <d-cite key="jordan2024muon"></d-cite> proved to be much more stable and yielded much lower losses. Below you can see two runs with a budget of ~400xB200h each.

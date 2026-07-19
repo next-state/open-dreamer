@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1920" height="820" viewBox="0 0 1920 820">
-  <rect width="1920" height="820" fill="#F7F8FC"/>
   <style>
     .sans { font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     .panel { font-size: 30px; font-weight: 780; fill: #1F2937; }
