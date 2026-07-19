@@ -475,29 +475,41 @@
   <p>
       More specifically, we use minibatch barycentric OT between entire noise and latent sequences <d-cite key="genevay2018sinkhorn, peyre2025optimal"></d-cite>. We&rsquo;ve found this helped make generation more stable during rollout .
   </p>
-
+  <h4>mu-parametrization</h4>
+  <p>
+      We've also tried playing with $\mu$-parametrization, however we've found it to be not needed for multipe reasons:
+  <ul>
+      <li>The smallest minecraft model we trained was just one order of magnitude smaller than the final model.</li>
+      <li>The muon optimizer keeps hyperparamters more stable through different model sizes <d-cite key="bernstein2025derivingmuon"></d-cite>.</li>
+  </ul>
+  </p>
+  
   <h3>Showcase the repository</h3>
   <p>
       Along with the blog post we are releasing the repository with the training code and dataset. Inside that code there are all the lessons we learned. We hope it will be of use to you
   </p>
 
-  <h3>Conclusion</h3>
+  <h3>The next starting point</h3>
   <p>
-      The biggest lesson from this project is that training a frontier-level world model is not one heroic leap. It is a sequence of smaller, testable problems: prove the architecture on a cheap environment, make every part of the pipeline observable, and only then spend the compute required to scale. CoinRun gave us a fast place to get the tokenizer, dynamics model, and policy working together; Minecraft exposed the systems and stability problems that only appear when the same ideas are pushed much further.
-  </p>
-  <p>
-      The final model matters, but the failures along the way are just as valuable. Efficient sharding, activation checkpointing, fixed input shapes, pre-tokenized data, EMA weights, careful precision choices, loss weighting, and optimal transport were not minor implementation details&mdash;they were what made training possible. We hope that documenting them saves others from having to rediscover the same lessons through expensive failed runs.
-  </p>
-  <p>
-      We are releasing the model, training code, and data so that this work can be a starting point rather than an endpoint. Try it, reproduce our results, adapt it to new environments, and challenge the choices we made. If you find a bug, discover a better recipe, or build something interesting with the repository, please open an issue or get in touch. Frontier world-model research should be something more people can participate in, and we hope this release helps make that possible.
+      We set out to reproduce Dreamer 4 and ended up with something more useful than a checkpoint: a trail through the expensive mistakes. The model, code, and data are yours&mdash;reproduce them, break them, or take them somewhere we did not imagine. The frontier is simply where the map runs out; we hope this release moves your starting line a little closer to it.
   </p>
 
-  <h3>Acknowledgements</h3>
-  <p>
-      Let&rsquo;s thank the guys that helped us: Reactor, P(doom), Rami, Danijar and Wilson, Yong-hyun Park (add people that we might have forgotten! Maybe Minjune and Davide?)
-  </p>
 
 </d-article>
+<d-appendix>
+    <h3>Acknowledgements</h3>
+    <p>
+        Other than <a href="https://www.reactor.inc/">Reactor</a>, who generosly sponsored this project, we want to thank
+        <a href="https://x.com/maharajamihir">Mihir Mahajan</a>,
+        <a href="https://derewah.dev/">Davide Locatelli</a>,
+        <a href="https://ramis.ai/">Rami Seid</a>,
+        <a href="https://srambical.fr/">Franz srambical</a>,
+        <a href="https://enkeejunior1.github.io/">Yong-hyun Park</a>,
+        <a href="https://danijar.com">Danijar Hafner</a> and
+        <a href="https://wilsonyan.com/">Wilson Yan</a>
+    </p>
+
+</d-appendix>
 <d-bibliography>
   <script type="text/bibtex">
 @article{vaswani2017attention,
@@ -625,6 +637,13 @@
   archivePrefix={arXiv},
   primaryClass={cs.CV},
   url={https://arxiv.org/abs/2511.13720}
+}
+
+@misc{bernstein2025derivingmuon,
+  title={Deriving Muon},
+  author={Bernstein, Jeremy},
+  year={2025},
+  url={https://jeremybernste.in/writing/deriving-muon}
 }
   </script>
 </d-bibliography>
