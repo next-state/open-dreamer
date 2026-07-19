@@ -74,9 +74,12 @@
   </div>
 </d-byline>
 <d-article>
-  <p>
-      In the last few months we’ve been working on making a frontier-level world model. We release and open source the model, the training code, and in this blog post with all the lessons we learned along the way. We want to make frontier research accessible to everyone and hope this will accelerate progress in the field.
-  </p>
+<p>
+    One of the most time consuming parts of doing science is climbing up to the shoulders of the giants. While this can be a very instructive experience, sometimes it’s very nice to be teleported right on top of it and get to work right away pushing the boundary of human knowledge.
+</p>
+<p>
+    In the last few months we’ve been working on making a frontier-level world model. We release and open source the model, the training code, and in this blog post with all the lessons we learned along the way. We want to make frontier research accessible to everyone and hope this will accelerate progress in the field.
+</p>
 
   <h2>A survival guide to training a world model</h2>
   <div>
@@ -142,7 +145,7 @@
       If you have ever trained a VAE in the past, you know how terrible of an experience that is. Most of the time the wisest thing to do is to give up and take an off-the-shelf one.
   </p>
   <p>
-      In this project we’ve trained a transformer-based Masked Autoencoder <d-cite key="chen2025maetok"></d-cite> with 100x compression, and we probably could have aimed higher.
+      In this project we’ve trained a transformer-based Masked Autoencoder <d-cite key="chen2025maetok"></d-cite> with ~100x compression, and we probably could have aimed higher.
   </p>
   <p>
       This architecture is really cool because:
@@ -156,7 +159,7 @@
   </ul>
   <h3>The Dynamics Model (World Model)</h3>
   <p>
-      World models fundamentally work by doing “next frame prediction”. Each frame is generated as an image conditioned on the previous ones. The dynamics model is trained with diffusion forcing with flow matching and shortcut models.
+      World models fundamentally work by doing “next frame prediction”. Each frame is generated as an image conditioned on the previous ones. The dynamics model is trained with diffusion forcing <d-cite key="chen2024diffusionforcing"></d-cite> with flow matching <d-cite key="lipman2023flowmatching"></d-cite> and shortcut models <d-cite key="frans2024onestep"></d-cite>.
   </p>
   </div>
   <figure class="l-gutter l-gutter-large">
@@ -169,7 +172,7 @@
   </figure>
   <p>
       Other than predicting just the next frame, we worked on predicting the next action as well.
-      Typically, the rollout alternates between the world and the agent. Given the previous action, the dynamics predicts the next state; the policy observes that state and samples the next action:
+      Typically, the rollout alternates between the world and the agent. Given the previous action $a_{t-1}$, the dynamics predicts the next state $s_t$; the policy $\pi_t$ observes that state and samples the next action:
   </p>
   <figure class="l-body-outset">
       <img src="website/causal-sequence.svg" alt="Causal rollout sequence: the previous action produces the current state, the policy reads that state and produces the next action, and the cycle repeats.">
@@ -194,9 +197,8 @@
   <p>
       What does $s_t$ contain? The state is the part generated through diffusion—or, more precisely, the model diffuses its latent spatial tokens. The state computation therefore includes:
   </p>
-  <ul>
-      <li>a noise-level token describing how corrupted the current latent is;</li>
-      <li>a shortcut step-size index describing how far the model should advance in one denoising step, following Shortcut Models <d-cite key="frans2024onestep"></d-cite>;</li>
+  <ul class="space-token-list">
+      <li>a noise-level and shortcut step-size token describing how far the model should advance in one denoising step, following Shortcut Models <d-cite key="frans2024onestep"></d-cite>;</li>
       <li>spatial latent tokens representing the visual state;</li>
       <li>register tokens, which provide shared workspace for internal computation. <d-cite key="darcet2023registers"></d-cite></li>
   </ul>
@@ -206,6 +208,7 @@
   <figure class="l-page">
       <iframe src="website/space-layer-mask.html" title="Interactive visualization of the space-layer attention mask" width="100%" height="520" loading="lazy" style="display: block; border: 0;"></iframe>
   </figure>
+  <figcation>figure 7: </figcation>
   <div>
   <h2>Coinrun experiments</h2>
 
@@ -239,26 +242,54 @@
         $D \propto C^{0.44}$ respectively.
       </figcaption>
   </figure>
-  <figure class="l-middle side video-figure">
-      <video controls playsinline preload="metadata" width="640" height="576">
-          <source src="website/coinrun-wm.mp4" type="video/mp4">
-          <source src="website/coinrun-wm.mov" type="video/quicktime">
-          Your browser cannot play this video. You can
-          <a href="website/coinrun-wm.mp4">download the Coinrun world-model rollout</a>
-          instead.
-      </video>
-      <figcaption>Figure 10: Our first prototype of an interactive world model</figcaption>
-  </figure>
+  <div class="coinrun-demo">
+      <figure class="l-middle side video-figure">
+          <video controls playsinline preload="metadata" width="640" height="576">
+              <source src="website/coinrun-wm.mp4" type="video/mp4">
+              <source src="website/coinrun-wm.mov" type="video/quicktime">
+              Your browser cannot play this video. You can
+              <a href="website/coinrun-wm.mp4">download the Coinrun world-model rollout</a>
+              instead.
+          </video>
+          <figcaption>Figure 10: Our first prototype of an interactive world model</figcaption>
+      </figure>
+      <p>
+          We first tried to train world model with random actions, but when we tried playing with model we found the experience quite terrible.
+      </p>
+      <p>
+          To solve this, we trained a very simple RL agent to collect trajectories, and then we trained a dynamics model first and then we trained a simple policy with a behaviour cloning objective.<d-footnote>The repository that we release doesn't have the behaviour cloning and RL code. This is because we didn't do it for minecraft and we didn't feel it made sense to release it.</d-footnote>
+      </p>
+      <p>
+          This showed that our pipeline was working end-to-end and we able to move on to scale thing up for minecraft!
+      </p>
+  </div>
   <h2>Scaling up</h2>
-  <p>
-      From this point on, debugging became much harder, and scaling from a working CoinRun model to Minecraft consumed most of our time. By documenting the failure modes and fixes, we hope to make this phase substantially faster for you.
-  </p>
-  <p>
-      The two main challenges when scaling up are: squeezing as much compute out of the gpus available and making sure everything is stable.
-  </p>
-  <p>
-      We used JAX because the XLA compiler is great for efficient and scalable SPMD programs. If you are not familiar we encourage you to read this page that illustrates how all that is done
-  </p>
+  <div>
+      <figure class="l-body side greentext-figure">
+          <pre class="greentext">&gt;train world model
+&gt;loss goes down
+&gt;generation quality goes down too
+&gt;distress.jpg
+&gt;spend two weeks fixing it
+&gt;finally looks good
+&gt;relief.jpg
+&gt;scale up
+&gt;loss improves even more
+&gt;generation quality becomes abstract art
+&gt;repeat for six months</pre>
+
+          <figcaption>Figure 11: The world model training loop, as experienced.</figcaption>
+      </figure>
+      <p>
+          From this point on, debugging became much harder, and scaling from a working CoinRun model to Minecraft consumed most of our time. By documenting the failure modes and fixes, we hope to make this phase substantially faster for you.
+      </p>
+      <p>
+          The two main challenges when scaling up are: squeezing as much compute out of the gpus available and making sure everything is stable.
+      </p>
+      <p>
+          We used JAX because the XLA compiler is great for efficient and scalable SPMD programs.
+      </p>
+  </div>
 
   <h3>Computemaxxing</h3>
   <p>
@@ -272,7 +303,7 @@
   </p>
   <figure class="l-page">
       <img src="website/roofline-analysis.svg" alt="B200 roofline chart showing the 292 FLOP-per-byte crossover and Dreamer dynamics training in the compute-bound region at 57 to 58 percent MFU" width="100%">
-      <figcaption>Figure 11: Roofline analysis for Dreamer dynamics training on a B200 GPU. Batching 256 frames per GPU places the workload beyond the ridge point, where throughput is limited by compute rather than memory bandwidth.</figcaption>
+      <figcaption>Figure 12: Roofline analysis for Dreamer dynamics training on a B200 GPU. Batching 256 frames per GPU places the workload beyond the ridge point, where throughput is limited by compute rather than memory bandwidth.</figcaption>
   </figure>
   <p>
       For transformer training, arithmetic intensity improves as you increase the number of tokens per GPU because weights are reused across every token in the batch.
@@ -284,7 +315,7 @@
       In our case we discovered that feeding 256 frames per GPU would be more than enough to be in the compute-bound region. In practice it&rsquo;s impossible to reach 100% MFU and 60% is considered a very healthy value of transformer training.
   </p>
   <p>
-      For more details on how to do this kind of analysis check the scaling book
+      For more details on how to do this kind of analysis, check the scaling book <d-cite key="scaling-book"></d-cite>.
   </p>
 
   <h4>Sharding</h4>
@@ -327,7 +358,7 @@
       Stability issues haunted this project from beginning to end. More than any other challenge, they consumed the largest share of our time.
   </p>
   <p>
-      Unlike syntax errors, which immediately halt execution, or synchronization bugs, where the failure mode is usually obvious, stability issues are far more elusive. They often emerge only at large scales&mdash;high data volumes, long training runs, and significant amounts of compute. As a result, they can take days or even weeks to surface. And when they finally do, the root cause is rarely apparent. As a matter of fact, most stability problems happen <strong>despite</strong> the loss going down! MSE goes down smoothly, but the generation quality degrades significantly.
+      Unlike syntax errors, which immediately halt execution, or synchronization bugs, where the failure mode is usually visible, stability issues are far more elusive. They often emerge only at large scales&mdash;high data volumes, long training runs, and significant amounts of compute. As a result, they can take days or even weeks to surface. And when they finally do, the root cause is rarely apparent. As a matter of fact, most stability problems happen <strong>despite</strong> the loss going down! MSE goes down smoothly, but the generation quality degrades significantly.
   </p>
   <p>
       Let&rsquo;s start from the simplest to hardest ones.
@@ -335,11 +366,15 @@
 
   <h4>Optimizers</h4>
   <p>
-      We&rsquo;ve found it very cumbersome to work with the Adam-family of optimizers, they would spike at random and those loss spikes would get more and more frequent with time. By contrast Muon proved to be much more stable and yielded much lower losses. Below you can see two runs with a budget of 10k$ each.
+      We&rsquo;ve found it very cumbersome to work with the Adam-family of optimizers, they would spike at random and those loss spikes would get more and more frequent with time. By contrast Muon <d-cite key="jordan2024muon"></d-cite> proved to be much more stable and yielded much lower losses. Below you can see two runs with a budget of ~400xB200h each.
   </p>
   <p>
       This is the simplest stability problem because it&rsquo;s the only one that is visible in the loss curve.
   </p>
+  <figure class="l-body">
+      <img src="website/optimizer-comparison.svg" alt="" width="100%">
+      <figcaption>Figure: Training loss comparison between Muon <d-cite key="jordan2024muon"></d-cite> and LaProp <d-cite key="liuziyin2020laprop"></d-cite>.</figcaption>
+  </figure>
 
   <h4>Exponential Moving Average</h4>
   <p>
@@ -348,6 +383,15 @@
       \theta_\textrm{EMA} \leftarrow \beta \theta_\textrm{EMA} + (1-\beta)\theta
       $$
   </p>
+  <figure class="l-body video-figure">
+      <video controls playsinline preload="metadata" width="640">
+          <source src="website/comparison.mov" type="video/quicktime">
+          Your browser cannot play this video. You can
+          <a href="website/comparison.mov">view the comparison video</a>
+          instead.
+      </video>
+      <figcaption>Video: Comparison of the model outputs.</figcaption>
+  </figure>
 
   <h4>Mixed precision Training</h4>
   <p>
@@ -368,7 +412,10 @@
       However since we are still working with flow-matching we decided to opt for a v-space loss with x-space prediction.
   </p>
   <p>
-      Thankfully this reduces to just a loss weighting term similar to the one in the dreamer4 paper&ndash; but with a square term at the denominator
+      Thankfully this reduces to just a loss weighting term similar to the one in the dreamer 4 paper&ndash; but with a square term at the denominator
+      $$
+      L_v = \frac{||x -\hat x ||^2}{(1-\tau)^2}
+      $$
   </p>
   <p>
       With this modification we got a small, but noticeable improvement over the dreamer4 loss-weighting, so we stuck with it.
@@ -376,10 +423,10 @@
 
   <h4>Optimal Transport</h4>
   <p>
-      Optimal transport and flow matching is a match made in heaven: OT finds pairings that minimize the distance travelled, giving flow matching shorter, less ambiguous paths.
+      Optimal transport and flow matching is a match made in heaven <d-cite key="gagneux2025avisualdive"></d-cite>: OT finds pairings that minimize the distance travelled, giving flow matching shorter, less ambiguous paths.
   </p>
   <p>
-      More specifically, we use minibatch barycentric OT between entire noise and latent sequences. We&rsquo;ve found this helped make generation more stable during rollout. [citation1, citation2]
+      More specifically, we use minibatch barycentric OT between entire noise and latent sequences <d-cite key="genevay2018sinkhorn, peyre2025optimal"></d-cite>. We&rsquo;ve found this helped make generation more stable during rollout .
   </p>
 
   <h3>Showcase the repository</h3>
@@ -389,7 +436,13 @@
 
   <h3>Conclusion</h3>
   <p>
-      Something cool here to push people to use our stuff and maybe add a contact section for further inquiry
+      The biggest lesson from this project is that training a frontier-level world model is not one heroic leap. It is a sequence of smaller, testable problems: prove the architecture on a cheap environment, make every part of the pipeline observable, and only then spend the compute required to scale. CoinRun gave us a fast place to get the tokenizer, dynamics model, and policy working together; Minecraft exposed the systems and stability problems that only appear when the same ideas are pushed much further.
+  </p>
+  <p>
+      The final model matters, but the failures along the way are just as valuable. Efficient sharding, activation checkpointing, fixed input shapes, pre-tokenized data, EMA weights, careful precision choices, loss weighting, and optimal transport were not minor implementation details&mdash;they were what made training possible. We hope that documenting them saves others from having to rediscover the same lessons through expensive failed runs.
+  </p>
+  <p>
+      We are releasing the model, training code, and data so that this work can be a starting point rather than an endpoint. Try it, reproduce our results, adapt it to new environments, and challenge the choices we made. If you find a bug, discover a better recipe, or build something interesting with the repository, please open an issue or get in touch. Frontier world-model research should be something more people can participate in, and we hope this release helps make that possible.
   </p>
 
   <h3>Acknowledgements</h3>
@@ -441,12 +494,80 @@
   url={https://arxiv.org/abs/2502.03444}
 }
 
+@article{chen2024diffusionforcing,
+  title={Diffusion Forcing: Next-token Prediction Meets Full-Sequence Diffusion},
+  author={Chen, Boyuan and Monso, Diego Marti and Du, Yilun and Simchowitz, Max and Tedrake, Russ and Sitzmann, Vincent},
+  journal={arXiv preprint arXiv:2407.01392},
+  year={2024},
+  url={https://arxiv.org/abs/2407.01392}
+}
+
+@article{lipman2023flowmatching,
+  title={Flow Matching for Generative Modeling},
+  author={Lipman, Yaron and Chen, Ricky T. Q. and Ben-Hamu, Heli and Nickel, Maximilian and Le, Matt},
+  journal={arXiv preprint arXiv:2210.02747},
+  year={2023},
+  url={https://arxiv.org/abs/2210.02747}
+}
+
+@misc{jordan2024muon,
+  title={Muon: An Optimizer for Hidden Layers in Neural Networks},
+  author={Jordan, Keller and Jin, Yuchen and Boza, Vlado and You, Jiacheng and Cesista, Franz and Newhouse, Laker and Bernstein, Jeremy},
+  year={2024},
+  url={https://kellerjordan.github.io/posts/muon/}
+}
+
+@article{liuziyin2020laprop,
+  title={LaProp: Separating Momentum and Adaptivity in Adam},
+  author={Ziyin, Liu and Wang, Zhikang T. and Ueda, Masahito},
+  journal={arXiv preprint arXiv:2002.04839},
+  year={2020},
+  url={https://arxiv.org/abs/2002.04839}
+}
+
+@article{scaling-book,
+  title = {How to Scale Your Model},
+  author = {Austin, Jacob and Douglas, Sholto and Frostig, Roy and Levskaya, Anselm and Chen, Charlie and Vikram, Sharad and Lebron, Federico and Choy, Peter and Ramasesh, Vinay and Webson, Albert and Pope, Reiner},
+  publisher = {Google DeepMind},
+  howpublished = {Online},
+  year = {2025},
+  url = {https://jax-ml.github.io/scaling-book/}
+}
+
+@inproceedings{gagneux2025avisualdive,
+  author = {Gagneux, Anne and Martin, Ségolène and Emonet, Rémi and Bertrand, Quentin and Massias, Mathurin},
+  title = {A Visual Dive into Conditional Flow Matching},
+  abstract = {Conditional flow matching (CFM) was introduced by three simultaneous papers at ICLR 2023, through different approaches (conditional matching, rectifying flows and stochastic interpolants). <br/> The main part of this post, Section 2, explains CFM by using both visual intuitions and insights on its probabilistic formulations. Section 1 introduces nomalizing flows; it can be skipped by reader familiar with the topic, or that wants to cover them later. Section 3 opens on the links between CFM and other approaches, and ends with a 'CFM playground'.},
+  booktitle = {ICLR Blogposts 2025},
+  year = {2025},
+  date = {April 28, 2025},
+  url  = {https://dl.heeere.com/conditional-flow-matching/blog/conditional-flow-matching/}
+}
+
 @misc{karpathy2026nanochat,
   title={nanochat miniseries v1},
   author={Karpathy, Andrej},
   year={2026},
   howpublished={GitHub Discussion},
   url={https://github.com/karpathy/nanochat/discussions/420}
+}
+
+@article{genevay2018sinkhorn,
+  title={Learning Generative Models with Sinkhorn Divergences},
+  author={Genevay, Aude and Chizat, Laetitia and Bach, Francis and Cuturi, Marco and Peyr{\'e}, Gabriel},
+  journal={arXiv preprint arXiv:1803.00567},
+  year={2018},
+  url={https://arxiv.org/abs/1803.00567}
+}
+
+@misc{peyre2025optimal,
+  title={Optimal Transport for Machine Learners},
+  author={Gabriel Peyr{\'e}},
+  year={2025},
+  eprint={2505.06589},
+  archivePrefix={arXiv},
+  primaryClass={stat.ML},
+  url={https://www.gpeyre.com/ot4ml/}
 }
   </script>
 </d-bibliography>

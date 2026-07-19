@@ -364,6 +364,32 @@ figure {
   background: #000;
 }
 
+.greentext-figure {
+  background: transparent;
+}
+
+.greentext {
+  margin: 0;
+  padding: 1rem;
+  border: 1px solid #d9bfb7;
+  border-radius: 2px;
+  background: #f0e0d6;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  color: #789922;
+  font: 13px/1.45 Arial, Helvetica, sans-serif;
+  white-space: pre-wrap;
+}
+
+.greentext-figure figcaption {
+  margin-top: 0.5rem;
+}
+
+.coinrun-demo::after {
+  content: "";
+  display: block;
+  clear: both;
+}
+
 details h2::before {
   content: '▶ ';
   display: inline-block;
@@ -430,6 +456,17 @@ d-article ul li {
   margin-bottom: 0.0em;
 }
 
+.space-token-list li:nth-child(1)::marker {
+  color: #8a70d6;
+}
+
+.space-token-list li:nth-child(2)::marker {
+  color: #a568cd;
+}
+
+.space-token-list li:nth-child(3)::marker {
+  color: #bc65bd;
+}
 
 /* For l-gutter class */
 @media (max-width: 767px) {
