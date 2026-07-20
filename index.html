@@ -232,7 +232,7 @@
       <figcaption>Figure 3: Tokenizer architecture</figcaption>
   </figure>
   <figure>
-      <img src="website/diffusion-forcing.svg">
+      <img src="website/diffusion-forcing.svg" alt="Diffusion forcing: parallel denoising during training and cached iterative next-frame generation during inference">
       <figcaption>Figure 4: Diffusion forcing training (left) and inference (right)</figcaption>
   </figure>
   <p>
@@ -311,7 +311,6 @@
       <figure class="l-middle side video-figure">
           <video controls playsinline preload="metadata" width="640" height="576">
               <source src="website/coinrun-wm.mp4" type="video/mp4">
-              <source src="website/coinrun-wm.mov" type="video/quicktime">
               Your browser cannot play this video. You can
               <a href="website/coinrun-wm.mp4">download the Coinrun world-model rollout</a>
               instead.
@@ -455,15 +454,17 @@
 </div>
   <h4>Optimizers</h4>
   <p>
-      We&rsquo;ve found it very cumbersome to work with the Adam-family of optimizers, they would spike at random and those loss spikes would get more and more frequent with time. By contrast Muon <d-cite key="jordan2024muon"></d-cite> proved to be much more stable and yielded much lower losses. Below you can see two runs with a budget of ~400xB200h each.
-  </p>
-  <p>
-      This is the simplest stability problem because it&rsquo;s the only one that is visible in the loss curve.
+      We've compared muon <d-cite key="jordan2024muon"></d-cite> with laprop <d-cite key="liuziyin2020laprop"></d-cite> (the original optimizer used in the dreamer series)
+      and found that laprop would spike at random and those loss spikes would get more and more frequent with time.<br>
+      By contrast muon proved to be much more stable and yielded much lower losses.
   </p>
   <figure class="l-body">
       <img src="website/optimizer-comparison.svg" alt="" width="100%">
-      <figcaption>Figure 14: Training loss comparison between Muon <d-cite key="jordan2024muon"></d-cite> and LaProp <d-cite key="liuziyin2020laprop"></d-cite>.</figcaption>
+      <figcaption>Figure 14: Training loss comparison between Muon and LaProp on two runs with a budget of ~400 B200 hours each</figcaption>
   </figure>
+  <p>
+      This is the simplest stability problem because it&rsquo;s the only one that is visible in the loss curve.
+  </p>
 
   <h4>Exponential Moving Average</h4>
   <p>
@@ -474,9 +475,9 @@
   </p>
   <figure class="l-body video-figure">
       <video controls playsinline preload="metadata" width="640">
-          <source src="website/comparison.mov" type="video/quicktime">
+          <source src="website/comparison.mp4" type="video/mp4">
           Your browser cannot play this video. You can
-          <a href="website/comparison.mov">view the comparison video</a>
+          <a href="website/comparison.mp4">view the comparison video</a>
           instead.
       </video>
       <figcaption>Figure 15: Comparison of the model outputs.</figcaption>
@@ -484,10 +485,10 @@
 
   <h4>Mixed precision Training</h4>
   <p>
-      Modern AI accelerators are designed to work in BF16, however for certain operations a higher precision is needed. Params are float32, most matmul activations are bf16, normalization and some sinusoidal/normalization helper math are float32, attention inputs are bf16, optional returned attention weights are float32, and the dynamics flow output head is explicitly float32.
+      Modern AI accelerators are optimized for BF16, but some operations still require higher precision. Keep the parameters in float32; use BF16 for most matrix-multiplication activations and attention inputs; and use float32 for normalization, selected sinusoidal and normalization helpers, optional attention weights, and the dynamics flow output head.
   </p>
   <p>
-      Getting this wrong will result in unstable learning or unstable generation.
+      These precision boundaries are important: getting them wrong can destabilize both training and generation.
   </p>
 
   <h4>Loss weighting</h4>
