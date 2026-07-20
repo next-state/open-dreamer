@@ -1,0 +1,37 @@
+# .dockerignore — files excluded from the image by `COPY . /app/`.
+# Edit to include/exclude per your project layout.
+
+# Python build / cache artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Python venvs — excluded from the image, which has its own
+# pre-baked venv at /opt/venv.
+.venv/
+venv/
+
+# Editor / IDE state
+.vscode/
+.idea/
+*.swp
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Source control
+.git/
+.gitignore
+
+# Docker config — already consumed by `docker build`, no need to ship.
+Dockerfile
+.dockerignore
+
+# Per the README, weights should be loaded from object storage at runtime,
+# not baked into the image. Uncomment if you have a local weights/ dir
+# you intentionally don't want copied:
+# weights/

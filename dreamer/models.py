@@ -1,142 +1,272 @@
-from functools import lru_cache
 import jax.numpy as jnp
-import flax.linen as nn
+from flax import nnx
 import jax
-import time
-from flax.core import FrozenDict
-import flax
-from enum import IntEnum
-from typing import Optional, Tuple, Any
+from typing import Tuple, Any, Dict, NamedTuple, Sequence
 from einops import rearrange, repeat
 import math
-from .utils import make_mask, Modality
+from .utils import (
+    Modality, TokenLayout,
+    normalize_with_dataset_stats,
+    unnormalize_with_dataset_stats,
+    to_jnp_dtype,
+    patchify, unpatchify
+)
+from .configs import (
+    TokenizerModelConfig, DynamicsModelConfig, EncoderModelConfig, DecoderModelConfig,
+)
+from .parallel import MeshRules
+from .actions import Actions
+
+# compatibility for reactor runtime. The reactor runtime has to use the older Flax version that does not have nnx.List
+def _nnx_list(items):
+    if hasattr(nnx, "List"):
+        return nnx.List(items)
+    return list(items)
 
 
-@flax.struct.dataclass  # immutable, PyTree-friendly
-class TokenLayout:
+
+
+# ============================================================================
+# KV Cache
+# ============================================================================
+
+@jax.tree_util.register_pytree_node_class
+class KVCache:
     """
-    Ordered token layout for a single timestep: latents first (if any),
-    then a sequence of (modality, count) segments.
+    Ring buffer KV cache for JIT compilation.
     """
-    n_latents: int
-    segments: Tuple[Tuple[Modality, int], ...]  # e.g., ((Modality.IMAGE, n_patches), (Modality.ACTION, n_act), ...)
+    def __init__(self, k, v, index, window_size):
+        self.k = k               # (B, Max_T, K, H)
+        self.v = v               # (B, Max_T, K, H)
+        self.index = index       # scalar integer (i32)
+        self.window_size = window_size  # static int
 
-    def S(self) -> int:
-        return self.n_latents + sum(n for _, n in self.segments)
+    def tree_flatten(self):
+        children = (self.k, self.v, self.index)
+        aux_data = (self.window_size,)
+        return children, aux_data
 
-    def modality_ids(self) -> jnp.ndarray:
-        parts = [jnp.full((self.n_latents,), Modality.LATENT, dtype=jnp.int32)] if self.n_latents > 0 else []
-        for m, n in self.segments:
-            if n > 0:
-                parts.append(jnp.full((n,), int(m), dtype=jnp.int32))
-        return jnp.concatenate(parts) if parts else jnp.zeros((0,), dtype=jnp.int32)  # (S,)
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        k, v, index = children
+        window_size, = aux_data
+        return cls(k, v, index, window_size)
 
-    def slices(self) -> dict:
-        """Convenience: start/stop indices per modality (first occurrence if repeated)."""
-        idx = 0
-        out = {}
-        if self.n_latents > 0:
-            out[Modality.LATENT] = slice(idx, idx + self.n_latents); idx += self.n_latents
-        for m, n in self.segments:
-            if n > 0 and m not in out:
-                out[m] = slice(idx, idx + n)
-            idx += n
-        return out
+    @classmethod
+    def init(cls, batch_size, window_size, num_kv_heads, head_dim, dtype=jnp.float32):
+        dtype = to_jnp_dtype(dtype)
+        return cls(
+            k=jnp.zeros((batch_size, window_size, num_kv_heads, head_dim), dtype=dtype),
+            v=jnp.zeros((batch_size, window_size, num_kv_heads, head_dim), dtype=dtype),
+            index=jnp.array(0, dtype=jnp.int32),
+            window_size=window_size
+        )
 
-    
-def sinusoid_table(n: int, d: int, base: float = 10000.0, dtype=jnp.float32) -> jnp.ndarray:
+    def update(self, k_new, v_new):
+        """
+        Writes k_new/v_new into the buffer.
+        Handles both contiguous writes and wrapping writes (T > 1) via branching.
+        Returns updated cache with index incremented by the length of new data.
+        """
+        T = k_new.shape[1]
+        write_idx = self.index % self.window_size
+
+        def _update_contiguous(operand, update, start_idx):
+            # Fast path
+            return jax.lax.dynamic_update_slice(operand, update, (0, start_idx, 0, 0))
+
+        def _update_wrap(operand, update, start_idx):
+            # Slow path
+            indices = (jnp.arange(T) + start_idx) % self.window_size
+            return operand.at[:, indices, :, :].set(update)
+
+        fits_contiguous = (write_idx + T) <= self.window_size
+
+        k_updated = jax.lax.cond(
+            fits_contiguous,
+            _update_contiguous,
+            _update_wrap,
+            self.k, k_new, write_idx
+        )
+        v_updated = jax.lax.cond(
+            fits_contiguous,
+            _update_contiguous,
+            _update_wrap,
+            self.v, v_new, write_idx
+        )
+
+        return KVCache(k=k_updated, v=v_updated, index=self.index + T, window_size=self.window_size)
+
+    def get_ordered_kv(self, query_len):
+        """
+        Returns rolled K, V, and a mask indicating valid data.
+        """
+        write_idx = self.index % self.window_size
+        shift = -1 * write_idx
+
+        # newest is at index -1
+        k_ordered = jnp.roll(self.k, shift, axis=1)
+        v_ordered = jnp.roll(self.v, shift, axis=1)
+
+        # Valid data is at the END of the buffer: indices [Window-valid_len : Window]
+        valid_len = jnp.minimum(self.index, self.window_size)
+
+        # Block garbage data during warmup
+        k_idx = jnp.arange(self.window_size)[None, None, None, :] # (1, 1, 1, Window)
+        start_valid = self.window_size - valid_len
+        valid_mask = k_idx >= start_valid
+
+        # Shifted causal mask
+        q_idx = jnp.arange(query_len)[None, None, :, None]
+        causal_mask = k_idx <= (self.window_size - query_len + q_idx)
+
+        final_mask = jnp.logical_and(valid_mask, causal_mask)
+
+        return k_ordered, v_ordered, final_mask
+
+
+KVCachesDict = Dict[int, KVCache]  # Type alias for transformer KV cache dictionaries
+
+
+class TokenizerCaches(NamedTuple):
+    """Namespaced KV caches for the tokenizer encoder and decoder."""
+
+    encoder: KVCachesDict | None
+    decoder: KVCachesDict | None
+
+
+def create_transformer_caches(
+    layer_is_time: Sequence[bool],
+    flattened_batch_size: int,
+    window_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype=jnp.float32,
+) -> KVCachesDict:
     """
-    Standard Transformer sinusoid: even dims use sin, odd dims use cos with frequencies
-    base^{-2k/d}. Works for odd d too.
-    """
-    pos = jnp.arange(n, dtype=dtype)[:, None]            # (n,1)
-    i = jnp.arange(d, dtype=dtype)[None, :]              # (1,d)
-    # k = floor(i/2)
-    k = jnp.floor(i / 2.0)
-    div = jnp.power(base, -(2.0 * k) / jnp.maximum(1.0, jnp.array(d, dtype)))
-    angles = pos * div                                    # (n,d)
-    table = jnp.where((i % 2) == 0, jnp.sin(angles), jnp.cos(angles))
-    return table.astype(dtype)
+    Creates KV cache dictionary for transformer layers.
 
+    Args:
+        layer_is_time: Boolean flags indicating which layers use temporal attention
+        flattened_batch_size: Batch size after spatial flattening (B * S)
+        window_size: Maximum temporal sequence length
+        num_kv_heads: Number of key/value heads
+        head_dim: Dimension per attention head
+        dtype: Data type for cache buffers
 
-@lru_cache(maxsize=8)
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype=jnp.float32) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
     Returns:
-        freqs_cos: (end, dim//2)
-        freqs_sin: (end, dim//2)
+        Dictionary mapping time layer indices to KVCache objects
     """
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
-    t = jnp.arange(end, dtype=dtype)
-    freqs = jnp.outer(t, freqs)  # (end, dim//2)
-    return jnp.cos(freqs), jnp.sin(freqs)
+    caches = {}
+    time_index = 0
+    for is_time_layer in layer_is_time:
+        if is_time_layer:
+            caches[time_index] = KVCache.init(
+                batch_size=flattened_batch_size,
+                window_size=window_size,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype=dtype
+            )
+            time_index += 1
+    return caches
 
 
-def apply_rotary_emb(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cos: jnp.ndarray, freqs_sin: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Apply Rotary Positional Embeddings (RoPE) to queries and keys using real sin/cos.
-    xq: (B, T, N, H)
-    xk: (B, S, K, H)
-    freqs_cos: (L, H/2)
-    freqs_sin: (L, H/2)
-    """
-    # Rearrange to (..., H/2, 2)
-    xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
-    xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
+# ============================================================================
+# Building Blocks
+# ============================================================================
 
-    xq_r, xq_i = xq_pairs[..., 0], xq_pairs[..., 1]
-    xk_r, xk_i = xk_pairs[..., 0], xk_pairs[..., 1]
+class RotaryEmbedding1D(nnx.Module):
+    """Rotary Position Embedding with precomputed frequencies."""
 
-    T, S = xq.shape[1], xk.shape[1]
-    
-    # Broadcast freqs (L, H/2) -> (1, L, 1, H/2)
-    cos_q = freqs_cos[None, :T, None, :]
-    sin_q = freqs_sin[None, :T, None, :]
-    cos_k = freqs_cos[None, :S, None, :]
-    sin_k = freqs_sin[None, :S, None, :]
+    def __init__(self, dim: int, theta: float = 10000.0, dtype: Any = jnp.float32, param_dtype: Any = jnp.float32):
+        self.dim = dim
+        self.theta = theta
+        self.dtype = to_jnp_dtype(dtype)
+        self.param_dtype = to_jnp_dtype(param_dtype)
 
-    # Rotation:
-    # x' = x cos - y sin
-    # y' = x sin + y cos
-    xq_out_r = xq_r * cos_q - xq_i * sin_q
-    xq_out_i = xq_r * sin_q + xq_i * cos_q
-    
-    xk_out_r = xk_r * cos_k - xk_i * sin_k
-    xk_out_i = xk_r * sin_k + xk_i * cos_k
+        # Precompute inverse frequencies as a Variable (not a Param, so it won't be trained)
+        inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
+        self.inv_freq = nnx.Variable(inv_freq)
 
-    # Stack back and flatten
-    xq_out = jnp.stack([xq_out_r, xq_out_i], axis=-1)
-    xk_out = jnp.stack([xk_out_r, xk_out_i], axis=-1)
+    def __call__(self, q, k, start_pos=0):
+        """
+        q: (B, T, N, H)
+        k: (B, T, K, H)
+        start_pos: scalar int (the absolute position of the first frame in T)
+        """
+        T = q.shape[1]
+        t_indices = jnp.arange(T, dtype=self.dtype) + start_pos
+        freqs = jnp.outer(t_indices, self.inv_freq.value) # (T, dim//2)
 
-    xq_out = rearrange(xq_out, '... d two -> ... (d two)')
-    xk_out = rearrange(xk_out, '... d two -> ... (d two)')
-    
-    return xq_out, xk_out
+        freqs_cos = jnp.cos(freqs).astype(self.dtype)
+        freqs_sin = jnp.sin(freqs).astype(self.dtype)
+
+        # (1, T, 1, Dim//2)
+        freqs_cos = freqs_cos[None, :, None, :]
+        freqs_sin = freqs_sin[None, :, None, :]
+
+        return self._apply(q, k, freqs_cos, freqs_sin)
+
+    def _apply(self, xq, xk, freqs_cos, freqs_sin):
+        """
+        Apply Rotary Positional Embeddings (RoPE) to queries and keys using real sin/cos.
+        xq: (B, T, N, H)
+        xk: (B, T, K, H)
+        freqs_cos: (L, H/2)
+        freqs_sin: (L, H/2)
+        """
+        # Rearrange to (..., H/2, 2)
+        xq_pairs = rearrange(xq, '... (d two) -> ... d two', two=2)
+        xk_pairs = rearrange(xk, '... (d two) -> ... d two', two=2)
+
+        xq_r, xq_i = xq_pairs[..., 0], xq_pairs[..., 1]
+        xk_r, xk_i = xk_pairs[..., 0], xk_pairs[..., 1]
+
+        # Rotation:
+        # x' = x cos - y sin
+        # y' = x sin + y cos
+        xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
+        xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
+
+        xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
+        xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
+
+        # Stack back and flatten
+        xq_out = jnp.stack([xq_out_r, xq_out_i], axis=-1)
+        xk_out = jnp.stack([xk_out_r, xk_out_i], axis=-1)
+
+        xq_out = rearrange(xq_out, '... d two -> ... (d two)')
+        xk_out = rearrange(xk_out, '... d two -> ... (d two)')
+
+        return xq_out, xk_out
 
 
-def add_sinusoidal_positions(tokens_btSd: jnp.ndarray) -> jnp.ndarray:
-    """tokens: (B,T,S,D) -> adds time and step sinusoids and returns same shape."""
-    B, T, S, D = tokens_btSd.shape
-    pos_t = sinusoid_table(T, D)     # (T,D)
-    pos_s = sinusoid_table(S, D)     # (S,D)
-    # Optionally scale to keep variance stable (common trick)
-    scale = 1.0 / jnp.sqrt(jnp.array(D, dtype=tokens_btSd.dtype))
-    return tokens_btSd + scale * (pos_t[None, :, None, :] + pos_s[None, None, :, :])
+class MAEReplacer(nnx.Module):
+    """Masked Autoencoder token replacer for training."""
 
-class MAEReplacer(nn.Module):
-    p_min: float = 0.0
-    p_max: float = 0.9
+    def __init__(self, D: int, p_min: float = 0.0, p_max: float = 0.9,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.p_min = p_min
+        self.p_max = p_max
+        self.dtype = to_jnp_dtype(dtype)
+        param_dtype = to_jnp_dtype(param_dtype)
 
-    @nn.compact
-    def __call__(self, patches_btnd: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        # Learnable mask token
+        self.mask_token = nnx.Param(jax.random.normal(rngs.params(), (D,), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
+
+    def __call__(self, patches_btnd: jnp.ndarray, *, rngs: nnx.Rngs, p_max_override: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         # patches_btnd: (B,T,Np,D)
         B, T, Np, D = patches_btnd.shape
-        mask_token = self.param("mask_token", nn.initializers.normal(0.02), (D,))
-        # draw RNGs from a named stream
-        rng = self.make_rng("mae")
-        p_rng, m_rng = jax.random.split(rng)
-        p_bt = jax.random.uniform(p_rng, (B, T), minval=self.p_min, maxval=self.p_max)  # (B,T)
+        mask_token = self.mask_token.value.astype(self.dtype)
+
+        p_max = p_max_override if p_max_override is not None else self.p_max
+
+        # Draw RNGs
+        p_rng = rngs.mae()
+        m_rng = rngs.mae()
+        p_bt = jax.random.uniform(p_rng, (B, T), minval=self.p_min, maxval=p_max)  # (B,T)
         keep_prob_bt1 = 1.0 - p_bt[..., None]                                           # (B,T,1)
         keep = jax.random.bernoulli(m_rng, keep_prob_bt1, (B, T, Np))                   # (B,T,Np)
         keep = keep[..., None]                                                          # (B,T,Np,1)
@@ -145,48 +275,25 @@ class MAEReplacer(nn.Module):
         return replaced, mae_mask, keep_prob_bt1
 
 
-# ---------- small building blocks ----------
+class MLP(nnx.Module):
+    """Transformer MLP with optional SwiGLU gating."""
 
-class RMSNorm(nn.Module):
-    eps: float = 1e-6
-    @nn.compact
-    def __call__(self, x):
-        scale = self.param("scale", nn.initializers.ones, (x.shape[-1],))
-        var = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
-        return x * (scale / jnp.sqrt(var + self.eps))
+    def __init__(self, d_model: int, mlp_ratio: float = 4.0, dropout_rate: float = 0.0,
+                 swiglu: bool = True, parity_2over3: bool = False, use_norm: bool = True,
+                 use_bias: bool = False, use_rmsnorm_scale: bool = True,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.d_model = d_model
+        self.mlp_ratio = mlp_ratio
+        self.dropout_rate = dropout_rate
+        self.swiglu = swiglu
+        self.parity_2over3 = parity_2over3
+        self.use_norm = use_norm
+        self.use_bias = use_bias
+        self.use_rmsnorm_scale = use_rmsnorm_scale
+        self.dtype = to_jnp_dtype(dtype)
+        param_dtype = to_jnp_dtype(param_dtype)
 
-class MLP(nn.Module):
-    """
-    Transformer MLP with optional SwiGLU gating.
-
-    Args:
-      d_model:          input/output width of the block (last-dim of x).
-      mlp_ratio:    expansion factor for hidden size if NOT using 2/3 parity.
-      dropout_rate: dropout rate applied after activation and after output proj.
-      swiglu:       if True, use SwiGLU; else standard GELU MLP.
-      parity_2over3:
-                    if True and swiglu=True, set hidden = (2/3)*mlp_ratio*d_model
-                    to roughly match parameter count of a GELU MLP with mlp_ratio.
-      dtype:        param/compute dtype.
-    """
-    d_model: int
-    mlp_ratio: float = 4.0
-    dropout_rate: float = 0.0
-    swiglu: bool = True
-    parity_2over3: bool = False
-    dtype: Any = jnp.float32
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
-        """
-        Args:
-          x:            (..., d_model) input activations.
-          deterministic:
-                        True disables dropout (eval); False enables dropout (train).
-
-        Returns:
-          y:            (..., d_model) output activations, same shape as input.
-        """
         # Choose hidden size
         mult = self.mlp_ratio
         if self.swiglu and self.parity_2over3:
@@ -194,52 +301,90 @@ class MLP(nn.Module):
 
         hidden = int(self.d_model * mult)
 
+        if self.use_norm:
+            self.norm = nnx.RMSNorm(d_model, use_scale=self.use_rmsnorm_scale, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
+
+        if self.swiglu:
+            self.fc_in = nnx.Linear(d_model, 2 * hidden, use_bias=self.use_bias, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        else:
+            self.fc_in = nnx.Linear(d_model, hidden, use_bias=self.use_bias, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+
+        self.fc_out = nnx.Linear(hidden, d_model, use_bias=self.use_bias, dtype=self.dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.dropout = nnx.Dropout(dropout_rate)
+
+    def __call__(self, x: jnp.ndarray,  deterministic: bool = True, rngs: nnx.Rngs | None = None) -> jnp.ndarray:
+        if self.use_norm:
+            x = self.norm(x)
+
         if self.swiglu:
             # SwiGLU: Dense -> split -> u * silu(v)
-            pre = nn.Dense(
-                2 * hidden, dtype=self.dtype, name="fc_in"
-            )(x)  # (..., 2H)
+            pre = self.fc_in(x)  # (..., 2H)
             u, v = jnp.split(pre, 2, axis=-1)     # (..., H), (..., H)
             h = u * jax.nn.silu(v)                # (..., H)
         else:
             # Standard GELU MLP
-            h = nn.Dense(hidden, dtype=self.dtype, name="fc_in")(x)
-            h = nn.gelu(h)
+            h = self.fc_in(x)
+            h = nnx.gelu(h)
 
-        h = nn.Dropout(self.dropout_rate)(h, deterministic=deterministic)
-        y = nn.Dense(self.d_model, dtype=self.dtype, name="fc_out")(h)
-        y = nn.Dropout(self.dropout_rate)(y, deterministic=deterministic)
+        h = self.dropout(h, deterministic=deterministic, rngs=rngs)
+        y = self.fc_out(h)
+        y = self.dropout(y, deterministic=deterministic, rngs=rngs)
         return y
 
-# ---------- axial attention layers ----------
-class GroupedQueryAttention(nn.Module):
-    dim: int
-    num_heads: int
-    num_kv_heads: int
-    dropout_rate: float = 0.0
-    deterministic: bool = True
-    qk_norm_type: str | None = None  # "qknorm", or "quest"
-    is_causal: bool = False 
-    use_rope: bool = False
-    rope_theta: float = 10000.0
 
-    def setup(self):
+class GroupedQueryAttention(nnx.Module):
+    """Grouped Query Attention with optional QK normalization and RoPE."""
+
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
+                 dropout_rate: float = 0.0, qk_norm_type: str | None = None,
+                 is_causal: bool = False, rope_theta: float = 10000.0,
+                 use_bias: bool = False, use_rmsnorm_scale: bool = True,
+                 use_seq_parallel: bool = False,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.dim = dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.dropout_rate = dropout_rate
+        self.qk_norm_type = qk_norm_type
+        self.is_causal = is_causal
+        self.rope_theta = rope_theta
+        self.use_bias = use_bias
+        self.use_rmsnorm_scale = use_rmsnorm_scale
+        dtype = to_jnp_dtype(dtype)
+        param_dtype = to_jnp_dtype(param_dtype)
+        self.dtype = dtype
+
+        if use_seq_parallel:
+            raise NotImplementedError("Sequence parallel not implemented for GQA")
+        
         assert self.dim % self.num_heads == 0
         assert self.num_heads % self.num_kv_heads == 0
 
         head_dim = self.dim // self.num_heads
         kv_dim = self.num_kv_heads * head_dim
 
-        self.to_q = nn.Dense(self.dim, use_bias=False)
-        self.to_kv = nn.Dense(2 * kv_dim, use_bias=False)
-        self.to_out = nn.Dense(self.dim, use_bias=False)
-        self.dropout = nn.Dropout(self.dropout_rate)
+        self.to_q = nnx.Linear(dim, dim, use_bias=self.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
+        self.to_kv = nnx.Linear(dim, 2 * kv_dim, use_bias=self.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
+        self.to_out = nnx.Linear(dim, dim, use_bias=self.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('attn')), rngs=rngs)
+        self.dropout = nnx.Dropout(dropout_rate)
 
         if self.qk_norm_type == 'qknorm':
-            self.q_ln = nn.LayerNorm(use_bias=True, use_scale=True)
-            self.k_ln = nn.LayerNorm(use_bias=True, use_scale=True)
+            self.q_ln = nnx.RMSNorm(head_dim, use_scale=self.use_rmsnorm_scale, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
+            self.k_ln = nnx.RMSNorm(head_dim, use_scale=self.use_rmsnorm_scale, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
 
-    def __call__(self, x, mask, *args):
+        self.rope = RotaryEmbedding1D(dim=head_dim, theta=self.rope_theta, dtype=dtype, param_dtype=param_dtype)
+
+    def __call__(
+            self,
+            x,
+            mask: jnp.ndarray | None = None,
+            local_window_size: int | tuple[int, int] | None = None,
+            deterministic: bool = True,
+            cache: KVCache | None = None,
+            rngs: nnx.Rngs | None = None,
+            return_weights: bool = False,
+        ):
         """
         https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html
         B = batch size
@@ -251,965 +396,1012 @@ class GroupedQueryAttention(nn.Module):
         G = number of groups, which equals to N // K
         """
         q = self.to_q(x)
-        kv = self.to_kv(x)
         q = rearrange(q, "B T (N H) -> B T N H", N=self.num_heads)
+        kv = self.to_kv(x)
         k, v = rearrange(kv, "B S (C K H) -> C B S K H", C=2, K=self.num_kv_heads)
-
-        if self.use_rope:
-            head_dim = q.shape[-1]
-            max_len = max(q.shape[1], k.shape[1])
-            freqs_cos, freqs_sin = precompute_freqs_cis(head_dim, max_len, self.rope_theta, dtype=q.dtype)
-            q, k = apply_rotary_emb(q, k, freqs_cos, freqs_sin)
 
         scale = q.shape[-1] ** -0.5
         if self.qk_norm_type == 'qknorm':
-            q = self.q_ln(q)
-            k = self.k_ln(k)
+            q = self.q_ln(q).astype(self.dtype)
+            k = self.k_ln(k).astype(self.dtype)
         elif self.qk_norm_type == 'quest':
             # claims to beat qknorm https://openreview.net/pdf?id=HkztQWZfl2
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
-            scale = 1.0 
+            scale = 1.0
 
-        attn = jax.nn.dot_product_attention(q, k, v, mask=mask, scale=scale, is_causal=self.is_causal)  # TODO: try setting implementation="cudnn"
+        # RoPE
+        start_pos = cache.index if cache is not None else 0
+        q, k = self.rope(q, k, start_pos=start_pos)
+
+        # KV cache
+        if self.is_causal and cache is not None:
+            # CACHED INFERENCE MODE
+            new_cache = cache.update(k, v)
+
+            T = q.shape[1]
+            k_attn, v_attn, cache_mask = new_cache.get_ordered_kv(query_len=T)
+
+            attn_is_causal = False  # Handled manually by cache_mask
+            if mask is not None:
+                mask_attn = jnp.logical_and(mask, cache_mask)
+            else:
+                mask_attn = cache_mask
+        else:
+            # TRAINING or NON-CAUSAL (SPACE) ATTENTION
+            new_cache = None
+            k_attn, v_attn = k, v
+            mask_attn = mask
+            attn_is_causal = self.is_causal and (mask is None)
+
+        # SDPA
+        attn = jax.nn.dot_product_attention(
+            q, k_attn, v_attn,
+            mask=mask_attn,
+            scale=scale,
+            is_causal=attn_is_causal,
+            local_window_size=local_window_size if cache is None else None
+        )  
+
+        if return_weights:
+            G = self.num_heads // self.num_kv_heads
+            k_exp = jnp.repeat(k_attn, G, axis=2)  # (B, S, N, H)
+            logits = jnp.einsum('B T N H, B S N H -> B N T S', q, k_exp) * scale
+            if mask_attn is not None:
+                logits = jnp.where(mask_attn, logits, jnp.finfo(logits.dtype).min)
+            elif attn_is_causal:
+                T_q, T_k = q.shape[1], k_attn.shape[1]
+                causal = jnp.tril(jnp.ones((T_q, T_k), dtype=jnp.bool_))
+                logits = jnp.where(causal[None, None], logits, jnp.finfo(logits.dtype).min)
+            attn_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+        else:
+            attn_weights = None
+
         attn = rearrange(attn, "B T N H -> B T (N H)")
 
         out = self.to_out(attn)
-        return self.dropout(out, deterministic=self.deterministic)
+        out = self.dropout(out, deterministic=deterministic, rngs=rngs)
 
-class SpaceSelfAttentionModality(nn.Module):
+        return out, new_cache, attn_weights
+
+class SpaceSelfAttention(nnx.Module):
     """Space self-attention with modality routing."""
-    dim: int
-    num_heads: int
-    num_kv_heads: int
-    dropout_rate: float = 0.0
-    qk_norm_type: str | None = None
-    use_rope: bool = False
-    rope_theta: float = 10000.0
 
-    @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
+                 qk_norm_type: str | None = None, rope_theta: float = 10000.0,
+                 use_bias: bool = False, use_rmsnorm_scale: bool = True,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *, 
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.attn = GroupedQueryAttention(
+            dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
+            dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
+            rope_theta=rope_theta, is_causal=False,
+            use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
+            dtype=dtype, param_dtype=param_dtype, 
+            mesh_rules=mesh_rules, rngs=rngs
+        )
+
+    def __call__(
+            self,
+            x,
+            *,
+            mask: jnp.ndarray | None = None,
+            local_window_size: int | tuple[int, int] | None = None,
+            deterministic: bool = True,
+            cache: KVCache | None = None,
+            rngs: nnx.Rngs | None = None,
+            return_weights: bool = False,
+        ):
         # x: (B, T, S, D)  -> attention across S within each (B,T)
+        # Note: local_window_size is ignored for space attention (just for compatibility)
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B T) S D")
 
-        out = GroupedQueryAttention(
-            dim=self.dim,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            dropout_rate=self.dropout_rate,
-            qk_norm_type=self.qk_norm_type,
-            use_rope=self.use_rope,
-            rope_theta=self.rope_theta,
-            deterministic=deterministic,
-            is_causal=False,
-        )(x, mask=mask)
-
+        out, _, attn_weights = nnx.remat(self.attn, static_argnums=(2, 3, 4, 6),)(x, mask, None, deterministic, None, rngs, return_weights)
         out = rearrange(out, "(B T) S D -> B T S D", B=B, T=T)
-        return out
+        if attn_weights is not None:
+            attn_weights = rearrange(attn_weights, "(B T) N S1 S2 -> B T N S1 S2", B=B, T=T)
+        return out, None, attn_weights
 
-class TimeSelfAttention(nn.Module):
+class TimeSelfAttention(nnx.Module):
     """Time self-attention."""
-    dim: int
-    num_heads: int
-    num_kv_heads: int
-    dropout_rate: float = 0.0
-    qk_norm_type: str | None = None
-    use_rope: bool = False
-    rope_theta: float = 10000.0
 
-    @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool):
-        # mask does nothing, but is required for API consistency
-        # x: (B, T, S, D) -> attend across T, causal
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0,
+                 qk_norm_type: str | None = None, rope_theta: float = 10000.0,
+                 use_bias: bool = False, use_rmsnorm_scale: bool = True,
+                 use_seq_parallel: bool = False,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.attn = GroupedQueryAttention(
+            dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
+            dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
+            rope_theta=rope_theta, is_causal=True,
+            use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
+            use_seq_parallel=use_seq_parallel,
+            dtype=dtype, param_dtype=param_dtype,
+            mesh_rules=mesh_rules, rngs=rngs
+        )
+
+    def __call__(
+        self,
+        x,
+        *,
+        mask: jnp.ndarray | None = None,
+        local_window_size: int | tuple[int, int] | None = None,
+        deterministic: bool = True,
+        cache: KVCache | None = None,
+        rngs: nnx.Rngs | None = None,
+        return_weights: bool = False,
+    ):
+        # x: (B, T, S, D) -> attention across T, causal
         B, T, S, D = x.shape
         x = rearrange(x, "B T S D -> (B S) T D")
-        out = GroupedQueryAttention(
-            dim=self.dim,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            dropout_rate=self.dropout_rate,
-            qk_norm_type=self.qk_norm_type,
-            use_rope=self.use_rope,
-            rope_theta=self.rope_theta,
-            deterministic=deterministic,
-            is_causal=True,
-        )(x, mask=None)
+
+        if mask is not None and mask.ndim >= 3 and mask.shape[0] == B:
+            mask = repeat(mask, 'B ... -> (B S) ...', S=S)
+
+        out, new_cache, attn_weights = nnx.remat(self.attn, static_argnums=(2, 3, 6),)(x, mask, local_window_size, deterministic, cache, rngs, return_weights)
         out = rearrange(out, "(B S) T D -> B T S D", B=B, S=S)
-        return out
+        if attn_weights is not None:
+            attn_weights = rearrange(attn_weights, "(B S) N T1 T2 -> B S N T1 T2", B=B, S=S)
+        return out, new_cache, attn_weights
 
-# ---------- a single block-causal layer ----------
-class BlockCausalLayer(nn.Module):
-    dim: int
-    num_heads: int
-    num_kv_heads: int
-    dropout_rate: float = 0.0
-    qk_norm_type: str | None = None
-    mlp_ratio: float = 4.0
-    layer_index: int = 0
-    time_every: int = 4
-    use_rope: bool = False
-    rope_theta: float = 10000.0
+class BlockCausalLayer(nnx.Module):
+    """Single block-causal transformer layer (alternating space/time attention)."""
 
-    def setup(self):
-        self.norm = RMSNorm()
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
+                 dropout_rate: float = 0.0, qk_norm_type: str | None = None,
+                 mlp_ratio: float = 4.0, layer_index: int = 0, time_every: int = 4, time_layer_offset: int = 1,
+                 rope_theta: float = 10000.0, use_bias: bool = False,
+                 use_rmsnorm_scale: bool = True, use_seq_parallel: bool = False,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32, *,
+                 rngs: nnx.Rngs, mesh_rules: MeshRules):
+        self.layer_index = layer_index
+        self.time_every = time_every
+        self.time_layer_offset = time_layer_offset
+        param_dtype = to_jnp_dtype(param_dtype)
 
-        # --- Time or space attention ---
-        self.use_time = (self.layer_index + 1) % self.time_every == 0
-        attention_module = TimeSelfAttention if self.use_time else SpaceSelfAttentionModality
-        self.attn = attention_module(
-            dim=self.dim,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            dropout_rate=self.dropout_rate,
-            qk_norm_type=self.qk_norm_type,
-            use_rope=self.use_rope,
-            rope_theta=self.rope_theta,
-        )
+        self.norm = nnx.RMSNorm(dim, use_scale=use_rmsnorm_scale, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
 
-        # --- MLP ---
-        self.norm_mlp = RMSNorm()
-        self.mlp = MLP(self.dim, self.mlp_ratio, self.dropout_rate)
+        # Time or space attention
+        is_time_layer = (self.layer_index + self.time_layer_offset) % self.time_every == 0
+        if is_time_layer:
+            self.attn = TimeSelfAttention(
+                dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
+                rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
+                use_seq_parallel=use_seq_parallel,
+                dtype=dtype, param_dtype=param_dtype,
+                mesh_rules=mesh_rules, rngs=rngs
+            )
+        else:
+            # SpaceSelfAttention doesn't need seq_parallel - it operates on (B*T, S, D)
+            # with T already in the batch dimension
+            self.attn = SpaceSelfAttention(
+                dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
+                rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
+                dtype=dtype, param_dtype=param_dtype,
+                mesh_rules=mesh_rules, rngs=rngs
+            )
 
-    @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool):
-        # --- Space attention (within timestep, modality-aware) ---
+        # MLP
+        self.mlp = MLP(dim, mlp_ratio, dropout_rate, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
+
+    @property
+    def is_time_layer(self) -> bool:
+        return isinstance(self.attn, TimeSelfAttention)
+
+    def __call__(
+        self,
+        x,
+        *,
+        space_mask: jnp.ndarray | None = None,
+        time_mask: jnp.ndarray | None = None,
+        time_local_window_size: int | tuple[int, int] | None = None,
+        deterministic: bool = True,
+        cache: KVCache | None = None,
+        rngs: nnx.Rngs | None = None,
+        return_weights: bool = False,
+    ):
+        # Attention (time or space, depending on layer_index)
         y = self.norm(x)
-        y = self.attn(y, mask=mask, deterministic=deterministic)
+        if self.is_time_layer:
+            attn_mask = time_mask
+            local_window_size = time_local_window_size
+        else:
+            attn_mask = space_mask
+            local_window_size = None
+        y, new_cache, attn_weights = self.attn(y, mask=attn_mask, local_window_size=local_window_size, deterministic=deterministic, cache=cache, rngs=rngs, return_weights=return_weights)
         x = x + y
 
-        # --- MLP ---
-        y = self.norm_mlp(x)
-        y = self.mlp(y, deterministic=deterministic)
+        # MLP
+        y = nnx.remat(self.mlp)(x, deterministic=deterministic, rngs=rngs)
         x = x + y
-        return x
-# ---------- the transformer stack ----------
+        return x, new_cache, attn_weights
 
-class BlockCausalTransformer(nn.Module):
-    d_model: int
-    n_heads: int
-    n_kv_heads: int
-    depth: int
-    dropout_rate: float = 0.0
-    qk_norm_type: str | None = None
-    mlp_ratio: float = 4.0
-    time_every: int = 4
-    use_rope: bool = False
-    rope_theta: float = 10000.0
+class BlockCausalTransformer(nnx.Module):
+    """Stack of block-causal transformer layers."""
 
-    @nn.compact
-    def __call__(self, x, mask, *, deterministic: bool):
-        for i in range(self.depth):
-            x = BlockCausalLayer(
-                self.d_model, self.n_heads, self.n_kv_heads,
-                dropout_rate=self.dropout_rate, qk_norm_type=self.qk_norm_type,
-                mlp_ratio=self.mlp_ratio, layer_index=i, time_every=self.time_every,
-                use_rope=self.use_rope,
-                rope_theta=self.rope_theta,
-            )(x, mask=mask, deterministic=deterministic)
-        return x
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, depth: int,
+                 dropout_rate: float = 0.0, qk_norm_type: str | None = None,
+                 mlp_ratio: float = 4.0, time_every: int = 4, time_layer_offset: int = 1, rope_theta: float = 10000.0,
+                 use_bias: bool = False, use_rmsnorm_scale: bool = True,
+                 use_seq_parallel: bool = False,
+                 dtype: Any = jnp.float32, param_dtype: Any = jnp.float32,
+                 use_residual_lambdas: bool = False, *,
+                 mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.d_model = d_model
+        self.depth = depth
+        self.time_every = time_every
+        self.time_layer_offset = time_layer_offset
+        self.use_residual_lambdas = use_residual_lambdas
+        self.dtype = to_jnp_dtype(dtype)
+        param_dtype = to_jnp_dtype(param_dtype)
 
-class Encoder(nn.Module):
-    d_model: int
-    n_latents: int
-    n_patches: int
-    n_heads: int
-    n_kv_heads: int
-    depth: int
-    d_bottleneck: int
-    dropout_rate: float = 0.0
-    qk_norm_type: str | None = None
-    mlp_ratio: float = 4.0
-    time_every: int = 4
-    mae_p_min: float = 0.0
-    mae_p_max: float = 0.9
-    use_rope: bool = False
-    rope_theta: float = 10000.0
+        if use_residual_lambdas:
+            self.resid_lambdas = nnx.Param(
+                jnp.ones(depth, dtype=param_dtype),
+                sharding_names=(None,)  # Small per-layer params, no sharding needed
+            )
+            self.x0_lambdas = nnx.Param(
+                jnp.zeros(depth, dtype=param_dtype),
+                sharding_names=(None,)  # Small per-layer params, no sharding needed
+            )
 
-    def setup(self):
-        self.patch_proj = nn.Dense(self.d_model, name="patch_proj")
-        self.bottleneck_proj = nn.Dense(self.d_bottleneck, name="bottleneck_proj")
-        self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
-        self.modality_ids = self.layout.modality_ids()            # (S,)
-        mask = make_mask(self.modality_ids, "encoder")
-        self.mask = self.variable("constants", "mask", lambda: mask)
+        # Create layers
+        self.layers = _nnx_list([
+            BlockCausalLayer(
+                dim=d_model, num_heads=n_heads, num_kv_heads=n_kv_heads,
+                dropout_rate=dropout_rate, qk_norm_type=qk_norm_type,
+                mlp_ratio=mlp_ratio, layer_index=i, time_every=time_every, time_layer_offset=time_layer_offset,
+                rope_theta=rope_theta, use_bias=use_bias, use_rmsnorm_scale=use_rmsnorm_scale,
+                use_seq_parallel=use_seq_parallel,
+                dtype=dtype, param_dtype=param_dtype,
+                mesh_rules=mesh_rules, rngs=rngs
+            ) for i in range(depth)
+        ])
+
+    def __call__(
+        self,
+        x,
+        *,
+        space_mask: jnp.ndarray | None = None,
+        time_mask: jnp.ndarray | None = None,
+        time_local_window_size: int | tuple[int, int] | None = None,
+        deterministic: bool = True,
+        caches: KVCachesDict | None = None,
+        rngs: nnx.Rngs | None = None,
+        return_weights: bool = False,
+    ) -> Tuple[jax.Array, KVCachesDict | None, list | None]:
+        """
+        Args:
+            x: (B, T, S, D) input tensor
+            space_mask: optional spatial attention mask
+            time_mask: optional time attention mask (unused)
+            time_local_window_size: optional local window size for time attention (left, right) or int for symmetric
+            deterministic: whether to use deterministic mode (no dropout)
+            caches: optional dict mapping layer_index -> KVCache
+            rngs: optional RNG state for dropout
+            return_weights: if True, all_weights is populated with per-layer attention matrices
+
+        Returns:
+            (x, new_caches, all_weights) — all_weights is None when return_weights=False.
+        """
+        new_caches = {} if caches is not None else None
+        all_weights: list | None = [] if return_weights else None
+        x0 = x
+        time_index = 0
+
+        for i, layer in enumerate(self.layers):
+            if self.use_residual_lambdas:
+                resid_lambda = self.resid_lambdas.value[i].astype(self.dtype)
+                x0_lambda = self.x0_lambdas.value[i].astype(self.dtype)
+                x = resid_lambda * x + x0_lambda * x0
+
+            is_time_layer = layer.is_time_layer
+            cache_i = caches.get(time_index) if caches is not None and is_time_layer else None
+
+            x, new_cache_i, w_i = layer(x, space_mask=space_mask, time_mask=time_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, cache=cache_i, rngs=rngs, return_weights=return_weights)
+            if all_weights is not None:
+                all_weights.append(w_i)
+
+            if new_caches is not None and new_cache_i is not None:
+                new_caches[time_index] = new_cache_i
+            if is_time_layer:
+                time_index += 1
+
+        return x, new_caches, all_weights
+
+    def estimate_attention_flops(self, batch_size: int, seq_time: int, seq_space: int,
+                                 time_window: int | None = None) -> int:
+        """Attention FLOPs per training step (forward + backward).
+
+        Computes FLOPs for Q@K^T and attn@V operations only (not weight matrices).
+        Factor of 12 = 2 matmuls × 2 ops × 3 (forward + backward).
+        """
+        n_time = sum(layer.is_time_layer for layer in self.layers)
+        n_space = self.depth - n_time
+        t_eff = seq_time if time_window is None else min(seq_time, time_window)
+        space_attn = 12 * n_space * self.d_model * (seq_space ** 2) * batch_size * seq_time
+        time_attn = 12 * n_time * self.d_model * seq_time * t_eff * batch_size * seq_space
+        return int(space_attn + time_attn)
+
+    def count_excluded_params(self) -> int:
+        """Count params excluded from FLOP estimation (per-layer scalars)."""
+        if not self.use_residual_lambdas:
+            return 0
+        return self.resid_lambdas.value.size + self.x0_lambdas.value.size
+
+
+# ============================================================================
+# Tokenizer
+# ============================================================================
+
+class Encoder(nnx.Module):
+    """Vision encoder with MAE masking."""
+
+    def __init__(self, cfg: EncoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.cfg = cfg
+        self.n_latents = cfg.n_latents
+        self.patch_size = cfg.patch_size
+        self.context_length = cfg.context_length
+        self.dataset_mean = cfg.dataset_mean
+        self.dataset_std = cfg.dataset_std
+        self.context_length = cfg.context_length
+        dtype = to_jnp_dtype(cfg.dtype)
+        param_dtype = to_jnp_dtype(cfg.param_dtype)
+
+        self.patch_proj = nnx.Linear(cfg.patch_size * cfg.patch_size * 3, cfg.d_model, use_bias=cfg.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.bottleneck_proj = nnx.Linear(cfg.d_model, cfg.d_bottleneck, use_bias=cfg.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
 
         self.transformer = BlockCausalTransformer(
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            n_kv_heads=self.n_kv_heads,
-            depth=self.depth,
-            dropout_rate=self.dropout_rate,
-            qk_norm_type=self.qk_norm_type,
-            mlp_ratio=self.mlp_ratio,
-            time_every=self.time_every,
-            use_rope=self.use_rope,
-            rope_theta=self.rope_theta,
+            d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
+            dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
+            time_every=cfg.time_every, time_layer_offset=getattr(cfg, 'time_layer_offset', 1), rope_theta=cfg.rope_theta,
+            use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
+            use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
+            dtype=dtype, param_dtype=param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
+            mesh_rules=mesh_rules, rngs=rngs
         )
-        self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
 
-    @nn.compact
-    def __call__(self, patch_tokens, *, deterministic: bool = True) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
-        # 1) Project patches to D_model
+        self.mask_and_replace = MAEReplacer(D=cfg.d_model, p_min=cfg.mae_p_min, p_max=cfg.mae_p_max, dtype=dtype, param_dtype=param_dtype, mesh_rules=mesh_rules, rngs=rngs)
+        self.latents_enc = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_latents, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
+
+    def get_token_layout(self, H: int, W: int) -> TokenLayout:
+        n_patches = (H // self.patch_size) * (W // self.patch_size)
+        return TokenLayout(((Modality.LATENT, self.n_latents), (Modality.IMAGE, n_patches)))
+
+    def create_static_caches(self, batch_size: int, H: int, W: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
+        """Creates concrete, zero-filled encoder KV cache buffers for JIT compilation."""
+        layout = self.get_token_layout(H, W)
+
+        return create_transformer_caches(
+            layer_is_time=[layer.is_time_layer for layer in self.transformer.layers],
+            flattened_batch_size=batch_size * layout.S,
+            window_size=window_size,
+            num_kv_heads=self.cfg.n_kv_heads,
+            head_dim=self.cfg.d_model // self.cfg.n_heads,
+            dtype=dtype,
+        )
+
+    def __call__(self, videos, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
+        # Videos in the [0, 255] range
+        B, T, H, W, C = videos.shape
+
+        normalized_videos = normalize_with_dataset_stats(videos, mean=self.dataset_mean, std=self.dataset_std)
+        patch_tokens = patchify(normalized_videos, patch=self.patch_size)
         proj_patches = self.patch_proj(patch_tokens)  # (B, T, Np, D)
 
-        # 2) MAE mask-and-replace on patch tokens (encoder input only)
-        proj_patches_masked, patch_mask, keep_prob = MAEReplacer(name="mae", p_min=self.mae_p_min, p_max=self.mae_p_max)(proj_patches)
-        # print(f"proj_patches_masked.shape: {proj_patches_masked.shape}")
-        # print(f"patch_mask.shape: {patch_mask.shape}")
+        # MAE mask-and-replace on patch tokens (encoder input only during training)
+        if deterministic or rngs is None:
+            # Skip MAE masking during inference
+            proj_patches_masked = proj_patches
+            patch_mask = jnp.zeros((B, T, proj_patches.shape[2], 1), dtype=jnp.bool_)
+            keep_prob = jnp.ones((B, T, 1))
+        else:
+            proj_patches_masked, patch_mask, keep_prob = self.mask_and_replace(proj_patches, rngs=rngs, p_max_override=mae_p_max)
 
-        # 3) Prepend learned latents (owned here)
-        # print(f"latents.shape: {latents.shape}")
-        B, T = proj_patches_masked.shape[:2]
-        latents = jnp.broadcast_to(self.latents[None, None, ...], (B, T, *self.latents.shape))
-        # print(f"lat_btld.shape: {lat_btld.shape}")
-        tokens = jnp.concatenate([latents, proj_patches_masked], axis=2)  # (B,T,S=(Np+Nl),D)
-        # print(f"tokens_btSd.shape: {tokens_btSd.shape}")
+        # patch_mask is (B,T,Np,1), need to expand to pixels (B, T, Np, P*P)
+        patch_mask_expanded = jnp.repeat(patch_mask, self.patch_size**2, axis=-1)
+        frame_mask = unpatchify(patch_mask_expanded, self.patch_size, H, W)
 
-        # 4) Add sinusoidal positions (param-free)
-        if not self.use_rope:
-            tokens = add_sinusoidal_positions(tokens)
+        # Prepend learned latents
+        latents = repeat(self.latents_enc.value.astype(proj_patches.dtype), "... -> b t ...", b=B, t=T)
+        tokens = jnp.concatenate([latents, proj_patches_masked], axis=2)  # (B, T, S=(Np+Nl), D)
 
-        # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
-        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
-        # 5) Feed tokens into transformer
-        encoded_tokens = self.transformer(tokens, mask=mask, deterministic=deterministic)
-        # print(f"encoded_tokens_btSd.shape: {encoded_tokens_btSd.shape}")
+        layout = self.get_token_layout(H, W)
+        space_mask = layout.build_space_mask("encoder")  # (1, 1, q_len, k_len)
 
-        # 6) Project latent tokens to bottleneck and tanh
-        latent_tokens = encoded_tokens[:, :, :self.n_latents, :]
-        proj_tokens = nn.tanh(self.bottleneck_proj(latent_tokens))
+        # Feed tokens into transformer
+        time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
+        encoded_tokens, new_caches, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, caches=caches, rngs=rngs)
 
-        return proj_tokens, (patch_mask, keep_prob)  # keep mask if you want diagnostics
+        # Project latent tokens to bottleneck and tanh
+        latent_tokens = encoded_tokens[:, :, :self.n_latents]
+        proj_tokens = nnx.tanh(self.bottleneck_proj(latent_tokens))
 
-class Decoder(nn.Module):
+        # new_caches is None unless a KV cache was provided.
+        return proj_tokens, (frame_mask, keep_prob), new_caches
+
+
+class Decoder(nnx.Module):
     """
     MAE-style decoder that reads temporal info from latent tokens and writes
     reconstructions at per-patch query tokens.
-
-    Inputs:
-      - z: (B, T, N_l, d_bottleneck)  -- encoder bottleneck output
-
-    Config:
-      - n_patches: number of patch query tokens to use in the decoder
-      - d_patch:   dimensionality of each patch to reconstruct (D_patch)
-      - d_model, n_heads, depth, dropout_rate, mlp_ratio, time_every, latents_only_time
-        typically mirror the encoder.
     """
-    d_model: int
-    n_heads: int
-    n_kv_heads: int
-    depth: int
-    n_latents: int
-    n_patches: int
-    d_patch: int
-    dropout_rate: float = 0.0
-    qk_norm_type: str | None = None
-    mlp_ratio: float = 4.0
-    time_every: int = 4
-    use_rope: bool = False
-    rope_theta: float = 10000.0
 
-    def setup(self):
-        self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
-        self.modality_ids = self.layout.modality_ids()
-        self.up_proj = nn.Dense(self.d_model, name="up_proj")
-        self.patch_queries = self.param(
-            "patch_queries",
-            nn.initializers.normal(0.02),
-            (self.n_patches, self.d_model),
-        ) # (Np, D)
-        self.patch_head = nn.Dense(self.d_patch, name="patch_head") # (Np, D_patch)
+    def __init__(self, cfg: DecoderModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.cfg = cfg
+        self.n_latents = cfg.n_latents
+        self.patch_size = cfg.patch_size
+        self.context_length = cfg.context_length
+        self.d_model = cfg.d_model
+        self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads
+        self.H = cfg.H
+        self.W = cfg.W
+        self.dataset_mean = cfg.dataset_mean
+        self.dataset_std = cfg.dataset_std
+        self.context_length = cfg.context_length
+        dtype = to_jnp_dtype(cfg.dtype)
+        param_dtype = to_jnp_dtype(cfg.param_dtype)
+
+        self.n_patches = (self.H // self.patch_size) * (self.W // self.patch_size)
+        self.up_proj = nnx.Linear(cfg.d_bottleneck, cfg.d_model, use_bias=cfg.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+        self.patch_head = nnx.Linear(cfg.d_model, cfg.d_patch, use_bias=cfg.use_bias, dtype=dtype, param_dtype=param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')), rngs=rngs)
+
         self.transformer = BlockCausalTransformer(
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            n_kv_heads=self.n_kv_heads,
-            depth=self.depth,
-            dropout_rate=self.dropout_rate,
-            qk_norm_type=self.qk_norm_type,
-            mlp_ratio=self.mlp_ratio,
-            time_every=self.time_every,
-            use_rope=self.use_rope,
-            rope_theta=self.rope_theta,
+            d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads, depth=cfg.depth,
+            dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type, mlp_ratio=4.0,
+            time_every=cfg.time_every, time_layer_offset=getattr(cfg, 'time_layer_offset', 1), rope_theta=cfg.rope_theta,
+            use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
+            use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
+            dtype=dtype, param_dtype=param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
+            mesh_rules=mesh_rules, rngs=rngs
         )
-        mask = make_mask(self.modality_ids, "decoder")
-        self.mask = self.variable("constants", "mask", lambda: mask)
 
-    @nn.compact
-    def __call__(self, z: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
+        self.patch_queries = nnx.Param(jax.random.normal(rngs.params(), (self.n_patches, cfg.d_model), dtype=param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
+
+    def get_token_layout(self) -> TokenLayout:
+        return TokenLayout((
+            (Modality.LATENT, self.n_latents),
+            (Modality.IMAGE, self.n_patches)
+        ))
+
+    def create_static_caches(self, batch_size: int, window_size: int = 1024, dtype=jnp.float32) -> KVCachesDict:
+        """Creates concrete, zero-filled decoder KV cache buffers for JIT compilation."""
+        layout = self.get_token_layout()
+
+        return create_transformer_caches(
+            layer_is_time=[layer.is_time_layer for layer in self.transformer.layers],
+            flattened_batch_size=batch_size * layout.S,
+            window_size=window_size,
+            num_kv_heads=self.cfg.n_kv_heads,
+            head_dim=self.cfg.d_model // self.cfg.n_heads,
+            dtype=dtype,
+        )
+
+    def __call__(
+            self,
+            z: jnp.ndarray,
+            *,
+            deterministic: bool = True,
+            caches: KVCachesDict | None = None,
+            rngs: nnx.Rngs | None = None
+        ):
+        # Always expect unpacked input: (B, T, n_latents, d_bottleneck)
         B, T, N_l, d_bottleneck = z.shape
 
-        # 1) Up-project latent bottleneck to d_model (per latent token)
+        # Up-project latent bottleneck to d_model (per latent token)
         latents = self.up_proj(z)  # (B, T, N_l, D)
 
-        # 2) Learned per-patch query tokens (owned by the decoder)
-        patches = jnp.broadcast_to(
-            self.patch_queries[None, None, ...],
-            (B, T, self.n_patches, self.d_model),
-        )  # (B, T, Np, D)
+        # Learned per-patch query tokens (owned by the decoder)
+        patches = repeat(self.patch_queries.value.astype(latents.dtype), " ... -> b t ...", b=B, t=T)  # (B, T, Np, D)
 
-        # 3) Concat: [latents, patch queries]  ->  (B, T, S=N_l+N_p, D)
-        tokens = jnp.concatenate([latents, patches], axis=2)
+        # Concat: [latents, patch queries]  ->  (B, T, S=N_l+N_p, D)
+        tokens = jnp.concatenate([latents, patches], axis=-2)
 
-        # 4) Add sinusoidal positions
-        if not self.use_rope:
-            tokens = add_sinusoidal_positions(tokens)
+        # Make mask
+        layout = self.get_token_layout()
+        space_mask = layout.build_space_mask("decoder")
 
-        # 5) Axial block-causal transformer
-        #    - SpaceSelfAttention over all S tokens (latents + queries)
-        #    - TimeSelfAttention only over the first N_l latent tokens
-        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
-        x = self.transformer(tokens, mask=mask, deterministic=deterministic)
-        # 6) Prediction head over the patch-query slice
+        time_local_window_size = (self.context_length - 1, 0) if self.context_length is not None else None
+        x, new_caches, _ = self.transformer(tokens, space_mask=space_mask, time_local_window_size=time_local_window_size, deterministic=deterministic, caches=caches, rngs=rngs)
+
+        # Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
         pred_btnd = self.patch_head(x_patches)  # (B, T, Np, D_patch)
-        return pred_btnd
+        out_normalized_frames = unpatchify(pred_btnd, patch=self.patch_size, H=self.H, W=self.W)
+        out_frames = unnormalize_with_dataset_stats(out_normalized_frames, mean=self.dataset_mean, std=self.dataset_std)
+        return out_frames, new_caches
 
-class ActionEncoder(nn.Module):
-    d_model: int
-    n_keyboard: int = 5  # up, down, left, right, null (categorical actions)
 
-    @nn.compact
-    def __call__(
-        self,
-        actions: Optional[jnp.ndarray],           # (B, T) int32 in [0, n_keyboard)
-        batch_time_shape: Optional[Tuple[int,int]] = None,
-        as_tokens: bool = True,
-    ):
-        # Base "action token" embedding (used always)
-        base_emb = self.param(
-            'base_action_emb', nn.initializers.normal(0.02), (self.d_model,)
+class Tokenizer(nnx.Module):
+    """Complete tokenizer (encoder + decoder)."""
+
+    def __init__(self, cfg: TokenizerModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.cfg = cfg
+
+        # Create encoder and decoder
+        self.encoder = Encoder(cfg.encoder, mesh_rules=mesh_rules, rngs=rngs)
+        self.decoder = Decoder(cfg.decoder, mesh_rules=mesh_rules, rngs=rngs)
+
+    def __call__(self, videos, *, deterministic: bool = True, caches: TokenizerCaches | None = None, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
+        encoder_caches = caches.encoder if caches is not None else None
+        decoder_caches = caches.decoder if caches is not None else None
+        z, aux, encoder_caches = self.encoder(videos, deterministic=deterministic, caches=encoder_caches, rngs=rngs, mae_p_max=mae_p_max)
+        recon, decoder_caches = self.decoder(z, deterministic=deterministic, caches=decoder_caches, rngs=rngs)
+        return recon, aux, TokenizerCaches(encoder=encoder_caches, decoder=decoder_caches)
+
+    def encode(self, videos, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None, mae_p_max: jnp.ndarray | None = None):
+        # Always returns unpacked: (B, T, n_latents, d_bottleneck)
+        return self.encoder(videos, deterministic=deterministic, caches=caches, rngs=rngs, mae_p_max=mae_p_max)
+
+    def decode(self, z, *, deterministic: bool = True, caches: KVCachesDict | None = None, rngs: nnx.Rngs | None = None):
+        # Always expects unpacked: (B, T, n_latents, d_bottleneck)
+        return self.decoder(z, deterministic=deterministic, caches=caches, rngs=rngs)
+
+    def create_static_caches(
+            self,
+            batch_size: int,
+            H: int,
+            W: int,
+            window_size: int = 1024,
+            dtype=jnp.float32,
+        ) -> TokenizerCaches:
+        """Creates namespaced encoder and decoder KV cache buffers."""
+        encoder_window_size = self.encoder.context_length if self.encoder.context_length is not None else window_size
+
+        return TokenizerCaches(
+            encoder=self.encoder.create_static_caches(batch_size=batch_size, H=H, W=W, window_size=encoder_window_size, dtype=dtype),
+            decoder=self.decoder.create_static_caches(batch_size=batch_size, window_size=window_size, dtype=dtype),
         )
 
-        if actions is None:
-            # unlabeled videos: just broadcast base embedding
-            assert batch_time_shape is not None
-            B, T = batch_time_shape
-            out = jnp.broadcast_to(base_emb, (B, T, self.d_model))
+    def num_scaling_params(self) -> int:
+        """Total params for scaling law analysis (Chinchilla-style, includes all)."""
+        _, state, _ = nnx.split(self, nnx.Param, ...)
+        sizes = jax.tree.map(jnp.size, state)
+        return jax.tree.reduce(lambda a, b: a + b, sizes)
+
+    def count_excluded_params(self) -> int:
+        """Params to exclude from FLOP estimation (embeddings + scalars)."""
+        excluded = 0
+        # Learned tokens (embedding-like)
+        excluded += self.encoder.latents_enc.value.size
+        excluded += self.encoder.mask_and_replace.mask_token.value.size
+        excluded += self.decoder.patch_queries.value.size
+        # Per-layer scalars
+        excluded += self.encoder.transformer.count_excluded_params()
+        excluded += self.decoder.transformer.count_excluded_params()
+        return excluded
+
+    def estimate_flops(self, batch_size: int, seq_length: int) -> int:
+        """FLOPs per training step (forward + backward).
+
+        Follows https://github.com/karpathy/nanochat/discussions/420.
+        """
+        S = self.decoder.get_token_layout().S
+
+        # Weight FLOPs (excluding embeddings/scalars)
+        total_params = self.num_scaling_params()
+        excluded = self.count_excluded_params()
+        weight_flops = 6 * (total_params - excluded) * batch_size * seq_length * S
+
+        # Attention FLOPs
+        enc_attn = self.encoder.transformer.estimate_attention_flops(batch_size, seq_length, S)
+        dec_attn = self.decoder.transformer.estimate_attention_flops(batch_size, seq_length, S)
+
+        return int(weight_flops + enc_attn + dec_attn)
+
+
+# ============================================================================
+# Dynamics
+# ============================================================================
+
+class ActionEncoder(nnx.Module):
+    """Action encoder for dynamics model."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_binary_actions: int = 0,
+        categorical_action_dim: int = 0,
+        continuous_action_dim: int = 0,
+        use_bias: bool = False,
+        dtype: Any = jnp.float32,
+        param_dtype: Any = jnp.float32,
+        *,
+        mesh_rules: MeshRules,
+        rngs: nnx.Rngs
+    ):
+        self.d_model = d_model
+        dtype = to_jnp_dtype(dtype)
+        param_dtype = to_jnp_dtype(param_dtype)
+        self.dtype = dtype
+
+        # Base "action token" embedding (used always)
+        self.base_action_emb = nnx.Param(
+            jax.random.normal(rngs.params(), (d_model,), dtype=param_dtype) * 0.02,
+            sharding_names=mesh_rules('embed')
+        )
+
+        # Embed binary actions
+        if num_binary_actions > 0:
+            binary_embeds = [
+                nnx.Embed(
+                    2, d_model,
+                    dtype=dtype, param_dtype=param_dtype,
+                    embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
+                    rngs=rngs
+                )
+                for _ in range(num_binary_actions)
+            ]
+            self.binary_embeds_list = _nnx_list(binary_embeds)  # num_binary_actions * (B, T, d_model)
         else:
-            # embed categorical actions
-            emb_key = nn.Embed(self.n_keyboard, self.d_model, name="emb_key")(actions)
-            out = emb_key + base_emb  # broadcast add
+            self.binary_embeds_list = None
+
+        # Embed categorical action
+        if categorical_action_dim > 0:
+            self.categorical_embeds = nnx.Embed(
+                categorical_action_dim, d_model,
+                dtype=dtype, param_dtype=param_dtype,
+                embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), mesh_rules('embed')),
+                rngs=rngs
+            )  # (B, T, d_model)
+        else:
+            self.categorical_embeds = None
+
+        # Continuous actions: linear projection
+        if continuous_action_dim > 0:
+            self.continuous_proj = nnx.Linear(
+                continuous_action_dim, d_model,
+                use_bias=use_bias,
+                dtype=dtype, param_dtype=param_dtype,
+                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')),
+                rngs=rngs
+            )  # (B, T, d_model)
+        else:
+            self.continuous_proj = None
+
+    def __call__(
+        self,
+        actions: Actions,
+        batch_time_shape: Tuple[int, int],
+        as_tokens: bool = True
+    ):
+        """
+        Encode actions into embeddings.
+
+        Args:
+            actions: Actions to encode (B, T, ...)
+            batch_time_shape: (B, T) shape for unlabeled videos
+            as_tokens: whether to expand to token dimension
+
+        Returns:
+            Action embeddings (B, T, d_model) or (B, T, 1, d_model) if as_tokens=True
+        """
+        base_emb = self.base_action_emb.value.astype(self.dtype)
+
+        # Unlabeled videos: just broadcast base embedding
+        B, T = batch_time_shape
+        out = jnp.broadcast_to(base_emb, (B, T, self.d_model))
+
+        if actions.binary is not None and self.binary_embeds_list is not None:
+            binary_emb = jnp.zeros((B, T, self.d_model), dtype=self.dtype)
+            for i, emb in enumerate(self.binary_embeds_list):
+                binary_state = actions.binary[..., i]  # (B, T)
+                binary_emb = binary_emb + emb(binary_state)
+            out = out + binary_emb
+
+        if actions.categorical is not None and self.categorical_embeds is not None:
+            categorical_emb = self.categorical_embeds(actions.categorical)
+            out = out + categorical_emb
+
+        if actions.continuous is not None and self.continuous_proj is not None:
+            continuous_emb = self.continuous_proj(actions.continuous.astype(self.dtype))
+            out = out + continuous_emb
 
         if as_tokens:
             # expand a token axis (S_a = 1)
-            out = out[:, :, None, :]
+            out = out[..., None, :]
 
         return out
 
-class Dynamics(nn.Module):
-    d_model: int              # dimensionality of each token
-    d_bottleneck: int         # dimensionality of the input bottleneck space
-    d_spatial: int            # dimensionality of each spatial token input
-    n_spatial: int            # number of spatial tokens
-    n_register: int           # number of learned register tokens
-    n_agent: int              # number of agent tokens
-    n_heads: int
-    n_kv_heads: int
-    depth: int
-    k_max: int                 # maximum number of sampling steps (defines finest step 1/)
-    dropout_rate: float = 0.0
-    qk_norm_type: str | None = None
-    mlp_ratio: float = 4.0
-    time_every: int = 4
-    use_rope: bool = False
-    rope_theta: float = 10000.0
 
-    def setup(self):
-        # Want to transform bottleneck inputs (B, T, N_b, D_b) to (B, T, N_b/packing_factor, D_b*packing_factor)
-        assert self.d_spatial % self.d_bottleneck == 0
-        self.spatial_proj = nn.Dense(self.d_model, name="proj_spatial") # converts spatial tokens, of dim d_spatial to d_model
-        self.register_tokens = self.param(
-            "register_tokens",
-            nn.initializers.normal(0.02),
-            (self.n_register, self.d_model),
+class TimestepEmbedder(nnx.Module):
+    """Sinusoidal timestep embedding"""
+
+    def __init__(
+        self,
+        out_dim: int,
+        freq_dim: int = 256,
+        max_period: float = 10000.0,
+        *,
+        dtype,
+        param_dtype,
+        mesh_rules: MeshRules,
+        rngs: nnx.Rngs,
+    ):
+        self.freq_dim = freq_dim
+        self.max_period = max_period
+        self.dtype = dtype
+        self.dense1 = nnx.Linear(
+            freq_dim, out_dim,
+            use_bias=True,
+            kernel_init=nnx.with_partitioning(nnx.initializers.normal(0.02), mesh_rules('mlp')),
+            dtype=dtype, param_dtype=param_dtype, rngs=rngs,
         )
-        self.action_encoder = ActionEncoder(d_model=self.d_model)
+        self.dense2 = nnx.Linear(
+            out_dim, out_dim,
+            use_bias=True,
+            kernel_init=nnx.with_partitioning(nnx.initializers.normal(0.02), mesh_rules('mlp')),
+            dtype=dtype, param_dtype=param_dtype, rngs=rngs,
+        )
 
-        # Two separate tokens for shortcut conditioning (your current layout):
+    def __call__(self, t: jax.Array) -> jax.Array:
+        """Embed scalar timestep(s).
+
+        Args:
+            t: (...) float array of timestep values.
+
+        Returns:
+            (..., out_dim) embedding array.
+        """
+        t = t.astype(jnp.float32) * 1000.0  # scale so t spans a useful range of the sinusoidal basis (DiT convention)
+        half = self.freq_dim // 2
+        freqs = jnp.exp(-math.log(self.max_period) * jnp.arange(half, dtype=jnp.float32) / half)
+        args = t[..., None] * freqs  # (..., half)
+        emb = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)  # (..., freq_dim)
+        emb = emb.astype(self.dtype)
+        emb = nnx.silu(self.dense1(emb))
+        return self.dense2(emb)
+
+
+class Dynamics(nnx.Module):
+    """Dynamics model (world model)."""
+
+    def __init__(self, cfg: DynamicsModelConfig, *, mesh_rules: MeshRules, rngs: nnx.Rngs):
+        self.cfg = cfg
+        self.dtype = to_jnp_dtype(cfg.dtype)
+        self.param_dtype = to_jnp_dtype(cfg.param_dtype)
+        self.d_model = cfg.d_model
+        self.d_bottleneck = cfg.d_bottleneck
+        self.depth = cfg.depth
+        self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads
+        self.packing_factor = cfg.packing_factor
+        self.n_register = cfg.n_register
+        self.k_max = cfg.k_max
+
+        # Project spatial tokens
+        self.spatial_proj = nnx.Linear(cfg.d_bottleneck * cfg.packing_factor, cfg.d_model, use_bias=cfg.use_bias, dtype=self.dtype, param_dtype=self.param_dtype, kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), mesh_rules('mlp')), rngs=rngs)
+
+        # Register tokens
+        self.register_tokens = nnx.Param(jax.random.normal(rngs.params(), (cfg.n_register, cfg.d_model), dtype=self.param_dtype) * 0.02, sharding_names=mesh_rules('embed'))
+
+        # Action encoder
+        self.action_encoder = ActionEncoder(
+            d_model=cfg.d_model,
+            num_binary_actions=cfg.num_binary_actions,
+            categorical_action_dim=cfg.categorical_action_dim,
+            continuous_action_dim=cfg.continuous_action_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            mesh_rules=mesh_rules,
+            rngs=rngs
+        )
+
+        # Transformer
+        self.transformer = BlockCausalTransformer(
+            d_model=cfg.d_model, n_heads=cfg.n_heads, n_kv_heads=cfg.n_kv_heads,
+            depth=cfg.depth, dropout_rate=cfg.dropout_rate, qk_norm_type=cfg.qk_norm_type,
+            mlp_ratio=cfg.mlp_ratio, time_every=cfg.time_every, time_layer_offset=cfg.time_layer_offset, rope_theta=cfg.rope_theta,
+            use_bias=cfg.use_bias, use_rmsnorm_scale=cfg.use_rmsnorm_scale,
+            use_seq_parallel=getattr(cfg, 'use_seq_parallel', False),
+            dtype=self.dtype, param_dtype=self.param_dtype,
+            use_residual_lambdas=cfg.use_residual_lambdas,
+            mesh_rules=mesh_rules, rngs=rngs
+        )
+
+        # Sinusoidal embeddings for shortcut conditioning
+        # step_idx ∈ {0,...,log2(k_max)} passed as float; tau ∈ [0,1] (tau_idx/k_max)
+        half_dim = cfg.d_model // 2
+        self.step_embed = TimestepEmbedder(
+            out_dim=half_dim,
+            dtype=self.dtype, param_dtype=self.param_dtype,
+            mesh_rules=mesh_rules, rngs=rngs,
+        )
+        self.signal_embed = TimestepEmbedder(
+            out_dim=half_dim,
+            dtype=self.dtype, param_dtype=self.param_dtype,
+            mesh_rules=mesh_rules, rngs=rngs,
+        )
+
+        # Output head (zero-init)
+        self.flow_x_head = nnx.Linear(
+            cfg.d_model, cfg.d_bottleneck * cfg.packing_factor,
+            use_bias=cfg.use_bias,
+            kernel_init=nnx.with_partitioning(nnx.initializers.zeros, mesh_rules('mlp')),
+            bias_init=nnx.initializers.zeros,
+            dtype=self.dtype, param_dtype=self.param_dtype, rngs=rngs
+        )
+
+    def get_token_layout(self, n_latents: int, n_agent: int = 0) -> TokenLayout:
+        """Get token layout.
+
+        Args:
+            n_latents: Number of unpacked latent tokens (will be packed internally)
+            n_agent: Number of agent tokens
+        """
+        n_spatial = n_latents // self.packing_factor
         segments = [
             (Modality.ACTION, 1),
-            (Modality.SHORTCUT_SIGNAL, 1),   # τ (signal level) token
-            (Modality.SHORTCUT_STEP, 1),     # d (step size) token
-            (Modality.SPATIAL, self.n_spatial),
-            (Modality.REGISTER, self.n_register),
+            (Modality.SHORTCUT, 1),
+            (Modality.SPATIAL, n_spatial),
+            (Modality.REGISTER, self.cfg.n_register),
         ]
-        if self.n_agent > 0:
-            segments.append((Modality.AGENT, self.n_agent))
-        self.layout = TokenLayout(n_latents=0, segments=tuple(segments))
-        self.spatial_slice = self.layout.slices()[Modality.SPATIAL]
-        self.agent_slice  = self.layout.slices().get(Modality.AGENT, slice(0,0))  # safe if n_agent==0
-        self.modality_ids = self.layout.modality_ids()
-        mask = make_mask(self.modality_ids, "wm_agent")
-        self.mask = self.variable("constants", "mask", lambda: mask)
+        if n_agent > 0:
+            segments.append((Modality.AGENT, n_agent))
+        return TokenLayout(tuple(segments))
 
-        self.transformer = BlockCausalTransformer(
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            n_kv_heads=self.n_kv_heads,
-            depth=self.depth,
-            dropout_rate=self.dropout_rate,
-            qk_norm_type=self.qk_norm_type,
-            mlp_ratio=self.mlp_ratio,
-            time_every=self.time_every,
-            use_rope=self.use_rope,
-            rope_theta=self.rope_theta,
+    def create_static_caches(self, batch_size: int, n_latents: int, window_size: int = 1024,
+                           n_agent: int = 0, dtype=jnp.float32) -> KVCachesDict:
+        """Creates concrete, zero-filled buffers for JIT compilation.
+
+        Args:
+            batch_size: Batch size
+            n_latents: Number of unpacked latent tokens (will be packed internally)
+            window_size: Maximum temporal sequence length
+            n_agent: Number of agent tokens
+            dtype: Data type for cache buffers
+        """
+        layout = self.get_token_layout(n_latents=n_latents, n_agent=n_agent)
+
+        return create_transformer_caches(
+            layer_is_time=[layer.is_time_layer for layer in self.transformer.layers],
+            flattened_batch_size=batch_size * layout.S,
+            window_size=window_size,
+            num_kv_heads=self.cfg.n_kv_heads,
+            head_dim=self.cfg.d_model // self.cfg.n_heads,
+            dtype=dtype
         )
 
-        # -------- Discrete embeddings for shortcut conditioning --------
-        # Step size d ∈ {1, 1/2, 1/4, ..., 1/256}
-        # We index steps by: step_idx = log2(1/d) ∈ {0, 1, 2, ...,7, 8}
-        self.num_step_bins = int(math.log2(self.k_max)) + 1
-        self.step_embed = nn.Embed(self.num_step_bins, self.d_model, name="step_embed")
-
-        # Signal level τ ∈ {0, 1/d, 2/d, ..., 1 - 1/d} (grid length = 1/d)
-        # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
-        self.signal_embed = nn.Embed(self.k_max + 1, self.d_model, name="signal_embed")
-        self.flow_x_head = nn.Dense(self.d_spatial, name="flow_x_head", kernel_init=nn.initializers.zeros,
-                            bias_init=nn.initializers.zeros)  # zero-init
-
-    @nn.compact
     def __call__(
         self,
-        actions,             # (B,T)
-        step_idxs,           # (B,T)
-        signal_idxs,         # (B,T)
-        packed_enc_tokens,   # (B,T,n_s,d_spatial)
+        actions: Actions,
+        step_indices,
+        tau_indices,
+        unpacked_enc_tokens,
         *,
-        agent_tokens: Optional[jnp.ndarray] = None,  # (B,T,n_agent,D) or None
+        context_length: int | None = None,
+        time_mask: jnp.ndarray | None = None,
+        task_embeddings: jnp.ndarray | None = None,
         deterministic: bool = True,
-    ):
+        caches: KVCachesDict | None = None,
+        rngs: nnx.Rngs | None = None
+    ) -> Tuple[jax.Array, Tuple[jax.Array | None, KVCachesDict | None]]:
         """
         Args:
-          packed_enc_tokens:      (B, T, n_spatial, d_spatial) packed encoder tokens
-          actions:    (B, T) int32 in [0, n_keyboard) raw action tokens
-          steps:      (B, T) float32 — step sizes, 1/2^x
-          signals:    (B, T) float32 - signal values, grid that is reachable by current step size
+            actions: Actions object
+            step_indices: (B, T) int32 — step indices for embedding lookup
+            tau_indices: (B, T) int32 - signal indices for embedding lookup
+            unpacked_enc_tokens: (B, T, n_latents, d_bottleneck) unpacked encoder tokens
+            context_length: optional context length for sliding window attention. If provided,
+                           creates local_window_size=(context_length - 1, 0) for causal sliding window.
+            time_mask: optional (B, 1, T, T) boolean mask for temporal attention
+            task_embeddings: (B, T, n_agent, d_model) optional agent tokens
+            caches: optional dict of KVCache for each layer
 
-        Shapes produced:
-          spatial_tokens: (B, T, n_spatial, d_model)
-          action_tokens:  (B, T, 1, d_model)  # if your ActionEncoder emits one token
-          signal_token:   (B, T, 1, d_model)
-          step_token:     (B, T, 1, d_model)
+        Shapes produced (internal):
+            spatial_tokens: (B, T, n_spatial, d_model)
+            action_token:  (B, T, 1, d_model)
+            shortcut_token: (B, T, 1, d_model)
         """
-        # --- 1) Project spatial tokens to model dimension
-        spatial_tokens = self.spatial_proj(packed_enc_tokens) # (B, T, n_spatial, d_model)
+        B, T = unpacked_enc_tokens.shape[:2]
 
-        # --- 2) Encode actions to d_model
-        action_tokens = self.action_encoder(actions)  # (B, T, N_a, d_model)
+        # Pack tokens internally for processing
+        packed_enc_tokens = rearrange(unpacked_enc_tokens, "b t (n p) d -> b t n (p d)", p=self.packing_factor)
+        # Project spatial tokens to d_model
+        spatial_tokens = self.spatial_proj(packed_enc_tokens)  # (B, T, n_spatial, d_model)
 
-        # --- 3) Prepare learned register tokens
+        # Encode actions to d_model
+        action_token = self.action_encoder(
+            actions=actions,
+            batch_time_shape=(B, T),
+        )  # (B, T, 1, d_model)
+
+        # Prepare learned register tokens
         B, T = spatial_tokens.shape[:2]
         register_tokens = jnp.broadcast_to(
-            self.register_tokens[None, None, ...],  # (1,1,n_register,d_model)
+            self.register_tokens.value.astype(self.dtype)[None, None, ...],  # (1, 1 ,n_register, d_model)
             (B, T, self.n_register, self.d_model),
         )
 
-        # --- 4) Shortcut embeddings (discrete lookup)
-        step_tok   = self.step_embed(step_idxs)[:, :, None, :]      # (B, T, 1, d_model)
-        signal_tok = self.signal_embed(signal_idxs)[:, :, None, :]     # (B, T, 1, d_model)
+        # Shortcut embeddings (sinusoidal, concatenated to single token)
+        # step_indices: int log2(K) → float for sinusoidal PE
+        # tau_indices: int τ*k_max → normalize to [0,1] for sinusoidal PE
+        step_emb = self.step_embed(step_indices.astype(jnp.float32))                          # (B, T, d_model//2)
+        signal_emb = self.signal_embed(tau_indices.astype(jnp.float32) / self.k_max)          # (B, T, d_model//2)
+        shortcut_token = jnp.concatenate([step_emb, signal_emb], axis=-1)[:, :, None, :]     # (B, T, 1, d_model)
+
+        # Concatenate in declared layout order (`get_token_layout`)
+        tokens = [action_token, shortcut_token, spatial_tokens, register_tokens]
+        if task_embeddings is not None:
+            tokens.append(task_embeddings)
+
+        tokens = jnp.concatenate(tokens, axis=2)  # (B, T, S, D)
+
+        # Make the layout for masking
+        n_agent = task_embeddings.shape[2] if task_embeddings is not None else 0
+        n_latents = unpacked_enc_tokens.shape[2]
+        layout = self.get_token_layout(n_latents=n_latents, n_agent=n_agent)
+        space_mask = layout.build_space_mask("wm_agent")
+
+        # Compute local_window_size from context_length for sliding window causal attention
+        time_local_window_size = None
+        if context_length is not None:
+            time_local_window_size = (context_length - 1, 0)
+
+        x, new_caches, _ = self.transformer(
+            tokens, space_mask=space_mask,
+            time_mask=time_mask,
+            time_local_window_size=time_local_window_size,
+            deterministic=deterministic,
+            caches=caches,
+            rngs=rngs
+        )
+
+        spatial_tokens = x[:, :, layout.slices()[Modality.SPATIAL], :]
+        x1_hat_packed = self.flow_x_head(spatial_tokens)  # (B, T, n_spatial, d_spatial)
+
+        # Unpack before returning
+        x1_hat = rearrange(x1_hat_packed, "b t n (p d) -> b t (n p) d", p=self.packing_factor)
         
-        # --- 5) Concatenate in your declared layout order
-        if self.n_agent > 0:
-            if agent_tokens is None:
-                agent_tokens = jnp.zeros((B, T, self.n_agent, self.d_model), dtype=spatial_tokens.dtype)
-            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, agent_tokens]
-        else:
-            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
-        tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
+        h_t = x[:, :, layout.slices()[Modality.AGENT], :] if task_embeddings is not None else None  # (B,T,n_agent,D) or None
+        return x1_hat, (h_t, new_caches)
 
-        if not self.use_rope:
-            tokens = add_sinusoidal_positions(tokens)      # (B, T, N_total, d_model)
-        
-        mask = repeat(self.mask.value, " ... -> bt h ...", bt=B*T, h=1)
-        x = self.transformer(tokens, mask, deterministic=deterministic)
-        spatial_tokens = x[:, :, self.spatial_slice, :]
-        x1_hat = self.flow_x_head(spatial_tokens)
-        h_t = x[:, :, self.agent_slice, :] if self.n_agent > 0 else None  # (B,T,n_agent,D) or None
-        return x1_hat, h_t
+    def num_scaling_params(self) -> int:
+        """Total params for scaling law analysis (Chinchilla-style, includes all)."""
+        _, state, _ = nnx.split(self, nnx.Param, ...)
+        sizes = jax.tree.map(jnp.size, state)
+        return jax.tree.reduce(lambda a, b: a + b, sizes)
 
-class TaskEmbedder(nn.Module):
-    d_model: int
-    n_agent: int = 1
-    use_ids: bool = True     # True: task is int ids; False: task is vector
-    n_tasks: int = 128       # only used if use_ids=True
-    d_task: int = 64         # only used if use_ids=False
+    def count_excluded_params(self) -> int:
+        """Params to exclude from FLOP estimation (embeddings + scalars)."""
+        excluded = 0
+        # Register tokens
+        excluded += self.register_tokens.value.size
+        # Action encoder embeddings
+        excluded += self.action_encoder.base_action_emb.value.size
+        if self.action_encoder.binary_embeds_list is not None:
+            for binary_emb in self.action_encoder.binary_embeds_list:
+                excluded += binary_emb.embedding.value.size
+        if self.action_encoder.categorical_embeds is not None:
+            excluded += self.action_encoder.categorical_embeds.embedding.value.size
+        # Per-layer scalars
+        excluded += self.transformer.count_excluded_params()
+        return excluded
 
-    @nn.compact
-    def __call__(self, task, B: int, T: int):
+    def estimate_flops(self, batch_size: int, seq_length: int, n_latents: int) -> int:
+        """FLOPs per training step (forward + backward).
+
+        Args:
+            batch_size: Batch size
+            seq_length: Sequence length
+            n_latents: Number of unpacked latent tokens (will be packed internally)
+
+        Follows https://github.com/karpathy/nanochat/discussions/420.
         """
-        If use_ids=True:
-            task: (B,) int32 ids in [0, n_tasks)
-        Else:
-            task: (B, d_task) float32 vector
+        S = self.get_token_layout(n_latents=n_latents).S
 
-        Returns agent tokens: (B, T, n_agent, d_model)
-        """
-        if self.use_ids:
-            emb = nn.Embed(self.n_tasks, self.d_model, name="task_table")(task)  # (B, D)
-        else:
-            emb = nn.Dense(self.d_model, name="task_proj")(task)                 # (B, D)
+        # Weight FLOPs (excluding embeddings/scalars)
+        total_params = self.num_scaling_params()
+        excluded = self.count_excluded_params()
+        weight_flops = 6 * (total_params - excluded) * batch_size * seq_length * S
 
-        # Learned base + optional small MLP to decouple from raw table
-        base = self.param("agent_base", nn.initializers.normal(0.02), (self.d_model,))
-        x = emb + base[None, :]
+        # Attention FLOPs
+        attn_flops = self.transformer.estimate_attention_flops(batch_size, seq_length, S, self.cfg.context_length)
 
-        # Replicate across time and agent slots
-        x = jnp.broadcast_to(x[:, None, None, :], (B, T, self.n_agent, self.d_model))
-        return x
-
-# === Phase B heads (use existing MLP) =========================================
-
-class PolicyHeadMTP(nn.Module):
-    """Multi-Token action prediction.
-    Input:  h_t (B, T, D)  -- agent readouts (pool n_agent first if needed)
-    Output: logits (B, T, L, A)
-    """
-    d_model: int
-    action_dim: int
-    L: int = 8
-    kind: str = "categorical"  # or "vbinary"
-    mlp_ratio: float = 2.0
-    dropout_rate: float = 0.0
-    swiglu: bool = True
-    parity_2over3: bool = False
-    dtype: Any = jnp.float32
-
-    def setup(self):
-        # Feature projector (D -> D) using your MLP
-        self.projector = MLP(
-            d_model=self.d_model,
-            mlp_ratio=self.mlp_ratio,
-            dropout_rate=self.dropout_rate,
-            swiglu=self.swiglu,
-            parity_2over3=self.parity_2over3,
-            dtype=self.dtype,
-        )
-        # Single matmul that produces all L offsets at once: (… , D) -> (…, L, A)
-        self.out = nn.DenseGeneral(
-            features=(self.L, self.action_dim),
-            axis=-1,
-            dtype=self.dtype,
-            name="out",
-        )
-
-    @nn.compact
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
-        x = self.projector(h_t, deterministic=deterministic)  # (B, T, D)
-        logits = self.out(x)                                  # (B, T, L, A)
-        return logits  # softmax/sigmoid applied at loss-time based on `kind`
-
-
-class RewardHeadMTP(nn.Module):
-    """Multi-Token reward prediction with symexp twohot bins.
-    Input:  h_t (B, T, D)
-    Output: logits (B, T, L, K), centers (K,)
-    """
-    d_model: int
-    L: int = 8
-    num_bins: int = 101
-    mlp_ratio: float = 2.0
-    dropout_rate: float = 0.0
-    swiglu: bool = True
-    parity_2over3: bool = False
-    dtype: Any = jnp.float32
-    # log-space bounds for symexp bins (tune per dataset)
-    log_low: float = -8.0
-    log_high: float = 8.0
-
-    def setup(self):
-        self.projector = MLP(
-            d_model=self.d_model,
-            mlp_ratio=self.mlp_ratio,
-            dropout_rate=self.dropout_rate,
-            swiglu=self.swiglu,
-            parity_2over3=self.parity_2over3,
-            dtype=self.dtype,
-        )
-        self.out = nn.DenseGeneral(
-            features=(self.L, self.num_bins),
-            axis=-1,
-            dtype=self.dtype,
-            name="out",
-        )
-        # Precompute bin centers as a constant (share across calls/checkpoints)
-        # Simple choice: uniform in log-space, then exponentiate symmetrically.
-        log_edges = jnp.linspace(self.log_low, self.log_high, self.num_bins)
-        # centers ~ same length for convenience (pad to K if using edges-midpoints):
-        centers = log_edges
-        self.centers_var = self.variable("constants", "symexp_centers_log", lambda: centers)
-
-    @nn.compact
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
-        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
-        logits = self.out(x)                                   # (B, T, L, K)
-        centers_log = self.centers_var.value                   # (K,)
-        return logits, centers_log
-
-
-class ValueHead(nn.Module):
-    """Value prediction with symexp twohot bins.
-    Input:  h_t (B, T, D)
-    Output: logits (B, T, K), centers (K,)
-    """
-    d_model: int
-    num_bins: int = 101
-    mlp_ratio: float = 2.0
-    dropout_rate: float = 0.0
-    swiglu: bool = True
-    parity_2over3: bool = False
-    dtype: Any = jnp.float32
-    # log-space bounds for symexp bins (tune per dataset)
-    log_low: float = -8.0
-    log_high: float = 8.0
-
-    def setup(self):
-        self.projector = MLP(
-            d_model=self.d_model,
-            mlp_ratio=self.mlp_ratio,
-            dropout_rate=self.dropout_rate,
-            swiglu=self.swiglu,
-            parity_2over3=self.parity_2over3,
-            dtype=self.dtype,
-        )
-        self.out = nn.DenseGeneral(
-            features=self.num_bins,
-            axis=-1,
-            dtype=self.dtype,
-            name="out",
-        )
-        # Precompute bin centers as a constant (share across calls/checkpoints)
-        # Simple choice: uniform in log-space, then exponentiate symmetrically.
-        log_edges = jnp.linspace(self.log_low, self.log_high, self.num_bins)
-        # centers ~ same length for convenience (pad to K if using edges-midpoints):
-        centers = log_edges
-        self.centers_var = self.variable("constants", "symexp_centers_log", lambda: centers)
-
-    @nn.compact
-    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
-        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
-        logits = self.out(x)                                   # (B, T, K)
-        centers_log = self.centers_var.value                   # (K,)
-        return logits, centers_log
-
-
-
-
-# ---------- test encoder/decoder ----------
-
-def test_encoder_decoder():
-    rng = jax.random.PRNGKey(0)
-    B = 2
-    T = 10
-    n_patches = 4
-    d_patch = 3
-    enc_n_latents = 2
-    enc_d_bottleneck = 3
-    x = jnp.ones((B, T, n_patches, d_patch))  # (B,T,Np,D_patch)
-
-    encoder = Encoder(d_model=8, n_latents=enc_n_latents, n_patches=n_patches, n_heads=2, n_kv_heads=1, depth=2, dropout_rate=0.5, d_bottleneck=enc_d_bottleneck)
-    decoder = Decoder(d_model=8, n_heads=2, n_kv_heads=1, depth=2, n_patches=n_patches, n_latents=enc_n_latents, d_patch=d_patch, dropout_rate=0.5)
-    # init: give both "mae" and "dropout" keys (dropout only needed if deterministic=False)
-    enc_vars = encoder.init(
-        {"params": rng, "mae": jax.random.PRNGKey(1), "dropout": jax.random.PRNGKey(2)},
-        x,
-        deterministic=True,
-    )
-    # Decode
-    fake_z = jnp.ones((B, T, enc_n_latents, enc_d_bottleneck))
-    dec_vars = decoder.init(
-        {"params": rng, "dropout": jax.random.PRNGKey(2)},
-        fake_z,
-        deterministic=True,
-    )
-
-    def forward_apply(enc_vars: FrozenDict, dec_vars: FrozenDict,
-                    patches_btnd: jnp.ndarray,
-                    *, mae_key=None, drop_key=None, train: bool):
-        # Encoder
-        rngs_enc = {}
-        if train:
-            rngs_enc = {"mae": mae_key, "dropout": drop_key}
-        else:
-            rngs_enc = {"mae": mae_key}  # if you still want masking during eval
-
-        z_btLd, mae_info = encoder.apply(enc_vars, patches_btnd,
-                                        rngs=rngs_enc,
-                                        deterministic=not train)
-        # Decoder
-        rngs_dec = {"dropout": drop_key} if train else {}
-        pred_btnd = decoder.apply(dec_vars, z_btLd,
-                                rngs=rngs_dec,
-                                deterministic=not train)
-        return pred_btnd, mae_info
-    
-    jit_forward = jax.jit(forward_apply, static_argnames=["train"])
-    mae_key = jax.random.PRNGKey(0)
-    drop_key = jax.random.PRNGKey(1)
-    # Warm-up (compilation happens here)
-    t0 = time.time()
-    out = jit_forward(enc_vars, dec_vars, x, mae_key=mae_key, drop_key=drop_key, train=True)
-    jax.tree_util.tree_map(lambda y: y.block_until_ready(), out)
-    t1 = time.time()
-    # Hot run (should be much faster)
-    t2 = time.time()
-    out = jit_forward(enc_vars, dec_vars, x, mae_key=mae_key, drop_key=drop_key, train=True)
-    jax.tree_util.tree_map(lambda y: y.block_until_ready(), out)
-    t3 = time.time()
-
-    print(f"Warm-up (compile+run): {t1 - t0:.3f}s")
-    print(f"Hot run (cached):      {t3 - t2:.3f}s")
-
-def test_dynamics():
-    rng = jax.random.PRNGKey(0)
-    B = 2
-    T = 10
-    fake_enc_z = jnp.ones((B, T, 512, 16), dtype=jnp.float32)
-    fake_actions = jnp.ones((B, T), dtype=jnp.int32)
-    fake_step_idxs = jnp.zeros((B, T), dtype=jnp.int32)
-    fake_signal_idxs = jnp.zeros((B, T), dtype=jnp.int32)
-    def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
-        """
-        (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
-        Requires: N_b == n_spatial * k  (e.g., 512 -> 256 with k=2).
-        """
-        return rearrange(z_btLd, 'b t (n_spatial k) d -> b t n_spatial (k d)', n_spatial=n_spatial, k=k)
-    fake_packed_enc_tokens = pack_bottleneck_to_spatial(fake_enc_z, n_spatial=256, k=2)
-
-
-    # need some way to assert that 512 * 16 == 256 * 32
-    dynamics_kwargs = {
-        "d_model": 128,
-        "n_spatial": 256,
-        "d_spatial": 32,
-        "d_bottleneck": 16,
-        "k_max": 8,
-        "n_register": 10,
-        "n_agent": 1,
-        "n_heads": 4,
-        "depth": 4,
-        "dropout": 0.0
-    }
-    dynamics = Dynamics(**dynamics_kwargs)
-    dynamics_vars = dynamics.init(
-        {"params": rng, "dropout": jax.random.PRNGKey(2)},
-        fake_actions,
-        fake_step_idxs,
-        fake_signal_idxs,
-        fake_packed_enc_tokens,
-    )
-    out = dynamics.apply(dynamics_vars, fake_actions, fake_step_idxs, fake_signal_idxs, fake_packed_enc_tokens,
-                        rngs={"dropout": jax.random.PRNGKey(2)},
-                        deterministic=True)
-
-def _build_modality_mask(modality_ids, mode: str):
-    return make_mask(modality_ids, mode)
-
-def _pack_bottleneck_to_spatial(z_btLd, n_spatial, k):
-    return rearrange(z_btLd, 'b t (n k) d -> b t n (k d)', n=n_spatial, k=k)
-
-def _abbr(m):
-    # short labels just for printing rows/cols
-    return {
-        int(Modality.ACTION): "ACT",
-        int(Modality.SHORTCUT_SIGNAL): "SIG",
-        int(Modality.SHORTCUT_STEP): "STP",
-        int(Modality.SPATIAL): "SPA",
-        int(Modality.REGISTER): "REG",
-        int(Modality.AGENT): "AGT",
-        int(Modality.LATENT): "LAT",
-    }.get(int(m), f"M{int(m)}")
-
-def _print_mask_summary(name: str, modality_ids: jnp.ndarray, mask_2d: jnp.ndarray):
-    # mask_2d: (S,S) with True meaning "query row can read key col"
-    S = modality_ids.shape[0]
-    mods = [int(x) for x in list(modality_ids)]
-    headers = "     " + " ".join(f"{_abbr(m):>3}" for m in mods)
-    print(f"\n[{name}] modality order (Q rows / K cols): {mods}")
-    print(headers)
-    for q in range(S):
-        row = "".join("  ✓" if bool(mask_2d[q, k]) else "  ·" for k in range(S))
-        print(f"{_abbr(modality_ids[q]):>3}: {row}")
-    # row-wise counts
-    counts = jnp.sum(mask_2d, axis=1)
-    print("Row read-counts:", counts.tolist())
-
-def test_agent_firewall():
-    # layout: [ACTION, SIG, STEP, SPATIALx3, REGISTERx2, AGENTx1]
-    ACTION,SIGNAL,STEP,SPATIAL,REGISTER,AGENT = 1,5,6,4,3,7
-    modality_ids = jnp.array([ACTION, SIGNAL, STEP, SPATIAL, SPATIAL, SPATIAL, REGISTER, REGISTER, AGENT], dtype=jnp.int32)
-    S = modality_ids.shape[0]
-    agent_col = (modality_ids == AGENT)  # keys that are agent
-    agent_row = (modality_ids == AGENT)  # queries that are agent
-
-    # ----- wm_agent -----
-    mask = _build_modality_mask(modality_ids, "wm_agent")  # (S,S)
-    _print_mask_summary("wm_agent", modality_ids, mask)
-
-    # Others never see agent: find any offending (q,k) where q!=agent and k is agent
-    bad_q = []
-    for q in range(S):
-        if not bool(agent_row[q]):
-            if bool(mask[q, agent_col].sum()):
-                bad_q.append(q)
-    if bad_q:
-        print("Violations in wm_agent (non-agent reads agent) at query rows:", bad_q)
-
-    # Agent reads all in wm_agent
-    agent_q_idx = int(jnp.where(agent_row, size=1, fill_value=-1)[0][0])
-    if agent_q_idx >= 0:
-        agent_reads = mask[agent_q_idx, :]
-        missing = [k for k in range(S) if not bool(agent_reads[k])]
-        if missing:
-            print("Violations in wm_agent (agent cannot read some keys). Missing cols:", missing)
-
-    # Assertions
-    for q in range(S):
-        if not bool(agent_row[q]):
-            assert mask[q, agent_col].sum() == 0, "Non-agent query can attend to agent!"
-    if agent_q_idx >= 0:
-        assert jnp.all(mask[agent_q_idx, :]), "Agent query cannot read some token in wm_agent"
-
-
-
-
-def test_x1hat_invariant_to_agent_tokens():
-    B,T = 2,5
-    n_b, d_b = 8, 4      # encoder latents
-    n_spatial, pack = 4, 2
-    d_spatial = d_b * pack
-    D = 32
-
-    fake_enc_z = jnp.ones((B, T, n_b, d_b))
-    packed = _pack_bottleneck_to_spatial(fake_enc_z, n_spatial=n_spatial, k=pack)
-    actions = jnp.zeros((B,T), dtype=jnp.int32)
-    step_idx = jnp.zeros((B,T), dtype=jnp.int32)
-    sig_idx  = jnp.zeros((B,T), dtype=jnp.int32)
-
-    dyn = Dynamics(
-        d_model=D, d_bottleneck=d_b, d_spatial=d_spatial,
-        n_spatial=n_spatial, n_register=2, n_agent=1,
-        n_heads=2, n_kv_heads=1, depth=2, k_max=8, dropout_rate=0.0, mlp_ratio=2.0,
-        time_every=2
-    )
-    vars_ = dyn.init({"params": jax.random.PRNGKey(0), "dropout": jax.random.PRNGKey(1)},
-                     actions, step_idx, sig_idx, packed)
-
-    # random agent vs zeros
-    agent_rand = jax.random.normal(jax.random.PRNGKey(2), (B,T,1,D))
-    x1_a, _ = dyn.apply(vars_, actions, step_idx, sig_idx, packed,
-                        agent_tokens=agent_rand, rngs={"dropout": jax.random.PRNGKey(3)}, deterministic=True)
-    x1_b, _ = dyn.apply(vars_, actions, step_idx, sig_idx, packed,
-                        agent_tokens=jnp.zeros_like(agent_rand), rngs={"dropout": jax.random.PRNGKey(3)}, deterministic=True)
-
-    diff = x1_a - x1_b
-    max_abs = float(jnp.max(jnp.abs(diff)))
-    l2 = float(jnp.sqrt(jnp.sum(diff * diff)))
-    print("\n[x1_hat invariance] max|Δ| =", max_abs, " ||Δ||₂ =", l2)
-    print("x1_a shape:", x1_a.shape, " x1_b shape:", x1_b.shape)
-
-    # Must be exactly equal because agent cannot influence others
-    assert jnp.allclose(x1_a, x1_b, atol=0, rtol=0), "x1_hat changed with agent tokens—firewall broken"
-
-
-def test_shapes_and_h_t():
-    B,T,D = 2,6,32
-    n_b,d_b = 8,4
-    n_spatial, pack = 4,2
-    d_spatial = d_b*pack
-
-    packed = _pack_bottleneck_to_spatial(jnp.ones((B,T,n_b,d_b)), n_spatial, pack)
-    dyn = Dynamics(d_model=D, d_bottleneck=d_b, d_spatial=d_spatial,
-                   n_spatial=n_spatial, n_register=3, n_agent=1,
-                   n_heads=2, depth=2, k_max=8)
-    actions = jnp.zeros((B,T), dtype=jnp.int32)
-    step_idx = jnp.zeros((B,T), dtype=jnp.int32)
-    sig_idx  = jnp.zeros((B,T), dtype=jnp.int32)
-    vars_ = dyn.init({"params": jax.random.PRNGKey(0), "dropout": jax.random.PRNGKey(1)},
-                     actions, step_idx, sig_idx, packed)
-
-    x1_hat, h_t = dyn.apply(vars_, actions, step_idx, sig_idx, packed,
-                            agent_tokens=jnp.zeros((B,T,1,D)))
-    print("\n[shapes] x1_hat:", x1_hat.shape, " h_t:", (None if h_t is None else h_t.shape))
-    print("Expect x1_hat =", (B,T,n_spatial,d_spatial), " h_t =", (B,T,1,D))
-    assert x1_hat.shape == (B,T,n_spatial,d_spatial)
-    assert h_t.shape     == (B,T,1,D)
-
-def test_wm_routed():
-    """
-    Checks space-attention routing for Dreamer-4-style dynamics:
-      - Action q -> {Action k}
-      - Obs q    -> {Obs k ∪ Action k} and never Agent k
-      - Agent q  -> {Obs k ∪ Action k ∪ Agent k}    (wm_agent)
-
-      - For any non-agent q, Agent k is disallowed.
-    """
-    # Shorthand modality ints
-    ACTION  = int(Modality.ACTION)
-    SIGNAL  = int(Modality.SHORTCUT_SIGNAL)
-    STEP    = int(Modality.SHORTCUT_STEP)
-    SPATIAL = int(Modality.SPATIAL)
-    REGISTER= int(Modality.REGISTER)
-    AGENT   = int(Modality.AGENT)
-
-    # Toy layout (Q rows / K cols share this order):
-    # [ACT, SIG, STP, SPA, SPA, SPA, REG, REG, ACT, AGT]
-    modality_ids = jnp.array(
-        [ACTION, SIGNAL, STEP, SPATIAL, SPATIAL, SPATIAL, REGISTER, REGISTER, ACTION, AGENT],
-        dtype=jnp.int32
-    )
-    S = modality_ids.shape[0]
-
-    # Helper sets
-    is_agent = (modality_ids == AGENT)
-    is_action = (modality_ids == ACTION)
-    is_obs = (
-        (modality_ids == SPATIAL) |
-        (modality_ids == REGISTER) |
-        (modality_ids == SIGNAL)  |
-        (modality_ids == STEP)
-    )
-
-    def assert_mask(mode: str):
-        mask = _build_modality_mask(modality_ids, mode)  # (S,S) bool
-        _print_mask_summary(mode, modality_ids, mask)
-
-        # 1) Non-agent q must never see Agent k
-        for q in range(S):
-            if not bool(is_agent[q]):
-                assert not bool(mask[q, is_agent].any()), f"[{mode}] non-agent q={q} can read Agent k!"
-
-        # 2) Action q -> Action k only? NO, in wm_agent, non-agent can read all non-agent.
-        # So we just check that non-agent CAN read other non-agent keys (like Spatial).
-        # And specifically check that they CANNOT read Agent.
-        
-        # 3) Obs q -> Obs k ∪ Action k? NO, same as above.
-        
-        # We only strictly enforce:
-        # A) Non-agent q cannot read Agent k
-        # B) Agent q can read Agent k (and everyone else)
-        
-        # Check A: (Already done in step 1)
-        
-        # Check B:
-        agent_rows = [i for i in range(S) if bool(is_agent[i])]
-        if agent_rows:
-            q = agent_rows[0]
-            if mode == "wm_agent":
-                # Agent reads everyone (including agent)
-                assert bool(mask[q].all()), "[wm_agent] agent q cannot read all keys!"
-
-
-    # Run both modes
-    assert_mask("wm_agent")
-
-    print("\n[test_wm_routed] All routing assertions passed ✅")
-
-
-if __name__ == "__main__":
-    test_encoder_decoder()
-    test_dynamics()
-    test_agent_firewall()
-    test_x1hat_invariant_to_agent_tokens()
-    test_shapes_and_h_t()
-    test_wm_routed()
-    print("\nAll tests passed ✅")
+        return int(weight_flops + attn_flops)

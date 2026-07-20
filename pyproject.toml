@@ -1,30 +1,49 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "tiny-dreamer-4"
 version = "0.1.0"
 description = "Dreamer 4 implementation in pure Jax"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = "==3.11.*"
 dependencies = [
-    "einops>=0.8.1",
-    "flax>=0.12.0",
-    "hydra-core>=1.3.2",
-    "imageio[ffmpeg]>=2.37.0",
-    "jax[cuda12]>=0.7.2",
-    "jaxlpips>=1.2.0",
-    "matplotlib>=3.10.7",
-    "optax>=0.2.6",
-    "tqdm>=4.67.1",
-    "wandb>=0.23.0",
-]
-
-[dependency-groups]
-dev = [
-    "ipdb>=0.13.13",
+    "einops",
+    "flax",
+    "hydra-core",
+    "imageio[ffmpeg]",
+    "jax[cuda12]",
+    "nvidia-cusparse-cu12>=12.5.8.93",  # pin to CUDA 12.8 compatible version; 12.5.10.65 requires nvJitLink 12.9
+    "jaxlpips",
+    "matplotlib",
+    "optax>=0.2.8",
+    "ott-jax",
+    "tqdm",
+    "wandb",
+    "tyro>=1.0.0",
+    "array-record>=0.8.3",
+    "grain>=0.2.15",
+    "ipykernel>=7.1.0",
+    "reactor-runtime>=2.7",
+    "pandas>=2.3.3",
+    "awscli>=1.27.0",
+    "decord>=0.6.0; sys_platform != 'linux' or platform_machine != 'aarch64'",
+    "ripgrep",
 ]
 
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.uv]
+override-dependencies = [
+    "numpy>=1.25",
+]
+
+[tool.uv.sources]
+optax = { git = "https://github.com/google-deepmind/optax.git" }
+minerl = { git = "https://github.com/minerllabs/minerl" }
 
 [tool.setuptools]
 package-dir = {"" = "."}

@@ -1,0 +1,42 @@
+# Build context is the project root (see reactor_app/build.sh). Keep the
+# context small: exclude generated/large files we don't need in the image.
+
+# Python cruft
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local venvs
+.venv/
+venv/
+
+# Source control
+.git/
+.gitignore
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Frontend (separate dev loop, not needed in the runtime image)
+frontend/node_modules/
+frontend/.next/
+
+# Large local artifacts — weights are mounted at runtime, not baked in
+checkpoints/
+assets/
+eval_outputs/
+*.tar.gz
+*.zip
+
+# Old reactor scaffold (to be deleted post-migration)
+reactor_code/
+
+# Docs scratch
+reactor-docs*.txt

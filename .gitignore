@@ -1,10 +1,29 @@
 logs/
 outputs/
+eval_outputs/
 overfit_exps/
 *.out
 slurm_outs/
 wandb/
 run_job.sh
+logs
+/data/
+
+# Next.js / frontend
+frontend/**/.next/
+frontend/**/node_modules/
+frontend/**/out/
+frontend/**/.vercel/
+frontend/**/coverage/
+frontend/**/next-env.d.ts
+frontend/**/*.tsbuildinfo
+frontend/**/.pnp
+frontend/**/.pnp.*
+frontend/**/.yarn/*
+!frontend/**/.yarn/patches/
+!frontend/**/.yarn/plugins/
+!frontend/**/.yarn/releases/
+!frontend/**/.yarn/versions/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -81,6 +100,7 @@ docs/_build/
 
 # PyBuilder
 .pybuilder/
+**.zip
 target/
 
 # Jupyter Notebook
@@ -165,6 +185,7 @@ ENV/
 env.bak/
 venv.bak/
 
+
 # Spyder project settings
 .spyderproject
 .spyproject
@@ -207,7 +228,7 @@ cython_debug/
 #   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
 #   and can be added to the global gitignore or merged into this file. However, if you prefer, 
 #   you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+.vscode/
 
 # Ruff stuff:
 .ruff_cache/
@@ -222,3 +243,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Repo stuff
+datasets
+datasets/
+migration/
+.claude/
+CLAUDE.md
+.hydra/
+
+jelly
+latents
+tokenizer

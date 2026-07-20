@@ -1,43 +1,265 @@
+# Config for `uv run scripts/train_tokenizer.py`.
+# This trains the causal video tokenizer used later by offline tokenization and
+# dynamics training.
+
 defaults:
+  # Shared logging/checkpoint/precision defaults.
   - common
+
+  # Raw MP4 dataset config. Tokenizer training expects `data_type: video`.
+  - dataset: minecraft_vpt
+
+  # Let values below override imported defaults.
   - _self_
 
+# Run name and default output directory (`logs/${run_name}`).
 run_name: tokenizer
-ckpt_max_to_keep: 5
-ckpt_save_every: 10_000
 
-patch_size: 4
+# Enables Weights & Biases through `logger.use_wandb`.
+use_wandb: false
 
-encoder:
-  n_latents: 16
-  d_bottleneck: 32
-  d_model: 64
-  n_heads: 4
-  n_kv_heads: 2
-  depth: 8
-  dropout_rate: 0.05
-  qk_norm_type: null  # options: qknorm, quest, null
-  use_rope: true
-  rope_theta: 10000.0
-  time_every: 4
-  mae_p_min: 0.0
-  mae_p_max: 0.9
+dataset:
+  dataloader_cfg:
+    # Global batch size across all JAX processes. Must be divisible by
+    # `jax.process_count()` and fit in memory with `long_T`.
+    B: 8
 
-decoder:
-  d_model: ${encoder.d_model}
-  n_heads: ${encoder.n_heads}
-  n_kv_heads: ${encoder.n_kv_heads}
-  n_latents: ${encoder.n_latents}
-  depth: ${encoder.depth}
-  dropout_rate: ${encoder.dropout_rate}
-  qk_norm_type: ${encoder.qk_norm_type}
-  use_rope: ${encoder.use_rope}
-  rope_theta: ${encoder.rope_theta}
-  time_every: ${encoder.time_every}
+    # Short training window used by tokenizer attention context below.
+    # Records must contain at least this many frames.
+    short_T: 16
 
-lr: 1e-3
-max_steps: 1_000_000_000
-log_every: 100
+    # Sequence length sampled by the dataloader for tokenizer training. This can
+    # be shorter than the full episode length used during offline tokenization.
+    long_T: 16
+
+ckpt:
+  # Keep only the newest tokenizer checkpoint by default.
+  max_to_keep: 1
+
+  # Save checkpoint every N steps and once at the final step.
+  save_interval_steps: 1000
+
+tokenizer:
+  encoder:
+    # Number of learned latent tokens per frame. More latents increase capacity
+    # and dynamics cost.
+    n_latents: 512
+
+    # Latent channel width emitted by the encoder. Must match the latent dataset
+    # `C`, `latent_mean` length, `latent_std` length, and dynamics d_bottleneck.
+    d_bottleneck: 16
+
+    # Number of block-causal transformer layers.
+    depth: 12
+
+    # Hidden width. This resolver scales width with depth for the current model
+    # family; if set manually, keep it divisible by `n_heads`.
+    d_model: ${mul:128,${tokenizer.encoder.depth}}
+
+    # Attention head count. Must divide `d_model`.
+    n_heads: ${floordiv:${tokenizer.encoder.d_model},64}
+
+    # KV head count for grouped-query attention. Must divide `n_heads`.
+    n_kv_heads: ${max:1,${floordiv:${tokenizer.encoder.n_heads},8}}
+
+    # Dropout inside transformer layers. Use 0.0 for deterministic large-batch
+    # pretraining unless you specifically want regularization.
+    dropout_rate: 0.0
+
+    # Query/key normalization type. Valid values: `qknorm`, `quest`, or `null`.
+    qk_norm_type: qknorm
+
+    # RoPE base frequency. Larger values extend usable temporal range but change
+    # the positional encoding scale.
+    rope_theta: 10000.0
+
+    # Every Nth transformer layer is a time-attention layer.
+    time_every: 4
+
+    # Offset used when deciding which layers are time-attention layers.
+    time_layer_offset: 3
+
+    # Minimum MAE masking probability for encoder patch tokens. Must be in [0, 1].
+    mae_p_min: 0.0
+
+    # Maximum MAE masking probability for encoder patch tokens. Must be in [0, 1]
+    # and normally >= `mae_p_min`.
+    mae_p_max: 0.9
+
+    # Spatial patch size inherited from the dataset. Must divide padded H and W.
+    patch_size: ${dataset.patch_size}
+
+    # Enables learned residual scaling parameters in transformer blocks.
+    use_residual_lambdas: false
+
+    # Whether linear layers use bias parameters.
+    use_bias: false
+
+    # Whether RMSNorm layers use learned scale parameters.
+    use_rmsnorm_scale: true
+
+    # Sliding-window time attention length. `null` means full causal attention.
+    # The default matches the tokenizer clip length.
+    context_length: ${dataset.dataloader_cfg.short_T}
+
+    # Activation/compute dtype.
+    dtype: ${dtype}
+
+    # Parameter storage dtype.
+    param_dtype: ${param_dtype}
+
+    # Pixel normalization stats from the raw dataset.
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
+
+  decoder:
+    # Decoder must read the same number of latent tokens emitted by the encoder.
+    n_latents: ${tokenizer.encoder.n_latents}
+
+    # Decoder latent width must match encoder output width.
+    d_bottleneck: ${tokenizer.encoder.d_bottleneck}
+
+    # Number of decoder transformer layers.
+    depth: 8
+
+    # Decoder hidden width. If set manually, keep divisible by `n_heads`.
+    d_model: ${mul:128,${tokenizer.decoder.depth}}
+
+    # Decoder attention head count. Must divide `d_model`.
+    n_heads: ${floordiv:${tokenizer.decoder.d_model},64}
+
+    # Decoder KV head count. Must divide `n_heads`.
+    n_kv_heads: ${max:1,${floordiv:${tokenizer.decoder.n_heads},8}}
+
+    # Match encoder dropout unless intentionally changing decoder regularization.
+    dropout_rate: ${tokenizer.encoder.dropout_rate}
+
+    # Match encoder attention normalization.
+    qk_norm_type: ${tokenizer.encoder.qk_norm_type}
+
+    # Match encoder RoPE base.
+    rope_theta: ${tokenizer.encoder.rope_theta}
+
+    # Match encoder time-attention cadence.
+    time_every: ${tokenizer.encoder.time_every}
+
+    # Match encoder time-attention offset.
+    time_layer_offset: ${tokenizer.encoder.time_layer_offset}
+
+    # Padded frame height decoded by the tokenizer.
+    H: ${sum:${dataset.padding_H[0]},${dataset.padding_H[1]},${dataset.H}}
+
+    # Padded frame width decoded by the tokenizer.
+    W: ${sum:${dataset.padding_W[0]},${dataset.padding_W[1]},${dataset.W}}
+
+    # Spatial patch size. Must match the encoder and dataset.
+    patch_size: ${dataset.patch_size}
+
+    # Flattened patch dimension: `patch_size * patch_size * channels`.
+    d_patch: ${mul:${dataset.patch_size},${dataset.patch_size},${dataset.C}}
+
+    # Keep architectural toggles aligned with the encoder.
+    use_residual_lambdas: ${tokenizer.encoder.use_residual_lambdas}
+    use_bias: ${tokenizer.encoder.use_bias}
+    use_rmsnorm_scale: ${tokenizer.encoder.use_rmsnorm_scale}
+
+    # Decoder temporal attention window. `null` means full causal attention.
+    context_length: ${dataset.dataloader_cfg.short_T}
+
+    # Activation/compute dtype.
+    dtype: ${dtype}
+
+    # Parameter storage dtype.
+    param_dtype: ${param_dtype}
+
+    # Pixel normalization stats used to unnormalize reconstructed frames.
+    dataset_mean: ${dataset.dataset_mean}
+    dataset_std: ${dataset.dataset_std}
+
+# Finetuning mode for MAE-to-full reconstruction. When true, the training step
+# freezes encoder gradients and linearly schedules `mae_p_max`.
+mae_finetune: false
+
+# Total optimizer steps. Checkpointing and learning-rate schedules derive from
+# this value.
+max_steps: 10_000
+
+# Reconstruction loss target. Valid values: `mse` for full-frame MSE or `mae`
+# for masked-region MSE.
+tokenizer_loss_type: mse
+
+# Reserved switch; the current training step uses `mae_finetune` to freeze the
+# encoder, not this field directly.
+freeze_encoder: false
+
+# Starting MAE p_max used when the finetune schedule is active.
+mae_finetune_p_max_start: 0.9
+
+# Ending MAE p_max used when the finetune schedule is active.
+mae_finetune_p_max_end: 0.0
+
+# EMA decay for tokenizer_ema checkpoints. Must be in [0, 1); values closer to
+# 1 update the EMA more slowly.
+ema_decay: 0.999
+
+lr_schedule:
+  # Learning-rate schedule. Valid values: `constant`, `wsd`, `cos`.
+  schedule_type: wsd
+
+  # Constant LR or peak LR, depending on schedule type.
+  lr: 0.003
+
+  # Initial LR for warmup schedules.
+  init_lr: 0.0
+
+  # Final LR for decay schedules.
+  lr_end: 0.0
+
+  # Fraction of `max_steps` spent warming up. Must keep
+  # `warmup_ratio + decay_ratio <= 1` for `wsd`.
+  warmup_ratio: 0.01
+
+  # Fraction of `max_steps` spent decaying at the end for `wsd`.
+  decay_ratio: 0.8
+
+  # Tie schedule horizon to top-level max_steps.
+  max_steps: ${max_steps}
+
+optimizer:
+  # Optimizer implementation. Valid values: `adamw`, `laprop`, `muon`.
+  optimizer_type: muon
+
+  # Decoupled weight decay applied to kernel-like parameters.
+  weight_decay: 0.1
+
+  # AdamW settings used for embeddings, biases, norms, and other non-matrix
+  # parameters when using Muon.
+  adam_lr_ratio: 1.0
+  adam_b1: 0.9
+  adam_b2: 0.99
+
+  # Adaptive gradient clipping. 0.0 disables AGC.
+  agc_clipping: 0.0
+  agc_eps: 1e-3
+
+  # MuP LR scaling for Adam-style parameter groups.
+  mup_scaling: true
+  mup_base_dim: 640
+
+  # Muon settings for 2D matrix weights.
+  muon_beta: 0.95
+  muon_ns_steps: 5
+  muon_nesterov: true
+
+# LPIPS loss multiplier. Set to 0 to avoid loading the LPIPS model.
 lpips_weight: 0.2
+
+# Fraction of timesteps used for LPIPS. Must be in (0, 1].
 lpips_frac: 0.5
-visualize_every: 10_000
+
+# Save reconstruction grids every N steps. Set 0 to disable visualization.
+visualize_every: 1000
+
+# Present for consistency with other configs, but train_tokenizer.py currently
+# forces data parallelism in code.
+parallel_strategy: fsdp

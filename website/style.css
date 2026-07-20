@@ -1,0 +1,571 @@
+/* Placeholder palette inspired by https://francesco215.github.io/Bayes-bandit/ */
+
+:root {
+  --font-size-base: 14px;
+  --background: #ffffff;
+  --surface: #f4f5f7;
+  --text: #121212;
+  --text-muted: #4a4f55;
+  --border: #cfd4d8;
+
+  --primary: #2b6caf;
+  --primary-hover: #2f79cc;
+  --primary-soft: rgba(122, 166, 255, 0.22);
+  --accent: #f07a26;
+  --accent-soft: rgba(240, 122, 38, 0.12);
+
+  --series-blue: #7aa6ff;
+  --series-purple: #7e6ad7;
+  --series-pink: #d63b76;
+  --series-orange: #f07a26;
+  --series-yellow: #f1b840;
+
+  /* Shared tokens for the space-layer visualization. */
+  --space-layer-background: var(--background);
+  --space-layer-surface: var(--surface);
+  --space-layer-text: var(--text);
+  --space-layer-text-muted: var(--text-muted);
+  --space-layer-border: var(--border);
+  --space-layer-primary: var(--primary);
+  --space-layer-primary-hover: var(--primary-hover);
+  --space-layer-primary-soft: var(--primary-soft);
+  --space-layer-highlight: var(--accent);
+  --space-layer-highlight-soft: var(--accent-soft);
+  --space-layer-series-blue: var(--series-blue);
+  --space-layer-series-purple: var(--series-purple);
+  --space-layer-series-pink: var(--series-pink);
+  --space-layer-series-orange: var(--series-orange);
+  --space-layer-series-yellow: var(--series-yellow);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  padding: 1rem;
+  color: var(--text);
+  background: var(--background);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: var(--font-size-base);
+}
+
+blockquote {
+  margin: 1.2em 0;
+  padding: 0.2em 0 0.2em 1em;
+  border-left: 3px solid var(--accent);
+  color: var(--text);
+  font-style: italic;
+}
+
+main {
+  width: 100%;
+  max-width: 1280px;
+  margin-inline: auto;
+}
+
+.form-label {
+  display: grid;
+  gap: 0.35rem;
+  width: fit-content;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.form-select {
+  min-width: 12rem;
+  padding: 0.45rem 2rem 0.45rem 0.65rem;
+  color: var(--text);
+  background-color: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  font: inherit;
+}
+
+.text-small {
+  font-size: max(11px, calc(var(--font-size-base) - 2px));
+}
+
+@media (max-width: 640px) {
+  body {
+    padding: 0.75rem;
+  }
+}
+
+#colab-hero {
+  margin-right: 20px;
+  display: block;
+  align-self: center;
+  text-align: center;
+  width: 170px;
+  height: 16px;
+  cursor: pointer
+}
+#colab-hero:hover {
+  background-color: rgb(231, 237, 244);
+}
+.colab-root {
+  display: inline-block;
+  background: rgba(255, 255, 255, 0.75);
+  padding: 15px 8px;
+  border-radius: 4px;
+  font-size: 12px !important;
+  text-decoration: none;
+  color: rgb(87, 87, 87);
+  border: none;
+  font-weight: 300;
+  border: solid 1px rgba(0, 0, 0, 0.08);
+  border-bottom-color: rgba(0, 0, 0, 0.08);
+  border-bottom-color: rgba(0, 0, 0, 0.15);
+  text-transform: uppercase;
+  line-height: 16px;
+}
+span.colab-span {
+  background-image: url(https://distill.pub/2020/growing-ca/images/colab.svg);
+  background-repeat: no-repeat;
+  background-size: 20px;
+  background-position-y: 2px;
+  display: inline-block;
+  padding-left: 24px;
+  border-radius: 4px;
+  text-decoration: none;
+}
+
+span.git-span {
+  background-image: url(https://upload.wikimedia.org/wikipedia/commons/9/91/Octicons-mark-github.svg);
+  background-repeat: no-repeat;
+  background-size: 15px;
+  background-position-y: 0px;
+  display: inline-block;
+  padding-left: 18px;
+  border-radius: 4px;
+  text-decoration: none;
+}
+span.mail-span {
+  background-image: url(website/other/email.svg);
+  background-repeat: no-repeat;
+  background-size: 15px;
+  background-position-y: 0px;
+  display: inline-block;
+  padding-left: 18px;
+  border-radius: 4px;
+  text-decoration: none;
+}
+
+p.definition_text {
+  border-left: 6px solid #ccc;
+  padding: 0.01em 16px;
+}
+
+p.theorem_text {
+  border-left: 6px solid #ccc;
+  padding: 0.01em 16px;
+}
+
+div.proof_text {
+  border-left: 3px solid #ccc;
+  padding: 0.01em 16px;
+}
+
+span.value {
+  display: inline-block;
+  width: 25px;
+}
+
+/* Float-based side figures, compatible with Distill's v1 layout names. */
+d-article figure.side {
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0 0 1em;
+  padding: 0;
+}
+
+@media (min-width: 768px) {
+  d-article figure.side {
+    float: right;
+    position: relative;
+    margin-left: 1.5em;
+  }
+
+  d-article figure.l-body.side {
+    width: 50%;
+  }
+
+  d-article figure.l-middle.side {
+    width: calc(50% + 61px);
+    margin-right: -61px;
+  }
+}
+
+@media (min-width: 1000px) {
+  d-article figure.l-middle.side {
+    width: calc(50% + 66px);
+    margin-right: -66px;
+  }
+}
+
+@media (min-width: 1180px) {
+  d-article figure.l-middle.side {
+    width: calc(50% + 92px);
+    margin-right: -92px;
+  }
+}
+
+/* Direct article children use Distill's grid instead of float positioning. */
+@media (min-width: 768px) {
+  d-article > figure.l-body.side {
+    grid-column: text;
+    justify-self: end;
+    width: 50%;
+    margin-right: 0;
+  }
+
+  d-article > figure.l-middle.side {
+    grid-column: middle;
+    justify-self: end;
+    width: 50%;
+    margin-right: 0;
+  }
+}
+
+d-article p {
+  clear: left;
+}
+
+/* table of contents */
+@media (max-width: 1000px) {
+  d-contents {
+    justify-self: start;
+    align-self: start;
+    grid-column-start: 2;
+    grid-column-end: 6;
+    padding-bottom: 0.5em;
+    margin-bottom: 1em;
+    padding-left: 0.25em;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+    border-bottom-width: 1px;
+    border-bottom-style: solid;
+    border-bottom-color: rgba(0, 0, 0, 0.1);
+  }
+}
+
+@media (min-width: 1000px) {
+  d-contents {
+    align-self: start;
+    grid-column-start: 1;
+    grid-column-end: 4;
+    justify-self: end;
+    padding-right: 3em;
+    padding-left: 2em;
+    border-right: 1px solid rgba(0, 0, 0, 0.1);
+    border-right-width: 1px;
+    border-right-style: solid;
+    border-right-color: rgba(0, 0, 0, 0.1);
+  }
+}
+
+@media (min-width: 1180px) {
+  d-contents {
+    grid-column-start: 1;
+    grid-column-end: 4;
+    justify-self: end;
+    padding-right: 3em;
+    padding-left: 2em;
+    border-right: 1px solid rgba(0, 0, 0, 0.1);
+    border-right-width: 1px;
+    border-right-style: solid;
+    border-right-color: rgba(0, 0, 0, 0.1);
+  }
+}
+
+d-contents nav h3 {
+  margin-top: 0;
+  margin-bottom: 1em;
+}
+
+d-contents nav a {
+  color: rgba(0, 0, 0, 0.8);
+  border-bottom: none;
+  text-decoration: none;
+}
+
+d-contents li {
+  list-style-type: none;
+}
+
+d-contents ul {
+  padding-left: 1em;
+}
+
+d-contents nav ul li {
+  margin-bottom: 0.25em;
+}
+
+d-contents nav a:hover {
+  text-decoration: underline solid rgba(0, 0, 0, 0.6);
+}
+
+d-contents nav ul {
+  margin-top: 0;
+  margin-bottom: 6px;
+}
+
+d-contents nav > div {
+  display: block;
+  outline: none;
+  margin-bottom: 0.5em;
+}
+
+d-contents nav > div > a {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+d-contents nav > div > a:hover,
+d-contents nav > ul > li > a:hover {
+  text-decoration: none;
+}
+
+canvas {
+  margin-right: auto;
+  margin-left: auto;
+  display: block;
+}
+
+.graph-container {
+  display: flex;
+  align-items: center;
+}
+.squar {
+  background-color: #6db4e2; /* Blue color */
+  width: 40px;
+  height: 40px;
+}
+.highlight {
+  stroke: #fe6100;
+  stroke-width: 2px;
+  fill: none;
+}
+
+figure {
+  margin-bottom: 1em;
+}
+
+.video-figure video {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #000;
+}
+
+.greentext-figure {
+  background: transparent;
+}
+
+.fourchan-post {
+  overflow: hidden;
+  border: 1px solid #d9bfb7;
+  border-radius: 2px;
+  background: #f0e0d6;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  color: #800000;
+  font: 13px/1.35 Arial, Helvetica, sans-serif;
+}
+
+.fourchan-post-header,
+.fourchan-post-footer {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.4rem;
+  background: #ead6cb;
+}
+
+.fourchan-post-header {
+  border-bottom: 1px solid #d9bfb7;
+  white-space: nowrap;
+}
+
+.fourchan-post-header strong {
+  color: #117743;
+}
+
+.fourchan-post-menu {
+  color: #0000aa;
+  font-weight: bold;
+}
+
+.fourchan-post-body {
+  padding: 0.65rem;
+}
+
+.fourchan-post-body::after {
+  content: "";
+  display: block;
+  clear: both;
+}
+
+.fourchan-post-image {
+  float: left;
+  width: 130px;
+  margin: 0 0.75rem 0.35rem 0;
+  color: #707070;
+  text-align: center;
+}
+
+.fourchan-post-image img {
+  display: block;
+  width: 130px;
+  height: auto;
+  margin-bottom: 0.3rem;
+}
+
+.greentext {
+  margin: 0;
+  padding: 0;
+  color: #789922;
+  font: inherit;
+  overflow-wrap: break-word;
+}
+
+.fourchan-post-footer {
+  justify-content: space-between;
+  border-top: 1px solid #d9bfb7;
+}
+
+.fourchan-post-footer span:last-child {
+  padding: 0.15rem 0.45rem;
+  border: 1px solid #c9afa5;
+  border-radius: 2px;
+  background: #f4e6df;
+  font-weight: bold;
+}
+
+.greentext-figure figcaption {
+  margin-top: 0.5rem;
+}
+
+@media (max-width: 520px) {
+  .fourchan-post-header {
+    white-space: normal;
+  }
+
+  .fourchan-post-image {
+    width: 100px;
+    margin-right: 0.5rem;
+  }
+
+  .fourchan-post-image img {
+    width: 100px;
+  }
+}
+
+.coinrun-demo::after {
+  content: "";
+  display: block;
+  clear: both;
+}
+
+details h2::before {
+  content: '▶ ';
+  display: inline-block;
+  width: 40px;
+}
+
+details[open] h2::before {
+  content: '▼ ';
+}
+
+details summary.custom_spoiler::-webkit-details-marker {
+  display:none;
+}
+
+details h3.topo::before{
+  content:'▶ ';
+  display: 'block-inline';
+  position: 'absolute';
+  width: '40px';
+}
+details[open] h3.topo::before{
+  content:'▼ ';
+  display: 'block-inline';
+  position: 'absolute';
+}
+
+/* this makes sure that the style of the d-section when inside a sumary doesn't fuck up */
+summary d-section {
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+
+@media (min-width: 1000px) {
+  .date-doi {
+    width: 200px;
+  }
+  p.affiliation{
+    width: 300px;
+  }
+  p.author{
+    width: 200px;
+  }
+}
+
+svg#graph {
+  overflow: visible !important;
+}
+
+.citation-short{
+  background: rgba(0, 0, 0, 0.02);
+  border: 1px solid rgba(0,0,0,0.1);
+  padding-top: 20px ;
+  border-radius: 3px;
+}
+
+d-article ul {
+  margin-top: 0.0em;
+  margin-bottom: 1.em;
+}
+
+d-article ul li {
+  margin-bottom: 0.0em;
+}
+
+.space-token-list li:nth-child(1)::marker {
+  color: #8a70d6;
+}
+
+.space-token-list li:nth-child(2)::marker {
+  color: #a568cd;
+}
+
+.space-token-list li:nth-child(3)::marker {
+  color: #bc65bd;
+}
+
+/* For l-gutter class */
+@media (max-width: 767px) {
+  .l-gutter {
+    width: 100%;
+  }
+  .l-gutter-large {
+    width: 100%;
+  }
+}
+
+@media (min-width: 768px) {
+  figcaption.l-gutter {
+    width: 150%;
+  }
+  .l-gutter-large {
+    width: 220%;
+    max-width: 560px;
+  }
+}

@@ -1,11 +1,87 @@
 import jax
 import jax.numpy as jnp
-from dreamer.data import patchify, unpatchify
-import orbax.checkpoint as ocp
+from flax import nnx
 from pathlib import Path
-from flax.core import freeze, unfreeze, FrozenDict
+import optax
+import operator
 from einops import rearrange
 from enum import IntEnum
+from typing import NamedTuple, Tuple
+from hydra.core.hydra_config import HydraConfig
+from dreamer.configs import LRScheduleConfig, OptimizerConfig
+
+
+def build_ema_model(dynamics: nnx.Module, *, ema_dtype: str | jnp.dtype) -> nnx.Module:
+    ema = nnx.clone(dynamics)
+    params = nnx.state(ema, nnx.Param)
+    ema_dtype = to_jnp_dtype(ema_dtype)
+    nnx.update(ema, jax.tree.map(lambda p: p.astype(ema_dtype), params))
+    return ema
+
+
+@nnx.jit(static_argnames=("ema_decay",))
+def ema_update_step(model: nnx.Module, model_ema: nnx.Module, *, ema_decay: float) -> None:
+    online_params = nnx.state(model, nnx.Param)
+    ema_params = nnx.state(model_ema, nnx.Param)
+    updated_ema = jax.tree.map(
+        lambda e, o: ema_decay * e + (1.0 - ema_decay) * o.astype(e.dtype),
+        ema_params,
+        online_params,
+    )
+    nnx.update(model_ema, updated_ema)
+
+# --- dtype helpers ---
+
+def to_jnp_dtype(dtype: str | jnp.dtype) -> jnp.dtype:
+    """Convert string or jnp.dtype to jnp.dtype."""
+    if isinstance(dtype, jnp.dtype):
+        return dtype
+    if dtype == "float32":
+        return jnp.float32
+    if dtype == "float16":
+        return jnp.float16
+    if dtype == "bfloat16":
+        return jnp.bfloat16
+    return jnp.dtype(dtype)
+
+
+# --- math helpers ---
+
+def is_pow2_frac(x: float) -> bool:
+    """Check if x is a power-of-two fraction (1/2, 1/4, 1/8, etc.)."""
+    if x <= 0 or x > 1:
+        return False
+    inv = round(1.0 / x)
+    return abs(1.0 / inv - x) < 1e-8 and (inv & (inv - 1)) == 0
+
+# --- helpers ---
+# 
+def patchify(x: jnp.ndarray, patch: int) -> jnp.ndarray:
+    """
+    x: (B, H, W, C)  ->  patches: (B, N, D)
+      where N = (H/patch)*(W/patch), D = patch*patch*C
+    """
+    patches = rearrange(x, "... (hp p1) (wp p2) c -> ... (hp wp) (p1 p2 c)", p1=patch, p2=patch)
+    return patches
+
+def unpatchify(patches: jnp.ndarray, patch: int, H: int, W: int) -> jnp.ndarray:
+    """
+    patches: (B, N, D)  ->  x: (B, H, W, C)
+      where N = (H/patch)*(W/patch), D = patch*patch*C
+    """
+    image = rearrange(patches, "... (hp wp) (p1 p2 c) -> ... (hp p1) (wp p2) c", hp=H//patch, wp=W//patch, p1=patch, p2=patch)
+    return image
+    
+    
+temporal_patchify = jax.jit(
+    jax.vmap(patchify, in_axes=(1, None), out_axes=1),  # (B,T,H,W,C) -> (B,T,Np,Dp)
+    static_argnames=("patch",),
+)
+
+temporal_unpatchify = jax.jit(
+    jax.vmap(unpatchify, in_axes=(1, None, None, None), out_axes=1),
+    static_argnames=("patch", "H", "W"),
+)
 
 class Modality(IntEnum):
     LATENT   = -1
@@ -14,31 +90,115 @@ class Modality(IntEnum):
     PROPRIO  = 2
     REGISTER = 3
     SPATIAL = 4
-    SHORTCUT_SIGNAL = 5
-    SHORTCUT_STEP = 6
-    AGENT = 7
-    # add more as needed
+    SHORTCUT = 5
+    AGENT = 6
 
+@jax.tree_util.register_pytree_node_class
+class TokenLayout:
+    """
+    Ordered token layout for a single timestep: segments define the order.
+    """
+    def __init__(self, segments: Tuple[Tuple[Modality, int], ...]):
+        self.segments = segments  # e.g. ((Modality.LATENT, n_latents), (Modality.IMAGE, n_patches), ...)
 
+    @property
+    def S(self) -> int:
+        return sum(n for _, n in self.segments)
 
-# --- helpers ---
-temporal_patchify = jax.jit(
-    jax.vmap(patchify, in_axes=(1, None), out_axes=1),  # (B,T,H,W,C) -> (B,T,Np,Dp)
-    static_argnames=("patch",),
-)
+    def modality_ids(self) -> jnp.ndarray:
+        parts = [jnp.full((n,), int(m), dtype=jnp.int32) for m, n in self.segments]
+        return jnp.concatenate(parts)
 
-temporal_unpatchify = jax.jit(
-    jax.vmap(unpatchify, in_axes=(1, None, None, None, None), out_axes=1),
-    static_argnames=("H", "W", "C", "patch"),
-)
+    def slices(self) -> dict:
+        """Convenience: start/stop indices per modality (first occurrence if repeated)."""
+        idx = 0
+        out = {}
+        for m, n in self.segments:
+            out[m] = slice(idx, idx + n)
+            idx += n
+        return out
+
+    def segment_size(self, modality: Modality) -> int:
+        """Number of tokens for the requested modality."""
+        for current_modality, count in self.segments:
+            if current_modality == modality:
+                return count
+        raise ValueError(f"Modality {modality!r} not found in token layout: {self.segments!r}")
+
+    def build_space_mask(self, mode: str):
+        """
+        Returns a (1, 1, S, S) boolean mask indicating allowed key for each query index, per mode.
+        S = number of tokens in a single frame.
+
+        Modes:
+        - "encoder":
+            - Latent tokens (query) can attend to ALL tokens (key).
+            - Non-latent tokens (query) can ONLY attend to tokens of the SAME modality (key).
+        - "decoder":
+            - Latent tokens (query) can ONLY attend to Latent tokens (key).
+            - Non-latent tokens (query) can attend to tokens of the SAME modality AND Latent tokens (key).
+        - "wm_agent":
+            - Action tokens (query) can ONLY attend to Action tokens (key).
+            - Observation tokens (query) can attend to Observation AND Action tokens (key).
+            - Agent tokens (query) can attend to ALL tokens (key).
+        """
+        modality_ids = self.modality_ids()
+        S = self.S
+
+        # Broadcast helpers
+        q_idx = jnp.arange(S)[:, None]       # (S, 1)
+        k_idx = jnp.arange(S)[None, :]       # (1, S)
+
+        q_mod = modality_ids[q_idx]      # (S, 1)
+        k_mod = modality_ids[k_idx]      # (1, S)
+
+        if mode == "encoder":
+            # latents -> all; non-latents -> same modality only
+            mask = (q_mod == k_mod) | (q_mod == Modality.LATENT)
+        elif mode == "decoder":
+            # latents -> latents only; non-latents -> same modality + latents
+            mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
+        elif mode == "wm_agent":
+            # wm_agent:
+
+            # Hierarchy levels: Action=0, Obs=1, Agent=2
+            # mask = level(q) >= level(k)
+
+            def get_level(mod):
+                # Default to 1 (Obs)
+                lvl = jnp.ones_like(mod, dtype=jnp.int32) # Default to 1 (Obs)
+                lvl = jnp.where(mod == Modality.ACTION, 0, lvl) # Set to 0 if Action
+                lvl = jnp.where(mod == Modality.AGENT, 2, lvl) # Set to 2 if Agent
+
+                return lvl
+
+            q_level = get_level(q_mod)
+            k_level = get_level(k_mod)
+
+            mask = q_level >= k_level
+        else:
+            raise ValueError(f"Unknown mode {mode}")
+
+        # Save (1, 1, S, S)
+        mask = mask[None, None, :, :]
+        mask = jax.lax.stop_gradient(mask)
+        return mask
+
+    def tree_flatten(self):
+        return ((), self.segments)
+    
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(aux_data)
+
 
 def normalize_with_dataset_stats(videos, *, mean, std):
     """
     Normalize videos using dataset-level statistics.
-    
-    Handles both flattened patches (B, T, N, patch*patch*C) and spatial images (B, T, H, W, C).
+
+    Handles spatial images (B, T, H, W, C).
     For flattened patches, tiles the per-channel stats to match the interleaved layout.
-    
+
     Args:
         videos: input videos/patches
         mean: dataset mean (list of C floats for per-channel)
@@ -46,27 +206,22 @@ def normalize_with_dataset_stats(videos, *, mean, std):
     Returns:
         normalized videos
     """
+    videos = videos.astype(jnp.float32)/255
     mean_arr = jnp.asarray(mean, dtype=videos.dtype)
     std_arr = jnp.asarray(std, dtype=videos.dtype)
-    
-    last_dim = videos.shape[-1]
-    num_channels = len(mean)
-    
-    if last_dim > num_channels and last_dim % num_channels == 0:
-        # flattened patches: tile stats to match interleaved layout
-        num_pixels = last_dim // num_channels
-        mean_arr = jnp.tile(mean_arr, num_pixels)
-        std_arr = jnp.tile(std_arr, num_pixels)
-    
-    return (videos - mean_arr) / std_arr
+
+    mean_c = jnp.expand_dims(mean_arr, axis=(0, 1, 2, 3))
+    std_c =  jnp.expand_dims(std_arr, axis=(0, 1, 2, 3))
+
+    return (videos - mean_c) / std_c
 
 def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
     """
     Unnormalize videos using dataset-level statistics.
-    
+
     Handles both flattened patches (B, T, N, patch*patch*C) and spatial images (B, T, H, W, C).
     For flattened patches, tiles the per-channel stats to match the interleaved layout.
-    
+
     Args:
         normalized_videos: normalized videos/patches
         mean: dataset mean (list of C floats for per-channel)
@@ -76,150 +231,360 @@ def unnormalize_with_dataset_stats(normalized_videos, *, mean, std):
     """
     mean_arr = jnp.asarray(mean, dtype=normalized_videos.dtype)
     std_arr = jnp.asarray(std, dtype=normalized_videos.dtype)
-    
-    last_dim = normalized_videos.shape[-1]
-    num_channels = len(mean)
-    
-    if last_dim > num_channels and last_dim % num_channels == 0:
-        # flattened patches: tile stats to match interleaved layout
-        num_pixels = last_dim // num_channels
-        mean_arr = jnp.tile(mean_arr, num_pixels)
-        std_arr = jnp.tile(std_arr, num_pixels)
-    
-    return normalized_videos * std_arr + mean_arr
+
+    mean_c = jnp.expand_dims(mean_arr, axis=(0, 1, 2, 3))
+    std_c =  jnp.expand_dims(std_arr, axis=(0, 1, 2, 3))
+
+    return (normalized_videos * std_c + mean_c)*255
+
+
+def normalize_latents(latents, mean, std, eps=1e-8):
+    """
+    Normalize latents to zero mean, unit std per dimension.
+
+    Args:
+        latents: (..., D) latent tokens where D matches len(mean) and len(std)
+        mean: tuple of D floats or None
+        std: tuple of D floats or None
+        eps: small constant for numerical stability
+
+    Returns:
+        normalized latents, or unchanged if mean/std are None
+    """
+    if mean is None or std is None:
+        return latents
+    mean = jnp.asarray(mean, dtype=latents.dtype)
+    std = jnp.asarray(std, dtype=latents.dtype)
+    return (latents - mean) / jnp.maximum(std, eps)
+
+
+def unnormalize_latents(latents, mean, std):
+    """
+    Unnormalize latents back to original distribution.
+
+    Args:
+        latents: (..., D) normalized latent tokens
+        mean: tuple of D floats or None
+        std: tuple of D floats or None
+
+    Returns:
+        unnormalized latents, or unchanged if mean/std are None
+    """
+    if mean is None or std is None:
+        return latents
+    mean = jnp.asarray(mean, dtype=latents.dtype)
+    std = jnp.asarray(std, dtype=latents.dtype)
+    return latents * std + mean
+
 
 def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
     Requires: N_b == n_spatial * k  (e.g., 512 -> 256 with k=2).
     """
-    return rearrange(z_btLd, 'b t (n_spatial k) d -> b t n_spatial (k d)', n_spatial=n_spatial, k=k)
+    return rearrange(z_btLd, '... (n_spatial k) d -> ... n_spatial (k d)', n_spatial=n_spatial, k=k)
 
 def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,S_z, D_z_pre) -> (B,T,N_b,D_b) by splitting D_z_pre into k channels along N_b.
     Requires: N_b == n_spatial * k  (e.g., 256 -> 512 with k=2).
     """
-    return rearrange(z_btLd, 'b t n_spatial (k d) -> b t (n_spatial k) d', n_spatial=n_spatial, k=k)
-
-# -------- Checkpoint helpers --------
-def with_params(variables, new_params):
-    # works whether `variables` is a FrozenDict or a plain dict
-    d = unfreeze(variables) if isinstance(variables, FrozenDict) else dict(variables)
-    d["params"] = new_params
-    return freeze(d)
-
-# Pack params so we can optimize both modules with one optimizer.
-def pack_mae_params(enc_vars, dec_vars):
-    return FrozenDict({
-        "enc": enc_vars["params"],
-        "dec": dec_vars["params"],
-    })
-
-def unpack_mae_params(packed_params, enc_vars, dec_vars):
-    enc_vars = with_params(enc_vars, packed_params["enc"])
-    dec_vars = with_params(dec_vars, packed_params["dec"])
-    return enc_vars, dec_vars
+    return rearrange(z_btLd, '... n_spatial (k d) -> ... (n_spatial k) d', n_spatial=n_spatial, k=k)
 
 
-def make_state(params, opt_state, rng, step):
-    # Pack training state as a PyTree; JAX/Orbax-friendly types only.
-    return {
-        "params": params,
-        "opt_state": opt_state,
-        "rng": rng,
-        "step": jnp.int32(step),
-    }
+# -------- Training utilities (shared across scripts) --------
 
-def make_manager(ckpt_dir: str, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("state","meta")):
-    path = Path(ckpt_dir).expanduser().resolve()
-    path.mkdir(parents=True, exist_ok=True)
-    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep,
-                                           save_interval_steps=save_interval_steps)
-    # item_names gives nice attribute access on restore: restored.state, restored.meta
-    mngr = ocp.CheckpointManager(path, options=options, item_names=item_names)
-    return mngr
+def _ensure_dir(p: Path) -> Path:
+    """Create directory if it doesn't exist and return the path."""
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta_example: dict | None = None):
+
+def setup_training_directories(cfg) -> tuple[Path, Path, Path]:
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
+    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
+    vis_dir = _ensure_dir(run_dir / "viz")
+    print(f"[setup] output dir: {run_dir.resolve()}")
+    return run_dir, ckpt_dir, vis_dir
+
+
+
+def apply_border(frames: jnp.ndarray, color = (255, 0, 0), width: int = 2) -> jnp.ndarray:
     """
-    Build abstract trees from current shapes/dtypes so Orbax can restore safely
-    (StandardRestore wants an abstract tree). :contentReference[oaicite:3]{index=3}
+    Add a colored border to a batch of frames.
     """
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)   # :contentReference[oaicite:4]{index=4}
-    restore_args = ocp.args.Composite(
-        state=ocp.args.StandardRestore(abstract_state),                                      # :contentReference[oaicite:5]{index=5}
-        meta=ocp.args.JsonRestore() if meta_example is not None else None
-    )
-    latest = mngr.latest_step()
-    if latest is None:
-        return None
-    restored = mngr.restore(latest, args=restore_args)
-    return latest, restored
-
-def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict | None = None):
-    if not mngr.should_save(step):  # obey save interval policy
-        return
-    save_args = ocp.args.Composite(
-        state=ocp.args.StandardSave(state),
-        meta=ocp.args.JsonSave(meta) if meta is not None else None
-    )
-    mngr.save(step, args=save_args)  # async by default; runs in a background thread. :contentReference[oaicite:6]{index=6}
+    color = jnp.asarray(color, dtype=frames.dtype)
+    frames = frames.at[..., :width, :, :].set(color)
+    frames = frames.at[..., -width:, :, :].set(color)
+    frames = frames.at[..., :, :width, :].set(color)
+    frames = frames.at[..., :, -width:, :].set(color)
+    return frames
 
 
+def from_dict(cls, d):
+    field_types = {f.name: f.type for f in cls.__dataclass_fields__.values()}
+    kwargs = {}
+    for k, v in d.items():
+        t = field_types[k]
+        if hasattr(t, "__dataclass_fields__"):
+            kwargs[k] = from_dict(t, v)
+        else:
+            kwargs[k] = v
+    return cls(**kwargs)
 
-def make_mask(modality_ids: jnp.ndarray, mode: str):
+
+def _count_component(component_params):
+    """Count total parameters in a component."""
+    params_sizes = jax.tree.map(jax.numpy.size, component_params)
+    total_parameters = jax.tree.reduce(operator.add, params_sizes)
+    return total_parameters
+
+
+def count_parameters_by_component(model):
     """
-    Returns a (S,S) boolean mask indicating allowed key for each query index, per mode.
-    S = number of tokens in a single frame.
+    Count parameters for each component of an NNX model.
 
-    Modes:
-    - "encoder":
-        - Latent tokens (query) can attend to ALL tokens (key).
-        - Non-latent tokens (query) can ONLY attend to tokens of the SAME modality (key).
-    - "decoder":
-        - Latent tokens (query) can ONLY attend to Latent tokens (key).
-        - Non-latent tokens (query) can attend to tokens of the SAME modality AND Latent tokens (key).
-    - "wm_agent":
-        - Action tokens (query) can ONLY attend to Action tokens (key).
-        - Observation tokens (query) can attend to Observation AND Action tokens (key).
-        - Agent tokens (query) can attend to ALL tokens (key).
+    Args:
+        model: NNX Model instance
+
+    Returns:
+        Dictionary with parameter counts for each component
     """
-    S = int(modality_ids.shape[0])
+    # Split model to get parameter structure
+    graphdef, state, _ = nnx.split(model, nnx.Param, ...)
 
-    # Broadcast helpers
-    q_idx = jnp.arange(S)[:, None]       # (S,1)
-    k_idx = jnp.arange(S)[None, :]       # (1,S)
+    # Count parameters for each top-level component
+    counts = {}
+    total_params = 0
 
-    q_mod = modality_ids[q_idx]      # (S,1)
-    k_mod = modality_ids[k_idx]      # (1,S)
+    for name, component in state.items():
+        count = _count_component(component)
+        counts[name] = count
+        total_params += count
 
-    if mode == "encoder":
-        # latents -> all; non-latents -> same modality only
-        mask = (q_mod == k_mod) | (q_mod == Modality.LATENT)
-    elif mode == "decoder":
-        # latents -> latents only; non-latents -> same modality + latents
-        mask = (q_mod == k_mod) | (k_mod == Modality.LATENT)
-    elif mode == "wm_agent":
-        # wm_agent:
+    counts["total"] = total_params
+    return counts
 
-        # Hierarchy levels: Action=0, Obs=1, Agent=2
-        # mask = level(q) >= level(k)
-        
-        def get_level(mod):
-            # Default to 1 (Obs)
-            lvl = jnp.ones_like(mod, dtype=jnp.int32) # Default to 1 (Obs)
-            lvl = jnp.where(mod == Modality.ACTION, 0, lvl) # Set to 0 if Action
-            lvl = jnp.where(mod == Modality.AGENT, 2, lvl) # Set to 2 if Agent
-            
-            return lvl
 
-        q_level = get_level(q_mod)
-        k_level = get_level(k_mod)
-        
-        mask = q_level >= k_level
+def build_lr_schedule(schedule_cfg: LRScheduleConfig) -> optax.Schedule:
+    """
+    Build learning rate schedule.
+
+    Args:
+        schedule_cfg: ScheduleConfig instance
+
+    Returns:
+        optax.Schedule instance
+    """
+    max_steps = schedule_cfg.max_steps
+
+    warmup_steps = int(max_steps * schedule_cfg.warmup_ratio)
+    decay_steps = int(max_steps * schedule_cfg.decay_ratio)
+
+    if schedule_cfg.schedule_type == "constant":
+        return optax.constant_schedule(value=schedule_cfg.lr)
+    elif schedule_cfg.schedule_type == "cos":
+        assert warmup_steps <= max_steps, "Warmup steps can't be greater than total steps."
+        return optax.warmup_cosine_decay_schedule(
+            init_value=schedule_cfg.init_lr,
+            peak_value=schedule_cfg.lr,
+            warmup_steps=warmup_steps,
+            # Note: decay_steps includes the warmup steps, so pass the total value.
+            decay_steps=max_steps,
+            end_value=schedule_cfg.lr_end,
+        )
+    elif schedule_cfg.schedule_type == "wsd":
+        assert (
+            warmup_steps + decay_steps <= max_steps
+        ), f"Warmup ({warmup_steps}) + decay ({decay_steps}) > max_steps ({max_steps})."
+        schedules = [
+            optax.linear_schedule(
+                init_value=schedule_cfg.init_lr, end_value=schedule_cfg.lr, transition_steps=warmup_steps
+            ),
+            optax.constant_schedule(value=schedule_cfg.lr),
+            optax.linear_schedule(
+                init_value=schedule_cfg.lr, end_value=schedule_cfg.lr_end, transition_steps=decay_steps
+            ),
+        ]
+        boundaries = [warmup_steps, max_steps - decay_steps]
+        return optax.join_schedules(schedules, boundaries)
     else:
-        raise ValueError(f"Unknown mode {mode}")
+        raise ValueError(
+            f"Unsupported learning rate schedule: {schedule_cfg.schedule_type}"
+        )
 
-    # Save (S,S)
-    modality_mask = jax.lax.stop_gradient(mask)
-    return modality_mask
+
+class ScaleByLaPropState(NamedTuple):
+    step: jax.Array
+    mu: optax.Updates
+    nu: optax.Updates
+
+
+def scale_by_laprop(
+    b1: float = 0.9,
+    b2: float = 0.999,
+    eps: float = 1e-8,
+) -> optax.GradientTransformation:
+    """Rescale updates according to the LaProp algorithm (Ziyin et al., 2020)."""
+
+    def init_fn(params):
+        mu = jax.tree.map(jnp.zeros_like, params)
+        nu = jax.tree.map(jnp.zeros_like, params)
+        return ScaleByLaPropState(step=jnp.zeros([], jnp.int32), mu=mu, nu=nu)
+
+    def update_fn(updates, state, params=None):
+        del params
+        count_inc: jax.Array = state.step + 1
+
+        # n_t = ν n_{t-1} + (1 - ν) g_t^2  (standard EMA)
+        nu = jax.tree.map(
+            lambda v, g: b2 * v + (1.0 - b2) * g ** 2, state.nu, updates
+        )
+
+        # Bias-correction factors
+        c_n = 1.0 - jnp.float32(b2) ** count_inc
+        c_m = 1.0 - jnp.float32(b1) ** count_inc
+
+        # m_t = μ m_{t-1} + (1 - μ) g_t / (sqrt(n_t / c_n) + ε)
+        # Gradient is normalized BEFORE being accumulated into momentum.
+        mu = jax.tree.map(
+            lambda m, g, v: b1 * m + (1.0 - b1) * g / (jnp.sqrt(v / c_n) + eps),
+            state.mu, updates, nu,
+        )
+
+        # θ_{t+1} = θ_t - λ_t m_t / c_m
+        new_updates = jax.tree.map(lambda m: m / c_m, mu)
+
+        return new_updates, ScaleByLaPropState(step=count_inc, mu=mu, nu=nu)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _kernel_wd_mask(params):
+    """Mask for decoupled weight decay: decay only linear-layer ``kernel`` params.
+
+    Excludes biases, norm scales (RMSNorm/LayerNorm), learned embeddings/tokens,
+    and any other scalar/1-D parameters.
+    """
+    def fn(path, x):
+        path_str = "/".join(str(getattr(k, "key", k)) for k in path)
+        is_kernel = path_str.endswith("kernel") or path_str.endswith("kernel/.value")
+        return bool(is_kernel and x.ndim >= 2)
+    return jax.tree_util.tree_map_with_path(fn, params)
+
+
+def laprop(
+    learning_rate: optax.ScalarOrSchedule,
+    b1: float = 0.9,
+    b2: float = 0.999,
+    eps: float = 1e-8,
+    weight_decay: float = 0.0,
+) -> optax.GradientTransformation:
+    """LaProp optimizer with decoupled weight decay (masked to kernels only)."""
+    return optax.chain(
+        scale_by_laprop(b1=b1, b2=b2, eps=eps),
+        optax.add_decayed_weights(weight_decay, mask=_kernel_wd_mask),
+        optax.scale_by_learning_rate(learning_rate),
+    )
+
+
+def _muon_weight_dims(params):
+    """Map params to Muon dimension numbers, excluding embeddings.
+
+    Returns pytree where:
+    - Params with "embedding" in path -> None (use AdamW)
+    - Other 2D+ params -> MuonDimensionNumbers() (use Muon)
+    - 1D params -> None (use AdamW)
+    """
+    from optax.contrib._muon import MuonDimensionNumbers
+
+    def mapper(path, x):
+        path_str = ".".join(str(getattr(k, "key", k)) for k in path)
+        if "embedding" in path_str:
+            return None
+        return MuonDimensionNumbers() if x.ndim >= 2 else None
+
+    return jax.tree_util.tree_map_with_path(mapper, params)
+
+
+def build_optimizer(
+    optimizer_cfg: OptimizerConfig,
+    model: nnx.Module,
+    lr_schedule: optax.Schedule,
+    d_model: int,
+) -> nnx.Optimizer:
+    """
+    Build optimizer with given learning rate schedule.
+
+    Args:
+        optimizer_cfg: OptimizerConfig instance
+        model: nnx.Module to optimize
+        lr_schedule: optax.Schedule instance (unscaled)
+        d_model: Model dimension for MuP LR scaling
+
+    Returns:
+        nnx.Optimizer instance
+    """
+    mup_scale = 1.0
+    if optimizer_cfg.mup_scaling:
+        mup_scale = (d_model / optimizer_cfg.mup_base_dim) ** -0.5
+
+    if optimizer_cfg.optimizer_type == "adamw":
+        if optimizer_cfg.mup_scaling:
+            scaled_schedule = lambda step, s=lr_schedule, m=mup_scale: s(step) * m
+        else:
+            scaled_schedule = lr_schedule
+
+        tx = optax.adamw(
+            scaled_schedule,
+            b1=optimizer_cfg.adam_b1,
+            b2=optimizer_cfg.adam_b2,
+            weight_decay=optimizer_cfg.weight_decay,
+            mask=_kernel_wd_mask,
+        )
+    elif optimizer_cfg.optimizer_type == "laprop":
+        if optimizer_cfg.mup_scaling:
+            scaled_schedule = lambda step, s=lr_schedule, m=mup_scale: s(step) * m
+        else:
+            scaled_schedule = lr_schedule
+
+        tx = laprop(
+            scaled_schedule,
+            b1=optimizer_cfg.adam_b1,
+            b2=optimizer_cfg.adam_b2,
+            eps=optimizer_cfg.adam_eps,
+            weight_decay=optimizer_cfg.weight_decay,
+        )
+    elif optimizer_cfg.optimizer_type == "muon":
+        muon_schedule = lr_schedule
+        adam_ratio = optimizer_cfg.adam_lr_ratio
+        if optimizer_cfg.mup_scaling:
+            adam_schedule = lambda step, s=lr_schedule, m=mup_scale, r=adam_ratio: s(step) * m * r
+        else:
+            adam_schedule = lambda step, s=lr_schedule, r=adam_ratio: s(step) * r
+
+        tx = optax.contrib.muon(
+            learning_rate=muon_schedule,
+            beta=optimizer_cfg.muon_beta,
+            ns_steps=optimizer_cfg.muon_ns_steps,
+            weight_decay=optimizer_cfg.weight_decay,
+            nesterov=optimizer_cfg.muon_nesterov,
+            # AdamW for non-Muon params (embeddings, biases)
+            adam_learning_rate=adam_schedule,
+            adam_b1=optimizer_cfg.adam_b1,
+            adam_b2=optimizer_cfg.adam_b2,
+            adam_weight_decay=0.0,  # hardcoded to 0
+            # Callable that excludes embeddings from Muon
+            muon_weight_dimension_numbers=_muon_weight_dims,
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer type: {optimizer_cfg.optimizer_type}")
+
+    if optimizer_cfg.agc_clipping > 0:
+        tx = optax.chain(
+            optax.adaptive_grad_clip(optimizer_cfg.agc_clipping, eps=optimizer_cfg.agc_eps),
+            tx,
+        )
+
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    return optimizer

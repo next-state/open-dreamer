@@ -1,454 +1,339 @@
+import logging
+import os
 from functools import partial
-from tqdm import tqdm
-from dataclasses import dataclass, asdict, field
-import time
+
+import einops
 import hydra
-from omegaconf import DictConfig, OmegaConf
+import imageio
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
-from dreamer.models import Encoder, Decoder
-from dreamer.data import make_iterator, DatasetConfig
-import imageio
+from flax import nnx
 from jaxlpips import LPIPS
-from pathlib import Path
-import wandb
-from hydra.core.hydra_config import HydraConfig
-from dreamer.utils import temporal_patchify, temporal_unpatchify, normalize_with_dataset_stats, unnormalize_with_dataset_stats, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
-from dreamer.logging import MetricLogger
+from omegaconf import OmegaConf
+from tqdm import tqdm
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+from dreamer.configs import TokenizerConfig
+from dreamer.training import compute_psnr
+from dreamer.data import build_iterator
+from dreamer.logging import build_logger
+from dreamer.models import Tokenizer
+from dreamer.parallel import build_parallel, MeshRules
+from dreamer.scaling import ScalingContext
+
+from dreamer.checkpointing import (
+    TokenizerCheckpointBundle,
+    build_checkpoint_manager,
+)
+from dreamer.utils import (
+    normalize_with_dataset_stats,
+    count_parameters_by_component,
+    setup_training_directories,
+    build_lr_schedule,
+    build_optimizer,
+    build_ema_model,
+    ema_update_step,
+)
+
+# disable preallocation completely
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.98'
+jax.config.update("jax_default_device", None)
+
+# Suppress absl info logs
+logging.getLogger('absl').setLevel(logging.WARNING)
+
+# Register OmegaConf resolver for arithmetic expressions
+# Usage: ${mul:a,b,c,...} multiplies all arguments
+OmegaConf.register_new_resolver("mul", lambda *args: __import__('functools').reduce(__import__('operator').mul, args))
+OmegaConf.register_new_resolver("sum", lambda *args: sum(args))
+OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
+OmegaConf.register_new_resolver("max", lambda *args: max(args))
+OmegaConf.register_new_resolver("min", lambda *args: min(args))
 
 
-# ---------------------------
-# Config
-# ---------------------------
+# ------------------------
+# Losses
+# ------------------------
 
-@dataclass
-class EncoderConfig:
-    n_latents: int = 16
-    d_bottleneck: int = 32
-    d_model: int = 64
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    n_patches: int = 64  # Will be computed from H, W, patch_size
-    depth: int = 8
-    dropout_rate: float = 0.05
-    qk_norm_type: str | None = None
-    use_rope: bool = False
-    rope_theta: float = 10000.0
-    time_every: int = 4
-    mae_p_min: float = 0.0
-    mae_p_max: float = 0.9
+def recon_loss_from_mae(pred, target, mae_mask):
+    sq_err = (pred - target) ** 2
+    masked_sq_err = jnp.asarray(jnp.where(mae_mask, sq_err, 0.0))
+    total_sse = jnp.sum(masked_sq_err)
+    count = jnp.maximum(mae_mask.sum(), 1.0)
+    return total_sse / count
 
-@dataclass
-class DecoderConfig:
-    d_model: int = 64
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    n_latents: int = 16
-    n_patches: int = 64  # Will be computed from H, W, patch_size
-    d_patch: int = 48    # Will be computed from patch_size, C
-    depth: int = 8
-    dropout_rate: float = 0.05
-    qk_norm_type: str | None = None
-    use_rope: bool = False
-    rope_theta: float = 10000.0
-    time_every: int = 4
+def recon_loss_full_mse(pred, target):
+    sq_err = (pred - target) ** 2
+    return jnp.mean(sq_err)  # scalar
 
-@dataclass(frozen=True)
-class TokenizerConfig:
-    # IO / ckpt
-    run_name: str
-    ckpt_max_to_keep: int = 5
-    ckpt_save_every: int = 10_000
 
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None
-    wandb_project: str | None = None
-
-    # dataset config
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-
-    # model parameters
-    patch_size: int = 4
-    encoder: EncoderConfig = field(default_factory=EncoderConfig)
-    decoder: DecoderConfig = field(default_factory=DecoderConfig)
-
-    # training
-    lr: float = 1e-4
-    max_steps: int = 1_000_000_000
-    log_every: int = 100
-    lpips_weight: float = 0.2
-    lpips_frac: float = 0.5
-    visualize_every: int = 10_000
-
-def _ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-def init_models(rng, encoder, decoder, patch_tokens, B, T, enc_n_latents, enc_d_bottleneck):
-    rng, params_rng, mae_rng, dropout_rng = jax.random.split(rng, 4)
-
-    enc_vars = encoder.init(
-        {"params": params_rng, "mae": mae_rng, "dropout": dropout_rng},
-        patch_tokens, deterministic=True
-    )
-    fake_z = jnp.zeros((B, T, enc_n_latents, enc_d_bottleneck))
-    dec_vars = decoder.init(
-        {"params": params_rng, "dropout": dropout_rng},
-        fake_z, deterministic=True
-    )
-    return rng, enc_vars, dec_vars
-
-# --- forward (no jit; we jit the train_step) ---
-def forward_apply(encoder, decoder, enc_vars, dec_vars, patches_btnd, *, mae_key, drop_key, train: bool):
-    # Avoid TracerBool issues: pass a python bool here OR replace with lax.cond if needed.
-    rngs_enc = {"mae": mae_key} if not train else {"mae": mae_key, "dropout": drop_key}
-    z_btLd, mae_info = encoder.apply(enc_vars, patches_btnd, rngs=rngs_enc, deterministic=not train)
-
-    rngs_dec = {} if not train else {"dropout": drop_key}
-    pred_btnd = decoder.apply(dec_vars, z_btLd, rngs=rngs_dec, deterministic=not train)
-    return pred_btnd, mae_info  # mae_info = (mae_mask, keep_prob)
-
-# --- loss ---
-def recon_loss_from_mae(pred_btnd, target_btnd, mae_mask):
-    pred_masked   = jnp.where(mae_mask, pred_btnd, 0.0)
-    target_masked = jnp.where(mae_mask, target_btnd, 0.0)
-    num = jnp.maximum(mae_mask.sum(), 1.0)
-    return jnp.sum((pred_masked - target_masked) ** 2) / (num * pred_btnd.shape[-1])
-
-# --- instantiate once (top-level / main) ---
-lpips_loss_fn = None
-
-def lpips_on_mae_recon(
-    pred, target, mae_mask, *, H, W, C, patch,
-    subsample_frac: float = 1.0
-):
-    """
-    pred:    (B,T,Np,D)
-    target:  (B,T,Np,D)
-    mae_mask:     (B,T,Np,1)  True where patch is masked (must reconstruct)
-    Returns scalar LPIPS averaged over (B,T).
-    """
-    # 1) Blend GT for visible patches => "recon_masked"
-    recon_masked_btnd = jnp.where(mae_mask, pred, target)
-
-    # 2) Unpatchify to (B,T,H,W,C) in [0,1]
-    recon_imgs = temporal_unpatchify(recon_masked_btnd, H, W, C, patch)
-    target_imgs = temporal_unpatchify(target,        H, W, C, patch)
-
-    # 3) Optional subsample frames over T to save compute
+def lpips_on_mae_recon(lpips_model: LPIPS, pred, target, subsample_frac=1.0):
+    # Lpips expects [-1, 1] pixel range. Normalize to [-1, 1]
+    pred = (pred - 0.5) * 2
+    target = (target - 0.5) * 2
     if subsample_frac < 1.0:
-        B, T = recon_imgs.shape[:2]
-        step = max(1, int(1.0/subsample_frac))
+        B, T = pred.shape[:2]
+        step = max(1, int(1.0 / subsample_frac))
         idx = jnp.arange(T)[::step]
-        recon_imgs = recon_imgs[:, idx]
-        target_imgs = target_imgs[:, idx]
+        pred = pred[:, idx]
+        target = target[:, idx]
 
-    # 4) Rescale to [-1,1] for LPIPS
-    recon_lp = jnp.clip(recon_imgs * 2.0 - 1.0, -1.0, 1.0)
-    target_lp = jnp.clip(target_imgs * 2.0 - 1.0, -1.0, 1.0)
-
-    # 5) Flatten B,T for a single LPIPS call: (B*T,H,W,C)
-    BT = recon_lp.shape[0] * recon_lp.shape[1]
-    H_, W_, C_ = recon_lp.shape[2], recon_lp.shape[3], recon_lp.shape[4]
-    recon_lp = recon_lp.reshape((BT, H_, W_, C_))
-    target_lp = target_lp.reshape((BT, H_, W_, C_))
-
-    # 6) LPIPS returns per-example loss; average it
-    lp = lpips_loss_fn(recon_lp, target_lp)  # shape (BT,)
-    return jnp.mean(lp)
-
-# --- viz step ---
-@partial(jax.jit, static_argnames=("encoder","decoder","patch"))
-def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, drop_key, dataset_mean, dataset_std):
-    # Same preprocessing as train
-    target_btnd = temporal_patchify(batch, patch)  # (B, T, Np, D)
-    target_norm = normalize_with_dataset_stats(target_btnd, mean=dataset_mean, std=dataset_std)
-
-    # Run full model (no dropout during viz)
-    pred_norm, (mae_mask_btNp1, keep_prob_bt1) = forward_apply(
-        encoder, decoder, enc_vars, dec_vars, target_norm,
-        mae_key=mae_key, drop_key=drop_key, train=False
-    )
-    pred_btnd = unnormalize_with_dataset_stats(pred_norm, mean=dataset_mean, std=dataset_std)
-    pred_btnd = jnp.clip(pred_btnd, 0.0, 1.0)
-
-    # Compose standard MAE visualization:
-    # - masked_input: what the model actually sees (masked target patches)
-    # - recon_masked: inpaint only masked patches (visible target patches kept as GT)
-    masked_input_btnd  = jnp.where(mae_mask_btNp1, 0.0, target_btnd)
-    recon_masked_btnd  = jnp.where(mae_mask_btNp1, pred_btnd, target_btnd)
-    recon_full_btnd    = pred_btnd  # decoder everywhere
-
-    return {
-        "target": target_btnd,
-        "masked_input": masked_input_btnd,
-        "recon_masked": recon_masked_btnd,
-        "recon_full": recon_full_btnd,
-        "mae_mask": mae_mask_btNp1,
-        "keep_prob": keep_prob_bt1,
-    }
+    pred_lp = einops.rearrange(pred, "b t h w c -> (b t) h w c")
+    tgt_lp  = einops.rearrange(target, "b t h w c -> (b t) h w c")
+    return jnp.mean(lpips_model(pred_lp, tgt_lp))
 
 
-# --- train step ---
-@partial(jax.jit, static_argnames=("encoder","decoder","tx","patch","H","W","C", "lpips_weight", "lpips_frac", "should_log"))
-def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch, *,
-               patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0, should_log=False, dataset_mean, dataset_std):
-    """
-    (master_key, params, opt_state, model_state, batch)
-        │
-        ▼
-    [ compute grads ]
-        │
-        ▼
-    Optax: (grads, opt_state, params) → (updates, new_opt_state)
-    Flax:  params ⟶ apply updates → new_params
-        │
-        ▼
-    return (new_params, new_opt_state, new_model_state, metrics)
-    """
-    # 1) Prepare data
-    target_btnd = temporal_patchify(batch, patch)  # (B, T, Np, Dp)
 
-    # 2) Make per-step RNGs (fold_in ensures different masks per step even if base key repeats)
-    step_key  = jax.random.fold_in(master_key, step)
-    mae_key, drop_key = jax.random.split(step_key)
+# ------------------------
+# Train step
+# ------------------------
 
-    # 3) Define loss fn (closes over encoder/decoder + non-param states)
-    def loss_fn(packed_params):
-        # Replace params in vars
-        ev, dv = unpack_mae_params(packed_params, enc_vars, dec_vars)
-        target_norm = normalize_with_dataset_stats(target_btnd, mean=dataset_mean, std=dataset_std)
-        pred_norm, mae_info = forward_apply(encoder, decoder, ev, dv, target_norm,
-                                            mae_key=mae_key, drop_key=drop_key, train=True)
-        mae_mask, keep_prob = mae_info
+@nnx.jit(static_argnames=("lpips_weight", "lpips_frac", "dataset_mean", "dataset_std", "log_gradients", "tokenizer_loss_type", "freeze_encoder"))
+def train_step(model: Tokenizer, optimizer: nnx.Optimizer, lpips_model: LPIPS | None, videos, *, mae_key, dropout_key, step,
+               lpips_weight, lpips_frac, dataset_mean, dataset_std, log_gradients: bool, tokenizer_loss_type: str,
+               mae_p_max: jnp.ndarray | None = None, freeze_encoder: bool = False):
 
-        mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
+    def loss_fn(model: Tokenizer):
+        rngs = nnx.Rngs(mae=mae_key, dropout=dropout_key)
+        pred, (mae_mask, keep_prob), _ = model(videos, deterministic=False, rngs=rngs, mae_p_max=mae_p_max)
 
-        mse_pix = 0.0  # only for logging, to compute PSNR/RMSE
-        pred_btnd = None
-        
-        if should_log or lpips_weight > 0.0:
-            pred_btnd = unnormalize_with_dataset_stats(pred_norm, mean=dataset_mean, std=dataset_std)
-            
-        if should_log:
-            mse_pix = recon_loss_from_mae(pred_btnd, target_btnd, mae_mask)
-
-        # LPIPS on recon_masked vs target (unpatchified frames)
-        if lpips_weight > 0.0:
-            lpips = lpips_on_mae_recon(
-                pred_btnd, target_btnd, mae_mask,
-                H=H, W=W, C=C, patch=patch, subsample_frac=lpips_frac
-            )
-            total = mse + lpips_weight * lpips
+        pred_norm = normalize_with_dataset_stats(pred, mean=dataset_mean, std=dataset_std)
+        target_norm = normalize_with_dataset_stats(videos, mean=dataset_mean, std=dataset_std)
+        if tokenizer_loss_type == "mae":
+            mse = recon_loss_from_mae(pred_norm, target_norm, mae_mask)
+        elif tokenizer_loss_type == "mse":
+            mse = recon_loss_full_mse(pred_norm, target_norm)
         else:
-            lpips = 0.0
-            total = mse
+            raise ValueError(f"Invalid loss type: {tokenizer_loss_type}")
 
-        aux = {
-            "loss_total": total,
-            "loss_mse": mse,
-            "loss_lpips": lpips,
-            "keep_prob": keep_prob,
-            "loss_mse_pix": mse_pix,
-        }
+        psnr = compute_psnr(pred / 255.0, videos / 255.0)
 
+        lp = jnp.array(0.0)
+        if lpips_weight > 0:
+            lp = lpips_on_mae_recon(lpips_model, pred / 255.0, videos / 255.0, lpips_frac)
+
+        total = mse + lpips_weight * lp
+
+        aux = {"loss_total": total, "loss_mse": mse, "loss_lpips": lp, "keep_prob": keep_prob, "psnr": psnr}
         return total, aux
 
-    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
 
-    # 4) Update
-    updates, opt_state = tx.update(grads, opt_state, params)
-    new_params = optax.apply_updates(params, updates)
+    if freeze_encoder:
+        encoder_grad_state = nnx.state(grads.encoder)
+        zeroed_state = jax.tree.map(jnp.zeros_like, encoder_grad_state)
+        nnx.update(grads.encoder, zeroed_state)
 
-    # 5) Put params back into variables for next step
-    new_enc_vars, new_dec_vars = unpack_mae_params(new_params, enc_vars, dec_vars)
-    return new_params, opt_state, new_enc_vars, new_dec_vars, aux
+    if log_gradients:
+        def _tree_std_mean(tree):
+            std_tree = jax.tree_util.tree_map(lambda x: jnp.std(x), tree)
+            leaves = jax.tree_util.tree_leaves(std_tree)
+            if len(leaves) == 0:
+                return jnp.array(0.0, dtype=jnp.float32)
+            return jnp.mean(jnp.stack([jnp.asarray(x, dtype=jnp.float32) for x in leaves]))
+
+        aux["grad/global_norm"] = optax.global_norm(grads)
+        graphdef, grad_state = nnx.split(grads)
+        aux["grad/encoder_norm"] = optax.global_norm(grad_state.get("encoder", {}))
+        aux["grad/decoder_norm"] = optax.global_norm(grad_state.get("decoder", {}))
+        aux["grad/encoder_std_mean"] = _tree_std_mean(grad_state.get("encoder", {}))
+        aux["grad/decoder_std_mean"] = _tree_std_mean(grad_state.get("decoder", {}))
+
+    optimizer.update(model, grads)
+
+    return aux
+# ------------------------
+# Visualization
+# ------------------------
+
+@partial(jax.jit, static_argnames=())
+def viz_step_jit(model: Tokenizer, model_ema: Tokenizer, videos, *, mae_key, drop_key, mae_p_max=None):
+    """Visualization step with NNX model."""
+    online_rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
+    ema_rngs = nnx.Rngs(mae=mae_key, dropout=drop_key)
+    recon, (mask, _), _ = model(videos, deterministic=False, rngs=online_rngs, mae_p_max=mae_p_max)
+    recon_ema, _, _ = model_ema(videos, deterministic=False, rngs=ema_rngs, mae_p_max=mae_p_max)
+
+    masked = videos * (1.0 - mask)
+    recon_masked = masked + recon * mask
+    recon_masked_ema = masked + recon_ema * mask
+
+    grid = jnp.concatenate([videos, masked, recon_masked, recon, recon_masked_ema, recon_ema], axis=2)
+    grid = einops.rearrange(grid, "b t h w c -> h (b t w) c")
+    return grid.clip(0, 255).astype(jnp.uint8)
+
+def viz_step(model: Tokenizer, model_ema: Tokenizer, videos, rng, step, vis_dir, logger, mae_p_max=None):
+    rng = jax.random.fold_in(rng, step)
+    mae_key, drop_key = jax.random.split(rng)
+
+    T = min(videos.shape[1],256)
+    grid = viz_step_jit(model, model_ema, videos[:2,:T:T//4], mae_key=mae_key, drop_key=drop_key, mae_p_max=mae_p_max)
+    grid = jax.device_get(grid)
+
+    imageio.imwrite(vis_dir / f"step_{step:06d}.png", grid)
+
+    logger.log_image(step, "reconstruction", np.array(grid), caption=f"Step {step}: original | masked | online(mixed) | online | ema(mixed) | ema")
+
+# ------------------------
+# Run
+# ------------------------
 
 def run(cfg: TokenizerConfig):
-    run_dir = Path(HydraConfig.get().runtime.output_dir)
-    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+    # Setup
+    run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
-    # Initialize wandb if enabled
-    if cfg.use_wandb:
-        wandb_project = cfg.wandb_project or cfg.run_name
-        wandb.init(
-            entity=cfg.wandb_entity,
-            project=wandb_project,
-            name=cfg.run_name,
-            config=asdict(cfg),
-            dir=str(run_dir),
-        )
-
-    rng = jax.random.PRNGKey(0)
-    
-    num_patches = (cfg.dataset.H // cfg.patch_size) * (cfg.dataset.W // cfg.patch_size)
-    D_patch = cfg.patch_size * cfg.patch_size * cfg.dataset.C
-
-    # instantiate once
-    global lpips_loss_fn
-    if cfg.lpips_weight > 0.0:
-        lpips_loss_fn = LPIPS(pretrained_network="alexnet")
-
-    # data
-    _next_batch = make_iterator(
-        cfg.dataset.B, cfg.dataset.T, cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, 
-        cfg.dataset.pixels_per_step, cfg.dataset.size_min, cfg.dataset.size_max, 
-        cfg.dataset.hold_min, cfg.dataset.hold_max
-    )
-    def next_batch(rng):
-        rng, (videos, actions, rewards) = _next_batch(rng)
-        return rng, videos
-
-    rng, batch_rng = jax.random.split(rng)
-    rng, first_batch = next_batch(rng)  # warmup
-
-    # models
-    enc_kwargs = asdict(cfg.encoder)
-    enc_kwargs.update({
-        "n_patches": num_patches,
-    })
-    
-    dec_kwargs = asdict(cfg.decoder)
-    dec_kwargs.update({
-        "n_patches": num_patches,
-        "d_patch": D_patch,
-    })
-
-    encoder = Encoder(**enc_kwargs)
-    decoder = Decoder(**dec_kwargs)
-
-    first_patches = temporal_patchify(first_batch, cfg.patch_size)
-    rng, enc_vars, dec_vars = init_models(
-        rng, encoder, decoder, first_patches, 
-        cfg.dataset.B, cfg.dataset.T, cfg.encoder.n_latents, cfg.encoder.d_bottleneck
+    # Logging
+    logger = build_logger(
+        logger_cfg=cfg.logger,
+        config=OmegaConf.to_container(cfg, resolve=True),
+        dir=str(run_dir),
     )
 
-    # optim
-    params = pack_mae_params(enc_vars, dec_vars)
-    tx = optax.adamw(cfg.lr)
-    opt_state = tx.init(params)
+    # Parallelism
+    mesh, data_sharding, mesh_rules = build_parallel("data") # simple data parallel, if you finetune on longer sequences comment this line and uncomment the three below
+    # mesh = jax.make_mesh((2, jax.local_device_count()//2), ('data', 'seq'))
+    # data_sharding = NamedSharding(mesh, P('data', 'seq', None, None, None))
+    # mesh_rules = MeshRules(data='data', seq='seq')
+    
 
-    # ---------- ORBAX: manager + (optional) restore ----------
-    ckpt_dir = run_dir / "checkpoints"
-    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
+    with logger, jax.set_mesh(mesh):
+        key = jax.random.key(cfg.seed)
+        rng, init_key = jax.random.split(key)
 
-    # Build example trees for safe restore (use live shapes/dtypes).
-    state_example = make_state(params, opt_state, rng, step=0)
-    meta_example = {
-        "enc_kwargs": enc_kwargs, 
-        "dec_kwargs": dec_kwargs,
-        "H": cfg.dataset.H, "W": cfg.dataset.W, "C": cfg.dataset.C, "patch_size": cfg.patch_size
-    }
+        # Initialize tokenizer
+        tokenizer = Tokenizer(cfg.tokenizer, mesh_rules=mesh_rules, rngs=nnx.Rngs(init_key))
+        tokenizer_ema = build_ema_model(tokenizer, ema_dtype=cfg.ema_dtype)
+        param_counts = count_parameters_by_component(tokenizer)
+        param_counts_formatted = {k: f"{v:,}" for k, v in param_counts.items()}
+        print(f"Parameter counts: {param_counts_formatted}")
 
-    restored = try_restore(mngr, state_example, meta_example)
-    start_step = 0
-    if restored is not None:
-        latest_step, r = restored
-        # Unpack state back to your locals
-        params = r.state["params"]
-        opt_state = r.state["opt_state"]
-        rng = r.state["rng"]
-        start_step = int(r.state["step"])
-        # Optional: you can read r.meta here if you want to sanity-check config.
+        # Scaling context (handles iso-FLOPs/tokens-per-param modes + CSV output)
+        n_patches = (cfg.dataset.H // cfg.tokenizer.encoder.patch_size) * (cfg.dataset.W // cfg.tokenizer.encoder.patch_size)
+        dl_cfg = cfg.dataset.dataloader_cfg
+        long_T = dl_cfg.long_T
+        B = dl_cfg.B
+        tokens_per_step_bt = B * long_T
+        expected_flops_per_step = tokenizer.estimate_flops(batch_size=B, seq_length=long_T)
 
-        # Rebuild enc_vars/dec_vars from params so downstream apply() uses the restored params.
-        enc_vars, dec_vars = unpack_mae_params(params, enc_vars, dec_vars)
-        print(f"Restored checkpoint at step {latest_step} from {ckpt_dir}")
-
-    # ---------- Train loop ----------
-    try:
-        logger = MetricLogger(
-            use_wandb=cfg.use_wandb, 
-            log_every=cfg.log_every, 
-            max_steps=cfg.max_steps,
-            wandb_obj=wandb
+        scaling = ScalingContext.create(
+            cfg=cfg,
+            param_count=param_counts["total"],
+            flops_per_step=expected_flops_per_step,
+            data_tokens_per_step=tokens_per_step_bt * n_patches,
+            total_tokens_per_step=tokens_per_step_bt * (n_patches + cfg.tokenizer.encoder.n_latents),
+            logger=logger,
+            run_dir=run_dir,
         )
-        pbar = tqdm(range(start_step, cfg.max_steps + 1), 
-                    initial=start_step, 
-                    total=cfg.max_steps, 
-                    desc="Training Tokenizer", 
-                    dynamic_ncols=True)
-        
-        for step in pbar:
-            # use a fixed batch for debugging
-            # _, batch = next_batch(jax.random.PRNGKey(0))
-            data_start_t = time.perf_counter()
-            rng, batch = next_batch(rng)
-            data_t = time.perf_counter() - data_start_t
 
-            rng, master_key = jax.random.split(rng)
-            train_start_t = time.perf_counter()
-            should_log = logger.should_log(step)
-            params, opt_state, enc_vars, dec_vars, aux = train_step(
-                encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch,
-                patch=cfg.patch_size, H=cfg.dataset.H, W=cfg.dataset.W, C=cfg.dataset.C, 
-                master_key=master_key, step=step, 
-                lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
-                should_log=should_log,
-                dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std,
-            )
-            train_t = time.perf_counter() - train_start_t
-            total_t = data_t + train_t
+        # Build learning rate schedule and optimizer
+        lr_schedule = build_lr_schedule(cfg.lr_schedule)
+        optimizer = build_optimizer(cfg.optimizer, tokenizer, lr_schedule, d_model=cfg.tokenizer.encoder.d_model)
 
-            # Log
-            if should_log:
-                mse_loss_pix = aux['loss_mse_pix']
-                psnr = 10 * jnp.log10(1.0 / jnp.maximum(mse_loss_pix, 1e-10))
-                rmse = jnp.sqrt(mse_loss_pix)
-                
-                logger.log(
-                    step,
-                    metrics={
-                        "total": aux['loss_total'],
-                        "rmse": rmse,
-                        "lpips": aux['loss_lpips'],
-                        "psnr": psnr,
-                        "time/data": data_t,
-                        "time/train": train_t,
-                        "time/total": total_t,
-                    },
-                    pbar=pbar,
-                    float_fmt=".6f"
+        # Initialize LPIPS model once (avoids repeated HF downloads during JIT tracing)
+        lpips_model = LPIPS(pretrained_network="alexnet") if cfg.lpips_weight > 0 else None
+
+        # Create checkpoint bundle
+        bundle = TokenizerCheckpointBundle(
+            tokenizer=tokenizer,
+            tokenizer_ema=tokenizer_ema,
+            tokenizer_optimizer=optimizer,
+        )
+
+        # Data iterator
+        train_dataloader = build_iterator(cfg.dataset, device=data_sharding, seq_len=dl_cfg.long_T)
+
+        with build_checkpoint_manager(cfg.ckpt, ckpt_dir, item_names=TokenizerCheckpointBundle.get_item_names()) as checkpoint_manager:
+            # Resume from checkpoint
+            start_step, bundle, rng = bundle.restore(checkpoint_manager, rng)
+            scaling.start_training()
+
+            # Training loop
+            pbar = tqdm(enumerate(train_dataloader, start=start_step), initial=start_step,total=cfg.max_steps, dynamic_ncols=True)
+            for step, batch in pbar:
+                if step >= cfg.max_steps:
+                    break
+
+                # Create fresh RNG state for this step by folding in step number
+                step_rng = jax.random.fold_in(rng, step)
+                mae_key, dropout_key = jax.random.split(step_rng)
+
+                # Compute dynamic mae_p_max if finetuning
+                current_mae_p_max = None
+                if cfg.mae_finetune_p_max_start != cfg.mae_finetune_p_max_end:
+                    frac = min(step / max(cfg.max_steps - 1, 1), 1.0)
+                    current_mae_p_max = jnp.array(
+                        cfg.mae_finetune_p_max_start + (cfg.mae_finetune_p_max_end - cfg.mae_finetune_p_max_start) * frac
+                    )
+
+                # Shard batch data
+                aux = train_step(
+                    bundle.tokenizer, bundle.tokenizer_optimizer, lpips_model, batch["videos"],
+                    mae_key=mae_key, dropout_key=dropout_key, step=step,
+                    lpips_weight=cfg.lpips_weight, lpips_frac=cfg.lpips_frac,
+                    dataset_mean=tuple(cfg.dataset.dataset_mean),
+                    dataset_std=tuple(cfg.dataset.dataset_std),
+                    log_gradients=cfg.logger.log_gradients,
+                    tokenizer_loss_type=cfg.tokenizer_loss_type,
+                    mae_p_max=current_mae_p_max,
+                    freeze_encoder=cfg.mae_finetune,
                 )
 
-            # Save (async)
-            state = make_state(params, opt_state, rng, step)
-            maybe_save(mngr, step, state, meta_example)
+                ema_update_step(bundle.tokenizer, bundle.tokenizer_ema, ema_decay=cfg.ema_decay)
 
-            # Viz
-            if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
-                rng, viz_key = jax.random.split(rng)
-                mae_key, drop_key, vis_batch_key = jax.random.split(viz_key, 3)
-                _, viz_batch = next_batch(vis_batch_key)
-                viz_batch = viz_batch[:8, :1]
-                out = viz_step(encoder, decoder, enc_vars, dec_vars, viz_batch,
-                               patch=cfg.patch_size, mae_key=mae_key, drop_key=drop_key,
-                               dataset_mean=cfg.dataset.dataset_mean, dataset_std=cfg.dataset.dataset_std)
-                target = jnp.concatenate(temporal_unpatchify(out["target"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
-                masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
-                rec_masked  = jnp.concatenate(temporal_unpatchify(out["recon_masked"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
-                rec_unmasked  = jnp.concatenate(temporal_unpatchify(out["recon_full"], cfg.dataset.H, cfg.dataset.W, cfg.dataset.C, cfg.patch_size).squeeze(), axis=1)
-                grid = jnp.concatenate([target, masked_in, rec_masked, rec_unmasked])
-                grid = jnp.asarray(grid * 255.0, dtype=jnp.uint8)
-                vis_path = run_dir / "viz"
-                _ensure_dir(vis_path)
-                imageio.imwrite(vis_path / f"step_{step:03d}.png", grid)
-    finally:
-        # Make sure any background saves finish before exit.
-        mngr.wait_until_finished()
-        if cfg.use_wandb and wandb.run is not None:
-            wandb.finish()
-            print("[wandb] Finished logging.")
+                if logger.should_log(step):
+                    metrics_cpu = jax.device_get(aux)
+                    scaling.on_step(step, metrics_cpu)
+                    mse = metrics_cpu["loss_mse"]
+                    logger.log(
+                        step,
+                        {
+                            "loss": metrics_cpu["loss_total"],
+                            "mse": mse,
+                            "rmse": float(jnp.sqrt(mse)),
+                            "lpips": metrics_cpu["loss_lpips"],
+                            "psnr": metrics_cpu["psnr"],
+                            "lr": lr_schedule(step),
+                            **({} if not cfg.mae_finetune else {"mae_p_max": float(current_mae_p_max)}),
+                            **scaling.get_step_metrics(step),
+                            **({} if not cfg.logger.log_gradients else {
+                                "grad/global_norm": metrics_cpu["grad/global_norm"],
+                                "grad/encoder_norm": metrics_cpu["grad/encoder_norm"],
+                                "grad/decoder_norm": metrics_cpu["grad/decoder_norm"],
+                                "grad/encoder_std_mean": metrics_cpu["grad/encoder_std_mean"],
+                                "grad/decoder_std_mean": metrics_cpu["grad/decoder_std_mean"],
+                            }),
+                        },
+                        pbar=pbar,
+                        pbar_filter=r"^(loss|mse|lpips|psnr|lr)$",
+                    )
+
+                # Checkpointing
+                bundle.maybe_save(checkpoint_manager, step, rng)
+
+                if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
+                    # Move a subset to host for visualization
+                    viz_videos = batch["videos"][:8]
+                    viz_step(
+                        bundle.tokenizer,
+                        bundle.tokenizer_ema,
+                        viz_videos,
+                        step_rng,
+                        step,
+                        vis_dir,
+                        logger,
+                        mae_p_max=current_mae_p_max,
+                    )
+
+            scaling.finalize()
+
 
 @hydra.main(version_base=None, config_path="../configs", config_name="tokenizer")
-def main(cfg: DictConfig):
-    schema = OmegaConf.structured(TokenizerConfig)
-    cfg = OmegaConf.merge(schema, cfg)
-    tokenizer_cfg = OmegaConf.to_object(cfg)
-    
-    run(tokenizer_cfg)
+def main(cfg: TokenizerConfig):
+    run(cfg)
+
 
 if __name__ == "__main__":
     main()

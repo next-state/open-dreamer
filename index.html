@@ -1,0 +1,700 @@
+<!doctype html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="website/scripts/distill.pub_template.v2.js"></script>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <link rel="stylesheet" href="website/style.css">
+  <style>
+    .sponsor-line {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .sponsor-line a {
+      display: inline-flex;
+      color: inherit;
+    }
+
+    .sponsor-line .reactor-logo {
+      width: 8.75rem;
+      height: auto;
+    }
+
+    .acknowledgement-logo-link {
+      display: inline-flex;
+      color: inherit;
+      vertical-align: -0.1em;
+    }
+
+    .acknowledgement-logo {
+      width: auto;
+      height: 0.72em;
+    }
+  </style>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.css" integrity="sha384-zTROYFVGOfTw7JV7KUu8udsvW2fx4lWOsCEDqhBreBwlHI4ioVRtmIvEThzJHGET" crossorigin="anonymous">
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.js" integrity="sha384-GxNFqL3r9uRJQhR+47eDxuPoNE7yLftQM8LcxzgS4HT73tp970WS/wV5p8UzCOmb" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/contrib/auto-render.min.js" integrity="sha384-vZTG03m+2yp6N6BNi5iM4rW4oIwk5DfcNdFfxkk9ZWpDriOkXX8voJBFrAO7MpVl" crossorigin="anonymous"></script>
+
+  <script>
+    document.addEventListener("DOMContentLoaded", function() {
+      renderMathInElement(document.body, {
+        delimiters: [
+          {left: '$$', right: '$$', display: true},
+          {left: '$', right: '$', display: false},
+          {left: '\\(', right: '\\)', display: false},
+          {left: '\\[', right: '\\]', display: true}
+        ],
+        throwOnError: false
+      });
+
+      const figure7Frame = document.querySelector('iframe[src="website/space-layer-mask.html"]');
+      const figure7Caption = document.getElementById('figure-7-caption');
+      if (figure7Frame && figure7Caption) {
+        const defaultFigure7Caption = figure7Caption.textContent.trim();
+        const restoreFigure7Caption = () => {
+          figure7Caption.textContent = defaultFigure7Caption;
+        };
+        figure7Frame.addEventListener('mouseleave', restoreFigure7Caption);
+        window.addEventListener('message', event => {
+          if (event.origin !== window.location.origin || event.source !== figure7Frame.contentWindow) return;
+          if (event.data?.type !== 'figure-7-caption') return;
+          if (typeof event.data.description === 'string') {
+            figure7Caption.textContent = `Figure 7: ${event.data.description}`;
+          } else {
+            restoreFigure7Caption();
+          }
+        });
+      }
+    });
+  </script>
+
+</head>
+
+<d-front-matter>
+  <script type="text/json">{"authors": []}</script>
+</d-front-matter>
+
+<d-title>
+  <h1>How to train a frontier-level world model</h1>
+  <p class="sponsor-line">
+    <span>Sponsored by</span>
+    <a href="https://www.reactor.inc/" aria-label="Reactor">
+      <svg class="reactor-logo" viewBox="0 0 174.323 20" role="img" aria-labelledby="reactor-logo-title" xmlns="http://www.w3.org/2000/svg">
+        <title id="reactor-logo-title">Reactor</title>
+        <g id="reactor-logotype">
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M23.8566 0.334543C26.2549 0.334543 27.3183 1.74048 27.3183 3.66023V9.31064C27.3183 11.176 26.2827 12.5819 23.9382 12.5819H23.8822C23.2723 12.584 22.9111 13.2606 23.2521 13.7621L27.2634 19.6655H22.3994L17.7569 13.0488C17.5515 12.7564 17.2148 12.5819 16.8557 12.5819C16.2491 12.5819 15.7577 13.0696 15.7577 13.6709V19.6655H11.5596V13.6709C11.5596 13.0696 11.0682 12.5819 10.4615 12.5819C10.1019 12.5819 9.76577 12.7564 9.56035 13.0488L4.91783 19.6655H0.0544232L4.06627 13.7621C4.40721 13.2606 4.04653 12.584 3.43613 12.5819H3.38011C1.03618 12.5819 0 11.176 0 9.31011V3.6597C0 1.74048 1.06285 0.334543 3.46174 0.334543H23.8566ZM4.6884 4.11963C4.3069 4.11963 4.19806 4.25462 4.19806 4.63344V8.33742C4.19806 8.68904 4.3069 8.79682 4.66172 8.79682H22.6577C23.012 8.79682 23.1208 8.68851 23.1208 8.33742V4.63344C23.1208 4.25515 23.012 4.11963 22.6305 4.11963H4.6884Z" fill="currentColor"></path>
+        <path d="M173.721 9.31064C173.721 11.176 172.822 12.2922 170.578 12.2922L169.495 12.2948C169.039 12.2959 168.788 12.8241 169.074 13.1784L174.323 19.6655H169.108L163.468 12.6507C163.286 12.4245 163.011 12.2927 162.721 12.2927C162.19 12.2927 161.761 12.7222 161.761 13.2521V19.6655H157.396V0.335075H170.5C172.796 0.335075 173.721 1.74101 173.721 3.66023V9.31064ZM161.761 4.11962V8.79682H169.352C169.691 8.79682 169.796 8.68851 169.796 8.33742V4.63344C169.796 4.25515 169.691 4.11962 169.326 4.11962H161.761Z" fill="currentColor"></path>
+        <path d="M57.3018 9.31064C57.3018 11.176 56.4033 12.2922 54.1597 12.2922L53.0765 12.2948C52.6209 12.2959 52.3696 12.8241 52.6561 13.1784L57.9053 19.6655H52.6902L47.0505 12.6507C46.8686 12.424 46.5932 12.2927 46.3024 12.2927C45.7726 12.2927 45.3431 12.7222 45.3431 13.2521V19.6655H40.9786V0.335075H54.0823C56.3782 0.335075 57.3029 1.74101 57.3029 3.66023V9.31064H57.3018ZM45.342 4.11962V8.79682H52.933C53.2724 8.79682 53.3764 8.68851 53.3764 8.33742V4.63344C53.3764 4.25515 53.2718 4.11962 52.9069 4.11962H45.342Z" fill="currentColor"></path>
+        <path d="M145.082 20C137.359 20 135.528 17.7969 135.528 10C135.528 2.20307 137.359 0 145.082 0C152.804 0 154.636 2.20307 154.636 10C154.636 17.7969 152.804 20 145.082 20ZM139.933 10C139.933 15.6931 140.478 16.312 145.082 16.312C149.685 16.312 150.181 15.6931 150.181 10C150.181 4.3069 149.636 3.68797 145.082 3.68797C140.527 3.68797 139.933 4.3069 139.933 10Z" fill="currentColor"></path>
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M96.5644 19.6655H91.9438L90.596 15.5517H82.2821L80.9343 19.6655H76.3137L82.6486 0.334543H90.23L96.565 19.6655H96.5644ZM86.1205 3.83737L83.4676 11.9336H89.4099L86.757 3.83737H86.1205Z" fill="currentColor"></path>
+        <path d="M74.9851 4.10202H64.7017V8.11653H74.0284V11.6247H64.7017V15.8985H75.0325V19.666H60.3367V0.334009H74.9851V4.10148V4.10202Z" fill="currentColor"></path>
+        <path d="M101.513 10C101.513 15.6888 102.107 16.3072 106.46 16.3072C109.329 16.3072 110.464 15.8244 110.81 14.1634C110.926 13.6949 110.976 12.3898 110.983 12.2111H115.144V12.8946C115.144 18.0883 113.016 19.9936 106.46 19.9936C98.9409 19.9936 97.1092 17.7916 97.1092 10C97.1092 2.20841 98.9409 0.00640297 106.46 0.00640297C112.422 0.00640297 115.144 1.56493 115.144 6.85786V7.51787H110.958C110.908 6.74208 110.922 5.55117 110.412 4.84794C109.823 3.99637 108.633 3.69278 106.46 3.69278C102.107 3.69278 101.513 4.31117 101.513 10Z" fill="currentColor"></path>
+        <path d="M133.97 4.10682H127.663V19.6655H123.298V4.10682H116.993V0.334543H133.97V4.10735V4.10682Z" fill="currentColor"></path>
+        </g>
+      </svg>
+    </a>
+  </p>
+</d-title>
+
+<d-byline>
+  <div class="byline grid">
+    <div class="authors-affiliations grid">
+      <h3>Authors</h3>
+      <h3>Affiliations</h3>
+
+        <p class="author">
+
+            <a class="name" href="https://github.com/Francesco215">Pietro Smusi</a>
+        </p>
+        <p class="affiliation">
+        None
+        </p>
+
+        <p class="author">
+            <a class="name" href=" "> </a>
+        </p>
+        <p class="affiliation">
+        <a class="affiliation" href=""></a>
+        </p>
+
+
+        <p class="author">
+            <a class="name" href=" "> </a>
+        </p>
+        <p class="affiliation">
+        <a class="affiliation" href=""></a>
+        </p>
+
+    </div>
+    <div></div>
+    <div class="date-doi">
+      <h3>Date</h3>
+      <p>TODO</p>
+      <h3>DOI</h3>
+      <p>TODO</p>
+    </div>
+  </div>
+</d-byline>
+<d-article>
+<p>
+    One of the most time consuming parts of doing science is climbing up to the shoulders of the giants. While this can be a very instructive experience, sometimes it’s very nice to be teleported right on top of it and get to work right away pushing the boundary of human knowledge.
+</p>
+<p>
+    In the last few months, with the support from Reactor, we’ve been working on making a frontier-level world model. We release and open source the model, the training code, and in this blog post with all the lessons we learned along the way. We want to make frontier research accessible to everyone and hope this will accelerate progress in the field.
+</p>
+<p>You can also play with our model thanks to the reactor runtime!</p>
+
+  <h2>A survival guide to training a world model</h2>
+  <div>
+      <blockquote>
+          We do these things not because they are easy, but because we thought they were going to be easy
+      </blockquote>
+      <figure class="l-body side">
+          <img src="website/search-space.svg" alt="Several possible paths through a search space, from starting point A to goal B">
+          <figcaption>Figure 1: The search space</figcaption>
+      </figure>
+      <p>
+        When starting a new project, you have to define:
+      </p>
+      <ul>
+        <li>The goal</li>
+        <li>The starting point</li>
+        <li>The search space</li>
+      </ul>
+      <p>
+        Our main objective was to reproduce the Dreamer4 paper <d-cite key="hafner2025dreamer4"></d-cite>. That gave us the search space: basically whatever method and architecture they used inside of that paper, and it gave us the goal: making a minecraft world model. As starting point we chose a simpler game than can be trained on a single graphics card: coinrun
+      </p>
+  </div>
+  <p>
+      We purposefully refrained from using different methods that were not in the original paper as that would have made the search space wider.
+  </p>
+
+  <h2>The starting point</h2>
+  <div>
+      <figure class="l-body side">
+          <img src="website/coinrun.gif">
+          <figcaption>Figure 2: Coinrun. Run to get the coin</figcaption>
+      </figure>
+      <p>
+          This is coinrun: It’s a 2D platform game where each level is procedurally generated. As the name would suggest, the goal is to run to get the coin.
+      </p>
+      <p>
+          With this simple game it is possible to do every step of the Dreamer 4 paper but with some really nice added benefits:
+      </p>
+      <p>
+          <ul>
+              <li>Just one gpu (much simpler to debug)</li>
+              <li>Fast iteration loop (much smaller training time)</li>
+              <li>Once done, the codebase will have all the core logic ready and working</li>
+          </ul>
+      </p>
+  </div>
+  <div>
+  <h2>The search space</h2>
+  <p>
+      The architecture is made of two main parts: The tokenizer and the dynamics model. Both use the same model architecture backbone: the block-causal transformer.
+  </p>
+  <p>
+      What sets it apart is the fact that there are two different attention-based layer
+  </p>
+  <ul>
+    <li><strong>Space Layer:</strong> where information propagates within all the elements that represent a single frame</li>
+    <li><strong>Causal Time Layer:</strong> where information propagates between different frames</li>
+  </ul>
+  <h3>
+      The Tokenizer (Autoencoder)
+  </h3>
+  <p>
+      If you have ever trained a VAE in the past, you know how terrible of an experience that is. Most of the time the wisest thing to do is to give up and take an off-the-shelf one.
+  </p>
+  <p>
+      In this project we’ve trained a transformer-based Masked Autoencoder <d-cite key="chen2025maetok"></d-cite> with ~100x compression, and we probably could have aimed higher.
+  </p>
+  <p>
+      This architecture is really cool because:
+  </p>
+  <ul>
+    <li>Masking makes the latent space more diffusable</li>
+    <li>There is no need for the KL and adversarial loss</li>
+    <li>It’s very fast to train</li>
+    <li>It’s scalable</li>
+    <li>All of the above make it easier to train compared to the typical VAE</li>
+  </ul>
+  <h3>The Dynamics Model (World Model)</h3>
+  <p>
+      World models fundamentally work by doing “next frame prediction”. Each frame is generated as an image conditioned on the previous ones. The dynamics model is trained with diffusion forcing <d-cite key="chen2024diffusionforcing"></d-cite> with flow matching <d-cite key="lipman2023flowmatching"></d-cite> and shortcut models <d-cite key="frans2024onestep"></d-cite>.
+  </p>
+  </div>
+  <figure class="l-gutter l-gutter-large">
+      <img src="website/maetok-autoencoder-platformer.svg">
+      <figcaption>Figure 3: Tokenizer architecture</figcaption>
+  </figure>
+  <figure>
+      <img src="website/diffusion-forcing.svg" alt="Diffusion forcing: parallel denoising during training and cached iterative next-frame generation during inference">
+      <figcaption>Figure 4: Diffusion forcing training (left) and inference (right)</figcaption>
+  </figure>
+  <p>
+      Other than predicting just the next frame, we worked on predicting the next action as well.
+      Typically, the rollout alternates between the world and the agent. Given the previous action $a_{t-1}$, the dynamics predicts the next state $s_t$; the policy $\pi_t$ observes that state and samples the next action:
+  </p>
+  <figure class="l-body-outset">
+      <img src="website/causal-sequence.svg" alt="Causal rollout sequence: the previous action produces the current state, the policy reads that state and produces the next action, and the cycle repeats.">
+      <figcaption>Figure 5: A rollout alternates between predicting the next state and sampling the next action.</figcaption>
+  </figure>
+  <p>
+      Evaluating the transition and policy as separate modules would require repeatedly moving between them. It would also prevent them from sharing the same representation and transformer parameters. Instead, we would like to process all timesteps in parallel during training and reuse the same computation for both the world and the agent.
+  </p>
+  <p>
+      This architecture folds the sequence into blocks:
+  </p>
+  $$
+  B_t = (a_{t-1}, s_t, \pi_t)
+  $$
+  <p>
+      Within each block, spatial attention implements $(a_{t-1} \to s_t \to \pi_t)$
+  </p>
+  <figure class="l-body-outset">
+      <img src="website/causal-space-time.svg" alt="The causal rollout folded into three timestep columns. Spatial attention runs down each column from the previous action to the state and policy, while causal temporal attention runs from left to right. Each policy produces the action entering the next column.">
+      <figcaption>Figure 6: Folding the rollout into timestep blocks. Spatial attention operates within each block, while causal temporal attention connects blocks across time.</figcaption>
+  </figure>
+  <p>
+      What does $s_t$ contain? The state is the part generated through diffusion—or, more precisely, the model diffuses its latent spatial tokens. The state computation therefore includes:
+  </p>
+  <ul class="space-token-list">
+      <li>a noise-level and shortcut step-size token describing how far the model should advance in one denoising step, following Shortcut Models <d-cite key="frans2024onestep"></d-cite>;</li>
+      <li>spatial latent tokens representing the visual state;</li>
+      <li>register tokens, which provide shared workspace for internal computation. <d-cite key="darcet2023registers"></d-cite></li>
+  </ul>
+  <p>
+      Together, these tokens let each space layer turn the previous action and a noisy latent into the next clean latent state.
+  </p>
+  <figure class="l-page">
+      <iframe src="website/space-layer-mask.html" title="Interactive visualization of the space-layer attention mask" width="100%" height="520" loading="lazy" style="display: block; border: 0;"></iframe>
+      <figcaption id="figure-7-caption" aria-live="polite">Figure 7: Space-layer attention in one dynamics timestep. The previous action A conditions the denoising step τ, spatial latents X, and shared registers R; the agent token π reads the resulting state to predict behavior. World-model tokens cannot read π, so task and policy information can affect future states only through the next action.</figcaption>
+  </figure>
+  <div>
+  <h2>Coinrun experiments</h2>
+
+  <p>
+    As mentioned before, our first experiments were in coinrun.<br><br>
+    We first trained the tokenizer and we’ve also done some scaling experiments and interestingly the compute optimal number of parameters and number of data points scale as the square root of compute!
+  </p>
+  <p>
+      As Karpathy puts it <d-cite key="karpathy2026nanochat"></d-cite>:
+  </p>
+  <blockquote>
+      “this really didn't have to be the case, it could have been something else and complicated and a function of the model size [...] but nature decided that compute optimal Transformers fall exactly on a straight line (what???)”
+  </blockquote>
+  </div>
+
+  <figure class="l-gutter l-gutter-large">
+      <img src="website/coinrun-tokenizer.jpg" alt="Coinrun experiments" width="100%">
+      <figcaption>
+        Figure 8. Coinrun tokenizer reconstruction. Rows from top to bottom:
+        ground truth, masked input, reconstructed patches overlaid on the input,
+        and full decoder reconstruction.
+      </figcaption>
+  </figure>
+
+  <figure  class="l-page">
+      <img src="website/compute_scaling_reconstructed.svg" alt="Coinrun experiments" width="100%">
+      <figcaption>
+        Figure 9: Iso-FLOPs scaling analysis for the Coinrun tokenizer. Across
+        fixed compute budgets, the best model size and training-token count
+        follow approximately $N \propto C^{0.56}$ and
+        $D \propto C^{0.44}$ respectively.
+      </figcaption>
+  </figure>
+  <div class="coinrun-demo">
+      <figure class="l-middle side video-figure">
+          <video controls playsinline preload="metadata" width="640" height="576">
+              <source src="website/coinrun-wm.mp4" type="video/mp4">
+              Your browser cannot play this video. You can
+              <a href="website/coinrun-wm.mp4">download the Coinrun world-model rollout</a>
+              instead.
+          </video>
+          <figcaption>Figure 10: Our first prototype of an interactive world model</figcaption>
+      </figure>
+      <p>
+          We first tried to train world model with random actions, but when we tried playing with model we found the experience quite terrible.
+      </p>
+      <p>
+          To solve this, we trained a very simple RL agent to collect trajectories, and then we trained a dynamics model first and then we trained a simple policy with a behaviour cloning objective.<d-footnote>The repository that we release doesn't have the behaviour cloning and RL code. This is because we didn't do it for minecraft and we didn't feel it made sense to release it.</d-footnote>
+      </p>
+      <p>
+          While far from optimal, we can see the policy learns to run and jump towards the right to get the coin. This showed that our pipeline was working end-to-end and we able to move on to scale thing up for minecraft
+      </p>
+      <figure>
+          <img src="website/behaviour-cloning.gif">
+          <figcaption>Figure 11: Some short examples of the behaviour cloning policy</figcaption>
+      </figure>
+  </div>
+  <h2>Scaling up</h2>
+  <div>
+      <p>
+          From this point on, debugging became much harder, and scaling from a working CoinRun model to Minecraft consumed most of our time. By documenting the failure modes and fixes, we hope to make this phase substantially faster for you.
+      </p>
+      <p>
+          The two main challenges when scaling up are: squeezing as much compute out of the gpus available and making sure everything is stable.
+      </p>
+      <p>
+          We used JAX because the XLA compiler is great for efficient and scalable SPMD programs.
+      </p>
+  </div>
+
+  <h3>Computemaxxing</h3>
+  <p>
+      We were able to get around 57~58% Model Flops Utilization (MFU). In this section we&rsquo;ll explain how.
+  </p>
+  <p>
+      What determines if a computation is compute bound or memory bound is the arithmetic intensity.
+  </p>
+  <p>
+      The arithmetic intensity represents how many FLOPs you do for every byte you move from memory. On a B200, the roofline crosses over at 292 FLOP/byte. Below that point, you are bandwidth-bound. Above it, you are compute-bound.
+  </p>
+  <figure class="l-page">
+      <img src="website/roofline-analysis.svg" alt="B200 roofline chart showing the 292 FLOP-per-byte crossover and Dreamer dynamics training in the compute-bound region at 57 to 58 percent MFU" width="100%">
+      <figcaption>Figure 12: Roofline analysis for Dreamer dynamics training on a B200 GPU. Batching 256 frames per GPU places the workload beyond the ridge point, where throughput is limited by compute rather than memory bandwidth.</figcaption>
+  </figure>
+  <p>
+      For transformer training, arithmetic intensity improves as you increase the number of tokens per GPU because weights are reused across every token in the batch.
+  </p>
+  <p>
+      In general, when doing world modelling, it should be possible to make sure that your training script is compute-bound. This is because even a short video is made of lots of tokens.
+  </p>
+  <p>
+      In our case we discovered that feeding 256 frames per GPU would be more than enough to be in the compute-bound region. In practice it&rsquo;s impossible to reach 100% MFU and 60% is considered a very healthy value of transformer training.
+  </p>
+  <p>
+      For more details on how to do this kind of analysis, check the scaling book <d-cite key="scaling-book"></d-cite>.
+  </p>
+
+  <h4>Sharding</h4>
+  <p>
+      At 1.6B parameters, the model state &mdash; parameters, gradients, optimizer state, and EMA &mdash; took around 24 GiB. That is large, but still manageable on a B200. The real memory cost came from the activations. Long video sequences create huge intermediate tensors, and those have to be kept around for the backward pass. Even with a batch size of one video sequence per GPU, we still needed activation checkpointing to fit training in memory.
+  </p>
+  <p>
+      So instead of aggressively sharding the model, we focused on making the per-GPU batch fit.
+  </p>
+  <p>
+      We tried data parallelism, FSDP, tensor parallelism, and sequence parallelism. In practice, DP and FSDP worked best. Since the model state already fit comfortably, FSDP did not buy us much, while it added extra communication and a little more complexity. We therefore used plain data parallelism.
+  </p>
+  <p>
+      Also, because each GPU performed substantial local computation before gradient synchronization, communication overhead remained small relative to compute.
+  </p>
+
+  <h4>Activation checkpointing</h4>
+  <p>
+      Even with &ldquo;just&rdquo; 256 frames per device, the activations stored will OOM. Instead of storing every intermediate activation during the forward pass, we only stored some of them and recomputed the missing ones during the backward pass. This costs relatively little FLOPs, but it saves a lot of memory.
+  </p>
+
+  <h4>Synchronization</h4>
+  <p>
+      GPUs have to run in lockstep. The only way we&rsquo;ve been able to guarantee that they stay in sync is only if the model ever sees input tensor of always the same shape. This means that if you are using batches of variable frame length you need to reshape and mask them accordingly to make them consistent.
+  </p>
+
+  <h4>Dataloading</h4>
+  <p>
+      The last bottleneck comes from keeping the GPUs well fed. Videos are heavy and decoding them with ffmpeg is not fast enough to keep the GPUs warm. So we pre-tokenized the entire dataset and saved it in .arrayrecord format.
+  </p>
+  <p>
+      Then for dataloading used grain and added a GPU-side prefetch buffer to preallocate the data directly inside of the GPUs and ready to go.
+  </p>
+
+  <h3>Stability</h3>
+  <p>
+      We believe this section will be the most valuable for practitioners, as it focuses on the problems that repeatedly blocked our progress and the lessons we learned while overcoming them.
+  </p>
+  <div> 
+  <figure class="l-body side greentext-figure">
+      <div class="fourchan-post">
+        <div class="fourchan-post-header">
+          <span class="fourchan-post-menu">⋮</span>
+          <strong>Anonymous</strong>
+          <span>07/19/26(Sun)20:06:43 No.420691337</span>
+        </div>
+        <div class="fourchan-post-body">
+          <div class="fourchan-post-image">
+            <img src="website/hollow-inside.jpg" alt="A hollow, exhausted face">
+            <span>15 KB JPG</span>
+          </div>
+          <div class="greentext">
+            &gt;train world model<br>
+            &gt;loss goes down<br>
+            &gt;generation quality goes down too<br>
+            &gt;distress.jpg<br>
+            &gt;spend two weeks fixing it<br>
+            &gt;finally looks good<br>
+            &gt;relief.jpg<br>
+            &gt;scale up<br>
+            &gt;loss improves even more<br>
+            &gt;generation quality becomes abstract art<br>
+            &gt;repeat for six months
+          </div>
+        </div>
+        <div class="fourchan-post-footer">
+          <span>1 Reply</span>
+          <span>View Thread</span>
+        </div>
+      </div>
+
+      <figcaption>Figure 13: The world model training loop, as experienced.</figcaption>
+  </figure>
+  <p>
+      Stability issues haunted this project from beginning to end. More than any other challenge, they consumed the largest share of our time.
+  </p>
+  <p>
+      Unlike syntax errors, which immediately halt execution, or synchronization bugs, where the failure mode is usually visible, stability issues are far more elusive. They often emerge only at large scales&mdash;high data volumes, long training runs, and significant amounts of compute. As a result, they can take days or even weeks to surface. And when they finally do, the root cause is rarely apparent. As a matter of fact, most stability problems happen <strong>despite</strong> the loss going down! MSE goes down smoothly, but the generation quality degrades significantly.
+  </p>
+  <p>
+      Let&rsquo;s start from the simplest to hardest ones.
+  </p>
+</div>
+  <h4>Optimizers</h4>
+  <p>
+      We've compared muon <d-cite key="jordan2024muon"></d-cite> with laprop <d-cite key="liuziyin2020laprop"></d-cite> (the original optimizer used in the dreamer series)
+      and found that laprop would spike at random and those loss spikes would get more and more frequent with time.<br>
+      By contrast muon proved to be much more stable and yielded much lower losses.
+  </p>
+  <figure class="l-body">
+      <img src="website/optimizer-comparison.svg" alt="" width="100%">
+      <figcaption>Figure 14: Training loss comparison between Muon and LaProp on two runs with a budget of ~400 B200 hours each</figcaption>
+  </figure>
+  <p>
+      This is the simplest stability problem because it&rsquo;s the only one that is visible in the loss curve.
+  </p>
+
+  <h4>Exponential Moving Average</h4>
+  <p>
+      In diffusion modelling doing inference with online weights yields subpar results. Using the exponential moving average of the parameters is a must.
+      $$
+      \theta_\textrm{EMA} \leftarrow \beta \theta_\textrm{EMA} + (1-\beta)\theta
+      $$
+  </p>
+  <figure class="l-body video-figure">
+      <video controls playsinline preload="metadata" width="640">
+          <source src="website/comparison.mp4" type="video/mp4">
+          Your browser cannot play this video. You can
+          <a href="website/comparison.mp4">view the comparison video</a>
+          instead.
+      </video>
+      <figcaption>Figure 15: Comparison of the model outputs.</figcaption>
+  </figure>
+
+  <h4>Mixed precision Training</h4>
+  <p>
+      Modern AI accelerators are optimized for BF16, but some operations still require higher precision. Keep the parameters in float32; use BF16 for most matrix-multiplication activations and attention inputs; and use float32 for normalization, selected sinusoidal and normalization helpers, optional attention weights, and the dynamics flow output head.
+  </p>
+  <p>
+      These precision boundaries are important: getting them wrong can destabilize both training and generation.
+  </p>
+
+  <h4>Loss weighting</h4>
+  <p>
+      Flow matching models are usually trained to directly predict the velocity field to denoise the input v-prediction. Recently, researchers have found that directly predicting the clean data from noisy inputs x-prediction with v-space loss results in higher quality generation <d-cite key="li2025back"></d-cite>
+  </p>
+  <p>
+      World models also have an extra inductive bias in favour of x-prediction: Since all context frames are in x-space, it would only be natural to ask the nn to predict the next frame in x-space as well.
+  </p>
+  <p>
+  </p>
+  <figure class="l-page">
+      <img src="website/xpred-vpred-noise-comparison.svg" alt="">
+      <figcaption>Figure 16: With x-pred given the same context the output of the should be roughly similar regardless of the noise present in the last frame.</figcaption>
+      
+  </figure>
+  <p>
+      In practice doing x-prediction with v-space loss reduces to just a loss weighting term similar to the one in the dreamer 4 paper&ndash; but with a square term at the denominator
+      $$
+      L_v = \frac{||x -\hat x ||^2}{(1-\tau)^2}
+      $$
+  </p>
+  <p>
+      With this modification we got a small, but noticeable improvement over the dreamer4 loss-weighting, so we stuck with it.
+  </p>
+
+  <h4>Optimal Transport</h4>
+  <p>
+      Optimal transport and flow matching is a match made in heaven <d-cite key="gagneux2025avisualdive"></d-cite>: OT finds pairings that minimize the distance travelled, giving flow matching shorter, less ambiguous paths.
+  </p>
+  <p>
+      More specifically, we use minibatch barycentric OT between entire noise and latent sequences <d-cite key="genevay2018sinkhorn, peyre2025optimal"></d-cite>. We&rsquo;ve found this helped make generation more stable during rollout .
+  </p>
+  <h4>mu-parametrization</h4>
+  <p>
+      We've also tried playing with $\mu$-parametrization, however we've found it to be not needed for multipe reasons:
+  <ul>
+      <li>The smallest minecraft model we trained was just one order of magnitude smaller than the final model.</li>
+      <li>The muon optimizer keeps hyperparamters more stable through different model sizes <d-cite key="bernstein2025derivingmuon"></d-cite>.</li>
+  </ul>
+  </p>
+  <h2>Conclusion</h2>
+  <p>
+      With this work, we hope to give researchers the tools, code, and hard-won lessons needed to explore the frontier of world models.
+  </p>
+
+
+</d-article>
+<d-appendix>
+    <h3>Acknowledgements</h3>
+    <p>
+        We want to thank
+        <a class="acknowledgement-logo-link" href="https://www.reactor.inc/" aria-label="Reactor">
+          <svg class="acknowledgement-logo" viewBox="40 0 134.323 20" role="img" aria-labelledby="reactor-acknowledgement-logo-title" xmlns="http://www.w3.org/2000/svg">
+            <title id="reactor-acknowledgement-logo-title">Reactor</title>
+            <use href="#reactor-logotype"></use>
+          </svg>
+        </a>, who generosly sponsored this project. Without them, this project would not have existed.
+    </p>
+    <p>
+        We also want to thank
+        <a href="https://x.com/maharajamihir">Mihir Mahajan</a>,
+        <a href="https://ramis.ai/">Rami Seid</a>,
+        <a href="https://derewah.dev/">Davide Locatelli</a>,
+        <a href="https://srambical.fr/">Franz srambical</a>,
+        <a href="https://enkeejunior1.github.io/">Yong-hyun Park</a>,
+        <a href="https://danijar.com">Danijar Hafner</a> and
+        <a href="https://wilsonyan.com/">Wilson Yan</a>
+        for the help and support throughout this project.
+    </p>
+
+</d-appendix>
+<d-bibliography>
+  <script type="text/bibtex">
+@article{vaswani2017attention,
+  title={Attention is all you need},
+  author={Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N and Kaiser, {\L}ukasz and Polosukhin, Illia},
+  journal={Advances in neural information processing systems},
+  volume={30},
+  year={2017},
+  url={https://arxiv.org/abs/1706.03762}
+}
+
+@article{frans2024onestep,
+  title={One Step Diffusion via Shortcut Models},
+  author={Frans, Kevin and Hafner, Danijar and Levine, Sergey and Abbeel, Pieter},
+  journal={arXiv preprint arXiv:2410.12557},
+  year={2024},
+  url={https://arxiv.org/abs/2410.12557}
+}
+
+@article{darcet2023registers,
+  title={Vision Transformers Need Registers},
+  author={Darcet, Timoth{\'e}e and Oquab, Maxime and Mairal, Julien and Bojanowski, Piotr},
+  journal={arXiv preprint arXiv:2309.16588},
+  year={2023},
+  url={https://arxiv.org/abs/2309.16588}
+}
+
+@article{hafner2025dreamer4,
+  title={Training Agents Inside of Scalable World Models},
+  author={Hafner, Danijar and Yan, Wilson and Lillicrap, Timothy},
+  journal={arXiv preprint arXiv:2509.24527},
+  year={2025},
+  url={https://arxiv.org/abs/2509.24527}
+}
+
+@article{chen2025maetok,
+  title={Masked Autoencoders Are Effective Tokenizers for Diffusion Models},
+  author={Chen, Hao and Han, Yujin and Chen, Fangyi and Li, Xiang and Wang, Yidong and Wang, Jindong and Wang, Ze and Liu, Zicheng and Zou, Difan and Raj, Bhiksha},
+  journal={arXiv preprint arXiv:2502.03444},
+  year={2025},
+  url={https://arxiv.org/abs/2502.03444}
+}
+
+@article{chen2024diffusionforcing,
+  title={Diffusion Forcing: Next-token Prediction Meets Full-Sequence Diffusion},
+  author={Chen, Boyuan and Monso, Diego Marti and Du, Yilun and Simchowitz, Max and Tedrake, Russ and Sitzmann, Vincent},
+  journal={arXiv preprint arXiv:2407.01392},
+  year={2024},
+  url={https://arxiv.org/abs/2407.01392}
+}
+
+@article{lipman2023flowmatching,
+  title={Flow Matching for Generative Modeling},
+  author={Lipman, Yaron and Chen, Ricky T. Q. and Ben-Hamu, Heli and Nickel, Maximilian and Le, Matt},
+  journal={arXiv preprint arXiv:2210.02747},
+  year={2023},
+  url={https://arxiv.org/abs/2210.02747}
+}
+
+@misc{jordan2024muon,
+  title={Muon: An Optimizer for Hidden Layers in Neural Networks},
+  author={Jordan, Keller and Jin, Yuchen and Boza, Vlado and You, Jiacheng and Cesista, Franz and Newhouse, Laker and Bernstein, Jeremy},
+  year={2024},
+  url={https://kellerjordan.github.io/posts/muon/}
+}
+
+@article{liuziyin2020laprop,
+  title={LaProp: Separating Momentum and Adaptivity in Adam},
+  author={Ziyin, Liu and Wang, Zhikang T. and Ueda, Masahito},
+  journal={arXiv preprint arXiv:2002.04839},
+  year={2020},
+  url={https://arxiv.org/abs/2002.04839}
+}
+
+@article{scaling-book,
+  title = {How to Scale Your Model},
+  author = {Austin, Jacob and Douglas, Sholto and Frostig, Roy and Levskaya, Anselm and Chen, Charlie and Vikram, Sharad and Lebron, Federico and Choy, Peter and Ramasesh, Vinay and Webson, Albert and Pope, Reiner},
+  publisher = {Google DeepMind},
+  howpublished = {Online},
+  year = {2025},
+  url = {https://jax-ml.github.io/scaling-book/}
+}
+
+@inproceedings{gagneux2025avisualdive,
+  author = {Gagneux, Anne and Martin, Ségolène and Emonet, Rémi and Bertrand, Quentin and Massias, Mathurin},
+  title = {A Visual Dive into Conditional Flow Matching},
+  abstract = {Conditional flow matching (CFM) was introduced by three simultaneous papers at ICLR 2023, through different approaches (conditional matching, rectifying flows and stochastic interpolants). <br/> The main part of this post, Section 2, explains CFM by using both visual intuitions and insights on its probabilistic formulations. Section 1 introduces nomalizing flows; it can be skipped by reader familiar with the topic, or that wants to cover them later. Section 3 opens on the links between CFM and other approaches, and ends with a 'CFM playground'.},
+  booktitle = {ICLR Blogposts 2025},
+  year = {2025},
+  date = {April 28, 2025},
+  url  = {https://dl.heeere.com/conditional-flow-matching/blog/conditional-flow-matching/}
+}
+
+@misc{karpathy2026nanochat,
+  title={nanochat miniseries v1},
+  author={Karpathy, Andrej},
+  year={2026},
+  howpublished={GitHub Discussion},
+  url={https://github.com/karpathy/nanochat/discussions/420}
+}
+
+@article{genevay2018sinkhorn,
+  title={Learning Generative Models with Sinkhorn Divergences},
+  author={Genevay, Aude and Chizat, Laetitia and Bach, Francis and Cuturi, Marco and Peyr{\'e}, Gabriel},
+  journal={arXiv preprint arXiv:1803.00567},
+  year={2018},
+  url={https://arxiv.org/abs/1803.00567}
+}
+
+@misc{peyre2025optimal,
+  title={Optimal Transport for Machine Learners},
+  author={Gabriel Peyr{\'e}},
+  year={2025},
+  eprint={2505.06589},
+  archivePrefix={arXiv},
+  primaryClass={stat.ML},
+  url={https://www.gpeyre.com/ot4ml/}
+}
+
+@misc{li2025back,
+  title={Back to Basics: Let Denoising Generative Models Denoise},
+  author={Tianhong Li and Kaiming He},
+  year={2025},
+  eprint={2511.13720},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2511.13720}
+}
+
+@misc{bernstein2025derivingmuon,
+  title={Deriving Muon},
+  author={Bernstein, Jeremy},
+  year={2025},
+  url={https://jeremybernste.in/writing/deriving-muon}
+}
+  </script>
+</d-bibliography>

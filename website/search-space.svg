@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 300" role="img" aria-labelledby="title description">
+  <title id="title">Paths through a search space</title>
+  <desc id="description">Several winding paths travel from starting point A to goal B.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#121212"/>
+    </marker>
+  </defs>
+
+  <g fill="none" stroke="#121212" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <!-- A direct, optimistic route. -->
+    <path d="M68 244 C82 98 190 42 337 58"/>
+    <path d="M153 87 C169 75 184 67 201 62" marker-end="url(#arrow)"/>
+
+    <!-- A route that explores the middle of the space. -->
+    <path d="M68 244 C102 183 142 129 181 136 C220 143 230 183 275 150 C309 125 327 93 337 58"/>
+    <path d="M241 173 C254 170 265 163 276 152" marker-end="url(#arrow)"/>
+
+    <!-- A long, winding route with several reversals. -->
+    <path d="M68 244 C109 254 136 272 111 280 C135 274 151 261 164 287 C180 286 184 263 201 269 C227 277 237 249 253 222 C273 190 293 184 267 181 C238 177 209 206 213 235 C217 270 264 274 305 258 C335 246 310 214 322 198 C339 176 358 181 355 153 C352 129 329 118 345 102 C361 85 347 71 337 58"/>
+    <path d="M311 257 C322 249 326 237 323 224" marker-end="url(#arrow)"/>
+
+    <!-- A short loop showing a local detour. -->
+    <path d="M213 235 C227 228 244 209 253 191 C260 175 256 166 244 173 C222 185 204 214 213 235"/>
+  </g>
+
+  <g fill="#121212">
+    <circle cx="68" cy="244" r="4"/>
+    <circle cx="337" cy="58" r="4"/>
+  </g>
+
+  <g fill="#121212" font-family="Georgia, 'Times New Roman', serif" font-size="22">
+    <text x="47" y="269">A</text>
+    <text x="349" y="55">B</text>
+  </g>
+</svg>
