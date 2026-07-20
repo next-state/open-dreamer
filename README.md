@@ -67,7 +67,6 @@ in [dreamer/data/README.md](dreamer/data/README.md).
 │   └── eval_fvd.yaml
 ├── docs/                    # Paper notes, figures, and development notes
 ├── frontend/                # Experimental interactive frontend
-└── reactor_app/             # Experimental Reactor sidecar
 ```
 
 ## Dataset
