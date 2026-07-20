@@ -510,12 +510,17 @@ summary d-section {
   .date-doi {
     width: 200px;
   }
-  p.affiliation{
+  p.author{
     width: 300px;
   }
-  p.author{
-    width: 200px;
-  }
+}
+
+d-byline .authors-affiliations {
+  grid-template-columns: 1fr;
+}
+
+d-byline .equal-contribution {
+  color: rgba(0, 0, 0, 0.6);
 }
 
 svg#graph {
