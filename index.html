@@ -139,32 +139,32 @@
 </d-byline>
 <d-article>
 <p>
-    One of the most time consuming parts of doing science is climbing up to the shoulders of the giants. While this can be a very instructive experience, sometimes it’s very nice to be teleported right on top of it and get to work right away pushing the boundary of human knowledge.
+    One of the most time-consuming parts of doing science is climbing up to the shoulders of giants. While this can be a very instructive experience, sometimes it’s nice to be teleported right on top of them and get to work right away, pushing the boundary of human knowledge.
 </p>
 <p>
-    In the last few months, with the support from Reactor, we’ve been working on making a frontier-level world model. We release and open source the model, the training code, and in this blog post with all the lessons we learned along the way. We want to make frontier research accessible to everyone and hope this will accelerate progress in the field.
+    In the last few months, with support from Reactor, we’ve been working on a frontier-level world model. We are releasing and open-sourcing the model and training code, and sharing all the lessons we learned along the way in this blog post. We want to make frontier research accessible to everyone and hope this will accelerate progress in the field.
 </p>
-<p>You can also play with our model thanks to the reactor runtime!</p>
+<p>You can also play with our model thanks to the Reactor runtime!</p>
 
   <h2>A survival guide to training a world model</h2>
   <div>
       <blockquote>
-          We do these things not because they are easy, but because we thought they were going to be easy
+          We do these things not because they are easy, but because we thought they were going to be easy.
       </blockquote>
       <figure class="l-body side">
           <img src="website/search-space.svg" alt="Several possible paths through a search space, from starting point A to goal B">
-          <figcaption>Figure 1: The search space</figcaption>
+          <figcaption>Figure 1: The search space.</figcaption>
       </figure>
       <p>
         When starting a new project, you have to define:
       </p>
       <ul>
-        <li>The goal</li>
-        <li>The starting point</li>
-        <li>The search space</li>
+        <li>The goal.</li>
+        <li>The starting point.</li>
+        <li>The search space.</li>
       </ul>
       <p>
-        Our main objective was to reproduce the Dreamer4 paper <d-cite key="hafner2025dreamer4"></d-cite>. That gave us the search space: basically whatever method and architecture they used inside of that paper, and it gave us the goal: making a minecraft world model. As starting point we chose a simpler game than can be trained on a single graphics card: coinrun
+        Our main objective was to reproduce the Dreamer4 paper <d-cite key="hafner2025dreamer4"></d-cite>. That gave us the search space: essentially, whichever methods and architecture it used. It also gave us the goal: building a Minecraft world model. As a starting point, we chose a simpler game that can be trained on a single GPU: CoinRun.
       </p>
   </div>
   <p>
@@ -175,33 +175,33 @@
   <div>
       <figure class="l-body side">
           <img src="website/coinrun.gif">
-          <figcaption>Figure 2: Coinrun. Run to get the coin</figcaption>
+          <figcaption>Figure 2: CoinRun. Run to get the coin.</figcaption>
       </figure>
       <p>
-          This is coinrun: It’s a 2D platform game where each level is procedurally generated. As the name would suggest, the goal is to run to get the coin.
+          This is CoinRun: it’s a 2D platform game where each level is procedurally generated. As the name suggests, the goal is to run to get the coin.
       </p>
       <p>
-          With this simple game it is possible to do every step of the Dreamer 4 paper but with some really nice added benefits:
+          With this simple game, it is possible to do every step of the Dreamer4 paper, with some nice added benefits:
       </p>
       <p>
           <ul>
-              <li>Just one gpu (much simpler to debug)</li>
-              <li>Fast iteration loop (much smaller training time)</li>
-              <li>Once done, the codebase will have all the core logic ready and working</li>
+              <li>Just one GPU (much simpler to debug).</li>
+              <li>A fast iteration loop (much shorter training time).</li>
+              <li>Once done, the codebase will have all the core logic ready and working.</li>
           </ul>
       </p>
   </div>
   <div>
   <h2>The search space</h2>
   <p>
-      The architecture is made of two main parts: The tokenizer and the dynamics model. Both use the same model architecture backbone: the block-causal transformer.
+      The architecture has two main parts: the tokenizer and the dynamics model. Both use the same model-architecture backbone: the block-causal transformer.
   </p>
   <p>
-      What sets it apart is the fact that there are two different attention-based layer
+      What sets it apart is that there are two different attention-based layers:
   </p>
   <ul>
-    <li><strong>Space Layer:</strong> where information propagates within all the elements that represent a single frame</li>
-    <li><strong>Causal Time Layer:</strong> where information propagates between different frames</li>
+    <li><strong>Space Layer:</strong> information propagates among all the elements that represent a single frame.</li>
+    <li><strong>Causal Time Layer:</strong> information propagates between different frames.</li>
   </ul>
   <h3>
       The Tokenizer (Autoencoder)
@@ -216,11 +216,11 @@
       This architecture is really cool because:
   </p>
   <ul>
-    <li>Masking makes the latent space more diffusable</li>
-    <li>There is no need for the KL and adversarial loss</li>
-    <li>It’s very fast to train</li>
-    <li>It’s scalable</li>
-    <li>All of the above make it easier to train compared to the typical VAE</li>
+    <li>Masking makes the latent space more diffusible.</li>
+    <li>There is no need for KL or adversarial loss.</li>
+    <li>It’s very fast to train.</li>
+    <li>It’s scalable.</li>
+    <li>All of the above make it easier to train than a typical VAE.</li>
   </ul>
   <h3>The Dynamics Model (World Model)</h3>
   <p>
@@ -229,11 +229,11 @@
   </div>
   <figure class="l-gutter l-gutter-large">
       <img src="website/maetok-autoencoder-platformer.svg">
-      <figcaption>Figure 3: Tokenizer architecture</figcaption>
+      <figcaption>Figure 3: Tokenizer architecture.</figcaption>
   </figure>
   <figure>
       <img src="website/diffusion-forcing.svg" alt="Diffusion forcing: parallel denoising during training and cached iterative next-frame generation during inference">
-      <figcaption>Figure 4: Diffusion forcing training (left) and inference (right)</figcaption>
+      <figcaption>Figure 4: Diffusion forcing training (left) and inference (right).</figcaption>
   </figure>
   <p>
       Other than predicting just the next frame, we worked on predicting the next action as well.
@@ -253,7 +253,7 @@
   B_t = (a_{t-1}, s_t, \pi_t)
   $$
   <p>
-      Within each block, spatial attention implements $(a_{t-1} \to s_t \to \pi_t)$
+      Within each block, spatial attention implements $(a_{t-1} \to s_t \to \pi_t)$.
   </p>
   <figure class="l-body-outset">
       <img src="website/causal-space-time.svg" alt="The causal rollout folded into three timestep columns. Spatial attention runs down each column from the previous action to the state and policy, while causal temporal attention runs from left to right. Each policy produces the action entering the next column.">
@@ -275,11 +275,11 @@
       <figcaption id="figure-7-caption" aria-live="polite">Figure 7: Space-layer attention in one dynamics timestep. The previous action A conditions the denoising step τ, spatial latents X, and shared registers R; the agent token π reads the resulting state to predict behavior. World-model tokens cannot read π, so task and policy information can affect future states only through the next action.</figcaption>
   </figure>
   <div>
-  <h2>Coinrun experiments</h2>
+  <h2>CoinRun experiments</h2>
 
   <p>
-    As mentioned before, our first experiments were in coinrun.<br><br>
-    We first trained the tokenizer and we’ve also done some scaling experiments and interestingly the compute optimal number of parameters and number of data points scale as the square root of compute!
+    As mentioned before, our first experiments were in CoinRun.<br><br>
+    We first trained the tokenizer and also ran some scaling experiments. Interestingly, the compute-optimal number of parameters and number of data points scale as the square root of compute!
   </p>
   <p>
       As Karpathy puts it <d-cite key="karpathy2026nanochat"></d-cite>:
@@ -290,18 +290,18 @@
   </div>
 
   <figure class="l-gutter l-gutter-large">
-      <img src="website/coinrun-tokenizer.jpg" alt="Coinrun experiments" width="100%">
+      <img src="website/coinrun-tokenizer.jpg" alt="CoinRun experiments" width="100%">
       <figcaption>
-        Figure 8. Coinrun tokenizer reconstruction. Rows from top to bottom:
+        Figure 8: CoinRun tokenizer reconstruction. Rows from top to bottom:
         ground truth, masked input, reconstructed patches overlaid on the input,
         and full decoder reconstruction.
       </figcaption>
   </figure>
 
   <figure  class="l-page">
-      <img src="website/compute_scaling_reconstructed.svg" alt="Coinrun experiments" width="100%">
+      <img src="website/compute_scaling_reconstructed.svg" alt="CoinRun experiments" width="100%">
       <figcaption>
-        Figure 9: Iso-FLOPs scaling analysis for the Coinrun tokenizer. Across
+        Figure 9: Iso-FLOPs scaling analysis for the CoinRun tokenizer. Across
         fixed compute budgets, the best model size and training-token count
         follow approximately $N \propto C^{0.56}$ and
         $D \propto C^{0.44}$ respectively.
@@ -312,23 +312,23 @@
           <video controls playsinline preload="metadata" width="640" height="576">
               <source src="website/coinrun-wm.mp4" type="video/mp4">
               Your browser cannot play this video. You can
-              <a href="website/coinrun-wm.mp4">download the Coinrun world-model rollout</a>
+              <a href="website/coinrun-wm.mp4">download the CoinRun world-model rollout</a>
               instead.
           </video>
-          <figcaption>Figure 10: Our first prototype of an interactive world model</figcaption>
+          <figcaption>Figure 10: Our first prototype of an interactive world model.</figcaption>
       </figure>
       <p>
-          We first tried to train world model with random actions, but when we tried playing with model we found the experience quite terrible.
+          We first tried to train a world model with random actions, but when we tried playing with the model, we found the experience quite terrible.
       </p>
       <p>
-          To solve this, we trained a very simple RL agent to collect trajectories, and then we trained a dynamics model first and then we trained a simple policy with a behaviour cloning objective.<d-footnote>The repository that we release doesn't have the behaviour cloning and RL code. This is because we didn't do it for minecraft and we didn't feel it made sense to release it.</d-footnote>
+          To solve this, we trained a very simple RL agent to collect trajectories. We then trained a dynamics model, followed by a simple policy with a behaviour-cloning objective.<d-footnote>The repository we released does not include the behaviour-cloning or RL code. We did not use it for Minecraft, so we did not feel it made sense to release it.</d-footnote>
       </p>
       <p>
-          While far from optimal, we can see the policy learns to run and jump towards the right to get the coin. This showed that our pipeline was working end-to-end and we able to move on to scale thing up for minecraft
+          While far from optimal, the policy learns to run and jump to the right to get the coin. This showed that our pipeline was working end-to-end, and we were able to scale things up for Minecraft.
       </p>
       <figure>
           <img src="website/behaviour-cloning.gif">
-          <figcaption>Figure 11: Some short examples of the behaviour cloning policy</figcaption>
+          <figcaption>Figure 11: Some short examples of the behaviour-cloning policy.</figcaption>
       </figure>
   </div>
   <h2>Scaling up</h2>
@@ -337,7 +337,7 @@
           From this point on, debugging became much harder, and scaling from a working CoinRun model to Minecraft consumed most of our time. By documenting the failure modes and fixes, we hope to make this phase substantially faster for you.
       </p>
       <p>
-          The two main challenges when scaling up are: squeezing as much compute out of the gpus available and making sure everything is stable.
+          The two main challenges when scaling up are squeezing as much compute as possible out of the available GPUs and making sure everything is stable.
       </p>
       <p>
           We used JAX because the XLA compiler is great for efficient and scalable SPMD programs.
@@ -346,7 +346,7 @@
 
   <h3>Computemaxxing</h3>
   <p>
-      We were able to get around 57~58% Model Flops Utilization (MFU). In this section we&rsquo;ll explain how.
+      We were able to achieve around 57–58% model FLOPs utilization (MFU). In this section, we&rsquo;ll explain how.
   </p>
   <p>
       What determines if a computation is compute bound or memory bound is the arithmetic intensity.
@@ -373,7 +373,7 @@
 
   <h4>Sharding</h4>
   <p>
-      At 1.6B parameters, the model state &mdash; parameters, gradients, optimizer state, and EMA &mdash; took around 24 GiB. That is large, but still manageable on a B200. The real memory cost came from the activations. Long video sequences create huge intermediate tensors, and those have to be kept around for the backward pass. Even with a batch size of one video sequence per GPU, we still needed activation checkpointing to fit training in memory.
+      At 1.6B parameters, the model state &mdash; parameters, gradients, optimizer state, and EMA &mdash; took around 24 GiB. That is large but still manageable on a B200. The real memory cost came from activations. Long video sequences create huge intermediate tensors, which must be kept around for the backward pass. Even with a batch size of one video sequence per GPU, we still needed activation checkpointing to fit training in memory.
   </p>
   <p>
       So instead of aggressively sharding the model, we focused on making the per-GPU batch fit.
@@ -387,12 +387,12 @@
 
   <h4>Activation checkpointing</h4>
   <p>
-      Even with &ldquo;just&rdquo; 256 frames per device, the activations stored will OOM. Instead of storing every intermediate activation during the forward pass, we only stored some of them and recomputed the missing ones during the backward pass. This costs relatively little FLOPs, but it saves a lot of memory.
+      Even with &ldquo;just&rdquo; 256 frames per device, storing the activations will cause an OOM error. Instead of storing every intermediate activation during the forward pass, we stored only some of them and recomputed the missing ones during the backward pass. This costs relatively few FLOPs, but it saves a lot of memory.
   </p>
 
   <h4>Synchronization</h4>
   <p>
-      GPUs have to run in lockstep. The only way we&rsquo;ve been able to guarantee that they stay in sync is only if the model ever sees input tensor of always the same shape. This means that if you are using batches of variable frame length you need to reshape and mask them accordingly to make them consistent.
+      GPUs have to run in lockstep. The only way we&rsquo;ve been able to guarantee that they stay in sync is to ensure that the model sees input tensors that always have the same shape. This means that, if you are using batches with variable frame lengths, you need to reshape and mask them accordingly to make them consistent.
   </p>
 
   <h4>Dataloading</h4>
@@ -400,7 +400,7 @@
       The last bottleneck comes from keeping the GPUs well fed. Videos are heavy and decoding them with ffmpeg is not fast enough to keep the GPUs warm. So we pre-tokenized the entire dataset and saved it in .arrayrecord format.
   </p>
   <p>
-      Then for dataloading used grain and added a GPU-side prefetch buffer to preallocate the data directly inside of the GPUs and ready to go.
+      Then, for dataloading, we used Grain and added a GPU-side prefetch buffer to preallocate the data directly on the GPUs, ready to go.
   </p>
 
   <h3>Stability</h3>
@@ -454,13 +454,13 @@
 </div>
   <h4>Optimizers</h4>
   <p>
-      We've compared muon <d-cite key="jordan2024muon"></d-cite> with laprop <d-cite key="liuziyin2020laprop"></d-cite> (the original optimizer used in the dreamer series)
-      and found that laprop would spike at random and those loss spikes would get more and more frequent with time.<br>
-      By contrast muon proved to be much more stable and yielded much lower losses.
+      We compared Muon <d-cite key="jordan2024muon"></d-cite> with LaProp <d-cite key="liuziyin2020laprop"></d-cite> (the original optimizer used in the Dreamer series)
+      and found that LaProp would spike randomly, with those loss spikes becoming increasingly frequent over time.<br>
+      By contrast, Muon proved to be much more stable and yielded much lower losses.
   </p>
   <figure class="l-body">
       <img src="website/optimizer-comparison.svg" alt="" width="100%">
-      <figcaption>Figure 14: Training loss comparison between Muon and LaProp on two runs with a budget of ~400 B200 hours each</figcaption>
+      <figcaption>Figure 14: Training loss comparison between Muon and LaProp on two runs with a budget of ~400 B200 hours each.</figcaption>
   </figure>
   <p>
       This is the simplest stability problem because it&rsquo;s the only one that is visible in the loss curve.
@@ -468,7 +468,7 @@
 
   <h4>Exponential Moving Average</h4>
   <p>
-      In diffusion modelling doing inference with online weights yields subpar results. Using the exponential moving average of the parameters is a must.
+      In diffusion modelling, doing inference with online weights yields subpar results. Using the exponential moving average of the parameters is a must.
       $$
       \theta_\textrm{EMA} \leftarrow \beta \theta_\textrm{EMA} + (1-\beta)\theta
       $$
@@ -483,7 +483,7 @@
       <figcaption>Figure 15: Comparison of the model outputs.</figcaption>
   </figure>
 
-  <h4>Mixed precision Training</h4>
+  <h4>Mixed-Precision Training</h4>
   <p>
       Modern AI accelerators are optimized for BF16, but some operations still require higher precision. Keep the parameters in float32; use BF16 for most matrix-multiplication activations and attention inputs; and use float32 for normalization, selected sinusoidal and normalization helpers, optional attention weights, and the dynamics flow output head.
   </p>
@@ -493,20 +493,20 @@
 
   <h4>Loss weighting</h4>
   <p>
-      Flow matching models are usually trained to directly predict the velocity field to denoise the input v-prediction. Recently, researchers have found that directly predicting the clean data from noisy inputs x-prediction with v-space loss results in higher quality generation <d-cite key="li2025back"></d-cite>
+      Flow-matching models are usually trained to directly predict the velocity field that denoises the input (v-prediction). Recently, researchers have found that directly predicting the clean data from noisy inputs (x-prediction) with v-space loss results in higher-quality generation <d-cite key="li2025back"></d-cite>.
   </p>
   <p>
-      World models also have an extra inductive bias in favour of x-prediction: Since all context frames are in x-space, it would only be natural to ask the nn to predict the next frame in x-space as well.
+      World models also have an extra inductive bias in favour of x-prediction: since all context frames are in x-space, it would only be natural to ask the neural network to predict the next frame in x-space as well.
   </p>
   <p>
   </p>
   <figure class="l-page">
       <img src="website/xpred-vpred-noise-comparison.svg" alt="">
-      <figcaption>Figure 16: With x-pred given the same context the output of the should be roughly similar regardless of the noise present in the last frame.</figcaption>
+      <figcaption>Figure 16: With x-prediction, given the same context, the output should be roughly similar regardless of the noise present in the last frame.</figcaption>
       
   </figure>
   <p>
-      In practice doing x-prediction with v-space loss reduces to just a loss weighting term similar to the one in the dreamer 4 paper&ndash; but with a square term at the denominator
+      In practice, doing x-prediction with v-space loss reduces to a loss-weighting term similar to the one in the Dreamer4 paper&ndash;but with a squared term in the denominator.
       $$
       L_v = \frac{||x -\hat x ||^2}{(1-\tau)^2}
       $$
@@ -520,14 +520,14 @@
       Optimal transport and flow matching is a match made in heaven <d-cite key="gagneux2025avisualdive"></d-cite>: OT finds pairings that minimize the distance travelled, giving flow matching shorter, less ambiguous paths.
   </p>
   <p>
-      More specifically, we use minibatch barycentric OT between entire noise and latent sequences <d-cite key="genevay2018sinkhorn, peyre2025optimal"></d-cite>. We&rsquo;ve found this helped make generation more stable during rollout .
+      More specifically, we use minibatch barycentric OT between entire noise and latent sequences <d-cite key="genevay2018sinkhorn, peyre2025optimal"></d-cite>. We&rsquo;ve found that this helped make generation more stable during rollouts.
   </p>
-  <h4>mu-parametrization</h4>
+  <h4>&mu;-Parametrization</h4>
   <p>
-      We've also tried playing with $\mu$-parametrization, however we've found it to be not needed for multipe reasons:
+      We also tried $\mu$-parametrization; however, we found that it was not needed for multiple reasons:
   <ul>
-      <li>The smallest minecraft model we trained was just one order of magnitude smaller than the final model.</li>
-      <li>The muon optimizer keeps hyperparamters more stable through different model sizes <d-cite key="bernstein2025derivingmuon"></d-cite>.</li>
+      <li>The smallest Minecraft model we trained was just one order of magnitude smaller than the final model.</li>
+      <li>The Muon optimizer keeps hyperparameters more stable across different model sizes <d-cite key="bernstein2025derivingmuon"></d-cite>.</li>
   </ul>
   </p>
   <h2>Conclusion</h2>
@@ -546,7 +546,7 @@
             <title id="reactor-acknowledgement-logo-title">Reactor</title>
             <use href="#reactor-logotype"></use>
           </svg>
-        </a>, who generosly sponsored this project. Without them, this project would not have existed.
+        </a>, who generously sponsored this project. Without them, this project would not have existed.
     </p>
     <p>
         We also want to thank
@@ -647,7 +647,7 @@
 @inproceedings{gagneux2025avisualdive,
   author = {Gagneux, Anne and Martin, Ségolène and Emonet, Rémi and Bertrand, Quentin and Massias, Mathurin},
   title = {A Visual Dive into Conditional Flow Matching},
-  abstract = {Conditional flow matching (CFM) was introduced by three simultaneous papers at ICLR 2023, through different approaches (conditional matching, rectifying flows and stochastic interpolants). <br/> The main part of this post, Section 2, explains CFM by using both visual intuitions and insights on its probabilistic formulations. Section 1 introduces nomalizing flows; it can be skipped by reader familiar with the topic, or that wants to cover them later. Section 3 opens on the links between CFM and other approaches, and ends with a 'CFM playground'.},
+  abstract = {Conditional flow matching (CFM) was introduced by three simultaneous papers at ICLR 2023, through different approaches (conditional matching, rectifying flows and stochastic interpolants). <br/> The main part of this post, Section 2, explains CFM by using both visual intuitions and insights on its probabilistic formulations. Section 1 introduces normalizing flows; it can be skipped by readers familiar with the topic or those who want to cover it later. Section 3 opens on the links between CFM and other approaches, and ends with a 'CFM playground'.},
   booktitle = {ICLR Blogposts 2025},
   year = {2025},
   date = {April 28, 2025},
