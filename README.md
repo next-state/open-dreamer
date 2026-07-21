@@ -1,7 +1,7 @@
 # Dreamer 4 JAX
 
-A simple, performant and easy to use JAX/Flax NNX implementation of the Dreamer 4 world-model pipeline from
-[Training Agents Inside of Scalable World Models](https://danijar.com/project/dreamer4/).
+A simple, performant and easy to use JAX/Flax NNX implementation of the Dreamer 4 world-model pipeline
+[See the blog post!](https://github.com/next-state/open-dreamer)
 
 This repo currently supports:
 
@@ -10,7 +10,7 @@ This repo currently supports:
 - Training an action-conditioned latent dynamics model
 - Generating rollouts and computing FVD
 
-It does not yet include the full Dreamer 4 agent/RL training loop.
+It does not yet include the full Dreamer 4  Behaviour-Cloning/RL training loop.
 
 ## Requirements
 
@@ -60,13 +60,11 @@ in [dreamer/data/README.md](dreamer/data/README.md).
 │   ├── train_dynamics.py
 │   └── eval_fvd.py
 ├── configs/
-│   ├── dataset/             # Raw-video and latent dataset configs
-│   ├── tokenizer.yaml
-│   ├── tokenize.yaml
-│   ├── dynamics.yaml
-│   └── eval_fvd.yaml
-├── docs/                    # Paper notes, figures, and development notes
-├── frontend/                # Experimental interactive frontend
+    ├── dataset/             # Raw-video and latent dataset configs
+    ├── tokenizer.yaml
+    ├── tokenize.yaml
+    ├── dynamics.yaml
+    └── eval_fvd.yaml
 ```
 
 ## Dataset
