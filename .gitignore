@@ -194,7 +194,13 @@ venv.bak/
 .ropeproject
 
 # mkdocs documentation
-/site
+# (`/site` intentionally not ignored — `site/` is the Next.js blog app, which
+#  manages its own build artifacts via site/.gitignore)
+
+# The Next.js blog app lives in site/; re-include source dirs that the
+# Python-oriented rules above (e.g. `lib/`) would otherwise swallow. Build
+# artifacts under site/ are handled by site/.gitignore.
+!site/lib/
 
 # mypy
 .mypy_cache/
