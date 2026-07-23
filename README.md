@@ -1,8 +1,6 @@
-<!-- TODO(banner): project banner image goes here (provided separately). -->
-
 <div align="center">
 
-# Open Dreamer
+<img src="assets/banner.png" alt="Open Dreamer" width="100%" />
 
 **An open, real-time implementation of the Dreamer 4 world-model pipeline in JAX/Flax.**
 
