@@ -1,77 +1,3 @@
-<!doctype html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="website/scripts/distill.pub_template.v2.js"></script>
-  <script src="https://d3js.org/d3.v7.min.js"></script>
-  <link rel="stylesheet" href="website/style.css">
-  <style>
-    .sponsor-line {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .sponsor-line a {
-      display: inline-flex;
-      color: inherit;
-    }
-
-    .sponsor-line .reactor-logo {
-      width: 8.75rem;
-      height: auto;
-    }
-
-    .acknowledgement-logo-link {
-      display: inline-flex;
-      color: inherit;
-      vertical-align: -0.1em;
-    }
-
-    .acknowledgement-logo {
-      width: auto;
-      height: 0.72em;
-    }
-  </style>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.css" integrity="sha384-zTROYFVGOfTw7JV7KUu8udsvW2fx4lWOsCEDqhBreBwlHI4ioVRtmIvEThzJHGET" crossorigin="anonymous">
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.js" integrity="sha384-GxNFqL3r9uRJQhR+47eDxuPoNE7yLftQM8LcxzgS4HT73tp970WS/wV5p8UzCOmb" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/contrib/auto-render.min.js" integrity="sha384-vZTG03m+2yp6N6BNi5iM4rW4oIwk5DfcNdFfxkk9ZWpDriOkXX8voJBFrAO7MpVl" crossorigin="anonymous"></script>
-
-  <script>
-    document.addEventListener("DOMContentLoaded", function() {
-      renderMathInElement(document.body, {
-        delimiters: [
-          {left: '$$', right: '$$', display: true},
-          {left: '$', right: '$', display: false},
-          {left: '\\(', right: '\\)', display: false},
-          {left: '\\[', right: '\\]', display: true}
-        ],
-        throwOnError: false
-      });
-
-      const figure7Frame = document.querySelector('iframe[src="website/space-layer-mask.html"]');
-      const figure7Caption = document.getElementById('figure-7-caption');
-      if (figure7Frame && figure7Caption) {
-        const defaultFigure7Caption = figure7Caption.textContent.trim();
-        const restoreFigure7Caption = () => {
-          figure7Caption.textContent = defaultFigure7Caption;
-        };
-        figure7Frame.addEventListener('mouseleave', restoreFigure7Caption);
-        window.addEventListener('message', event => {
-          if (event.origin !== window.location.origin || event.source !== figure7Frame.contentWindow) return;
-          if (event.data?.type !== 'figure-7-caption') return;
-          if (typeof event.data.description === 'string') {
-            figure7Caption.textContent = `Figure 7: ${event.data.description}`;
-          } else {
-            restoreFigure7Caption();
-          }
-        });
-      }
-    });
-  </script>
-
-</head>
-
 <d-front-matter>
   <script type="text/json">{"authors": []}</script>
 </d-front-matter>
@@ -133,6 +59,8 @@
     In the last few months, with support from Reactor, we’ve been working on a frontier-level world model. We are releasing and open-sourcing the model and training code, and sharing all the lessons we learned along the way in this blog post. We want to make frontier research accessible to everyone and hope this will accelerate progress in the field.
 </p>
 <p>You can also play with our model thanks to the Reactor runtime!</p>
+
+<div id="live-demo" class="l-page"></div>
 
   <h2>A survival guide to training a world model</h2>
   <div>

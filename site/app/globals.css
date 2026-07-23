@@ -1,0 +1,98 @@
+/* Tailwind is loaded WITHOUT its preflight base reset: the Distill article
+   brings its own stylesheet (website/style.css) and resetting globally would
+   flatten its typography and grid. Only the theme tokens and utility classes
+   are pulled in; the demo subtree gets a scoped, preflight-like reset below. */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+/* ── Article head styles (moved verbatim from the original index.html) ─────── */
+.sponsor-line {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.sponsor-line a {
+  display: inline-flex;
+  color: inherit;
+}
+
+.sponsor-line .reactor-logo {
+  width: 8.75rem;
+  height: auto;
+}
+
+.acknowledgement-logo-link {
+  display: inline-flex;
+  color: inherit;
+  vertical-align: -0.1em;
+}
+
+.acknowledgement-logo {
+  width: auto;
+  height: 0.72em;
+}
+
+/* ── Embedded demo ─────────────────────────────────────────────────────────
+   Everything the live demo renders is scoped under `.od-demo`. Because global
+   preflight is disabled, replicate the small slice of it the ported Tailwind
+   components rely on (border-style, box-sizing, button normalization). This
+   lives in @layer base so Tailwind's utilities (in @layer utilities) always
+   override it — otherwise the unlayered reset would beat `bg-*`/`text-*`
+   classes on buttons and flatten them to transparent/inherited text. */
+@layer base {
+  .od-demo,
+  .od-demo *,
+  .od-demo *::before,
+  .od-demo *::after {
+    box-sizing: border-box;
+    border: 0 solid;
+  }
+
+  .od-demo button {
+    margin: 0;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    background-color: transparent;
+    background-image: none;
+    border: 0 solid;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    /* Kill the iOS long-press text selection / callout and tap highlight that
+       make the on-screen gamepad flicker and select its labels on touch. */
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .od-demo button:disabled {
+    cursor: not-allowed;
+  }
+
+  .od-demo svg {
+    display: block;
+  }
+}
+
+/* Traveling pulse for the queue flow-line decoration. */
+@keyframes bg-flow-v {
+  0% {
+    transform: translateY(-100%);
+  }
+  100% {
+    transform: translateY(266%);
+  }
+}
+
+/* Soft opacity pulse for live-status dots and the mode-toggle prompt. */
+@keyframes dreamxPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
