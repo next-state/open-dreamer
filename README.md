@@ -1,7 +1,24 @@
-# Dreamer 4 JAX
+<!-- TODO(banner): project banner image goes here (provided separately). -->
 
-A simple, performant and easy to use JAX/Flax NNX implementation of the Dreamer 4 world-model pipeline
-[See the blog post!](https://github.com/next-state/open-dreamer)
+<div align="center">
+
+# Open Dreamer
+
+**An open, real-time implementation of the Dreamer 4 world-model pipeline in JAX/Flax.**
+
+[🌐 Website & Blog Post](https://next-state.github.io/open-dreamer/) &nbsp;·&nbsp;
+[🎮 Live Demo](https://next-state.github.io/open-dreamer/) &nbsp;·&nbsp;
+[⚡ Inference Code](https://github.com/reactor-team/open-dreamer)
+
+</div>
+
+---
+
+Open Dreamer is a simple, performant, and easy-to-use JAX/Flax NNX
+implementation of the Dreamer 4 world model — trained on Minecraft/VPT-style
+gameplay and playable in real time. This repository holds the **training
+pipeline**: a causal video tokenizer, an action-conditioned latent dynamics
+model, and the tools to generate rollouts and measure quality.
 
 This repo currently supports:
 
@@ -10,12 +27,37 @@ This repo currently supports:
 - Training an action-conditioned latent dynamics model
 - Generating rollouts and computing FVD
 
-It does not yet include the full Dreamer 4  Behaviour-Cloning/RL training loop.
+## 🎮 Try it now
 
-## Requirements
+The fastest way to experience Open Dreamer is the **live, in-browser demo** —
+step into a generated Minecraft world and play it in real time, with a
+Game ⟷ Dream toggle that hands the stream from the real game to the world
+model frame by frame. No setup required; the real-time model runs in the cloud
+on [Reactor](https://reactor.inc).
+
+👉 **[Open the demo](https://next-state.github.io/open-dreamer/)**
+
+The [website](https://next-state.github.io/open-dreamer/) also walks through how
+the model works, with interactive figures and result galleries.
+
+## ⚡ Run it yourself
+
+To roll out the trained model locally on your own video and actions — generating
+new frames from an MP4 and a matching action sequence — use the inference
+repository:
+
+👉 **[reactor-team/open-dreamer](https://github.com/reactor-team/open-dreamer)**
+
+The rest of this README covers **training** the model from scratch.
+
+## 📋 Roadmap
+
+- [ ] Full Dreamer 4 Behaviour-Cloning / RL agent training loop
+
+## ⚙️ Requirements
 
 - Python 3.11
-- `uv`
+- [`uv`](https://docs.astral.sh/uv/)
 - CUDA 12-compatible JAX environment
 - Minecraft/VPT-style ArrayRecord data; see [dreamer/data/README.md](dreamer/data/README.md)
 
@@ -60,11 +102,12 @@ in [dreamer/data/README.md](dreamer/data/README.md).
 │   ├── train_dynamics.py
 │   └── eval_fvd.py
 ├── configs/
-    ├── dataset/             # Raw-video and latent dataset configs
-    ├── tokenizer.yaml
-    ├── tokenize.yaml
-    ├── dynamics.yaml
-    └── eval_fvd.yaml
+│   ├── dataset/             # Raw-video and latent dataset configs
+│   ├── tokenizer.yaml
+│   ├── tokenize.yaml
+│   ├── dynamics.yaml
+│   └── eval_fvd.yaml
+└── site/                    # Website, blog post, and the live demo (Next.js)
 ```
 
 ## Dataset
@@ -180,8 +223,7 @@ Useful config files:
 - [configs/dataset/minecraft_vpt.yaml](configs/dataset/minecraft_vpt.yaml) - raw MP4 dataset settings.
 - [configs/dataset/minecraft_vpt_latent.yaml](configs/dataset/minecraft_vpt_latent.yaml) - tokenized latent dataset settings.
 
-
-## References
+## 📚 References
 
 - Dreamer 4: [Training Agents Inside of Scalable World Models](https://danijar.com/project/dreamer4/)
 - Jasmine: [A simple, performant and scalable JAX-based world modeling codebase](https://github.com/p-doom/jasmine)
