@@ -225,3 +225,33 @@ Useful config files:
 
 - Dreamer 4: [Training Agents Inside of Scalable World Models](https://danijar.com/project/dreamer4/)
 - Jasmine: [A simple, performant and scalable JAX-based world modeling codebase](https://github.com/p-doom/jasmine)
+
+## 📄 Citation
+
+If you use Open Dreamer in your research, please cite:
+
+```bibtex
+@misc{marti2026opendreamer,
+    title={How to Train a Frontier-level World Model},
+    author={Diego, Marti Monso and Sacco, Francesco and Hu, Edward},
+    month={jul},
+    year={2026},
+    publisher={Zenodo},
+    doi={10.5281/zenodo.21475232},
+    url={https://next-state.github.io/open-dreamer/},
+}
+```
+
+Please also cite the original Dreamer 4 paper:
+
+```bibtex
+@misc{hafner2025trainingagentsinsidescalable,
+    title={Training Agents Inside of Scalable World Models}, 
+    author={Danijar Hafner and Wilson Yan and Timothy Lillicrap},
+    year={2025},
+    eprint={2509.24527},
+    archivePrefix={arXiv},
+    primaryClass={cs.AI},
+    url={https://arxiv.org/abs/2509.24527}, 
+}
+```
