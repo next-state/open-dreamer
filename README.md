@@ -233,7 +233,7 @@ If you use Open Dreamer in your research, please cite:
 ```bibtex
 @misc{marti2026opendreamer,
     title={How to Train a Frontier-level World Model},
-    author={Diego, Marti Monso and Sacco, Francesco and Hu, Edward},
+    author={Marti Monso, Diego and Sacco, Francesco and Hu, Edward},
     month={jul},
     year={2026},
     publisher={Zenodo},
