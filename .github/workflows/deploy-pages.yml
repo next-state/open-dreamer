@@ -1,0 +1,74 @@
+# Builds the Next.js static export in site/ and publishes it to GitHub Pages.
+#
+# The queue worker host is baked into the bundle at build time via
+# NEXT_PUBLIC_OPEN_DREAMER_PARTYKIT_HOST. Set it as a repository *variable*
+# (Settings → Secrets and variables → Actions → Variables) named
+# OPEN_DREAMER_PARTYKIT_HOST — it is a public hostname, not a secret, and must
+# match the deployed worker (e.g. open-dreamer-queue.<your-org>.workers.dev).
+#
+# One-time setup: Settings → Pages → Build and deployment → Source: GitHub Actions.
+name: Deploy site to Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; let an in-progress run finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v4
+
+      # The repo root has no package.json, so point pnpm/action-setup at the
+      # site package (its `packageManager` field pins the pnpm version).
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: site/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: site/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build static export
+        env:
+          NEXT_PUBLIC_OPEN_DREAMER_PARTYKIT_HOST: ${{ vars.OPEN_DREAMER_PARTYKIT_HOST }}
+        run: pnpm build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

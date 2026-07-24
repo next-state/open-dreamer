@@ -1,0 +1,55 @@
+# Optional config for tokenizer MAE finetuning:
+# `uv run scripts/train_tokenizer.py --config-name tokenizer_finetune`.
+# Inherits `configs/tokenizer.yaml` and only overrides finetuning-specific
+# values.
+
+defaults:
+  # Start from the fully commented tokenizer training config.
+  - tokenizer
+  - _self_
+
+# Finetuning step count. Usually shorter than tokenizer pretraining.
+max_steps: 30_000
+
+dataset:
+  dataloader_cfg:
+    # Global batch size. Must be divisible by `jax.process_count()`.
+    B: 8
+
+    # Finetune on the same 16-frame clip length used by the base tokenizer
+    # config unless you have memory and data reasons to increase it.
+    short_T: 16
+    long_T: 16
+
+# Enable finetune mode. The train step freezes encoder gradients and schedules
+# MAE masking from `mae_finetune_p_max_start` to `mae_finetune_p_max_end`.
+mae_finetune: true
+
+# Initial encoder masking probability for the finetune schedule. Must be in
+# [0, 1].
+mae_finetune_p_max_start: 0.9
+
+# Final encoder masking probability for the finetune schedule. 0.0 turns the end
+# of finetuning into full-frame reconstruction.
+mae_finetune_p_max_end: 0.0
+
+# LPIPS reconstruction loss multiplier. Set 0.0 to disable LPIPS.
+lpips_weight: 0.2
+
+lr_schedule:
+  # Lower peak LR for finetuning than for tokenizer pretraining.
+  lr: 1e-3
+
+  # Warm up for this fraction of `max_steps`.
+  warmup_ratio: 0.05
+
+  # Decay for this fraction of `max_steps`; for `wsd`, warmup + decay must be
+  # <= 1.
+  decay_ratio: 0.8
+
+  # Tie schedule horizon to this finetune config's max_steps.
+  max_steps: ${max_steps}
+
+ckpt:
+  # Save finetune checkpoints every N steps.
+  save_interval_steps: 1000

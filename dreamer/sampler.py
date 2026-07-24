@@ -1,0 +1,95 @@
+# sampling logic for debugging / visualization. Not JIT friendly.
+from __future__ import annotations
+from typing import Tuple
+
+import jax
+import jax.numpy as jnp
+from flax import nnx
+
+from dreamer.models import Tokenizer, Dynamics
+from dreamer.actions import Actions
+from .generation import DenoiseSchedule, latent_rollout
+
+
+# ---------------------------
+# Multi-frame rollout wrapper
+# ---------------------------
+
+# Calls under `jax.set_mesh(...)` must be jit'd: `with_partitioning` -> `with_sharding_constraint`
+# is a no-op in eager mode (jax#17422), so eager activations get mis-laid-out and frames look corrupt.
+@nnx.jit
+def encode_jit(tokenizer: Tokenizer, frames: jax.Array) -> jax.Array:
+    latents, _, _ = tokenizer.encode(frames, deterministic=True)
+    return latents
+
+@nnx.jit
+def decode_jit(tokenizer: Tokenizer, z: jax.Array) -> jax.Array:
+    frames, _ = tokenizer.decode(z, deterministic=True)
+    return frames
+
+def sample_video(
+    tokenizer: Tokenizer,
+    dynamics: Dynamics,
+    frames: jax.Array | None,   # (B, T, H, W, C) in [0, 255] - None if using latents
+    actions: Actions,           # (B, T)
+    horizon: int,
+    schedule_config: DenoiseSchedule,
+    rng: jax.Array,
+    latents: jax.Array | None = None,  # (B, T, n_latents, d_bottleneck) - pre-tokenized latents
+) -> Tuple[jax.Array, jax.Array, jax.Array | None]:
+    """
+    Sample video predictions using Tokenizer and Dynamics.
+
+    Args:
+        tokenizer: Tokenizer NNX model (has encode/decode methods)
+        dynamics: Dynamics NNX model
+        frames: Input video frames (B, T, H, W, C) in [0, 255] uint8. None if using latents.
+        actions: Action sequence (B, T)
+        horizon: Number of future frames to predict
+        schedule_config: DenoiseSchedule with rollout parameters
+        rng: Random key
+        latents: Optional pre-tokenized latents (B, T, n_latents, d_bottleneck). If provided,
+                skips tokenizer encoding. Latents should already be unpacked.
+
+    Returns:
+        pred_frames: (B, ctx+horizon, H, W, C) predicted frames [0, 255] uint8
+        gt_decoded_frames: (B, ctx+horizon, H, W, C) GT latents decoded [0, 255] uint8
+        original_frames: (B, ctx+horizon, H, W, C) original frames [0, 255] uint8, or None if using latents
+    """
+
+    if latents is not None:
+        # Pre-tokenized latent path
+        # Latents are already unpacked
+        latents = latents.astype(jnp.bfloat16)
+    else:
+        assert frames is not None
+        # Video path - encode frames
+
+        # Encode frames to clean latents (returns unpacked)
+        latents = encode_jit(tokenizer, frames)
+
+    # Split context vs future
+    latents_ctx = latents[:, :-horizon, :, :]
+    actions_ctx, actions_future = actions[:, :-horizon], actions[:, -horizon:]
+
+    # Decode GT latents for visualization
+    gt_decoded_frames = decode_jit(tokenizer, latents)
+    gt_decoded_frames = jnp.clip(gt_decoded_frames, 0, 255).astype(jnp.uint8)
+
+    # Use latent_rollout for both paths (frames already encoded to latents above)
+    rollout_result = latent_rollout(
+        dynamics,
+        actions_future=actions_future,
+        schedule=schedule_config,
+        latents_ctx=latents_ctx,
+        actions_ctx=actions_ctx,
+        num_steps=horizon,
+        rng=rng,
+    )
+
+    # Decode predicted latents to frames
+    pred_frames = decode_jit(tokenizer, rollout_result['latents'])
+    pred_frames = jnp.clip(pred_frames, 0, 255).astype(jnp.uint8)
+    original_frames = jnp.clip(frames, 0, 255).astype(jnp.uint8) if frames is not None else None
+
+    return pred_frames, gt_decoded_frames, original_frames

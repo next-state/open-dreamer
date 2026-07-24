@@ -1,0 +1,799 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Space Layer Mask</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<div id="space-layer-block-mask" class="space-layer-vis">
+  <div class="space-layer-canvas">
+  <div class="space-layer-layout">
+    <figure class="space-layer-panel" aria-labelledby="space-layer-connectivity-caption">
+      <svg id="space-layer-connectivity" class="space-layer-chart" viewBox="0 0 680 470" role="img" aria-labelledby="space-layer-connectivity-title space-layer-connectivity-desc">
+        <title id="space-layer-connectivity-title">Key-to-query connectivity grouped by modality</title>
+        <desc id="space-layer-connectivity-desc">Horizontal query and key sequences whose block lengths represent token counts. One arrow is drawn for each allowed modality-block pair.</desc>
+      </svg>
+      <div class="space-layer-legend text-small" aria-label="Token groups">
+        <span class="space-layer-legend-item"><span class="space-layer-swatch" style="--sl-color: var(--sl-series-blue)"></span><span class="space-layer-symbol">A</span> action</span>
+        <span class="space-layer-legend-item"><span class="space-layer-swatch" style="--sl-color: var(--sl-series-purple)"></span><span class="space-layer-symbol">τ</span> denoising step</span>
+        <span class="space-layer-legend-item"><span class="space-layer-swatch" style="--sl-color: var(--sl-series-pink)"></span><span class="space-layer-symbol">X</span> spatial</span>
+        <span class="space-layer-legend-item"><span class="space-layer-swatch" style="--sl-color: var(--sl-series-orange)"></span><span class="space-layer-symbol">R</span> register</span>
+        <span class="space-layer-legend-item"><span class="space-layer-swatch" style="--sl-color: var(--sl-series-yellow)"></span><span class="space-layer-symbol">π</span> agent</span>
+      </div>
+      <figcaption id="space-layer-connectivity-caption">(a) Allowed information flow between token groups.</figcaption>
+    </figure>
+
+    <figure class="space-layer-panel" aria-labelledby="space-layer-matrix-caption">
+      <svg id="space-layer-matrix" class="space-layer-chart" viewBox="0 0 560 520" role="img" aria-labelledby="space-layer-matrix-title space-layer-matrix-desc">
+        <title id="space-layer-matrix-title">Query-key mask grouped by modality</title>
+        <desc id="space-layer-matrix-desc">Rows are query modality blocks and columns are key modality blocks. Filled rectangles are allowed connections; their sizes reflect the number of tokens in each block.</desc>
+      </svg>
+      <figcaption id="space-layer-matrix-caption">(b) The same connectivity written as a query–key mask.</figcaption>
+    </figure>
+  </div>
+
+  </div>
+</div>
+
+<style>
+  html,
+  body {
+    min-height: 0;
+  }
+
+  #space-layer-block-mask {
+    --sl-background: var(--space-layer-background, #ffffff);
+    --sl-surface: var(--space-layer-surface, #f4f5f7);
+    --sl-text: var(--space-layer-text, #121212);
+    --sl-text-muted: var(--space-layer-text-muted, #4a4f55);
+    --sl-border: var(--space-layer-border, #cfd4d8);
+    --sl-primary: var(--space-layer-primary, #2b6caf);
+    --sl-primary-hover: var(--space-layer-primary-hover, #2f79cc);
+    --sl-primary-soft: var(--space-layer-primary-soft, rgba(122, 166, 255, 0.22));
+    --sl-highlight: var(--space-layer-highlight, #f07a26);
+    --sl-highlight-soft: var(--space-layer-highlight-soft, rgba(240, 122, 38, 0.12));
+    --sl-series-blue: var(--space-layer-series-blue, #7aa6ff);
+    --sl-series-purple: #8a70d6;
+    --sl-series-pink: #a568cd;
+    --sl-series-orange: #bc65bd;
+    --sl-series-yellow: #f07a26;
+
+    --background: var(--sl-background);
+    --foreground: var(--sl-text);
+    --muted: var(--sl-surface);
+    --muted-foreground: var(--sl-text-muted);
+    --border: var(--sl-border);
+    --input: var(--sl-border);
+    --ring: var(--sl-primary);
+
+    width: 100%;
+    color: var(--sl-text);
+    color-scheme: light;
+  }
+
+  #space-layer-block-mask .space-layer-canvas {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 1rem;
+    color: var(--sl-text);
+    background: var(--sl-background);
+  }
+
+  #space-layer-block-mask .space-layer-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1.12fr) minmax(0, 0.88fr);
+    gap: 1rem;
+    align-items: start;
+  }
+
+  #space-layer-block-mask .space-layer-panel {
+    min-width: 0;
+    margin: 0;
+  }
+
+  #space-layer-block-mask .space-layer-panel figcaption {
+    margin-block-start: 0.35rem;
+    color: var(--sl-text-muted);
+    font-size: 12px;
+    line-height: 1.5em;
+  }
+
+  #space-layer-block-mask .space-layer-legend {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0.3rem 0.9rem;
+    margin-block-start: 0.35rem;
+    color: var(--sl-text);
+  }
+
+  #space-layer-block-mask .space-layer-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    white-space: nowrap;
+  }
+
+  #space-layer-block-mask .space-layer-swatch {
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: 0.2rem;
+    background: var(--sl-color);
+  }
+
+  #space-layer-block-mask .space-layer-symbol {
+    font-weight: 500;
+  }
+
+  #space-layer-block-mask .space-layer-chart {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+
+  #space-layer-block-mask .sl-sequence-label,
+  #space-layer-block-mask .sl-axis-title,
+  #space-layer-block-mask .sl-axis-label {
+    fill: var(--sl-text);
+    font-size: calc(var(--font-size-base) * 1.4);
+    font-weight: 500;
+    pointer-events: none;
+    user-select: none;
+  }
+
+  #space-layer-block-mask .sl-block rect {
+    fill: var(--sl-color);
+    fill-opacity: 1;
+    stroke: var(--sl-border);
+    stroke-width: 1.25;
+    transition: fill 140ms ease, fill-opacity 140ms ease, opacity 140ms ease, stroke 140ms ease, stroke-width 140ms ease;
+  }
+
+  #space-layer-block-mask .sl-block {
+    cursor: default;
+  }
+
+  #space-layer-block-mask .sl-edge {
+    fill: none;
+    stroke: var(--sl-text-muted);
+    stroke-width: 1.25;
+    opacity: 0.35;
+    pointer-events: stroke;
+    transition: opacity 140ms ease, stroke 140ms ease, stroke-width 140ms ease;
+  }
+
+  #space-layer-block-mask .sl-cell {
+    stroke: var(--sl-text-muted);
+    stroke-width: 1;
+    transition: fill 140ms ease, opacity 140ms ease, stroke 140ms ease, stroke-width 140ms ease, fill-opacity 140ms ease;
+  }
+
+  #space-layer-block-mask .sl-cell.is-allowed {
+    fill: var(--sl-border);
+    fill-opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-cell.is-blocked {
+    fill: var(--sl-surface);
+    fill-opacity: 0.13;
+  }
+
+  #space-layer-block-mask .sl-mark {
+    cursor: default;
+  }
+
+  #space-layer-block-mask .sl-block.is-dimmed rect,
+  #space-layer-block-mask .sl-cell.is-dimmed {
+    fill: var(--sl-background);
+    fill-opacity: 1;
+    opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-block.is-dimmed rect {
+    stroke: var(--sl-border);
+  }
+
+  #space-layer-block-mask .sl-cell.is-dimmed {
+    stroke: var(--sl-text-muted);
+  }
+
+  #space-layer-block-mask .sl-edge.is-dimmed {
+    stroke: var(--sl-border);
+    opacity: 0.18;
+  }
+
+  #space-layer-block-mask .sl-edge.is-active {
+    stroke: var(--sl-active-color, var(--sl-color));
+    stroke-width: 3;
+    opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-block.is-active rect,
+  #space-layer-block-mask .sl-block.is-related rect {
+    stroke: var(--sl-border);
+    stroke-width: 1.25;
+    fill-opacity: 1;
+    opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-cell.is-active {
+    fill: var(--sl-active-color, var(--sl-color));
+    stroke: var(--sl-text-muted);
+    stroke-width: 1;
+    fill-opacity: 1;
+    opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-cell.is-related {
+    fill: var(--sl-active-color, var(--sl-color));
+    stroke: var(--sl-text-muted);
+    stroke-width: 1;
+    fill-opacity: 1;
+    opacity: 1;
+  }
+
+  #space-layer-block-mask .sl-block.is-blocked-endpoint rect,
+  #space-layer-block-mask .sl-cell.is-blocked.is-active {
+    stroke: var(--sl-border);
+  }
+
+  #space-layer-block-mask .sl-axis-label.is-active {
+    fill: var(--sl-text);
+  }
+
+  #space-layer-block-mask .sl-edge.is-pair-active {
+    stroke: var(--sl-highlight);
+  }
+
+  #space-layer-block-mask .sl-cell.is-pair-active {
+    fill: var(--sl-highlight);
+    fill-opacity: 1;
+    stroke: var(--sl-highlight);
+    stroke-width: 3;
+    opacity: 1;
+  }
+
+  @media (max-width: 640px) {
+    #space-layer-block-mask .space-layer-layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  @media (max-width: 360px) {
+    #space-layer-block-mask .sl-sequence-label,
+    #space-layer-block-mask .sl-axis-title,
+    #space-layer-block-mask .sl-axis-label {
+      font-size: calc(var(--font-size-base) * 2.1);
+    }
+  }
+
+  @media (min-width: 1024px) {
+    #space-layer-block-mask .space-layer-panel figcaption {
+      font-size: 13px;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    #space-layer-block-mask .sl-block rect,
+    #space-layer-block-mask .sl-edge,
+    #space-layer-block-mask .sl-cell {
+      transition: none;
+    }
+  }
+</style>
+
+<script>
+(() => {
+  const root = document.getElementById('space-layer-block-mask');
+  if (!root || root.dataset.initialized === 'true') return;
+  root.dataset.initialized = 'true';
+
+  const connectivitySvg = root.querySelector('#space-layer-connectivity');
+  const matrixSvg = root.querySelector('#space-layer-matrix');
+  const NS = 'http://www.w3.org/2000/svg';
+
+  const dynamicsMask = {
+    groups: [
+      {
+        id: 'action',
+        label: 'action',
+        short: 'A',
+        count: 1,
+        level: 0,
+        color: 'var(--sl-series-blue)',
+        queryInsight: 'Action queries combine the control inputs for this timestep without looking ahead into the state those controls are meant to influence.',
+        keyInsight: 'Action keys are visible to every later group, allowing the denoiser and agent to condition on what was done.'
+      },
+      {
+        id: 'denoising-step',
+        label: 'denoising step',
+        short: 'τ',
+        count: 1,
+        level: 1,
+        color: 'var(--sl-series-purple)',
+        queryInsight: 'The denoising-step query combines the signal level and requested shortcut step size with the state it governs.',
+        keyInsight: 'The denoising-step key tells state tokens how noisy X is and how far this pass should move it toward a clean latent.'
+      },
+      {
+        id: 'spatial',
+        label: 'spatial',
+        short: 'X',
+        count: 6,
+        level: 1,
+        color: 'var(--sl-series-pink)',
+        queryInsight: 'Spatial queries turn the noisy visual latents into a coherent next-state representation using the action, denoising condition, within-frame context, and registers.',
+        keyInsight: 'Spatial keys carry the noisy visual state that the layer denoises and that the agent uses to choose behavior.'
+      },
+      {
+        id: 'register',
+        label: 'register',
+        short: 'R',
+        count: 2,
+        level: 1,
+        color: 'var(--sl-series-orange)',
+        queryInsight: 'Register queries gather global features from the state into a shared scratch space, helping distant spatial tokens stay coordinated.',
+        keyInsight: 'Register keys redistribute shared global context to the denoiser and expose that context to the agent.'
+      },
+      {
+        id: 'agent',
+        label: 'agent',
+        short: 'π',
+        count: 1,
+        level: 2,
+        color: 'var(--sl-series-yellow)',
+        queryInsight: 'The task-conditioned agent query reads the completed state to predict the next action, reward, and value; nothing in the world model can read back from it.',
+        keyInsight: 'Agent keys are private to the agent group. Keeping π hidden from world-model tokens prevents task or policy information from leaking into predicted dynamics.'
+      }
+    ],
+    allowed: (query, key) => query.level >= key.level
+  };
+
+  function svgElement(tag, attributes = {}) {
+    const element = document.createElementNS(NS, tag);
+    Object.entries(attributes).forEach(([name, value]) => element.setAttribute(name, value));
+    return element;
+  }
+
+  function appendText(parent, text, attributes = {}) {
+    const element = svgElement('text', attributes);
+    element.textContent = text;
+    parent.appendChild(element);
+    return element;
+  }
+
+  function preserveAccessibleNodes(svg) {
+    const title = svg.querySelector('title');
+    const desc = svg.querySelector('desc');
+    svg.replaceChildren();
+    if (title) svg.appendChild(title);
+    if (desc) svg.appendChild(desc);
+  }
+
+  function blockWidth(group) {
+    return group.count * 42;
+  }
+
+  function blockLayout(groups, canvasWidth) {
+    const gap = 8;
+    const totalWidth = groups.reduce((sum, group) => sum + blockWidth(group), 0) + gap * (groups.length - 1);
+    let x = (canvasWidth - totalWidth) / 2;
+    return groups.map(group => {
+      const width = blockWidth(group);
+      const positioned = { ...group, x, width, center: x + width / 2 };
+      x += width + gap;
+      return positioned;
+    });
+  }
+
+  function distributedAnchor(block, index, count) {
+    if (count <= 1) return block.center;
+    const inset = Math.min(12, block.width * 0.1);
+    const availableWidth = block.width - inset * 2;
+    const span = Math.min(8 * (count - 1), availableWidth);
+    return block.center - span / 2 + span * index / (count - 1);
+  }
+
+  function makeMarker(defs, id, color) {
+    const marker = svgElement('marker', {
+      id,
+      viewBox: '0 0 8 8',
+      refX: '7',
+      refY: '4',
+      markerWidth: '7',
+      markerHeight: '7',
+      orient: 'auto-start-reverse',
+      markerUnits: 'userSpaceOnUse'
+    });
+    marker.appendChild(svgElement('path', { d: 'M 0 0 L 8 4 L 0 8 z', fill: color }));
+    defs.appendChild(marker);
+  }
+
+  function drawBlock(parent, group, side, y, height) {
+    const wrapper = svgElement('g', {
+      class: 'sl-block sl-mark',
+      'data-side': side,
+      'data-group': group.id,
+      style: `--sl-color: ${group.color}`
+    });
+    const title = svgElement('title');
+    title.textContent = `${group.label}, ${group.count} ${group.count === 1 ? 'token' : 'tokens'}`;
+    wrapper.appendChild(title);
+    wrapper.appendChild(svgElement('rect', {
+      x: group.x,
+      y,
+      width: group.width,
+      height,
+      rx: '7',
+      ry: '7'
+    }));
+    parent.appendChild(wrapper);
+  }
+
+  function drawConnectivity() {
+    preserveAccessibleNodes(connectivitySvg);
+    const groups = blockLayout(dynamicsMask.groups, 680);
+    const keysForQuery = new Map(dynamicsMask.groups.map(query => [
+      query.id,
+      dynamicsMask.groups.filter(key => dynamicsMask.allowed(query, key))
+    ]));
+    const queriesForKey = new Map(dynamicsMask.groups.map(key => [
+      key.id,
+      dynamicsMask.groups.filter(query => dynamicsMask.allowed(query, key))
+    ]));
+    const queryY = 58;
+    const keyY = 350;
+    const blockHeight = 52;
+
+    const defs = svgElement('defs');
+    makeMarker(defs, 'space-arrow', 'var(--sl-text-muted)');
+    dynamicsMask.groups.forEach(group => makeMarker(defs, `space-arrow-active-${group.id}`, group.color));
+    makeMarker(defs, 'space-arrow-pair', 'var(--sl-highlight)');
+    connectivitySvg.appendChild(defs);
+
+    appendText(connectivitySvg, 'Q', {
+      class: 'sl-sequence-label',
+      x: '22',
+      y: queryY + blockHeight / 2,
+      'dominant-baseline': 'middle'
+    });
+    appendText(connectivitySvg, 'K', {
+      class: 'sl-sequence-label',
+      x: '22',
+      y: keyY + blockHeight / 2,
+      'dominant-baseline': 'middle'
+    });
+
+    const edges = svgElement('g', { 'aria-hidden': 'true' });
+    dynamicsMask.groups.forEach((query, queryIndex) => {
+      dynamicsMask.groups.forEach((key, keyIndex) => {
+        if (!dynamicsMask.allowed(query, key)) return;
+        const queryBlock = groups[queryIndex];
+        const keyBlock = groups[keyIndex];
+        const sourcePeers = queriesForKey.get(key.id);
+        const targetPeers = keysForQuery.get(query.id);
+        const sourceX = distributedAnchor(keyBlock, sourcePeers.findIndex(peer => peer.id === query.id), sourcePeers.length);
+        const targetX = distributedAnchor(queryBlock, targetPeers.findIndex(peer => peer.id === key.id), targetPeers.length);
+        const path = svgElement('path', {
+          class: 'sl-edge sl-mark',
+          'data-q': query.id,
+          'data-k': key.id,
+          d: `M ${sourceX} ${keyY} L ${targetX} ${queryY + blockHeight}`,
+          'marker-end': 'url(#space-arrow)',
+          style: `--sl-color: ${query.color}`
+        });
+        const title = svgElement('title');
+        title.textContent = `${key.label} keys can send information to ${query.label} queries`;
+        path.appendChild(title);
+        edges.appendChild(path);
+      });
+    });
+    connectivitySvg.appendChild(edges);
+
+    const blocks = svgElement('g');
+    groups.forEach(group => drawBlock(blocks, group, 'q', queryY, blockHeight));
+    groups.forEach(group => drawBlock(blocks, group, 'k', keyY, blockHeight));
+    connectivitySvg.appendChild(blocks);
+
+  }
+
+  function proportionalLayout(groups, start, size) {
+    const totalTokens = groups.reduce((sum, group) => sum + group.count, 0);
+    let cursor = start;
+    return groups.map(group => {
+      const extent = size * group.count / totalTokens;
+      const positioned = { ...group, start: cursor, extent, center: cursor + extent / 2 };
+      cursor += extent;
+      return positioned;
+    });
+  }
+
+  function drawMatrix() {
+    preserveAccessibleNodes(matrixSvg);
+    const plotX = 112;
+    const plotY = 44;
+    const plotSize = 390;
+    const columns = proportionalLayout(dynamicsMask.groups, plotX, plotSize);
+    const rows = proportionalLayout(dynamicsMask.groups, plotY, plotSize);
+
+    appendText(matrixSvg, 'Keys K', {
+      class: 'sl-axis-title',
+      x: plotX + plotSize / 2,
+      y: plotY + plotSize + 60,
+      'text-anchor': 'middle'
+    });
+    appendText(matrixSvg, 'Queries Q', {
+      class: 'sl-axis-title',
+      x: '18',
+      y: plotY + plotSize / 2,
+      transform: `rotate(-90 18 ${plotY + plotSize / 2})`,
+      'text-anchor': 'middle'
+    });
+
+    columns.forEach(column => {
+      appendText(matrixSvg, column.short, {
+        class: 'sl-axis-label',
+        'data-axis': 'k',
+        'data-group': column.id,
+        x: column.center,
+        y: plotY + plotSize + 26,
+        'text-anchor': 'middle'
+      });
+    });
+    rows.forEach(row => {
+      appendText(matrixSvg, row.short, {
+        class: 'sl-axis-label',
+        'data-axis': 'q',
+        'data-group': row.id,
+        x: plotX - 20,
+        y: row.center,
+        'text-anchor': 'middle',
+        'dominant-baseline': 'middle'
+      });
+    });
+
+    const cells = svgElement('g');
+    rows.forEach((row, queryIndex) => {
+      columns.forEach((column, keyIndex) => {
+        const query = dynamicsMask.groups[queryIndex];
+        const key = dynamicsMask.groups[keyIndex];
+        const allowed = dynamicsMask.allowed(query, key);
+        const cell = svgElement('rect', {
+          class: `sl-cell sl-mark ${allowed ? 'is-allowed' : 'is-blocked'}`,
+          'data-q': query.id,
+          'data-k': key.id,
+          'data-allowed': String(allowed),
+          x: column.start,
+          y: row.start,
+          width: column.extent,
+          height: row.extent,
+          style: `--sl-color: ${query.color}`
+        });
+        const title = svgElement('title');
+        title.textContent = allowed
+          ? `${query.label} queries can read ${key.label} keys`
+          : `${query.label} queries cannot read ${key.label} keys`;
+        cell.appendChild(title);
+        cells.appendChild(cell);
+      });
+    });
+    matrixSvg.appendChild(cells);
+  }
+
+  function groupById(id) {
+    return dynamicsMask.groups.find(group => group.id === id);
+  }
+
+  function allMarks() {
+    return root.querySelectorAll('.sl-mark');
+  }
+
+  function setFigureCaption(description) {
+    window.parent.postMessage({ type: 'figure-7-caption', description }, '*');
+  }
+
+  function resetHighlight() {
+    root.querySelectorAll('.is-dimmed, .is-active, .is-related, .is-blocked-endpoint, .is-pair-active').forEach(element => {
+      element.classList.remove('is-dimmed', 'is-active', 'is-related', 'is-blocked-endpoint', 'is-pair-active');
+      element.style.removeProperty('--sl-active-color');
+      if (element.classList.contains('sl-edge')) element.setAttribute('marker-end', 'url(#space-arrow)');
+    });
+    setFigureCaption(null);
+  }
+
+  function dimAllMarks() {
+    allMarks().forEach(mark => mark.classList.add('is-dimmed'));
+  }
+
+  function activate(element, related = false, markerGroupId = null) {
+    if (!element) return;
+    element.classList.remove('is-dimmed');
+    element.classList.add(related ? 'is-related' : 'is-active');
+    if (element.classList.contains('sl-edge')) {
+      element.setAttribute('marker-end', `url(#space-arrow-active-${markerGroupId || element.dataset.q})`);
+    }
+  }
+
+  function selectAll(selector) {
+    return Array.from(root.querySelectorAll(selector));
+  }
+
+  function pairInsight(query, key, allowed) {
+    if (!allowed) {
+      if (query.id === 'action') {
+        return 'Causality keeps action queries from inspecting the state or agent outputs that follow the action.';
+      }
+      if (key.id === 'agent') {
+        return 'World-model tokens cannot read π. Task and policy information can influence future states only after it becomes the next action A.';
+      }
+      return 'This connection is excluded to preserve the within-timestep causal order.';
+    }
+
+    if (query.id === 'action') {
+      return 'Action components can combine into one control representation without seeing the state they will influence.';
+    }
+    if (query.id === 'agent') {
+      const insights = {
+        action: 'The agent relates the current state to the action that led into it.',
+        'denoising-step': 'The agent can account for the current noise level when it reads noisy states during training.',
+        spatial: 'The task-conditioned agent reads the visual state to predict policy, reward, and value.',
+        register: 'The agent consumes the global features assembled in the world model’s shared workspace.',
+        agent: 'Agent tokens combine task context and coordinate their policy, reward, and value readouts.'
+      };
+      return insights[key.id];
+    }
+    if (key.id === 'action') {
+      return 'The state update is action-conditioned: what the agent did can change the predicted next frame.';
+    }
+
+    const stateInsights = {
+      'denoising-step': {
+        'denoising-step': 'The conditioning token retains the signal level and requested shortcut step size for this pass.',
+        spatial: 'The denoising condition is contextualized by the noisy latent it governs.',
+        register: 'Shared registers provide global state context to the denoising condition.'
+      },
+      spatial: {
+        'denoising-step': 'The denoiser learns how noisy X is and how far this pass should move it toward a clean state.',
+        spatial: 'Spatial latents exchange within-frame information so distant parts of the scene remain coherent.',
+        register: 'Registers provide global scratch space that coordinates details across spatial tokens.'
+      },
+      register: {
+        'denoising-step': 'Registers know the denoising target for the current pass.',
+        spatial: 'Registers gather a global summary from the latent scene.',
+        register: 'Registers refine the shared intermediate features used across the state.'
+      }
+    };
+    return stateInsights[query.id][key.id];
+  }
+
+  function highlightQuery(queryId) {
+    resetHighlight();
+    dimAllMarks();
+    const query = groupById(queryId);
+    const allowedKeys = dynamicsMask.groups.filter(key => dynamicsMask.allowed(query, key));
+    selectAll(`.sl-block[data-side="q"][data-group="${queryId}"]`).forEach(element => activate(element));
+    selectAll(`.sl-edge[data-q="${queryId}"]`).forEach(element => {
+      const sourceKey = groupById(element.dataset.k);
+      element.style.setProperty('--sl-active-color', sourceKey.color);
+      activate(element, false, sourceKey.id);
+    });
+    selectAll(`.sl-cell[data-q="${queryId}"][data-allowed="true"]`).forEach(element => {
+      element.style.setProperty('--sl-active-color', groupById(element.dataset.k).color);
+      activate(element);
+    });
+    allowedKeys.forEach(key => {
+      selectAll(`.sl-block[data-side="k"][data-group="${key.id}"]`).forEach(element => activate(element, true));
+    });
+    const axis = root.querySelector(`.sl-axis-label[data-axis="q"][data-group="${queryId}"]`);
+    if (axis) axis.classList.add('is-active');
+    setFigureCaption(`${query.short} ${query.label} — ${query.queryInsight}`);
+  }
+
+  function highlightKey(keyId) {
+    resetHighlight();
+    dimAllMarks();
+    const key = groupById(keyId);
+    const allowedQueries = dynamicsMask.groups.filter(query => dynamicsMask.allowed(query, key));
+    selectAll(`.sl-block[data-side="k"][data-group="${keyId}"]`).forEach(element => activate(element));
+    selectAll(`.sl-edge[data-k="${keyId}"]`).forEach(element => {
+      const destinationQuery = groupById(element.dataset.q);
+      element.style.setProperty('--sl-active-color', destinationQuery.color);
+      activate(element, false, destinationQuery.id);
+    });
+    selectAll(`.sl-cell[data-k="${keyId}"][data-allowed="true"]`).forEach(element => {
+      element.style.setProperty('--sl-active-color', groupById(element.dataset.q).color);
+      activate(element);
+    });
+    allowedQueries.forEach(query => {
+      selectAll(`.sl-block[data-side="q"][data-group="${query.id}"]`).forEach(element => activate(element, true));
+    });
+    const axis = root.querySelector(`.sl-axis-label[data-axis="k"][data-group="${keyId}"]`);
+    if (axis) axis.classList.add('is-active');
+    setFigureCaption(`${key.short} ${key.label} — ${key.keyInsight}`);
+  }
+
+  function highlightPair(queryId, keyId, useOrange) {
+    resetHighlight();
+    dimAllMarks();
+    const query = groupById(queryId);
+    const key = groupById(keyId);
+    const allowed = dynamicsMask.allowed(query, key);
+    const queryBlock = root.querySelector(`.sl-block[data-side="q"][data-group="${queryId}"]`);
+    const keyBlock = root.querySelector(`.sl-block[data-side="k"][data-group="${keyId}"]`);
+    const cell = root.querySelector(`.sl-cell[data-q="${queryId}"][data-k="${keyId}"]`);
+    activate(queryBlock);
+    activate(keyBlock);
+    activate(cell);
+    if (useOrange) cell.classList.add('is-pair-active');
+    if (allowed) {
+      const edge = root.querySelector(`.sl-edge[data-q="${queryId}"][data-k="${keyId}"]`);
+      activate(edge);
+      if (useOrange) {
+        edge.classList.add('is-pair-active');
+        edge.setAttribute('marker-end', 'url(#space-arrow-pair)');
+      }
+      setFigureCaption(`${query.short} reads ${key.short} — ${pairInsight(query, key, true)}`);
+    } else {
+      queryBlock.classList.add('is-blocked-endpoint');
+      keyBlock.classList.add('is-blocked-endpoint');
+      setFigureCaption(`${query.short} cannot read ${key.short} — ${pairInsight(query, key, false)}`);
+    }
+    selectAll(`.sl-axis-label[data-axis="q"][data-group="${queryId}"], .sl-axis-label[data-axis="k"][data-group="${keyId}"]`).forEach(label => label.classList.add('is-active'));
+  }
+
+  function attachInteractions() {
+    let hoveredMark = null;
+
+    const showMarkDescription = mark => {
+      if (mark.classList.contains('sl-block')) {
+        if (mark.dataset.side === 'q') highlightQuery(mark.dataset.group);
+        else highlightKey(mark.dataset.group);
+      } else if (mark.classList.contains('sl-edge')) {
+        highlightPair(mark.dataset.q, mark.dataset.k, false);
+      } else if (mark.classList.contains('sl-cell')) {
+        highlightPair(mark.dataset.q, mark.dataset.k, true);
+      }
+    };
+
+    const updateHoveredMark = event => {
+      const mark = event.target.closest?.('.sl-mark') || null;
+      if (mark === hoveredMark) return;
+      hoveredMark = mark;
+      if (mark) showMarkDescription(mark);
+      else resetHighlight();
+    };
+
+    root.addEventListener('mouseover', updateHoveredMark);
+    root.addEventListener('mousemove', updateHoveredMark);
+    root.addEventListener('click', updateHoveredMark);
+    root.addEventListener('mouseleave', () => {
+      hoveredMark = null;
+      resetHighlight();
+    });
+  }
+
+  function render() {
+    drawConnectivity();
+    drawMatrix();
+    attachInteractions();
+    resetHighlight();
+  }
+
+  render();
+
+  const resizeFrame = () => {
+    if (window.frameElement) {
+      const contentHeight = Math.ceil(document.body.getBoundingClientRect().height);
+      window.frameElement.style.height = `${contentHeight}px`;
+    }
+  };
+  window.addEventListener('load', resizeFrame);
+  new ResizeObserver(resizeFrame).observe(document.documentElement);
+})();
+</script>
+</main>
+</body>
+</html>

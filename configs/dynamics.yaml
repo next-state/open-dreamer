@@ -1,0 +1,224 @@
+# Config for `uv run scripts/train_dynamics.py`.
+# This trains the action-conditioned latent dynamics model on tokenized episodes.
+
+defaults:
+  # Shared logging/checkpoint/precision defaults.
+  - common
+
+  # Tokenized latent dataset produced by `scripts/tokenize_minecraft_dataset.py`.
+  - dataset: minecraft_vpt_latent
+
+  # Let values below override imported defaults.
+  - _self_
+
+# Run name and output directory (`logs/${run_name}`).
+run_name: dynamics-pre-final
+
+# Required tokenizer checkpoint. Even when training from latent data, the script
+# loads the tokenizer so dynamics checkpoints are self-contained and can decode
+# rollouts.
+tokenizer_ckpt: logs/tokenizer-500M/checkpoints
+
+ckpt:
+  # Keep only the newest dynamics checkpoint by default.
+  max_to_keep: 1
+
+  # Save checkpoint every N steps and once at the final step.
+  save_interval_steps: 5_000
+
+dataset:
+  dataloader_cfg:
+    # Global batch size across all JAX processes. Must be divisible by
+    # `jax.process_count()` and fit in memory with `long_T`.
+    B: 8
+
+    # Grain workers for latent loading and slicing.
+    num_workers: 16
+
+    # Short sequence length. Short batches are packed into `long_T` batches and
+    # trained with block-causal masks.
+    short_T: 64
+
+    # Long sequence length. Every selected latent record must contain at least
+    # this many timesteps. Must be a multiple of `short_T`.
+    long_T: 256
+
+    # Fraction of batches sampled as true long episodes. The rest are packed
+    # short chunks. Must be in [0, 1].
+    long_ratio: 0.1
+
+dynamics:
+  # Latent channel width consumed and predicted by dynamics. Must match the
+  # tokenizer encoder `d_bottleneck` and latent stats length.
+  d_bottleneck: 16
+
+  # Number of block-causal transformer layers.
+  depth: 30
+
+  # Hidden width. If set manually, keep divisible by `n_heads`.
+  d_model: ${mul:64,${dynamics.depth}}
+
+  # Attention head count. Must divide `d_model`.
+  n_heads: ${floordiv:${dynamics.d_model},64}
+
+  # KV head count for grouped-query attention. Must divide `n_heads`.
+  n_kv_heads: ${max:1,${floordiv:${dynamics.n_heads},8}}
+
+  # Number of neighboring tokenizer latent tokens packed into one dynamics
+  # spatial token. Must divide tokenizer `n_latents`.
+  packing_factor: 2
+
+  # Learned register tokens appended per timestep.
+  n_register: 32
+
+  # Query/key normalization type. Valid values: `qknorm`, `quest`, or `null`.
+  qk_norm_type: qknorm
+
+  # RoPE base frequency for attention.
+  rope_theta: 10000.0
+
+  # Every Nth transformer layer is a time-attention layer.
+  time_every: 4
+
+  # Offset used when deciding which layers are time-attention layers.
+  time_layer_offset: 0
+
+  # Transformer MLP expansion ratio.
+  mlp_ratio: 4
+
+  # Dropout inside transformer layers.
+  dropout_rate: 0.00
+
+  # Maximum shortcut/diffusion noise resolution. Should be a power of two; FVD
+  # diffusion sampling uses this as the default number of denoising steps.
+  k_max: 256
+
+  # Sliding-window time attention length. `null` would mean full causal
+  # attention; this default caps memory for long sequences.
+  context_length: ${min:192,${dataset.dataloader_cfg.long_T}}
+
+  # Enables learned residual scaling parameters in transformer blocks.
+  use_residual_lambdas: false
+
+  # Whether linear layers use bias parameters.
+  use_bias: false
+
+  # Whether RMSNorm layers use learned scale parameters.
+  use_rmsnorm_scale: true
+
+  # Activation/compute dtype.
+  dtype: ${dtype}
+
+  # Parameter storage dtype.
+  param_dtype: ${param_dtype}
+
+  # Latent normalization stats from the tokenized dataset.
+  latent_mean: ${dataset.latent_mean}
+  latent_std: ${dataset.latent_std}
+
+  # Action dimensions copied from the dataset. These must match the parser and
+  # checkpointed model shape.
+  num_binary_actions: ${dataset.num_binary_actions}
+  categorical_action_dim: ${dataset.categorical_action_dim}
+  continuous_action_dim: ${dataset.continuous_action_dim}
+
+# EMA decay for dynamics_ema checkpoints and bootstrap targets. Must be in
+# [0, 1); values closer to 1 update the EMA more slowly.
+ema_decay: 0.999
+
+# Total optimizer steps. Checkpointing and learning-rate schedules derive from
+# this value.
+max_steps: 200_000
+
+# Before this step, train only the flow-matching objective. After this step,
+# enable shortcut/bootstrap samples according to `bootstrap_fraction`.
+bootstrap_start: 100_000
+
+# Fraction of the batch used for bootstrap/self-distillation samples after
+# `bootstrap_start`. Must be in [0, 1].
+bootstrap_fraction: 0.25
+
+# Fraction of the batch treated as independent images instead of temporal
+# sequences. Must be in [0, 1].
+image_fraction: 0.0
+
+# Minibatch optimal-transport coupling for noise/data pairs.
+ot:
+  # Enable OT pairing. If false, pairs are sampled without OT coupling.
+  enabled: true
+
+  # Entropic regularization for OTT. `null` lets OTT choose/default the value.
+  epsilon: null
+
+  # Maximum Sinkhorn iterations.
+  max_iter: 50
+
+  # Sinkhorn convergence threshold.
+  threshold: 1e-3
+
+  # Use log-sum-exp Sinkhorn mode for numerical stability.
+  lse_mode: true
+
+  # How to map OT solutions to pairs. Valid values: `barycentric`, `argmax`,
+  # `sample`.
+  pairing: barycentric
+
+  # Cost normalization passed to OTT. `mean` is the expected setting here.
+  scale_cost: mean
+
+# Per-sample loss weighting as a function of signal level. Valid values:
+# `none`, `ramp`, `v_space`.
+loss_weighting: v_space
+
+lr_schedule:
+  # Learning-rate schedule. Valid values: `constant`, `wsd`, `cos`.
+  schedule_type: wsd
+
+  # Constant LR or peak LR, depending on schedule type.
+  lr: 3e-4
+
+  # Initial LR for warmup schedules.
+  init_lr: 0.0
+
+  # Final LR for decay schedules.
+  lr_end: 0.0
+
+  # Fraction of `max_steps` spent warming up. Must keep
+  # `warmup_ratio + decay_ratio <= 1` for `wsd`.
+  warmup_ratio: 0.05
+
+  # Fraction of `max_steps` spent decaying at the end for `wsd`.
+  decay_ratio: 0.1
+
+  # Tie schedule horizon to top-level max_steps.
+  max_steps: ${max_steps}
+
+optimizer:
+  # Optimizer implementation. Valid values: `adamw`, `laprop`, `muon`.
+  optimizer_type: muon
+
+  # Decoupled weight decay applied to kernel-like parameters.
+  weight_decay: 0.1
+
+  # AdamW settings used for embeddings, biases, norms, and other non-matrix
+  # parameters when using Muon.
+  adam_b1: 0.9
+  adam_b2: 0.99
+  adam_eps: 1e-8
+  adam_lr_ratio: 1.0
+
+  # MuP LR scaling for Adam-style parameter groups.
+  mup_scaling: false
+
+  # Adaptive gradient clipping. 0.0 disables AGC.
+  agc_clipping: 0.0
+  agc_eps: 1e-3
+
+  # Muon settings for 2D matrix weights.
+  muon_beta: 0.99
+  muon_nesterov: true
+  muon_ns_steps: 5
+
+# Save rollout/evaluation videos every N steps. 0 disables periodic video eval;
+# the final step still triggers evaluation in the training loop.
+write_video_every: 0

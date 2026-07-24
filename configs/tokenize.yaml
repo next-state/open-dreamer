@@ -1,0 +1,35 @@
+# Config for `uv run scripts/tokenize_minecraft_dataset.py`.
+# Edit this file before running the command; command-line Hydra overrides are
+# still supported for quick experiments.
+
+defaults:
+  # Raw MP4 dataset to read. This script expects `data_type: video`.
+  - dataset: minecraft_vpt
+  - _self_
+
+# Required tokenizer checkpoint directory. This should point at the
+# `checkpoints/` directory produced by `scripts/train_tokenizer.py`.
+tokenizer_ckpt: /mnt/data/logs/tokenizer-big/checkpoints
+
+# Required output directory for latent ArrayRecord shards and metadata. Existing
+# files are not automatically cleaned; use a fresh directory for a clean run.
+output_dir: /mnt/data/tokenized_data_last
+
+# Number of full episodes written to each latent shard before rotating to the
+# next `shard-000NN.array_record` file. Larger values produce fewer files;
+# smaller values make partial reruns easier.
+records_per_shard: 5000
+
+# RNG seed used for model/init plumbing. Tokenization reads records sequentially
+# with no shuffle, so this does not change record order.
+seed: 0
+
+# Device mesh for tokenizer encoding. Valid values: `data`, `fsdp`, `tp`, `sp`.
+# `data` is the usual choice for offline tokenization.
+parallel_strategy: data
+
+# Run in the repository root instead of creating per-run Hydra output folders.
+# Tokenization writes its real output to `output_dir`.
+hydra:
+  run:
+    dir: .
