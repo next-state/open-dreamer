@@ -506,21 +506,22 @@ summary d-section {
 }
 
 
-@media (min-width: 1000px) {
-  .date-doi {
-    width: 200px;
-  }
-  p.author{
-    width: 300px;
-  }
-}
-
-d-byline .authors-affiliations {
+d-byline .byline .authors-affiliations {
   grid-template-columns: 1fr;
 }
 
+@media (min-width: 768px) {
+  d-byline .byline {
+    grid-template-columns: 1fr 2fr 1fr;
+  }
+
+  d-byline .byline .authors-affiliations {
+    grid-column-end: span 1;
+  }
+}
+
 d-byline .equal-contribution {
-  color: rgba(0, 0, 0, 0.6);
+  color: rgba(0, 0, 0, 0.4);
 }
 
 svg#graph {
