@@ -8,6 +8,18 @@
 [🎮 Live Demo](https://next-state.github.io/open-dreamer/) &nbsp;·&nbsp;
 [⚡ Inference Code](https://github.com/reactor-team/open-dreamer)
 
+<br />
+<br />
+
+<sub>REAL-TIME DEMO POWERED BY</sub>
+
+<a href="https://reactor.inc">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/reactor-logo-light.svg" />
+    <img alt="Reactor" src="assets/reactor-logo-dark.svg" height="24" />
+  </picture>
+</a>
+
 </div>
 
 ---
@@ -225,6 +237,11 @@ Useful config files:
 
 - Dreamer 4: [Training Agents Inside of Scalable World Models](https://danijar.com/project/dreamer4/)
 - Jasmine: [A simple, performant and scalable JAX-based world modeling codebase](https://github.com/p-doom/jasmine)
+
+## 📄 License
+
+**All rights reserved.** See [LICENSE](LICENSE). This is a temporary notice; a
+formal license is expected in a future release.
 
 ## 📄 Citation
 
