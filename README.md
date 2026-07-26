@@ -11,6 +11,17 @@
 <br />
 <br />
 
+<strong>Authors</strong>
+<br />
+<a href="https://www.diego-marti.com/">Diego Marti Monso</a><sup>*</sup> &nbsp;·&nbsp;
+<a href="https://francesco215.github.io/">Francesco Sacco</a><sup>*</sup> &nbsp;·&nbsp;
+<a href="https://edwardshu.com/">Edward Hu</a>
+<br />
+<sub><sup>*</sup> Equal contribution</sub>
+
+<br />
+<br />
+
 <sub>REAL-TIME DEMO POWERED BY</sub>
 
 <a href="https://reactor.inc">
