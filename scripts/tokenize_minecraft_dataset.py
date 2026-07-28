@@ -38,6 +38,7 @@ from dreamer.data.data import DataLoaderIteratorWrapper
 from dreamer.data.shard_writer import ShardWriter
 from dreamer.data.transforms import ProcessMinecraftEpisodeAndSlice
 from dreamer.parallel import build_parallel
+from dreamer.tokenization import make_tokenization_batch
 
 decord.bridge.set_bridge("native")
 
@@ -97,7 +98,7 @@ def make_tokenization_iterator(
             full_episode=True,
             mouse_repr=mouse_repr,
         ),
-        grain.transforms.Batch(batch_size=batch_size, drop_remainder=True),
+        make_tokenization_batch(batch_size),
     ]
 
     return grain.DataLoader(
