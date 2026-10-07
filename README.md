@@ -74,6 +74,9 @@ The rest of this README covers **training** the model from scratch.
 ## 📋 Roadmap
 
 - [ ] Full Dreamer 4 Behaviour-Cloning / RL agent training loop
+- [ ] Text-conditioned world model: patch → text cross-attention layers interleaved with space and time layers. Layers are implemented and tested; wiring into the encoder and training are in progress ([writeup + diagrams](docs/text_conditioning.md))
+- [ ] **Action decoder**: turns the world model's next-state prediction into the next action (learned action queries cross-attending to the predicted state and the instruction)
+- [ ] **Schema-driven arm adapter**: maps a robot-agnostic action to a specific arm's controls (joints, gripper, limits) from a declarative schema, so one model can drive different robots
 
 ## ⚙️ Requirements
 
@@ -122,6 +125,9 @@ in [dreamer/data/README.md](dreamer/data/README.md).
 │   ├── tokenize_minecraft_dataset.py
 │   ├── train_dynamics.py
 │   └── eval_fvd.py
+├── docs/
+│   └── text_conditioning.md # Text-conditioning design notes and diagrams
+├── tests/                   # Property tests (pytest)
 ├── configs/
 │   ├── dataset/             # Raw-video and latent dataset configs
 │   ├── tokenizer.yaml

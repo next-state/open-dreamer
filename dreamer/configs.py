@@ -4,9 +4,11 @@ from typing import Literal
 
 # ---- Dataset Configs ----
 
+
 @dataclass(frozen=True, unsafe_hash=True)
 class DataloaderConfig:
     """Configuration for dataloader parameters."""
+
     # Batch dimension
     B: int = 32  # batch size
 
@@ -23,6 +25,7 @@ class DataloaderConfig:
 
     dtype: str = "bfloat16"
 
+
 @dataclass(frozen=False, unsafe_hash=True)
 class DatasetConfig:
     """Configuration for dataset parameters.
@@ -30,15 +33,20 @@ class DatasetConfig:
     This config is shared across all experiments (tokenizer, dynamics, policy)
     to ensure consistent data loading.
     """
+
     name: str = "coinrun"
 
     dataloader_cfg: DataloaderConfig = field(default_factory=DataloaderConfig)
     # Frame dimensions
     H: int = 64  # frame height
     W: int = 64  # frame width
-    C: int = 3   # channels
-    padding_H: tuple[int,int] = field(default_factory=lambda: (0, 0))  # how much to pad each frame along the height axis
-    padding_W: tuple[int,int] = field(default_factory=lambda: (0, 0))  # how much to pad each frame along the width axis
+    C: int = 3  # channels
+    padding_H: tuple[int, int] = field(
+        default_factory=lambda: (0, 0)
+    )  # how much to pad each frame along the height axis
+    padding_W: tuple[int, int] = field(
+        default_factory=lambda: (0, 0)
+    )  # how much to pad each frame along the width axis
 
     patch_size: int = 8
 
@@ -46,7 +54,9 @@ class DatasetConfig:
     num_binary_actions: int = 0
     categorical_action_dim: int = 0
     continuous_action_dim: int = 0
-    mouse_repr: str = "categorical"  # "categorical" (mu-law bins, default) or "continuous" ([dx, dy])
+    mouse_repr: str = (
+        "categorical"  # "categorical" (mu-law bins, default) or "continuous" ([dx, dy])
+    )
     array_record_path: str = "datasets/coinrun_episodes/train"
 
     # For minecraft_vpt: number of shards to use (each shard = 1 episode)
@@ -68,6 +78,7 @@ class DatasetConfig:
 
 
 # ---- Model Configs ----
+
 
 @dataclass(frozen=False)
 class EncoderModelConfig:
@@ -91,10 +102,31 @@ class EncoderModelConfig:
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
-    context_length: int | None = None  # sliding window size for temporal attention; None = full causal
+    context_length: int | None = (
+        None  # sliding window size for temporal attention; None = full causal
+    )
 
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
-    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
+    dataset_std: tuple[float, ...] = (0.288675, 0.288675, 0.288675)  # sqrt(1/12)
+
+
+@dataclass(frozen=False)
+class TextEncoderConfig:
+    d_model: int = 512
+    vocab_size: int = 50000
+    max_seq_len: int = 512
+    dtype: str = "float32"
+
+
+@dataclass(frozen=False)
+class TextEncoderModelConfig(EncoderModelConfig):
+    # REVIEW ITEM 10: I had `= TextEncoderConfig(d_model=512)` as the default. A
+    #     dataclass instance as a default would be shared by every config object
+    #     (changing one changes all), so Python refuses it and the whole `dreamer`
+    #     package failed to import. default_factory builds a fresh one per instance.
+    text_encoder_cfg: TextEncoderConfig = field(
+        default_factory=lambda: TextEncoderConfig(d_model=512)
+    )
 
 
 @dataclass(frozen=False)
@@ -118,17 +150,20 @@ class DecoderModelConfig:
     use_seq_parallel: bool = False  # Enable sequence parallelism for time attention
     dtype: str = "float32"
     param_dtype: str = "float32"
-    context_length: int | None = None  # sliding window size for temporal attention; None = full causal
+    context_length: int | None = (
+        None  # sliding window size for temporal attention; None = full causal
+    )
     H: int = 64  # sum(DatasetConfig.padding_H, DatasetConfig.H)
     W: int = 64  # sum(DatasetConfig.padding_W, DatasetConfig.W)
 
     dataset_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
-    dataset_std: tuple[float, ...] =(0.288675, 0.288675, 0.288675)  # sqrt(1/12)
+    dataset_std: tuple[float, ...] = (0.288675, 0.288675, 0.288675)  # sqrt(1/12)
 
 
 @dataclass(frozen=False)
 class TokenizerModelConfig:
     """Model configuration for tokenizer (encoder + decoder architecture)."""
+
     encoder: EncoderModelConfig = field(default_factory=EncoderModelConfig)
     decoder: DecoderModelConfig = field(default_factory=DecoderModelConfig)
 
@@ -141,7 +176,7 @@ class DynamicsModelConfig:
     n_heads: int = 12
     n_kv_heads: int = 1
     packing_factor: int = 2
-    n_register: int = 4 # number of register tokens for dynamics
+    n_register: int = 4  # number of register tokens for dynamics
     qk_norm_type: str | None = None
     rope_theta: float = 10000.0
     time_every: int = 4
@@ -172,25 +207,30 @@ class DynamicsModelConfig:
 
 # ---- Experiment Configs ----
 
+
 @dataclass(frozen=False)
 class LRScheduleConfig:
     """Configuration for learning rate schedule."""
+
     # Schedule type
     # - "constant": constant learning rate (uses lr)
     # - "cos": warmup cosine decay
     # - "wsd": warmup -> hold -> decay (linear warmup, constant hold, linear decay)
     schedule_type: str = "constant"
-    lr: float = 1e-4  # Used for constant schedule, or as peak/max_lr for other schedules
+    lr: float = (
+        1e-4  # Used for constant schedule, or as peak/max_lr for other schedules
+    )
     init_lr: float = 0.0  # Starting LR for warmup schedules
     lr_end: float = 0.0  # Ending LR for decay schedules
     max_steps: int = 1_000_000_000
     warmup_ratio: float = 0.0  # e.g., 0.1 = 10% warmup
-    decay_ratio: float = 0.0   # e.g., 0.2 = 20% decay (for wsd)
+    decay_ratio: float = 0.0  # e.g., 0.2 = 20% decay (for wsd)
 
 
 @dataclass(frozen=True, unsafe_hash=True)
 class OptimalTransportConfig:
     """Configuration for minibatch optimal transport coupling."""
+
     enabled: bool = False
     epsilon: float | None = None
     max_iter: int = 50
@@ -203,6 +243,7 @@ class OptimalTransportConfig:
 @dataclass(frozen=False)
 class CheckpointConfig:
     """Configuration for checkpointing."""
+
     max_to_keep: int = 5  # Maximum number of checkpoints to keep
     save_interval_steps: int = 10_000  # Save checkpoint every N steps
     max_steps: int = 1_000_000_000  # Maximum number of training steps
@@ -211,33 +252,35 @@ class CheckpointConfig:
 @dataclass(frozen=False)
 class OptimizerConfig:
     """Configuration for optimizer."""
+
     # Optimizer type: "adamw", "laprop", or "muon"
     optimizer_type: str = "muon"
     weight_decay: float = 1e-4
 
     # AdamW hyperparameters (also used for non-matrix params when using Muon)
-    adam_lr_ratio: float = 1.0      # adam_lr = muon_lr * adam_lr_ratio
+    adam_lr_ratio: float = 1.0  # adam_lr = muon_lr * adam_lr_ratio
     adam_b1: float = 0.9
     adam_b2: float = 0.9
     adam_eps: float = 1e-8
 
     # MuP scaling (scales AdamW LR by (d_model/mup_base_dim)^-0.5)
-    mup_base_dim: int = 512         # Reference dimension for MuP scaling
-    mup_scaling: bool = False       # Enable MuP LR scaling
+    mup_base_dim: int = 512  # Reference dimension for MuP scaling
+    mup_scaling: bool = False  # Enable MuP LR scaling
 
     # Adaptive Gradient Clipping (AGC)
-    agc_clipping: float = 0.0       # 0 = disabled; e.g. 0.3 clips at 30% of weight norm
-    agc_eps: float = 1e-3           # Floor for weight norm in AGC
+    agc_clipping: float = 0.0  # 0 = disabled; e.g. 0.3 clips at 30% of weight norm
+    agc_eps: float = 1e-3  # Floor for weight norm in AGC
 
     # Muon-specific hyperparameters (for 2D matrix params, excluding embeddings)
-    muon_beta: float = 0.95         # Momentum for Muon
-    muon_ns_steps: int = 5          # Newton-Schulz iterations
-    muon_nesterov: bool = True      # Use Nesterov momentum
+    muon_beta: float = 0.95  # Momentum for Muon
+    muon_ns_steps: int = 5  # Newton-Schulz iterations
+    muon_nesterov: bool = True  # Use Nesterov momentum
 
 
 @dataclass(frozen=False)
 class LoggerConfig:
     """Configuration for experiment logging."""
+
     run_name: str = ""
 
     use_wandb: bool = False
@@ -246,12 +289,13 @@ class LoggerConfig:
 
     log_every: int = 100
     max_steps: int = 1_000_000_000
-    log_gradients:  bool = False
+    log_gradients: bool = False
 
 
 @dataclass(frozen=False)
 class BaseExperimentConfig:
     """Base configuration shared across all experiment types."""
+
     # IO
     run_name: str
     use_wandb: bool = False
@@ -269,7 +313,9 @@ class BaseExperimentConfig:
     max_steps: int = 1_000_000_000
     log_every: int = 100
     seed: int = 0  # Random seed
-    parallel_strategy: Literal["data", "fsdp", "tp", "sp"]  = "data"  # data | fsdp | tp | sp
+    parallel_strategy: Literal["data", "fsdp", "tp", "sp"] = (
+        "data"  # data | fsdp | tp | sp
+    )
 
     # Precision
     dtype: str = "bfloat16"
@@ -289,7 +335,7 @@ class TokenizerConfig(BaseExperimentConfig):
     lpips_weight: float = 0.2
     lpips_frac: float = 0.5
     visualize_every: int = 10_000
-    tokenizer_loss_type: str = "mae" # "mse" | "mae"
+    tokenizer_loss_type: str = "mae"  # "mse" | "mae"
 
     # Finetuning: gradually reduce MAE masking while freezing encoder
     mae_finetune: bool = False
@@ -305,7 +351,8 @@ class TokenizerConfig(BaseExperimentConfig):
     # Optimizer
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
-    #TODO: add dataset stats
+    # TODO: add dataset stats
+
 
 @dataclass(frozen=False)
 class DynamicsConfig(BaseExperimentConfig):
@@ -315,7 +362,9 @@ class DynamicsConfig(BaseExperimentConfig):
     dynamics: DynamicsModelConfig = field(default_factory=DynamicsModelConfig)
 
     # Training
-    bootstrap_start: int = 5_000  # Number of start steps trained exclusively on flow-matching objective
+    bootstrap_start: int = (
+        5_000  # Number of start steps trained exclusively on flow-matching objective
+    )
     bootstrap_fraction: float = 0.25  # Fraction of batch used for bootstrap samples
     image_fraction: float = 0.3
 
