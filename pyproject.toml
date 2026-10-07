@@ -13,8 +13,9 @@ dependencies = [
     "flax",
     "hydra-core",
     "imageio[ffmpeg]",
-    "jax[cuda12]",
-    "nvidia-cusparse-cu12>=12.5.8.93",  # pin to CUDA 12.8 compatible version; 12.5.10.65 requires nvJitLink 12.9
+    "jax[cuda12]; sys_platform == 'linux'",
+    "jax; sys_platform != 'linux'",
+    "nvidia-cusparse-cu12>=12.5.8.93; sys_platform == 'linux'",  # pin to CUDA 12.8 compatible version; 12.5.10.65 requires nvJitLink 12.9
     "jaxlpips",
     "matplotlib",
     "optax>=0.2.8",
@@ -25,8 +26,10 @@ dependencies = [
     "array-record>=0.8.3",
     "grain>=0.2.15",
     "ipykernel>=7.1.0",
-    "decord>=0.6.0; sys_platform != 'linux' or platform_machine != 'aarch64'",
+    "decord>=0.6.0; sys_platform != 'darwin' and (sys_platform != 'linux' or platform_machine != 'aarch64')",
     "ripgrep",
+    "transformers>=5.17.0",
+    "torch>=2.14.0",
 ]
 
 
